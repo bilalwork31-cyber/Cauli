@@ -1,0 +1,16 @@
+# Build artifacts
+target/
+*.egg-info/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+
+# Benchmark outputs and logs
+bench/results/
+bench/campaign/results/
+bench/**/results/
+itest/worker.log
+*.log

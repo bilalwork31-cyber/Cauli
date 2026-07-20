@@ -1,0 +1,42 @@
+# rupy (Python client)
+
+Python client for **rupy**, a Rust background worker runtime for Python task queues.
+Define tasks in Python, enqueue from any web framework, execute on the Rust worker.
+
+## Install
+
+    pip install rupy    # Python >= 3.10, needs redis>=5
+
+## Define an app and tasks (myproj/tasks.py)
+
+    from rupy import Rupy
+
+    app = Rupy(redis_url="redis://localhost:6379/0", default_queue="default")
+
+    @app.task()
+    async def send_email(to: str) -> str:
+        ...                      # io task: runs on the worker's asyncio loop
+        return "sent"
+
+    @app.task(kind="cpu", timeout=120, soft_timeout=60, max_retries=5)
+    def crunch(n: int) -> int:   # cpu task: runs in a child Python process
+        return sum(i * i for i in range(n))
+
+## Enqueue from Django, FastAPI, or Flask
+
+    from myproj.tasks import send_email
+
+    r = send_email.delay("a@b.com")
+    r = send_email.apply_async(args=("a@b.com",), countdown=30, queue="emails",
+                               idempotency_key="welcome:a@b.com")
+    r.status()           # "pending" | "success" | "failure" | "duplicate"
+    r.get(timeout=10)    # value on success; raises TaskFailedError / TimeoutError
+
+Tasks stay directly callable for tests: `crunch(10)` runs inline, no broker needed.
+
+## Run the worker (Rust binary)
+
+    rupy-worker --app myproj.tasks:app --queues default,emails --cpu-workers 4
+
+The URL falls back to env `RUPY_REDIS_URL`, then `redis://localhost:6379/0`.
+See `PROTOCOL.md` in the repo root for the full wire contract.
