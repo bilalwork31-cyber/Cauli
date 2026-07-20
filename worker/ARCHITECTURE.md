@@ -1,0 +1,105 @@
+# rupy-worker architecture (as built)
+
+One Rust OS process (`rupy-worker`) executes many Python tasks concurrently
+against Redis Streams per PROTOCOL.md. Module map:
+
+| File | Role |
+|---|---|
+| `src/main.rs` | Bootstrap: CLI, tracing, Python init, redis connect, spawns all loops, §4.7 drain, exit codes |
+| `src/cli.rs` | clap CLI per §7 + queue name validation |
+| `src/loops.rs` | fetch loop (XREADGROUP), delayed mover (§4.3), recovery (§4.4), stats |
+| `src/dispatch.rs` | per-entry pipeline: parse -> idempotency (§4.5) -> route -> finish (§4.1/§4.2) |
+| `src/exec.rs` | sync-thread / async-loop / cpu-child execution, timeouts (§4.6) |
+| `src/ctx.rs` | shared context, executor response -> Outcome normalization |
+| `src/pyrt.rs` | pyo3 glue: interpreter init, shim import, sync io thread pool, async submit bridge |
+| `src/shim.py` | embedded Python shim (include_str!): app loading, run_sync, asyncio loops, soft-timeout watchdog |
+| `src/cpu.rs` | §5.1 child process pool, kill+respawn, `RUPY_EXEC_CMD` test hook |
+| `src/broker.rs` | Redis key layout, group setup, mover Lua, pipelined completion writes |
+| `src/envelope.rs` | §2 envelope (unknown-field preserving), §8 result/error JSON, redelivery limit |
+| `src/backoff.rs` | §4.2 backoff math (jitter after clamp) |
+| `src/stats.rs` | counters + `stats:` line, rss_mb from /proc/self/status VmRSS |
+
+## Threading model
+
+- **tokio multi-thread runtime** owns all broker plumbing: one fetch loop doing
+  `XREADGROUP ... BLOCK 1000` over all queues (dedicated ConnectionManager so
+  BLOCK never stalls writes), pipelined ack/retry/DLQ writers, 250ms delayed
+  mover (single EVAL per queue), XPENDING/XCLAIM recovery every
+  visibility_timeout/2, stats loop, signal task.
+- **Embedded CPython** via pyo3 auto-initialize; `prepare_freethreaded_python()`
+  at startup before the runtime. The GIL is NEVER held on tokio worker threads
+  during broker I/O: sync tasks run on dedicated OS threads, async submission
+  happens inside `spawn_blocking`, completions arrive from Python loop threads.
+- **Shim** (`src/shim.py`, imported once via `PyModule::from_code`): the pyo3
+  surface is strings-in/strings-out. `load_app` duck-types (getattr only) the
+  app per §6 and honors VIRTUAL_ENV site-packages; `run_sync` captures returns/
+  exceptions/Retry/SerializationError as outcome JSON; `start_loops(N)` spawns
+  N daemon threads each running `loop.run_forever()`; `submit_async` uses
+  `run_coroutine_threadsafe` + `asyncio.wait_for(coro, effective_s)` and pushes
+  completion into a Rust `PyCFunction` closure -> tokio oneshot (no polling).
+- **Sync io pool** (`--io-threads`): Rust-spawned OS threads; each takes the
+  GIL only around the shim `run_sync` call; CPython releases it during blocking
+  I/O, so io parallelism is real. Soft timeout: shim watchdog `threading.Timer`
+  injecting `SoftTimeLimitExceeded` via `PyThreadState_SetAsyncExc`.
+- **Cpu pool** (`--cpu-workers`): children `{python} -m rupy._exec --app {spec}`,
+  line-delimited JSON, one in-flight per child, ready-line handshake, SIGKILL +
+  respawn on hard timeout ("TimeoutError") or death ("WorkerLost"), both
+  retryable. Children get `PR_SET_PDEATHSIG=SIGKILL` so a SIGKILLed worker
+  cannot leak them; remaining children are killed on exit paths.
+  **Test hook:** env `RUPY_EXEC_CMD` (whitespace-split argv) replaces the child
+  command verbatim, used by e2e to run `tests/fixtures/fake_exec.py`.
+
+## Admission / backpressure
+
+Global io semaphore `--io-concurrency` gates io execution. Cpu backlog is a
+bounded channel of `2 * cpu_workers`; a dispatch that finds it full parks on
+`send().await` and raises an overflow flag. The fetch loop only issues
+XREADGROUP when io permits exist AND overflow == 0. Io fetch can therefore
+pause while a cpu flood drains, but never indefinitely: cpu children always
+make progress (hard-timeout SIGKILL bounds every slot), so overflow clears in
+bounded time. This satisfies "bound cpu backlog to 2*cpu_workers" without
+letting it wedge io fetching forever.
+
+## Completion writes (all pipelined, §4.1/§4.2)
+
+- success: `SET result EX ttl` (if store_result) + XACK + XDEL
+- retry: retries+=1, `ZADD delayed (now+d)` (unknown envelope fields preserved)
+  + XACK + XDEL, d per §4.2 (jitter = uniform(0.5d, d) after the max clamp);
+  `rupy.Retry.countdown` overrides d
+- final failure: `XADD dlq (e, reason="max_retries", error)` + result + XACK+XDEL
+- malformed / unregistered / redelivery_limit: DLQ (error field empty) + XACK+XDEL
+
+Counters: ok counts successes and duplicates; failed counts final failures;
+retried counts scheduled retries; dlq counts every DLQ write.
+
+## Known limitations / deviations (flagged)
+
+1. **Sync hard timeout cannot kill the thread** (§4.6, documented in protocol):
+   the task is failed on the retry path and the thread result abandoned; the
+   pool slot stays occupied until the Python call returns.
+2. **cpu Retry countdown**: §5.1 error JSON has no countdown field, so a cpu
+   task raising `Retry` is recognized by error type name and retried with the
+   COMPUTED backoff (countdown lost over the pipe).
+3. **No result key** is written for `malformed` / `unregistered` /
+   `redelivery_limit` DLQ entries: §4 / §4.4 specify only the DLQ write, so a
+   client `get()` on such a task waits until timeout. Spec followed literally.
+4. **Non-JSON `-m rupy._exec` responses** are treated as retryable
+   WorkerShimError failures rather than crashing the pool.
+5. Usage errors print via clap but exit 1 (spec: 1 = fatal config error;
+   clap's default 2 is overridden). `--help`/`--version` exit 0.
+6. Second signal exits 130 immediately; cpu children die with the worker via
+   PDEATHSIG rather than explicit reaping on that path.
+
+## Ops quickstart
+
+```
+rupy-worker --app myproj.tasks:app --queues default,emails \
+    --redis-url redis://127.0.0.1:6379/0 --cpu-workers 4 --log-level info
+```
+
+Redis URL precedence: `--redis-url` > `RUPY_REDIS_URL` > `app.redis_url`.
+Stats line every `--stats-interval`s:
+`stats: fetched=N ok=N failed=N retried=N dlq=N inflight_io=N inflight_cpu=N rss_mb=N`.
+SIGTERM/SIGINT: stop fetching, drain up to `--drain-timeout`, exit 0; second
+signal exits 130. SIGKILL is safe: pending entries are re-claimed by another
+worker after `--visibility-timeout` (§4.4).

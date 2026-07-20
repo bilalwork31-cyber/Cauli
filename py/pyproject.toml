@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rupy"
+version = "0.1.0"
+description = "Python client for rupy, a Rust background worker runtime for Python task queues"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "redis>=5",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+]
+
+[tool.setuptools]
+packages = ["rupy"]
+
+[tool.setuptools.package-data]
+rupy = ["py.typed"]

@@ -1,0 +1,31 @@
+[package]
+name = "rupy-worker"
+version = "0.1.0"
+edition = "2021"
+description = "Rust worker runtime for rupy Python task queues"
+
+[[bin]]
+name = "rupy-worker"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+async-channel = "2"
+clap = { version = "4", features = ["derive"] }
+crossbeam-channel = "0.5"
+gethostname = "1"
+libc = "0.2"
+pyo3 = { version = "0.26", features = ["auto-initialize"] }
+rand = "0.9"
+redis = { version = "0.32", features = ["tokio-comp", "connection-manager"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+libc = "0.2"
+redis = { version = "0.32", features = ["tokio-comp"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }

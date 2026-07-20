@@ -1,0 +1,8 @@
+celery[redis,gevent]>=5.4
+redis>=5
+requests>=2.31
+httpx>=0.27
+uvicorn>=0.30
+starlette>=0.37
+psutil>=5.9
+pytest>=8
