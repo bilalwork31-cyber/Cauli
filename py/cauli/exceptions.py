@@ -1,8 +1,8 @@
-"""rupy exceptions.
+"""cauli exceptions.
 
 See PROTOCOL.md sections 4.2, 6 and 8. ``Retry`` and ``SoftTimeLimitExceeded``
 are part of the wire contract: the Rust worker matches them by the classes
-exposed as ``rupy.Retry`` / ``rupy.SoftTimeLimitExceeded``.
+exposed as ``cauli.Retry`` / ``cauli.SoftTimeLimitExceeded``.
 """
 
 from __future__ import annotations
@@ -35,7 +35,7 @@ class SoftTimeLimitExceeded(Exception):
 
 
 class TaskFailedError(Exception):
-    """Raised by :meth:`rupy.AsyncResult.get` when a task finished with status failure.
+    """Raised by :meth:`cauli.AsyncResult.get` when a task finished with status failure.
 
     Attributes mirror the error JSON from PROTOCOL.md section 8:
     ``type`` (exception class name), ``message``, ``traceback`` (may be truncated).

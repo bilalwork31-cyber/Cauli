@@ -1,4 +1,4 @@
-"""ONE campaign implementation imported by BOTH stacks (Celery and rupy).
+"""ONE campaign implementation imported by BOTH stacks (Celery and cauli).
 
 dispatch_tick:  quota = max(1, APP_MAX_PER_MINUTE // active_campaigns) applied
                 PER TICK (production quirk, kept), claim capped additionally by
@@ -26,10 +26,11 @@ Batch ends with ONE grouped store.mark_results (sent flags were already set
 at send time, so duplicate protection never waits on the grouped write).
 
 Sync: ThreadPoolExecutor(CONCURRENT_GLOBAL) per batch + threading.Semaphore
-per page. Async: per-page asyncio.Semaphore; GLOBAL slots come from rupy's
+per page. Async: per-page asyncio.Semaphore; GLOBAL slots come from cauli's
 --io-concurrency admission gate itself; HTTP via graph_async (raw asyncio
 keepalive pool), redis via store_async.
 """
+
 import asyncio
 import concurrent.futures
 import random
@@ -45,8 +46,8 @@ import store_async
 
 CONFIG = campconfig.CONFIG
 SEND_URL = campconfig.GRAPH_URL + "/me/messages"
-IN_PROCESS_TRIES = 4            # 1 initial + up to 3 retries
-BACKOFFS = (1.0, 2.0, 4.0)      # seconds, scaled by RETRY_SCALE
+IN_PROCESS_TRIES = 4  # 1 initial + up to 3 retries
+BACKOFFS = (1.0, 2.0, 4.0)  # seconds, scaled by RETRY_SCALE
 
 
 def now_ms():
@@ -61,7 +62,7 @@ def dispatch_tick(campaign_id):
     limit = min(quota, CONFIG["MAX_BATCHES_PER_DISPATCH"] * CONFIG["BATCH_SIZE"])
     claimed = store.claim_batch(campaign_id, now_ms(), limit)
     bs = CONFIG["BATCH_SIZE"]
-    batches = [claimed[i:i + bs] for i in range(0, len(claimed), bs)]
+    batches = [claimed[i : i + bs] for i in range(0, len(claimed), bs)]
     total = store.campaign_total(campaign_id)
     queue = "campaign_short" if total <= 500 else "campaign_long"
     return {"batches": batches, "queue": queue, "claimed": len(claimed)}
@@ -70,8 +71,9 @@ def dispatch_tick(campaign_id):
 # ------------------------------------------------------------- failure paths -
 def _failure_fields(attempts):
     if attempts < CONFIG["MAX_ATTEMPTS"]:
-        delay_s = (min(90.0, 8.0 * (2.0 ** (attempts - 1)))
-                   + random.uniform(1.0, 15.0)) * CONFIG["BACKOFF_SCALE"]
+        delay_s = (
+            min(90.0, 8.0 * (2.0 ** (attempts - 1))) + random.uniform(1.0, 15.0)
+        ) * CONFIG["BACKOFF_SCALE"]
         return {"outcome": "retry", "next_due_ms": now_ms() + int(delay_s * 1000)}
     return {"outcome": "failed"}
 
@@ -100,7 +102,8 @@ def _post_once_sync(cid, rid, page_id):
         resp = requests.post(
             SEND_URL,
             json={"campaign_id": cid, "recipient_id": rid, "page_id": page_id},
-            timeout=30)
+            timeout=30,
+        )
     except requests.RequestException:
         return "fail", True
     if resp.status_code == 200:
@@ -122,11 +125,14 @@ def _send_one_sync(cid, rid, page_id):
                 sent_at = now_ms()
                 store.set_sent_flag(cid, rid)
                 time.sleep(CONFIG["SEND_DELAY"])
-                return {"rid": rid, "outcome": "sent", "attempts": attempts,
-                        "sent_at_ms": sent_at}
+                return {
+                    "rid": rid,
+                    "outcome": "sent",
+                    "attempts": attempts,
+                    "sent_at_ms": sent_at,
+                }
             if res == "blocked":
-                return {"rid": rid, "outcome": "already_sent",
-                        "attempts": attempts}
+                return {"rid": rid, "outcome": "already_sent", "attempts": attempts}
             if not retryable:
                 break
             if i < IN_PROCESS_TRIES - 1:
@@ -136,11 +142,13 @@ def _send_one_sync(cid, rid, page_id):
 
 
 def send_batch_sync(campaign_id, batch):
-    """batch: [[rid, page_id], ...]. Called by Celery AND rupy sync tasks."""
+    """batch: [[rid, page_id], ...]. Called by Celery AND cauli sync tasks."""
     with concurrent.futures.ThreadPoolExecutor(
-            max_workers=CONFIG["CONCURRENT_GLOBAL"]) as ex:
-        futs = [ex.submit(_send_one_sync, campaign_id, rid, page)
-                for rid, page in batch]
+        max_workers=CONFIG["CONCURRENT_GLOBAL"]
+    ) as ex:
+        futs = [
+            ex.submit(_send_one_sync, campaign_id, rid, page) for rid, page in batch
+        ]
         results = [f.result() for f in futs]
     store.mark_results(campaign_id, results)
     return _batch_summary(batch, results)
@@ -165,8 +173,8 @@ async def _post_once_async(cid, rid, page_id):
     pool = graph_async.get_pool(campconfig.GRAPH_URL)
     try:
         status = await pool.post_json(
-            {"campaign_id": cid, "recipient_id": rid, "page_id": page_id},
-            timeout=30.0)
+            {"campaign_id": cid, "recipient_id": rid, "page_id": page_id}, timeout=30.0
+        )
     except Exception:
         return "fail", True
     if status == 200:
@@ -188,11 +196,14 @@ async def _send_one_async(cid, rid, page_id):
                 sent_at = now_ms()
                 await store_async.set_sent_flag(cid, rid)
                 await asyncio.sleep(CONFIG["SEND_DELAY"])
-                return {"rid": rid, "outcome": "sent", "attempts": attempts,
-                        "sent_at_ms": sent_at}
+                return {
+                    "rid": rid,
+                    "outcome": "sent",
+                    "attempts": attempts,
+                    "sent_at_ms": sent_at,
+                }
             if res == "blocked":
-                return {"rid": rid, "outcome": "already_sent",
-                        "attempts": attempts}
+                return {"rid": rid, "outcome": "already_sent", "attempts": attempts}
             if not retryable:
                 break
             if i < IN_PROCESS_TRIES - 1:
@@ -202,10 +213,11 @@ async def _send_one_async(cid, rid, page_id):
 
 
 async def send_batch_async(campaign_id, batch):
-    """Same logic as send_batch_sync on asyncio (rupy async variant)."""
+    """Same logic as send_batch_sync on asyncio (cauli async variant)."""
     results = await asyncio.gather(
-        *[_send_one_async(campaign_id, rid, page) for rid, page in batch])
-    store.mark_results(campaign_id, results)   # one sync pipeline per batch
+        *[_send_one_async(campaign_id, rid, page) for rid, page in batch]
+    )
+    store.mark_results(campaign_id, results)  # one sync pipeline per batch
     return _batch_summary(batch, results)
 
 

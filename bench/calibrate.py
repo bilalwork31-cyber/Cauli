@@ -6,6 +6,7 @@ common.CPU_ITER (with the measured ms in the comment).
 
 Run:  python calibrate.py [target_ms]
 """
+
 import hashlib
 import statistics
 import sys
@@ -43,8 +44,10 @@ def main() -> None:
     measured = time_iters(suggested, reps=11)
     print()
     print(f"target {TARGET_MS:.0f} ms  ->  suggested CPU_ITER = {suggested}")
-    print(f"verification: {suggested} iterations = {measured:.1f} ms median "
-          f"({1000.0 / measured:.1f} tasks/sec/core)")
+    print(
+        f"verification: {suggested} iterations = {measured:.1f} ms median "
+        f"({1000.0 / measured:.1f} tasks/sec/core)"
+    )
     print(f"bake into common.py:  CPU_ITER = {suggested}  # {measured:.1f} ms measured")
 
 

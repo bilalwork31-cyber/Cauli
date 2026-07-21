@@ -1,8 +1,9 @@
 """Duck-typed fixture app for worker e2e tests.
 
 Plain classes exposing exactly the PROTOCOL §6 introspection attributes;
-no rupy package import. The worker reads everything via getattr.
+no cauli package import. The worker reads everything via getattr.
 """
+
 import asyncio
 import os
 import time
@@ -17,10 +18,22 @@ class Retry(Exception):
 
 
 class TaskDef:
-    def __init__(self, name, fn, is_async=False, kind="io", queue=None,
-                 max_retries=3, timeout_ms=300000, soft_timeout_ms=None,
-                 backoff_base_ms=500, backoff_factor=2.0, backoff_max_ms=60000,
-                 jitter=True, store_result=True):
+    def __init__(
+        self,
+        name,
+        fn,
+        is_async=False,
+        kind="io",
+        queue=None,
+        max_retries=3,
+        timeout_ms=300000,
+        soft_timeout_ms=None,
+        backoff_base_ms=500,
+        backoff_factor=2.0,
+        backoff_max_ms=60000,
+        jitter=True,
+        store_result=True,
+    ):
         self.name = name
         self.fn = fn
         self.is_async = is_async

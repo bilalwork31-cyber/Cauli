@@ -4,6 +4,7 @@ Same broker/backend/conf as campaign_celery (additive file, own app object).
 Extra queue `persist` is served by an additional prefork worker (-c 2) inside
 the same 1G scope (see runner_c.sh).
 """
+
 import os
 
 from celery import Celery
@@ -58,6 +59,7 @@ def send_batch(campaign_id, batch):
 def persist_drain():
     def reenqueue(countdown):
         persist_drain.apply_async(queue="persist", countdown=countdown)
+
     return persist_common.drain_and_chain(reenqueue)
 
 

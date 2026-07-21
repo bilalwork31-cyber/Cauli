@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Benchmark orchestrator: Celery vs rupy, sequential, resource capped, on WSL2.
+# Benchmark orchestrator: Celery vs cauli, sequential, resource capped, on WSL2.
 #
 # Usage:   bash runner.sh [filter]
 #   filter matches scenario name prefixes (S1, S1a, S3, ...) or a stack name
-#   (celery | rupy). No filter runs everything.
+#   (celery | cauli). No filter runs everything.
 #
 # One system under test at a time. Throwaway redis on $BENCH_REDIS_PORT
 # (default 6390, NEVER 6379), FLUSHALL between scenarios, mock_api running
@@ -25,7 +25,7 @@ CELERY_BIN="$VENV/bin/celery"
 PORT="${BENCH_REDIS_PORT:-6390}"
 export BENCH_REDIS_PORT="$PORT"
 export PYTHONUNBUFFERED=1
-RUPY_WORKER_BIN="${RUPY_WORKER_BIN:-/home/blackdevil/rupy-target/release/rupy-worker}"
+CAULI_WORKER_BIN="${CAULI_WORKER_BIN:-/home/blackdevil/rupy-target/release/cauli-worker}"
 RESULTS="$BENCH_DIR/results"
 LOGS="$RESULTS/logs"
 DRIVER_TIMEOUT="${BENCH_DRIVER_TIMEOUT:-600}"
@@ -39,19 +39,19 @@ log() { echo "[runner $(date +%H:%M:%S)] $*" | tee -a "$LOGS/runner.log"; }
 
 [ -x "$PY" ] || { echo "venv missing at $VENV; run: bash setup.sh"; exit 1; }
 
-RUPY_URL="redis://127.0.0.1:$PORT/0"
+CAULI_URL="redis://127.0.0.1:$PORT/0"
 
-# The rupy worker embeds CPython and spawns `python -m rupy._exec` children;
-# both must be able to import rupy, tasks_rupy, common and their deps from the
+# The cauli worker embeds CPython and spawns `python -m cauli._exec` children;
+# both must be able to import cauli, tasks_cauli, common and their deps from the
 # bench venv. PYTHONPATH covers the embedded interpreter; --python (added to
-# the rupy invocations below) makes the cpu children use the venv interpreter
+# the cauli invocations below) makes the cpu children use the venv interpreter
 # directly. Harmless for Celery (it already runs from the venv).
 SITEPKG="$("$PY" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])' 2>/dev/null || true)"
 if [ -n "$SITEPKG" ]; then
     export PYTHONPATH="$SITEPKG:$BENCH_DIR${PYTHONPATH:+:$PYTHONPATH}"
 fi
 # Editable installs (pip install -e) rely on .pth hooks, which PYTHONPATH
-# entries never execute; expose the rupy package source dir directly, and
+# entries never execute; expose the cauli package source dir directly, and
 # export VIRTUAL_ENV so the worker shim performs real site processing
 # (site.addsitedir) for the venv as well.
 export PYTHONPATH="$(cd "$BENCH_DIR/.." && pwd)/py:$PYTHONPATH"
@@ -183,7 +183,7 @@ wait_ready() {            # wait_ready <stack>
         done
         return 1
     else
-        # rupy: no ping protocol; give it 3s to import the app and settle
+        # cauli: no ping protocol; give it 3s to import the app and settle
         sleep 3
         kill -0 "$WORKER_PID" 2>/dev/null
     fi
@@ -196,10 +196,10 @@ match_filter() {          # match_filter <name> <stack>
     return 1
 }
 
-skip_if_no_rupy() {       # skip_if_no_rupy <name> <stack>
-    if [ "$2" = "rupy" ] && [ ! -x "$RUPY_WORKER_BIN" ]; then
-        log "SKIP $1: rupy binary not found at $RUPY_WORKER_BIN (set RUPY_WORKER_BIN to override)"
-        printf '{"scenario":"%s","status":"skipped","reason":"rupy binary not found"}\n' "$1" > "$RESULTS/$1.json"
+skip_if_no_cauli() {       # skip_if_no_cauli <name> <stack>
+    if [ "$2" = "cauli" ] && [ ! -x "$CAULI_WORKER_BIN" ]; then
+        log "SKIP $1: cauli binary not found at $CAULI_WORKER_BIN (set CAULI_WORKER_BIN to override)"
+        printf '{"scenario":"%s","status":"skipped","reason":"cauli binary not found"}\n' "$1" > "$RESULTS/$1.json"
         return 0
     fi
     return 1
@@ -210,7 +210,7 @@ run_scenario() {          # run_scenario <name> <stack> <cap> <task> <n> -- <wor
     local name="$1" stack="$2" cap="$3" task="$4" n="$5"; shift 5
     [ "${1:-}" = "--" ] && shift
     match_filter "$name" "$stack" || return 0
-    skip_if_no_rupy "$name" "$stack" && return 0
+    skip_if_no_cauli "$name" "$stack" && return 0
     log "=== $name  stack=$stack cap=$cap task=$task n=$n"
     redis-cli -p "$PORT" flushall >/dev/null
     if ! start_scoped "$name" "$cap" "$@"; then
@@ -244,7 +244,7 @@ run_idle() {              # run_idle <name> <stack> <cap> -- <worker cmd...>
     local name="$1" stack="$2" cap="$3"; shift 3
     [ "${1:-}" = "--" ] && shift
     match_filter "$name" "$stack" || return 0
-    skip_if_no_rupy "$name" "$stack" && return 0
+    skip_if_no_cauli "$name" "$stack" && return 0
     log "=== $name (idle ram) stack=$stack cap=$cap"
     redis-cli -p "$PORT" flushall >/dev/null
     if ! start_scoped "$name" "$cap" "$@"; then
@@ -267,36 +267,36 @@ run_idle() {              # run_idle <name> <stack> <cap> -- <worker cmd...>
 }
 
 # ------------------------------------------------------------------ suite ---
-log "suite start (filter='${FILTER:-all}') redis=$PORT rupy_bin=$RUPY_WORKER_BIN driver_timeout=${DRIVER_TIMEOUT}s"
+log "suite start (filter='${FILTER:-all}') redis=$PORT cauli_bin=$CAULI_WORKER_BIN driver_timeout=${DRIVER_TIMEOUT}s"
 start_redis
 start_mock
 
 CEL=("$CELERY_BIN" -A tasks_celery worker --loglevel=WARNING)
-RUPY=("$RUPY_WORKER_BIN" --app tasks_rupy:app --redis-url "$RUPY_URL" --python "$PY")
+CAULI=("$CAULI_WORKER_BIN" --app tasks_cauli:app --redis-url "$CAULI_URL" --python "$PY")
 
 # S1: 10k io tasks, 1G cap
 run_scenario S1a_celery_prefork8   celery 1G io       10000 -- "${CEL[@]}" -c 8   -P prefork
 run_scenario S1b_celery_prefork16  celery 1G io       10000 -- "${CEL[@]}" -c 16  -P prefork
 run_scenario S1c_celery_gevent500  celery 1G io       10000 -- "${CEL[@]}" -c 500 -P gevent
-run_scenario S1d_rupy_sync_io500   rupy   1G io       10000 -- "${RUPY[@]}" --io-concurrency 500 --io-threads 64
-run_scenario S1e_rupy_async_io500  rupy   1G io_async 10000 -- "${RUPY[@]}" --io-concurrency 500
+run_scenario S1d_cauli_sync_io500   cauli   1G io       10000 -- "${CAULI[@]}" --io-concurrency 500 --io-threads 64
+run_scenario S1e_cauli_async_io500  cauli   1G io_async 10000 -- "${CAULI[@]}" --io-concurrency 500
 
 # S2: 2k cpu tasks, 1G cap
 run_scenario S2a_celery_prefork6   celery 1G cpu 2000 -- "${CEL[@]}" -c 6 -P prefork
-run_scenario S2b_rupy_cpu6         rupy   1G cpu 2000 -- "${RUPY[@]}" --cpu-workers 6
+run_scenario S2b_cauli_cpu6         cauli   1G cpu 2000 -- "${CAULI[@]}" --cpu-workers 6
 
 # S3: 10k io tasks under 512M stress (celery prefork expected to OOM/thrash;
 # the driver survives that and records status=stalled/worker_dead + counts)
 run_scenario S3a_celery_prefork8_512M   celery 512M io       10000 -- "${CEL[@]}" -c 8   -P prefork
 run_scenario S3b_celery_gevent500_512M  celery 512M io       10000 -- "${CEL[@]}" -c 500 -P gevent
-run_scenario S3c_rupy_async_io1000_512M rupy   512M io_async 10000 -- "${RUPY[@]}" --io-concurrency 1000
+run_scenario S3c_cauli_async_io1000_512M cauli   512M io_async 10000 -- "${CAULI[@]}" --io-concurrency 1000
 
 # S4: idle RAM per worker configuration (20s settle, no tasks)
 run_idle S4a_celery_prefork8_idle  celery 1G -- "${CEL[@]}" -c 8   -P prefork
 run_idle S4b_celery_prefork16_idle celery 1G -- "${CEL[@]}" -c 16  -P prefork
 run_idle S4c_celery_gevent500_idle celery 1G -- "${CEL[@]}" -c 500 -P gevent
-run_idle S4d_rupy_io_idle          rupy   1G -- "${RUPY[@]}" --io-concurrency 500 --io-threads 64
-run_idle S4e_rupy_cpu_idle         rupy   1G -- "${RUPY[@]}" --cpu-workers 6
+run_idle S4d_cauli_io_idle          cauli   1G -- "${CAULI[@]}" --io-concurrency 500 --io-threads 64
+run_idle S4e_cauli_cpu_idle         cauli   1G -- "${CAULI[@]}" --cpu-workers 6
 
 # ---------------------------------------------------------------- summary ---
 log "suite done; results in $RESULTS"

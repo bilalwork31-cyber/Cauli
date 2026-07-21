@@ -6,6 +6,7 @@ client per running event loop (redis.asyncio connections are loop-bound).
 Semantics are identical to the sync functions in store.py; batch-end
 mark_results stays sync (one pipeline per batch, ~1 RTT).
 """
+
 import asyncio
 
 import redis.asyncio as aredis
@@ -19,15 +20,13 @@ def _conn():
     loop = asyncio.get_running_loop()
     c = _clients.get(id(loop))
     if c is None:
-        c = aredis.Redis(host="127.0.0.1", port=S.PORT, db=S.DB,
-                         decode_responses=True)
+        c = aredis.Redis(host="127.0.0.1", port=S.PORT, db=S.DB, decode_responses=True)
         _clients[id(loop)] = c
     return c
 
 
 async def acquire_lock(cid, rid):
-    return bool(await _conn().set(S.k_lock(cid, rid), "1", nx=True,
-                                  ex=S.LOCK_TTL_S))
+    return bool(await _conn().set(S.k_lock(cid, rid), "1", nx=True, ex=S.LOCK_TTL_S))
 
 
 async def begin_send(cid, rid):

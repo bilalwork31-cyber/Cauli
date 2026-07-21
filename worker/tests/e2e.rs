@@ -27,7 +27,7 @@ async fn e2e_main_flows() {
     assert!(r["finished_at"].as_u64().unwrap() > 0);
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     let len: u64 = redis::cmd("XLEN")
-        .arg("rupy:q:default")
+        .arg("cauli:q:default")
         .query_async(&mut c)
         .await
         .unwrap();
@@ -60,7 +60,7 @@ async fn e2e_main_flows() {
     let mut found = None;
     for _ in 0..100 {
         let zs: Vec<(String, f64)> = redis::cmd("ZRANGE")
-            .arg("rupy:delayed:default")
+            .arg("cauli:delayed:default")
             .arg(0)
             .arg(-1)
             .arg("WITHSCORES")
@@ -85,7 +85,7 @@ async fn e2e_main_flows() {
         "score {score} above window"
     );
     let _: u64 = redis::cmd("ZREM")
-        .arg("rupy:delayed:default")
+        .arg("cauli:delayed:default")
         .arg(&member)
         .query_async(&mut c)
         .await
@@ -115,7 +115,7 @@ async fn e2e_main_flows() {
     );
 
     // 6. retry task: fails first 2 times (counter file), then succeeds
-    let cf = format!("/tmp/rupy-flaky-{}", unique_id());
+    let cf = format!("/tmp/cauli-flaky-{}", unique_id());
     let (id, e) = envelope("fx.flaky", "default", |v| {
         v["args"] = json!([cf, 2]);
         v["backoff_base_ms"] = json!(50);
@@ -126,8 +126,8 @@ async fn e2e_main_flows() {
     assert_eq!(r["status"], "success");
     assert_eq!(r["result"], 3, "flaky should succeed on 3rd attempt");
 
-    // 7. rupy.Retry(countdown) forced retry then success
-    let cf = format!("/tmp/rupy-retryonce-{}", unique_id());
+    // 7. cauli.Retry(countdown) forced retry then success
+    let cf = format!("/tmp/cauli-retryonce-{}", unique_id());
     let (id, e) = envelope("fx.retry_once", "default", |v| v["args"] = json!([cf]));
     xadd(&mut c, "default", &e.to_string()).await;
     let r = wait_result(&mut c, &id, 15).await;
@@ -177,11 +177,11 @@ async fn idempotency_and_timeouts(c: &mut redis::aio::MultiplexedConnection) {
     let r2 = wait_result(c, &id2, 10).await;
     assert_eq!(r2["status"], "duplicate");
     assert_eq!(r2["result"], serde_json::Value::Null);
-    // The idemp key is stored hashed (rupy:idemp:{fnv1a-hex}), not the raw
+    // The idemp key is stored hashed (cauli:idemp:{fnv1a-hex}), not the raw
     // app-supplied key (M1 hardening), so scan for it rather than assuming
     // the literal key name.
     let idemp_keys: Vec<String> = redis::cmd("KEYS")
-        .arg("rupy:idemp:*")
+        .arg("cauli:idemp:*")
         .query_async(c)
         .await
         .unwrap();
@@ -196,7 +196,7 @@ async fn idempotency_and_timeouts(c: &mut redis::aio::MultiplexedConnection) {
     // C1 regression: idempotency_key + a task that fails once then succeeds
     // must actually retry and finish "success", not silently resolve as
     // "duplicate" against its own earlier claim.
-    let cf = format!("/tmp/rupy-c1-idemp-retry-{}", unique_id());
+    let cf = format!("/tmp/cauli-c1-idemp-retry-{}", unique_id());
     let retry_key = format!("idk-retry-{}", unique_id());
     let (id, e) = envelope("fx.flaky", "default", |v| {
         v["args"] = json!([cf, 1]); // fails once, succeeds on 2nd attempt
@@ -298,7 +298,7 @@ async fn idempotency_and_timeouts(c: &mut redis::aio::MultiplexedConnection) {
     assert_eq!(efield, raw);
 
     // M1 regression: a crafted id that doesn't match [a-z0-9]{32} -> DLQ
-    // malformed, never executed (protects rupy:result:{id} from collision).
+    // malformed, never executed (protects cauli:result:{id} from collision).
     let (_, mut bad_id_env) = envelope("fx.echo", "default", |_| {});
     bad_id_env["id"] = json!("not-a-valid-32-char-lowercase-hex-id");
     xadd(c, "default", &bad_id_env.to_string()).await;

@@ -2,7 +2,7 @@
 
 Broker db 0, backend db 1 on the suite redis; acks_late=True, prefetch=1,
 json. Measurement is store-based (db 3), so task results are ignored on both
-stacks (rupy matches with store_result=False).
+stacks (cauli matches with store_result=False).
 
 Queues -> workers (started by runner_campaign.sh inside ONE 1G scope):
   celery,backfill_heavy,webhook_ingest   default worker  -c 2
@@ -10,6 +10,7 @@ Queues -> workers (started by runner_campaign.sh inside ONE 1G scope):
   campaign_short                         -c 2
   dispatch                               --pool=solo
 """
+
 import os
 
 from celery import Celery

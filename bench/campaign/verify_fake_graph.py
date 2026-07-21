@@ -8,6 +8,7 @@
 
 Usage: python verify_fake_graph.py   (FAKE_GRAPH_URL env, default :8078)
 """
+
 import asyncio
 import os
 import sys
@@ -24,8 +25,8 @@ async def one(pool, sem, out):
         t = time.perf_counter()
         try:
             status = await pool.post_json(
-                {"campaign_id": "v", "recipient_id": "r", "page_id": "p"},
-                timeout=30.0)
+                {"campaign_id": "v", "recipient_id": "r", "page_id": "p"}, timeout=30.0
+            )
         except Exception as e:
             out.append((None, time.perf_counter() - t, repr(e)))
             return
@@ -56,10 +57,14 @@ def main():
     lats.sort()
     lo, hi = lats[0], lats[-1]
     p50 = lats[len(lats) // 2]
-    print(f"[verify_fake_graph] latency check: n=400 conc=40 wall={wall:.1f}s "
-          f"min={lo*1000:.0f}ms p50={p50*1000:.0f}ms max={hi*1000:.0f}ms")
-    print(f"[verify_fake_graph] statuses: 200={st200} 500={st500} 429={st429} "
-          f"exceptions={excs} error_rate={errs/400:.3f}")
+    print(
+        f"[verify_fake_graph] latency check: n=400 conc=40 wall={wall:.1f}s "
+        f"min={lo * 1000:.0f}ms p50={p50 * 1000:.0f}ms max={hi * 1000:.0f}ms"
+    )
+    print(
+        f"[verify_fake_graph] statuses: 200={st200} 500={st500} 429={st429} "
+        f"exceptions={excs} error_rate={errs / 400:.3f}"
+    )
     if not (0.190 <= lo and hi <= 0.900):
         print("FAIL: latency outside 200-500ms window (+overhead)")
         fail = 1
@@ -73,8 +78,10 @@ def main():
     out, wall = asyncio.run(run(4000, 1000))
     ok = sum(1 for st, _, _ in out if st is not None)
     rps = ok / wall
-    print(f"[verify_fake_graph] burst: n=4000 conc=1000 wall={wall:.2f}s "
-          f"rps={rps:.0f} completed={ok}")
+    print(
+        f"[verify_fake_graph] burst: n=4000 conc=1000 wall={wall:.2f}s "
+        f"rps={rps:.0f} completed={ok}"
+    )
     if rps < 2000:
         print("FAIL: burst below 2000 rps")
         fail = 1

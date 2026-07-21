@@ -1,4 +1,4 @@
-# rupy protocol v1
+# cauli protocol v1
 
 This document is the versioned wire/behavior contract between the Rust worker (`worker/`) and
 the Python package (`py/`): Redis key layout, envelope JSON, retry/timeout/idempotency
@@ -6,13 +6,13 @@ semantics, and the cpu-child pipe protocol. Implementations in either language m
 where this document and the code disagree, that is a bug (in one or the other), not a license
 to improvise.
 
-rupy is a Rust background worker runtime for Python task queues. One Rust OS process executes
+cauli is a Rust background worker runtime for Python task queues. One Rust OS process executes
 many Python tasks concurrently:
 
 - **io tasks** run inside ONE embedded CPython interpreter: `async def` tasks on embedded
   asyncio event loop thread(s); sync io tasks on a Python thread pool (the GIL is released
   during blocking I/O by CPython itself).
-- **cpu tasks** run on a small pool of child Python processes (`python3 -m rupy._exec`),
+- **cpu tasks** run on a small pool of child Python processes (`python3 -m cauli._exec`),
   sized to CPU cores, fed over a line delimited JSON pipe protocol.
 
 Broker and result backend: Redis >= 7.0. At least once delivery via Redis Streams consumer
@@ -22,15 +22,15 @@ groups. All timestamps are integer unix epoch **milliseconds** unless stated oth
 
 ## 1. Redis key layout
 
-All keys use prefix `rupy:`. `{queue}` is a queue name matching `[a-zA-Z0-9_.-]+`.
+All keys use prefix `cauli:`. `{queue}` is a queue name matching `[a-zA-Z0-9_.-]+`.
 
 | Key | Type | Purpose |
 |---|---|---|
-| `rupy:q:{queue}` | Stream | Ready tasks. Each entry has exactly one field `e` whose value is the envelope JSON (UTF-8). |
-| `rupy:delayed:{queue}` | ZSET | Delayed/retrying tasks. member = envelope JSON string, score = fire_at epoch ms. |
-| `rupy:dlq:{queue}` | Stream | Dead letters. Fields: `e` = envelope JSON, `reason` = string, `error` = error JSON (see §8) or empty string. |
-| `rupy:result:{task_id}` | String | Result JSON (see §8), `SET ... EX result_ttl`. |
-| `rupy:idemp:{h}` | String | Idempotency guard. Value = task id that claimed it. `SET NX EX idemp_ttl`. |
+| `cauli:q:{queue}` | Stream | Ready tasks. Each entry has exactly one field `e` whose value is the envelope JSON (UTF-8). |
+| `cauli:delayed:{queue}` | ZSET | Delayed/retrying tasks. member = envelope JSON string, score = fire_at epoch ms. |
+| `cauli:dlq:{queue}` | Stream | Dead letters. Fields: `e` = envelope JSON, `reason` = string, `error` = error JSON (see §8) or empty string. |
+| `cauli:result:{task_id}` | String | Result JSON (see §8), `SET ... EX result_ttl`. |
+| `cauli:idemp:{h}` | String | Idempotency guard. Value = task id that claimed it. `SET NX EX idemp_ttl`. |
 
 `{h}` in the idempotency key is a deterministic hash of the app-supplied `idempotency_key`
 (the worker uses FNV-1a 64-bit, hex-encoded), not the raw string. This bounds the key to a
@@ -38,8 +38,8 @@ fixed size and neutralizes cluster hash-tag injection (`{...}`) or other charset
 app-controlled string; it does not need to be cryptographic since idempotency keys are chosen
 by the app author, not an adversary distinct from the app.
 
-Consumer group: name `rupy`, created per queue stream with
-`XGROUP CREATE rupy:q:{queue} rupy 0 MKSTREAM` (ignore BUSYGROUP error).
+Consumer group: name `cauli`, created per queue stream with
+`XGROUP CREATE cauli:q:{queue} cauli 0 MKSTREAM` (ignore BUSYGROUP error).
 Consumer name: `{hostname}:{pid}` (any unique string is acceptable).
 
 ## 2. Envelope JSON
@@ -77,7 +77,7 @@ Unknown fields must be preserved on re-enqueue (retries) if practical, otherwise
 - `timeout_ms`: hard timeout. `soft_timeout_ms`: null or int < timeout_ms.
 - `idempotency_key`: null or string (see §1 for how the worker keys it).
 - `not_before`: null normally. When the client enqueues with `countdown`, the client does NOT
-  XADD; it ZADDs the envelope to `rupy:delayed:{queue}` with score = now + countdown*1000 and
+  XADD; it ZADDs the envelope to `cauli:delayed:{queue}` with score = now + countdown*1000 and
   sets `not_before` to that score.
 
 Envelope contents are treated as unvalidated input by the worker (they may be crafted, not just
@@ -85,7 +85,7 @@ client-produced). Two worker-side gates apply before an entry is ever executed:
 
 - `id` must match `[a-z0-9]{32}` (32 lowercase hex, matching what the client always produces);
   anything else -> DLQ reason `"malformed"`, no retry. Without this, a crafted id could collide
-  with / overwrite another task's `rupy:result:{id}` key.
+  with / overwrite another task's `cauli:result:{id}` key.
 - The raw `e` field must not exceed `--max-envelope-bytes` (default 1 MiB); oversize -> DLQ
   reason `"malformed"` (a truncated preview is stored, not the full oversize payload). This
   bounds the `serde_json::Value` memory amplification and processing cost of a hostile or
@@ -95,8 +95,8 @@ client-produced). Two worker-side gates apply before an entry is ever executed:
 ## 3. Client enqueue rules (Python package)
 
 1. Build envelope. `enqueued_at` = now ms.
-2. If countdown given: `ZADD rupy:delayed:{queue} score envelope_json`. Done.
-3. Else: `XADD rupy:q:{queue} * e envelope_json`.
+2. If countdown given: `ZADD cauli:delayed:{queue} score envelope_json`. Done.
+3. Else: `XADD cauli:q:{queue} * e envelope_json`.
 4. Return `AsyncResult(id)`.
 
 No client-side idempotency check (the worker enforces it at execution time).
@@ -104,7 +104,7 @@ No client-side idempotency check (the worker enforces it at execution time).
 ## 4. Worker delivery loop
 
 - One consumer group read loop:
-  `XREADGROUP GROUP rupy {consumer} COUNT {batch} BLOCK 1000 STREAMS rupy:q:{q1} rupy:q:{q2} ... > > ...`
+  `XREADGROUP GROUP cauli {consumer} COUNT {batch} BLOCK 1000 STREAMS cauli:q:{q1} cauli:q:{q2} ... > > ...`
   Batch default 16. Only fetch when free execution slots exist (per class admission below;
   a simple global gate on io slots is acceptable but do not let cpu backlog starve io fetch
   indefinitely: bound in-worker cpu backlog to `2 * cpu_workers` pending items).
@@ -115,8 +115,8 @@ No client-side idempotency check (the worker enforces it at execution time).
 
 ### 4.1 Completion
 
-- Success: if `store_result`: `SET rupy:result:{id} {result json} EX result_ttl`.
-  Then `XACK rupy:q:{queue} rupy {stream_id}` and `XDEL rupy:q:{queue} {stream_id}`.
+- Success: if `store_result`: `SET cauli:result:{id} {result json} EX result_ttl`.
+  Then `XACK cauli:q:{queue} cauli {stream_id}` and `XDEL cauli:q:{queue} {stream_id}`.
 - Failure (Python exception, timeout, worker-side error): see retry policy.
 
 All completion writes in this section (and §4.2, §4.4, §4.5) are issued as a single redis
@@ -136,22 +136,22 @@ On failure with `retries < max_retries`:
 2. attempt = new `retries` value (1-based).
    `d_ms = min(backoff_max_ms, backoff_base_ms * backoff_factor^(attempt-1))`.
    If `jitter`: `d_ms = uniform(0.5 * d_ms, d_ms)`.
-3. `ZADD rupy:delayed:{queue} (now + d_ms) new_envelope_json`.
+3. `ZADD cauli:delayed:{queue} (now + d_ms) new_envelope_json`.
 4. XACK + XDEL the delivered entry. Do NOT write a result key (task is still pending).
 
 On failure with `retries >= max_retries` (final):
-1. `XADD rupy:dlq:{queue} * e envelope_json reason "max_retries" error {error json}`.
-2. If `store_result`: `SET rupy:result:{id} {failure result json} EX result_ttl`.
+1. `XADD cauli:dlq:{queue} * e envelope_json reason "max_retries" error {error json}`.
+2. If `store_result`: `SET cauli:result:{id} {failure result json} EX result_ttl`.
 3. XACK + XDEL.
 
-A task may raise `rupy.Retry(countdown=X)` to force a retry with an explicit delay
+A task may raise `cauli.Retry(countdown=X)` to force a retry with an explicit delay
 (still bounded by max_retries; the forced countdown replaces the computed backoff).
 Recognition is duck-typed, identically across both Python execution paths (the embedded io
-shim and the cpu child's `rupy._exec`) and the Rust cpu-response mapping: an exception whose
+shim and the cpu child's `cauli._exec`) and the Rust cpu-response mapping: an exception whose
 class name is exactly `"Retry"` AND exposes a `.countdown` attribute is treated as a forced
 retry, regardless of which module defines that class (this lets an app or test fixture supply
-its own duck-typed `Retry` without importing `rupy.Retry` — the embedded io shim in particular
-cannot rely on `isinstance` since the worker's interpreter may not have `rupy` installed at
+its own duck-typed `Retry` without importing `cauli.Retry` — the embedded io shim in particular
+cannot rely on `isinstance` since the worker's interpreter may not have `cauli` installed at
 all). `.countdown` is read as a float seconds value (`None` → use the computed backoff).
 
 ### 4.3 Delayed mover
@@ -159,7 +159,7 @@ all). `.countdown` is read as a float seconds value (`None` → use the computed
 Every 250ms per queue, atomically move due members (Lua script, single EVAL):
 
 ```lua
--- KEYS[1]=rupy:delayed:{queue}  KEYS[2]=rupy:q:{queue}  ARGV[1]=now_ms  ARGV[2]=limit
+-- KEYS[1]=cauli:delayed:{queue}  KEYS[2]=cauli:q:{queue}  ARGV[1]=now_ms  ARGV[2]=limit
 local due = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, tonumber(ARGV[2]))
 for i, e in ipairs(due) do
   redis.call('ZREM', KEYS[1], e)
@@ -175,7 +175,7 @@ client does not run it — single source: worker only. The client merely ZADDs).
 
 Every `visibility_timeout / 2` (visibility_timeout default 60s, CLI flag), per queue:
 
-1. `XPENDING rupy:q:{queue} rupy IDLE {visibility_timeout_ms} - + {batch}` (extended form,
+1. `XPENDING cauli:q:{queue} cauli IDLE {visibility_timeout_ms} - + {batch}` (extended form,
    returns entry id, consumer, idle ms, delivery_count). `visibility_timeout` is a FLOOR here,
    not itself the reclaim threshold for every task — see the per-envelope check below.
 2. For each candidate entry, peek its envelope (`XRANGE` by exact id — read-only, does not
@@ -193,7 +193,7 @@ Every `visibility_timeout / 2` (visibility_timeout default 60s, CLI flag), per q
 3. Otherwise (idle >= required_idle_ms): if `delivery_count > redelivery_limit` (default
    `max(3, max_retries+1)`, computed per envelope after claim; use 3 if envelope unreadable):
    claim it (`XCLAIM ... JUSTID` acceptable), DLQ with reason `"redelivery_limit"`, XACK+XDEL.
-4. Else `XCLAIM rupy:q:{queue} rupy {consumer} {visibility_timeout_ms} {id}` and execute it
+4. Else `XCLAIM cauli:q:{queue} cauli {consumer} {visibility_timeout_ms} {id}` and execute it
    normally (same code path as a fresh delivery; do not increment `retries` for a claim).
 
 This makes a SIGKILLed worker's in flight tasks run again elsewhere: at least once semantics.
@@ -206,7 +206,7 @@ needs to be for tasks that legitimately crash).
 
 At execution start, if `idempotency_key` is not null (`{h}` = the hashed key per §1):
 
-- Atomically (single Lua script): `SET rupy:idemp:{h} {task_id} NX EX idemp_ttl`; if that fails
+- Atomically (single Lua script): `SET cauli:idemp:{h} {task_id} NX EX idemp_ttl`; if that fails
   because the key already exists, `GET` the existing value and compare it to `task_id`.
 - If the SET succeeded (fresh claim), OR the existing value equals THIS task's own `id`
   (**"mine again"** — see below) → execute normally.
@@ -243,7 +243,7 @@ would be strictly worse than running it; the worker logs a warning and proceeds.
   channel is `timeout_ms + grace` (grace = 2000ms) using saturating arithmetic, so a
   crafted/huge `timeout_ms` (e.g. `u64::MAX`) cannot wrap into a near-zero spurious timeout.
 - sync io task (thread): soft timeout only, via `PyThreadState_SetAsyncExc` injecting
-  `rupy.SoftTimeLimitExceeded` after `soft_timeout_ms` (if set). A per-thread generation
+  `cauli.SoftTimeLimitExceeded` after `soft_timeout_ms` (if set). A per-thread generation
   counter fences a timer that fires after the task already finished, so a stale injection
   cannot land inside a LATER task on the same pool thread. One residual, inherent-to-async-exc
   race remains: if the timer fires after the task function returns but before its `finally`
@@ -255,7 +255,7 @@ would be strictly worse than running it; the worker logs a warning and proceeds.
   still queued (not yet dequeued) when its own hard timeout fired, a worker thread skips
   running it instead of executing it late with no one listening ("zombie execution").
 - cpu task: soft timeout enforced inside the child via SIGALRM raising
-  `rupy.SoftTimeLimitExceeded`; hard timeout enforced by the worker: SIGKILL the child,
+  `cauli.SoftTimeLimitExceeded`; hard timeout enforced by the worker: SIGKILL the child,
   respawn it, mark failure (retryable) with error type `"TimeoutError"`.
 
 ### 4.7 Graceful shutdown
@@ -272,9 +272,9 @@ exit immediately (code 130).
 - `--io-concurrency N` (default 256): max in flight io tasks total (semaphore, admission gate).
 - `--cpu-workers N` (default = cores): child processes for cpu tasks.
 
-### 5.1 cpu child protocol (`python3 -m rupy._exec`)
+### 5.1 cpu child protocol (`python3 -m cauli._exec`)
 
-Spawn: `{python} -m rupy._exec --app {module:attr}`. Child imports the app, prints exactly one
+Spawn: `{python} -m cauli._exec --app {module:attr}`. Child imports the app, prints exactly one
 ready line on stdout: `{"ready": true, "pid": 1234}\n`, then reads requests line by line from
 stdin and answers one line per request on stdout. stderr is passthrough logging.
 
@@ -283,7 +283,7 @@ Response: `{"id": "...", "ok": true, "result": <json>}\n`
       or: `{"id": "...", "ok": false, "error": {"type": "...", "message": "...", "traceback": "..."}}\n`
       or: `{"id": "...", "ok": false, "retry": true, "countdown": <float|null>, "error": {...}}\n`
 
-The third shape is a forced retry (a task raised `rupy.Retry`, recognized per §4.2's duck-typed
+The third shape is a forced retry (a task raised `cauli.Retry`, recognized per §4.2's duck-typed
 rule): `countdown` DOES cross the pipe (a float seconds value, or `null` to use the computed
 backoff) — it is not lost or unavailable here, despite what an earlier draft of this document
 and worker/ARCHITECTURE.md once claimed.
@@ -295,13 +295,13 @@ retryable, error type `"WorkerLost"`).
 
 ## 6. Python public API (`py/`)
 
-Package name `rupy`, pure Python, py>=3.10, only hard dependency: `redis>=5`.
+Package name `cauli`, pure Python, py>=3.10, only hard dependency: `redis>=5`.
 
 ```python
-from rupy import Rupy, Retry, SoftTimeLimitExceeded, TaskFailedError
+from cauli import Cauli, Retry, SoftTimeLimitExceeded, TaskFailedError
 
-app = Rupy(
-    redis_url="redis://localhost:6379/0",   # or env RUPY_REDIS_URL; default shown
+app = Cauli(
+    redis_url="redis://localhost:6379/0",   # or env CAULI_REDIS_URL; default shown
     default_queue="default",
     result_ttl=3600,      # seconds
     idemp_ttl=86400,      # seconds
@@ -342,25 +342,25 @@ Worker introspection contract (Rust reads these exact attributes via the embedde
   `timeout_ms: int`, `soft_timeout_ms: int|None`, `backoff_base_ms: int`,
   `backoff_factor: float`, `backoff_max_ms: int`, `jitter: bool`, `store_result: bool`
 - `app.redis_url: str`, `app.default_queue: str`, `app.result_ttl: int`, `app.idemp_ttl: int`
-- Exceptions: `rupy.Retry(countdown: float|None)` (attribute `.countdown`),
-  `rupy.SoftTimeLimitExceeded`.
+- Exceptions: `cauli.Retry(countdown: float|None)` (attribute `.countdown`),
+  `cauli.SoftTimeLimitExceeded`.
 
 Decorated task objects also stay directly callable (`send_email("a@b.com")` runs the function
 inline, no queue) so the same code is testable without a broker.
 
-## 7. Worker CLI (`rupy-worker` binary)
+## 7. Worker CLI (`cauli-worker` binary)
 
 ```
-rupy-worker --app myproj.tasks:app [--queues default,emails] [--redis-url URL]
+cauli-worker --app myproj.tasks:app [--queues default,emails] [--redis-url URL]
             [--io-loops 1] [--io-threads 64] [--io-concurrency 256] [--cpu-workers N]
             [--batch 16] [--visibility-timeout 60] [--max-envelope-bytes 1048576]
             [--drain-timeout 30] [--python python3] [--stats-interval 10] [--log-level info]
 ```
 
 - `--app`: `module:attr`. The worker adds CWD to `sys.path`, imports module, reads attr. Note:
-  this means running `rupy-worker` in an untrusted working directory can import
-  attacker-controlled modules — a standard Python-tooling caveat, not specific to rupy.
-- `--redis-url` precedence: CLI > env `RUPY_REDIS_URL` > `app.redis_url`.
+  this means running `cauli-worker` in an untrusted working directory can import
+  attacker-controlled modules — a standard Python-tooling caveat, not specific to cauli.
+- `--redis-url` precedence: CLI > env `CAULI_REDIS_URL` > `app.redis_url`.
 - `--queues` default: `app.default_queue`.
 - `--batch` and `--visibility-timeout` must be >= 1 (exit 1 at startup otherwise): `--batch 0`
   would mean "unlimited" to Redis's `XREADGROUP COUNT`, and `--visibility-timeout 0` would make
@@ -378,7 +378,7 @@ rupy-worker --app myproj.tasks:app [--queues default,emails] [--redis-url URL]
 
 ## 8. Result / error JSON
 
-Result key value (`rupy:result:{id}`):
+Result key value (`cauli:result:{id}`):
 
 ```json
 {"status": "success", "result": <json>, "error": null, "finished_at": 123}
@@ -390,7 +390,7 @@ Result key value (`rupy:result:{id}`):
 serializable success value is a failure with type `"SerializationError"` (no retry — treat as
 final failure regardless of retries left).
 
-Full tracebacks (and results) are stored in plaintext in `rupy:result:*` and DLQ stream
+Full tracebacks (and results) are stored in plaintext in `cauli:result:*` and DLQ stream
 entries. If a task's exception message or arguments embed secrets or PII, anyone with read
 access to the Redis instance can see them — this is a property of the trust model (Redis is
 trusted infra; task payloads/results are not automatically scrubbed), not a bug.
@@ -418,9 +418,9 @@ cd worker
 cargo build --release
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
-cargo test --release --bin rupy-worker       # unit tests only
+cargo test --release --bin cauli-worker       # unit tests only
 cargo test --release --features test-hooks   # unit tests + both e2e suites
-                                              # (e2e needs the RUPY_EXEC_CMD test hook; see cpu.rs)
+                                              # (e2e needs the CAULI_EXEC_CMD test hook; see cpu.rs)
 
 # python client
 cd py
@@ -433,7 +433,7 @@ pytest -q
 cd itest
 pip install -e ../py
 pytest -q test_integration.py   # needs the release worker binary built above on PATH
-                                 # or set RUPY_WORKER_BIN=/path/to/rupy-worker
+                                 # or set CAULI_WORKER_BIN=/path/to/cauli-worker
 ```
 
 Building on a slow or network filesystem: set `CARGO_TARGET_DIR` to a local path before running

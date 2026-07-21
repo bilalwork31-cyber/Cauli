@@ -3,18 +3,18 @@
 # absent), fake_graph 8078 (started if absent, left running), UNCAPPED workers,
 # N=300, 5 pages, SEND_DELAY=0.2, TICK_SECONDS=3, production topology.
 #
-# Usage: bash verify_mini.sh celery|rupy_sync|rupy_async
+# Usage: bash verify_mini.sh celery|cauli_sync|cauli_async
 set -u
 set -o pipefail
 
-STACK="${1:?usage: verify_mini.sh celery|rupy_sync|rupy_async}"
+STACK="${1:?usage: verify_mini.sh celery|cauli_sync|cauli_async}"
 CAMP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BENCH_DIR="$(cd "$CAMP_DIR/.." && pwd)"
 ROOT_DIR="$(cd "$BENCH_DIR/.." && pwd)"
 VENV="${BENCH_VENV:-/home/blackdevil/rupy-bench-venv}"
 PY="$VENV/bin/python"
 CELERY_BIN="$VENV/bin/celery"
-RUPY_WORKER_BIN="${RUPY_WORKER_BIN:-/home/blackdevil/rupy-target/release/rupy-worker}"
+CAULI_WORKER_BIN="${CAULI_WORKER_BIN:-/home/blackdevil/rupy-target/release/cauli-worker}"
 PORT="${BENCH_REDIS_PORT:-6393}"
 export BENCH_REDIS_PORT="$PORT"
 export PYTHONUNBUFFERED=1
@@ -66,7 +66,7 @@ teardown() {
     fi
     pkill -9 -f "celery.*-A campaign_celery" 2>/dev/null || true
     if [ "$STACK" != "celery" ]; then
-        pkill -9 -f "rupy-worker.*campaign_rupy" 2>/dev/null || true
+        pkill -9 -f "cauli-worker.*campaign_cauli" 2>/dev/null || true
     fi
     redis-cli -p "$PORT" flushall >/dev/null 2>&1 || true
 }
@@ -91,24 +91,24 @@ wait" > "$LOGS/mini_celery.worker.log" 2>&1 &
     done
     [ "$ok" = "1" ] || { log "FATAL: celery workers not ready"; exit 1; }
     ;;
-  rupy_sync|rupy_async)
-    DRIVER_STACK=rupy
-    if [ "$STACK" = "rupy_async" ]; then
-        export RUPY_VARIANT=async
+  cauli_sync|cauli_async)
+    DRIVER_STACK=cauli
+    if [ "$STACK" = "cauli_async" ]; then
+        export CAULI_VARIANT=async
         FLAGS="--io-concurrency 1000 --io-threads 8"
     else
-        export RUPY_VARIANT=sync
+        export CAULI_VARIANT=sync
         FLAGS="--io-concurrency 200 --io-threads 96"
     fi
     # shellcheck disable=SC2086
-    setsid "$RUPY_WORKER_BIN" --app campaign_rupy:app \
+    setsid "$CAULI_WORKER_BIN" --app campaign_cauli:app \
         --redis-url "redis://127.0.0.1:$PORT/0" --python "$PY" \
         --queues default,dispatch,campaign_short,campaign_long,backfill_heavy,webhook_ingest \
         --cpu-workers 1 --visibility-timeout 300 $FLAGS \
         > "$LOGS/mini_$STACK.worker.log" 2>&1 &
     WPID=$!
     sleep 3
-    kill -0 "$WPID" 2>/dev/null || { log "FATAL: rupy worker died (see $LOGS/mini_$STACK.worker.log)"; exit 1; }
+    kill -0 "$WPID" 2>/dev/null || { log "FATAL: cauli worker died (see $LOGS/mini_$STACK.worker.log)"; exit 1; }
     ;;
   *) log "unknown stack $STACK"; exit 1 ;;
 esac

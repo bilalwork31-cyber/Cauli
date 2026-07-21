@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Campaign pipeline benchmark orchestrator: Celery (production topology) vs
-# rupy, sequential, 1G-capped, on WSL2. Same conventions as bench/runner.sh:
+# cauli, sequential, 1G-capped, on WSL2. Same conventions as bench/runner.sh:
 # throwaway redis on $BENCH_REDIS_PORT (default 6390, NEVER 6379), FLUSHALL
 # between scenarios, fake Graph API uncapped on 8078 for the whole suite,
 # workers inside `systemd-run --user --scope -p MemoryMax=1G -p MemorySwapMax=0`.
 #
 # Usage:   bash runner_campaign.sh [filter]
 #   filter matches scenario name prefixes (A, B, A_prod_celery, ...) or a
-#   stack name (celery | rupy). No filter runs everything.
+#   stack name (celery | cauli). No filter runs everything.
 set -u
 set -o pipefail
 
@@ -20,7 +20,7 @@ CELERY_BIN="$VENV/bin/celery"
 PORT="${BENCH_REDIS_PORT:-6390}"
 export BENCH_REDIS_PORT="$PORT"
 export PYTHONUNBUFFERED=1
-RUPY_WORKER_BIN="${RUPY_WORKER_BIN:-/home/blackdevil/rupy-target/release/rupy-worker}"
+CAULI_WORKER_BIN="${CAULI_WORKER_BIN:-/home/blackdevil/rupy-target/release/cauli-worker}"
 RESULTS="$CAMP_DIR/results"
 LOGS="$RESULTS/logs"
 DRIVER_TIMEOUT="${BENCH_DRIVER_TIMEOUT:-1800}"
@@ -36,11 +36,11 @@ log() { echo "[runner $(date +%H:%M:%S)] $*" | tee -a "$LOGS/runner.log"; }
 
 [ -x "$PY" ] || { echo "venv missing at $VENV; run: bash ../setup.sh"; exit 1; }
 
-RUPY_URL="redis://127.0.0.1:$PORT/0"
+CAULI_URL="redis://127.0.0.1:$PORT/0"
 
-# PYTHONPATH/VIRTUAL_ENV exports copied from bench/runner.sh: the rupy worker
+# PYTHONPATH/VIRTUAL_ENV exports copied from bench/runner.sh: the cauli worker
 # embeds CPython; venv site-packages + this dir + bench dir on PYTHONPATH,
-# the raw py/ source dir for the editable rupy install (.pth hooks never run
+# the raw py/ source dir for the editable cauli install (.pth hooks never run
 # from PYTHONPATH), VIRTUAL_ENV so the worker shim does real site processing.
 SITEPKG="$("$PY" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])' 2>/dev/null || true)"
 if [ -n "$SITEPKG" ]; then
@@ -198,31 +198,31 @@ $c -n dispatch@%h -Q dispatch --pool=solo & \
 wait"
 }
 
-RUPY_QUEUES="default,dispatch,campaign_short,campaign_long,backfill_heavy,webhook_ingest"
+CAULI_QUEUES="default,dispatch,campaign_short,campaign_long,backfill_heavy,webhook_ingest"
 
 run_campaign() {          # run_campaign <name> <stack> <n> <pages>
     local name="$1" stack="$2" n="$3" pages="$4"
     match_filter "$name" "$stack" || return 0
-    if [ "$stack" = "rupy" ] && [ ! -x "$RUPY_WORKER_BIN" ]; then
-        log "SKIP $name: rupy binary not found at $RUPY_WORKER_BIN"
-        printf '{"scenario":"%s","status":"skipped","reason":"rupy binary not found"}\n' "$name" > "$RESULTS/$name.json"
+    if [ "$stack" = "cauli" ] && [ ! -x "$CAULI_WORKER_BIN" ]; then
+        log "SKIP $name: cauli binary not found at $CAULI_WORKER_BIN"
+        printf '{"scenario":"%s","status":"skipped","reason":"cauli binary not found"}\n' "$name" > "$RESULTS/$name.json"
         return 0
     fi
-    log "=== $name  stack=$stack n=$n pages=$pages send_delay=$SEND_DELAY tick=$TICK_SECONDS variant=${RUPY_VARIANT:-sync}"
+    log "=== $name  stack=$stack n=$n pages=$pages send_delay=$SEND_DELAY tick=$TICK_SECONDS variant=${CAULI_VARIANT:-sync}"
     redis-cli -p "$PORT" flushall >/dev/null
     local started=1
     if [ "$stack" = "celery" ]; then
         start_scoped "$name" 1G bash -c "$(celery_topology_cmd)" && started=0
     else
         local flags
-        if [ "${RUPY_VARIANT:-sync}" = "async" ]; then
+        if [ "${CAULI_VARIANT:-sync}" = "async" ]; then
             flags="--io-concurrency 1000 --io-threads 8"
         else
             flags="--io-concurrency 200 --io-threads 96"
         fi
         # shellcheck disable=SC2086
-        start_scoped "$name" 1G "$RUPY_WORKER_BIN" --app campaign_rupy:app \
-            --redis-url "$RUPY_URL" --python "$PY" --queues "$RUPY_QUEUES" \
+        start_scoped "$name" 1G "$CAULI_WORKER_BIN" --app campaign_cauli:app \
+            --redis-url "$CAULI_URL" --python "$PY" --queues "$CAULI_QUEUES" \
             --cpu-workers 1 --visibility-timeout 300 $flags && started=0
     fi
     if [ "$started" != "0" ]; then
@@ -260,23 +260,23 @@ set_B() {   # uncorked profile
     N=10000; PAGES=50
 }
 
-log "suite start (filter='${FILTER:-all}') redis=$PORT graph=$GRAPH_PORT rupy_bin=$RUPY_WORKER_BIN driver_timeout=${DRIVER_TIMEOUT}s"
+log "suite start (filter='${FILTER:-all}') redis=$PORT graph=$GRAPH_PORT cauli_bin=$CAULI_WORKER_BIN driver_timeout=${DRIVER_TIMEOUT}s"
 start_redis
 start_graph
 
 set_A
-export RUPY_VARIANT=sync
+export CAULI_VARIANT=sync
 run_campaign A_prod_celery      celery "$N" "$PAGES"
-run_campaign A_prod_rupy_sync   rupy   "$N" "$PAGES"
-export RUPY_VARIANT=async
-run_campaign A_prod_rupy_async  rupy   "$N" "$PAGES"
+run_campaign A_prod_cauli_sync   cauli   "$N" "$PAGES"
+export CAULI_VARIANT=async
+run_campaign A_prod_cauli_async  cauli   "$N" "$PAGES"
 
 set_B
-export RUPY_VARIANT=sync
+export CAULI_VARIANT=sync
 run_campaign B_uncorked_celery    celery "$N" "$PAGES"
-run_campaign B_uncorked_rupy_sync rupy   "$N" "$PAGES"
-export RUPY_VARIANT=async
-run_campaign B_uncorked_rupy_async rupy  "$N" "$PAGES"
+run_campaign B_uncorked_cauli_sync cauli   "$N" "$PAGES"
+export CAULI_VARIANT=async
+run_campaign B_uncorked_cauli_async cauli  "$N" "$PAGES"
 
 log "suite done; results in $RESULTS"
 "$PY" - <<'EOF'

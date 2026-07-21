@@ -56,11 +56,11 @@ def assert_default_option_fields(env: dict[str, Any]) -> None:
 
 
 class ExecChild:
-    """Drives one `python -m rupy._exec` child over its line pipe protocol."""
+    """Drives one `python -m cauli._exec` child over its line pipe protocol."""
 
     def __init__(self, cwd: Path, app_spec: str = "exec_fixture_app:app") -> None:
         self.proc = subprocess.Popen(
-            [sys.executable, "-m", "rupy._exec", "--app", app_spec],
+            [sys.executable, "-m", "cauli._exec", "--app", app_spec],
             cwd=str(cwd),
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,

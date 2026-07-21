@@ -73,7 +73,7 @@ pub struct Worker(pub Child);
 
 impl Worker {
     pub fn spawn(queues: &str, extra: &[&str]) -> Worker {
-        let mut cmd = Command::new(env!("CARGO_BIN_EXE_rupy-worker"));
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_cauli-worker"));
         cmd.current_dir(fixtures_dir())
             .args(["--app", "fixture_app:app", "--queues", queues])
             .args(["--redis-url", &redis_url()]);
@@ -99,7 +99,7 @@ impl Worker {
         }
         cmd.args(extra)
             .env(
-                "RUPY_EXEC_CMD",
+                "CAULI_EXEC_CMD",
                 format!("python3 {}", fixtures_dir().join("fake_exec.py").display()),
             )
             .stdout(Stdio::null())
@@ -173,7 +173,7 @@ pub fn envelope(task: &str, queue: &str, patch: impl FnOnce(&mut Value)) -> (Str
 
 pub async fn xadd(c: &mut redis::aio::MultiplexedConnection, queue: &str, payload: &str) {
     let _: String = redis::cmd("XADD")
-        .arg(format!("rupy:q:{queue}"))
+        .arg(format!("cauli:q:{queue}"))
         .arg("*")
         .arg("e")
         .arg(payload)
@@ -182,12 +182,12 @@ pub async fn xadd(c: &mut redis::aio::MultiplexedConnection, queue: &str, payloa
         .unwrap();
 }
 
-/// Poll rupy:result:{id} until it exists (or timeout) and parse it.
+/// Poll cauli:result:{id} until it exists (or timeout) and parse it.
 pub async fn wait_result(c: &mut redis::aio::MultiplexedConnection, id: &str, secs: u64) -> Value {
     let deadline = Instant::now() + Duration::from_secs(secs);
     while Instant::now() < deadline {
         let r: Option<String> = redis::cmd("GET")
-            .arg(format!("rupy:result:{id}"))
+            .arg(format!("cauli:result:{id}"))
             .query_async(c)
             .await
             .unwrap();
@@ -210,7 +210,7 @@ pub async fn wait_dlq(
     let deadline = Instant::now() + Duration::from_secs(secs);
     while Instant::now() < deadline {
         let entries: Vec<(String, Vec<String>)> = redis::cmd("XRANGE")
-            .arg(format!("rupy:dlq:{queue}"))
+            .arg(format!("cauli:dlq:{queue}"))
             .arg("-")
             .arg("+")
             .query_async(c)
@@ -239,7 +239,7 @@ pub async fn wait_group(c: &mut redis::aio::MultiplexedConnection, queue: &str, 
     while Instant::now() < deadline {
         let r: redis::RedisResult<redis::Value> = redis::cmd("XINFO")
             .arg("GROUPS")
-            .arg(format!("rupy:q:{queue}"))
+            .arg(format!("cauli:q:{queue}"))
             .query_async(c)
             .await;
         if r.is_ok() {

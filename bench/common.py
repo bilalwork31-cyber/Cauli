@@ -1,16 +1,17 @@
-"""Canonical benchmark workloads. Imported by BOTH stacks (Celery and rupy).
+"""Canonical benchmark workloads. Imported by BOTH stacks (Celery and cauli).
 
 Exactly one implementation per workload so the comparison measures the two
 runtimes, not two different task bodies.
 
 Fairness notes:
 - io_call() uses plain requests.get (new connection per call) on both stacks.
-- io_call_async() is the rupy async variant: a minimal HTTP/1.1 keepalive
+- io_call_async() is the cauli async variant: a minimal HTTP/1.1 keepalive
   pool on raw asyncio streams, one pool per event loop (see the deviation
   note at the pool class below for why it is not httpx).
 - cpu_call() is pure hashlib C code (pbkdf2_hmac holds one core busy either
   way) and is identical on both stacks.
 """
+
 import asyncio
 import hashlib
 import os
@@ -47,7 +48,7 @@ def cpu_call() -> str:
 
 
 # ---------------------------------------------------------------------------
-# Async IO variant (used only by the rupy async task).
+# Async IO variant (used only by the cauli async task).
 #
 # DELIBERATE DEVIATION, measured on this machine (2026-07-20): the originally
 # planned module level httpx.AsyncClient tops out near 300 requests/sec of
@@ -58,7 +59,7 @@ def cpu_call() -> str:
 # call and was measured at 5099 rps with 300 in flight against the 50ms
 # endpoint (8465 rps against ms=0), so the runtime under test remains the
 # bottleneck. One pool per running event loop, connections reused LIFO,
-# created on demand (in flight count is gated by rupy --io-concurrency).
+# created on demand (in flight count is gated by cauli --io-concurrency).
 # ---------------------------------------------------------------------------
 class _AsyncHTTPPool:
     """Minimal HTTP/1.1 GET client with keepalive connection reuse."""

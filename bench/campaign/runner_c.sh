@@ -6,7 +6,7 @@
 # REFUSES to start if the A/B suite appears active (camp-*.scope units, or
 # something already listening on 6390/8078).
 #
-# Usage: bash runner_c.sh [filter]     filter: celery | rupy | C_...
+# Usage: bash runner_c.sh [filter]     filter: celery | cauli | C_...
 set -u
 set -o pipefail
 
@@ -19,7 +19,7 @@ CELERY_BIN="$VENV/bin/celery"
 PORT="${BENCH_REDIS_PORT:-6390}"
 export BENCH_REDIS_PORT="$PORT"
 export PYTHONUNBUFFERED=1
-RUPY_WORKER_BIN="${RUPY_WORKER_BIN:-/home/blackdevil/rupy-target/release/rupy-worker}"
+CAULI_WORKER_BIN="${CAULI_WORKER_BIN:-/home/blackdevil/rupy-target/release/cauli-worker}"
 RESULTS="$CAMP_DIR/results"
 LOGS="$RESULTS/logs"
 DRIVER_TIMEOUT="${BENCH_DRIVER_TIMEOUT:-3600}"
@@ -30,7 +30,7 @@ export FAKE_GRAPH_URL="http://127.0.0.1:$GRAPH_PORT"
 # ---- scenario C knobs (env-driven; CONFIG reads these at import) ----
 export SEND_DELAY=0 TICK_SECONDS=5 N_PAGES=200 ERROR_RATE=0.05 \
        APP_MAX_PER_MINUTE=1000000000 MAX_BATCHES_PER_DISPATCH=1000000 \
-       LEASE_MS=600000 RUPY_VARIANT=async
+       LEASE_MS=600000 CAULI_VARIANT=async
 C_CAMPAIGNS="${C_CAMPAIGNS:-100}"
 C_MIN_N="${C_MIN_N:-4000}"
 C_MAX_N="${C_MAX_N:-5000}"
@@ -62,7 +62,7 @@ if ! "$PY" -c "import psycopg2, persist_common; persist_common.ensure_schema()" 
     exit 1
 fi
 
-RUPY_URL="redis://127.0.0.1:$PORT/0"
+CAULI_URL="redis://127.0.0.1:$PORT/0"
 SITEPKG="$("$PY" -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])' 2>/dev/null || true)"
 if [ -n "$SITEPKG" ]; then
     export PYTHONPATH="$SITEPKG:$CAMP_DIR:$BENCH_DIR${PYTHONPATH:+:$PYTHONPATH}"
@@ -190,8 +190,8 @@ match_filter() {
 run_c() {                 # run_c <name> <stack>
     local name="$1" stack="$2"
     match_filter "$name" "$stack" || return 0
-    if [ "$stack" = "rupy" ] && [ ! -x "$RUPY_WORKER_BIN" ]; then
-        log "SKIP $name: no rupy binary"
+    if [ "$stack" = "cauli" ] && [ ! -x "$CAULI_WORKER_BIN" ]; then
+        log "SKIP $name: no cauli binary"
         return 0
     fi
     log "=== $name stack=$stack campaigns=$C_CAMPAIGNS n=$C_MIN_N-$C_MAX_N pages=$N_PAGES error_rate=$ERROR_RATE"
@@ -200,8 +200,8 @@ run_c() {                 # run_c <name> <stack>
     if [ "$stack" = "celery" ]; then
         start_scoped "$name" 1G bash -c "$(celery_c_cmd)" && started=0
     else
-        start_scoped "$name" 1G "$RUPY_WORKER_BIN" --app campaign_rupy_c:app \
-            --redis-url "$RUPY_URL" --python "$PY" \
+        start_scoped "$name" 1G "$CAULI_WORKER_BIN" --app campaign_cauli_c:app \
+            --redis-url "$CAULI_URL" --python "$PY" \
             --queues default,dispatch,campaign_short,campaign_long,backfill_heavy,webhook_ingest,persist \
             --io-concurrency 1000 --io-threads 16 --cpu-workers 1 \
             --visibility-timeout 300 && started=0
@@ -226,7 +226,7 @@ run_c() {                 # run_c <name> <stack>
 
 log "scenario C suite start (filter='${FILTER:-all}') redis=$PORT graph=$GRAPH_PORT timeout=${DRIVER_TIMEOUT}s"
 run_c C_celery celery
-run_c C_rupy   rupy
+run_c C_cauli   cauli
 log "suite done; results in $RESULTS"
 
 "$PY" - <<'EOF'

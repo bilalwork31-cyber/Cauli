@@ -4,6 +4,7 @@ persist record. Standalone copy (additive; graph_async.py stays untouched
 while the A/B suite runs from it). Same raw-asyncio keepalive pattern from
 bench/common.py (httpx anti-scales on this box).
 """
+
 import asyncio
 import json
 from urllib.parse import urlsplit

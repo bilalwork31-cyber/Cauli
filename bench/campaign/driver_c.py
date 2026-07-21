@@ -1,3 +1,4 @@
+# ruff: noqa: E402 -- imports intentionally follow sys.path/env setup
 """Scenario C driver: 100-campaign full-throughput chaos + stage-2 persist.
 
 Seeds C campaigns (sizes uniform in [min_n, max_n], seeded RNG) with GLOBALLY
@@ -17,6 +18,7 @@ JSON: latency + persist-lag percentiles, sends/s + persists/s 10s timelines,
 attempts histogram, counters, validations (pg_count==sent, duplicates==0),
 memory (1s sampling). Raw per-recipient arrays are NOT stored (450k rows).
 """
+
 import argparse
 import importlib
 import json
@@ -52,21 +54,30 @@ def seed_all(n_campaigns, min_n, max_n, pages, seed):
     pipe = r.pipeline(transaction=False)
     for cid, n in sizes.items():
         for i in range(n):
-            rid = f"{cid}r{i:06d}"          # globally unique recipient id
+            rid = f"{cid}r{i:06d}"  # globally unique recipient id
             page = f"p{cursor % pages}"
             cursor += 1
-            pipe.hset(store.k_hash(cid, rid), mapping={
-                "status": "pending", "attempts": 0, "page_id": page,
-                "next_due_ms": now, "lease_until_ms": 0, "sent_at_ms": 0,
-                "enqueued_first_ms": 0,
-            })
+            pipe.hset(
+                store.k_hash(cid, rid),
+                mapping={
+                    "status": "pending",
+                    "attempts": 0,
+                    "page_id": page,
+                    "next_due_ms": now,
+                    "lease_until_ms": 0,
+                    "sent_at_ms": 0,
+                    "enqueued_first_ms": 0,
+                },
+            )
             pipe.zadd(store.k_due(cid), {rid: now})
             pipe.sadd(store.k_ids(cid), rid)
             if len(pipe) >= 3000:
                 pipe.execute()
                 pipe = r.pipeline(transaction=False)
-        r.hset(store.k_meta(cid), mapping={"total": n, "n_pages": pages,
-                                           "seeded_at_ms": now})
+        r.hset(
+            store.k_meta(cid),
+            mapping={"total": n, "n_pages": pages, "seeded_at_ms": now},
+        )
         r.sadd(store.ACTIVE_SET, cid)
     pipe.execute()
     return sizes
@@ -98,13 +109,15 @@ def aggregate_rows(cids, t0_ms):
         for row in store.collect_rows(cid):
             counts[row["status"]] = counts.get(row["status"], 0) + 1
             att_hist[row["attempts"]] = att_hist.get(row["attempts"], 0) + 1
-            if row["status"] == "sent" and row["sent_at_ms"] > 0 \
-                    and row["enqueued_first_ms"] > 0:
+            if (
+                row["status"] == "sent"
+                and row["sent_at_ms"] > 0
+                and row["enqueued_first_ms"] > 0
+            ):
                 lat.append(float(row["sent_at_ms"] - row["enqueued_first_ms"]))
                 b = int((row["sent_at_ms"] - t0_ms) // 10000)
                 buckets[b] = buckets.get(b, 0) + 1
-    timeline = [buckets.get(i, 0) for i in range(max(buckets) + 1)] \
-        if buckets else []
+    timeline = [buckets.get(i, 0) for i in range(max(buckets) + 1)] if buckets else []
     return lat, att_hist, counts, timeline
 
 
@@ -114,7 +127,7 @@ def sum_counter(cids, name):
 
 def main():
     ap = argparse.ArgumentParser(description="scenario C chaos driver")
-    ap.add_argument("--stack", required=True, choices=["celery", "rupy"])
+    ap.add_argument("--stack", required=True, choices=["celery", "cauli"])
     ap.add_argument("--scenario", required=True)
     ap.add_argument("--campaigns", type=int, default=100)
     ap.add_argument("--min-n", type=int, default=4000)
@@ -131,7 +144,8 @@ def main():
     os.makedirs(RESULTS_DIR, exist_ok=True)
     out_path = os.path.join(RESULTS_DIR, f"{args.scenario}.json")
     mod = importlib.import_module(
-        "campaign_celery_c" if args.stack == "celery" else "campaign_rupy_c")
+        "campaign_celery_c" if args.stack == "celery" else "campaign_cauli_c"
+    )
 
     store.conn().ping()
     persist_common.ensure_schema()
@@ -140,15 +154,16 @@ def main():
     persist_common.results_conn().flushdb()
 
     seed_t = time.time()
-    sizes = seed_all(args.campaigns, args.min_n, args.max_n, args.pages,
-                     args.seed)
+    sizes = seed_all(args.campaigns, args.min_n, args.max_n, args.pages, args.seed)
     cids = list(sizes)
     total = sum(sizes.values())
     bgfill_common.seed_webhook_inbox(500)
     store.set_bg_active(True)
-    print(f"[c] seeded campaigns={args.campaigns} recipients={total} "
-          f"pages={args.pages} seed={args.seed} in {time.time() - seed_t:.1f}s",
-          file=sys.stderr)
+    print(
+        f"[c] seeded campaigns={args.campaigns} recipients={total} "
+        f"pages={args.pages} seed={args.seed} in {time.time() - seed_t:.1f}s",
+        file=sys.stderr,
+    )
 
     sampler = bench_driver.MemorySampler(args.cgroup_path, args.pid, 1.0)
     sampler.start()
@@ -181,15 +196,19 @@ def main():
                 exact = exact_counts(cids)
                 exact_ts = now
             pgc = persist_common.pg_count()
-            if sum(exact.get(s, 0) for s in TERMINAL) >= total \
-                    and pgc >= exact.get("sent", 0):
+            if sum(exact.get(s, 0) for s in TERMINAL) >= total and pgc >= exact.get(
+                "sent", 0
+            ):
                 break
         if now - last_log >= 10.0:
             rate = (done_est - prev_done) / max(now - prev_t, 1e-9)
             prev_done, prev_t = done_est, now
-            print(f"[c] t={now - t0:7.1f}s done={done_est}/{total} "
-                  f"rate={rate:6.1f}/s pg={persist_common.pg_count()} "
-                  f"backlog={backlog} nonterminal={nt}", file=sys.stderr)
+            print(
+                f"[c] t={now - t0:7.1f}s done={done_est}/{total} "
+                f"rate={rate:6.1f}/s pg={persist_common.pg_count()} "
+                f"backlog={backlog} nonterminal={nt}",
+                file=sys.stderr,
+            )
             last_log = now
         if now - t0 >= args.timeout:
             status = "stalled"
@@ -228,8 +247,7 @@ def main():
     backlog = persist_common.backlog_len()
     retries = {
         "http_retries": sum_counter(cids, "http_retries"),
-        "rows_with_multiple_attempts":
-            sum(v for k, v in att_hist.items() if k > 1),
+        "rows_with_multiple_attempts": sum(v for k, v in att_hist.items() if k > 1),
         "attempts_histogram": {str(k): v for k, v in sorted(att_hist.items())},
         "lock_skips": sum_counter(cids, "lock_skips"),
         "already_sent_repairs": sum_counter(cids, "already_sent"),
@@ -251,8 +269,9 @@ def main():
     blob = {
         "scenario": args.scenario,
         "stack": args.stack,
-        "rupy_variant": os.environ.get("RUPY_VARIANT", "async")
-            if args.stack == "rupy" else None,
+        "cauli_variant": os.environ.get("CAULI_VARIANT", "async")
+        if args.stack == "cauli"
+        else None,
         "campaigns": args.campaigns,
         "n_total": total,
         "pages": args.pages,
@@ -272,26 +291,31 @@ def main():
         "sends_per_10s": send_tl,
         "persists_per_10s": persist_tl,
         "bgfill": bgfill_common.webhook_counts(),
-        "memory": {**mem,
-                   "worker_alive_at_end": bench_driver.worker_alive(args.pid)},
+        "memory": {**mem, "worker_alive_at_end": bench_driver.worker_alive(args.pid)},
         "samples": {"memory": sampler.samples},
     }
     with open(out_path, "w") as f:
         json.dump(blob, f, indent=1)
 
-    peak = mem.get("memory_peak_file_bytes") or sampler.peak_cgroup \
-        or sampler.peak_rss or 0
+    peak = (
+        mem.get("memory_peak_file_bytes")
+        or sampler.peak_cgroup
+        or sampler.peak_rss
+        or 0
+    )
     ok = status == "ok" and validations["pg_matches_sent"] and dup == 0
-    print(f"[c] {args.scenario} stack={args.stack} status={status} "
-          f"campaigns={args.campaigns} n={total} drain_s={drain_s:.1f} "
-          f"sends_ps={sent / max(drain_s, 1e-9):.1f} sent={sent} "
-          f"failed={validations['failed']} skipped={validations['skipped']} "
-          f"dup={dup} pg={pgc} pg_match={validations['pg_matches_sent']} "
-          f"http_retries={retries['http_retries']} "
-          f"p50={lat_summary['p50']}ms p95={lat_summary['p95']}ms "
-          f"p99={lat_summary['p99']}ms lag_p50={lag_summary['p50']}ms "
-          f"lag_p95={lag_summary['p95']}ms "
-          f"peak_mem={peak / 1048576:.1f}MiB oom={mem.get('oom_kills')}")
+    print(
+        f"[c] {args.scenario} stack={args.stack} status={status} "
+        f"campaigns={args.campaigns} n={total} drain_s={drain_s:.1f} "
+        f"sends_ps={sent / max(drain_s, 1e-9):.1f} sent={sent} "
+        f"failed={validations['failed']} skipped={validations['skipped']} "
+        f"dup={dup} pg={pgc} pg_match={validations['pg_matches_sent']} "
+        f"http_retries={retries['http_retries']} "
+        f"p50={lat_summary['p50']}ms p95={lat_summary['p95']}ms "
+        f"p99={lat_summary['p99']}ms lag_p50={lag_summary['p50']}ms "
+        f"lag_p95={lag_summary['p95']}ms "
+        f"peak_mem={peak / 1048576:.1f}MiB oom={mem.get('oom_kills')}"
+    )
     return 0 if ok else 3
 
 

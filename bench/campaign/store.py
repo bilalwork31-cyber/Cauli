@@ -1,6 +1,6 @@
 """Recipient store: Redis mimic of the production Postgres recipient table.
 
-Shared by BOTH stacks (Celery and rupy). Lives in db STORE_DB (3) of the suite
+Shared by BOTH stacks (Celery and cauli). Lives in db STORE_DB (3) of the suite
 redis so it never collides with broker (db 0) or celery backend (db 1).
 
 Key layout:
@@ -31,6 +31,7 @@ Duplicate-protection contract (mirror of production):
      counter increments and the send is refused. Nonzero duplicates means the
      guard chain was bypassed; the driver asserts it is 0.
 """
+
 import time
 
 import redis
@@ -52,8 +53,7 @@ _ids_cache = {}
 def conn():
     global _client
     if _client is None:
-        _client = redis.Redis(host="127.0.0.1", port=PORT, db=DB,
-                              decode_responses=True)
+        _client = redis.Redis(host="127.0.0.1", port=PORT, db=DB, decode_responses=True)
     return _client
 
 
@@ -171,19 +171,25 @@ def seed_campaign(cid, n, n_pages, at_ms=None):
     for i in range(n):
         rid = f"r{i:06d}"
         page = f"p{i % n_pages}"
-        pipe.hset(k_hash(cid, rid), mapping={
-            "status": "pending", "attempts": 0, "page_id": page,
-            "next_due_ms": now, "lease_until_ms": 0, "sent_at_ms": 0,
-            "enqueued_first_ms": 0,
-        })
+        pipe.hset(
+            k_hash(cid, rid),
+            mapping={
+                "status": "pending",
+                "attempts": 0,
+                "page_id": page,
+                "next_due_ms": now,
+                "lease_until_ms": 0,
+                "sent_at_ms": 0,
+                "enqueued_first_ms": 0,
+            },
+        )
         pipe.zadd(k_due(cid), {rid: now})
         pipe.sadd(k_ids(cid), rid)
         if len(pipe) >= 3000:
             pipe.execute()
             pipe = r.pipeline(transaction=False)
     pipe.execute()
-    r.hset(k_meta(cid), mapping={"total": n, "n_pages": n_pages,
-                                 "seeded_at_ms": now})
+    r.hset(k_meta(cid), mapping={"total": n, "n_pages": n_pages, "seeded_at_ms": now})
     r.sadd(ACTIVE_SET, cid)
     _ids_cache.pop(cid, None)
 
@@ -204,7 +210,8 @@ def claim_batch(cid, at_ms=None, limit=50, lease_ms=None):
     lease = lease_ms if lease_ms is not None else campconfig.CONFIG["LEASE_MS"]
     flat = _script("claim", CLAIM_LUA)(
         keys=[k_due(cid), k_leased(cid)],
-        args=[now, int(limit), int(lease), f"campaign:{cid}:r:"])
+        args=[now, int(limit), int(lease), f"campaign:{cid}:r:"],
+    )
     pairs = [(flat[i], flat[i + 1]) for i in range(0, len(flat), 2)]
     if pairs:
         conn().incrby(k_ctr(cid, "claimed_total"), len(pairs))
@@ -236,8 +243,14 @@ def sent_flag_exists(cid, rid):
 def record_send_attempt(cid, rid):
     """Tripwire before an actual POST. False = flag already up, duplicates
     counter incremented, caller MUST NOT send."""
-    return int(_script("attempt", ATTEMPT_LUA)(
-        keys=[k_flag(cid, rid), k_dup(cid)], args=[])) == 1
+    return (
+        int(
+            _script("attempt", ATTEMPT_LUA)(
+                keys=[k_flag(cid, rid), k_dup(cid)], args=[]
+            )
+        )
+        == 1
+    )
 
 
 def set_sent_flag(cid, rid):
@@ -265,9 +278,15 @@ def mark_results(cid, results):
             continue
         pipe.zrem(k_leased(cid), rid)
         if o == "sent":
-            pipe.hset(h, mapping={"status": "sent", "attempts": att,
-                                  "sent_at_ms": res["sent_at_ms"],
-                                  "lease_until_ms": 0})
+            pipe.hset(
+                h,
+                mapping={
+                    "status": "sent",
+                    "attempts": att,
+                    "sent_at_ms": res["sent_at_ms"],
+                    "lease_until_ms": 0,
+                },
+            )
             pipe.zrem(k_due(cid), rid)
             pipe.delete(k_lock(cid, rid))
         elif o == "already_sent":
@@ -276,14 +295,19 @@ def mark_results(cid, results):
             pipe.delete(k_lock(cid, rid))
             pipe.incr(k_ctr(cid, "already_sent"))
         elif o == "retry":
-            pipe.hset(h, mapping={"status": "retry", "attempts": att,
-                                  "next_due_ms": res["next_due_ms"],
-                                  "lease_until_ms": 0})
+            pipe.hset(
+                h,
+                mapping={
+                    "status": "retry",
+                    "attempts": att,
+                    "next_due_ms": res["next_due_ms"],
+                    "lease_until_ms": 0,
+                },
+            )
             pipe.delete(k_lock(cid, rid))
             pipe.zadd(k_due(cid), {rid: res["next_due_ms"]})
         elif o in ("failed", "skipped"):
-            pipe.hset(h, mapping={"status": o, "attempts": att,
-                                  "lease_until_ms": 0})
+            pipe.hset(h, mapping={"status": o, "attempts": att, "lease_until_ms": 0})
             pipe.zrem(k_due(cid), rid)
             pipe.delete(k_lock(cid, rid))
         else:
@@ -318,7 +342,7 @@ def count_by_status(cid):
     counts = {}
     for off in range(0, len(ids), 2000):
         pipe = r.pipeline(transaction=False)
-        chunk = ids[off:off + 2000]
+        chunk = ids[off : off + 2000]
         for rid in chunk:
             pipe.hget(k_hash(cid, rid), "status")
         for st in pipe.execute():
@@ -334,15 +358,20 @@ def collect_rows(cid):
     rows = []
     for off in range(0, len(ids), 2000):
         pipe = r.pipeline(transaction=False)
-        chunk = ids[off:off + 2000]
+        chunk = ids[off : off + 2000]
         for rid in chunk:
             pipe.hmget(k_hash(cid, rid), fields)
         for rid, vals in zip(chunk, pipe.execute()):
-            rows.append({"rid": rid, "status": vals[0],
-                         "attempts": int(vals[1] or 0),
-                         "sent_at_ms": int(vals[2] or 0),
-                         "enqueued_first_ms": int(vals[3] or 0),
-                         "page_id": vals[4]})
+            rows.append(
+                {
+                    "rid": rid,
+                    "status": vals[0],
+                    "attempts": int(vals[1] or 0),
+                    "sent_at_ms": int(vals[2] or 0),
+                    "enqueued_first_ms": int(vals[3] or 0),
+                    "page_id": vals[4],
+                }
+            )
     return rows
 
 

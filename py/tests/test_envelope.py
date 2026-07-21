@@ -7,7 +7,7 @@ import re
 
 from helpers import ENVELOPE_KEYS, assert_default_option_fields, now_ms
 
-from rupy import AsyncResult
+from cauli import AsyncResult
 
 
 def test_delay_xadds_exact_envelope(app, redis_client):
@@ -21,7 +21,7 @@ def test_delay_xadds_exact_envelope(app, redis_client):
 
     assert isinstance(res, AsyncResult)
 
-    entries = redis_client.xrange("rupy:q:default")
+    entries = redis_client.xrange("cauli:q:default")
     assert len(entries) == 1
     _entry_id, fields = entries[0]
     assert set(fields.keys()) == {b"e"}, "stream entry must have exactly one field 'e'"
@@ -44,7 +44,7 @@ def test_delay_xadds_exact_envelope(app, redis_client):
     assert env["not_before"] is None
 
     # nothing leaked into the delayed zset
-    assert redis_client.exists("rupy:delayed:default") == 0
+    assert redis_client.exists("cauli:delayed:default") == 0
 
 
 def test_each_delay_gets_unique_id_and_entry(app, redis_client):
@@ -56,7 +56,7 @@ def test_each_delay_gets_unique_id_and_entry(app, redis_client):
     r2 = ping.delay()
     assert r1.id != r2.id
 
-    entries = redis_client.xrange("rupy:q:default")
+    entries = redis_client.xrange("cauli:q:default")
     assert len(entries) == 2
     ids = {json.loads(fields[b"e"])["id"] for _sid, fields in entries}
     assert ids == {r1.id, r2.id}

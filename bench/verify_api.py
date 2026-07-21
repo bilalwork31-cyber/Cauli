@@ -1,6 +1,6 @@
 """Verify mock_api.py is never the benchmark bottleneck: must sustain >2000 rps.
 
-Uses common._AsyncHTTPPool, the exact client the rupy async task uses, so this
+Uses common._AsyncHTTPPool, the exact client the cauli async task uses, so this
 verifies both the server capacity AND the benchmark's async client path:
   phase 1: /io       (50ms simulated latency), 300 concurrent  -> must be >2000 rps
   phase 2: /io?ms=0  (no sleep), 100 concurrent                -> raw ceiling
@@ -13,6 +13,7 @@ PASS requires phase 1 > 2000 rps. Exit code 0 on pass, 1 on fail.
 
 Run (mock_api.py must already be up):  python verify_api.py
 """
+
 import asyncio
 import sys
 import time
@@ -47,7 +48,9 @@ async def httpx_reference(conc: int, seconds: float) -> float:
     import httpx
 
     async with httpx.AsyncClient(
-        limits=httpx.Limits(max_connections=conc + 10, max_keepalive_connections=conc + 10),
+        limits=httpx.Limits(
+            max_connections=conc + 10, max_keepalive_connections=conc + 10
+        ),
         timeout=10.0,
     ) as client:
         counter = [0]
@@ -62,8 +65,10 @@ async def httpx_reference(conc: int, seconds: float) -> float:
         await asyncio.gather(*(worker(t0 + seconds) for _ in range(conc)))
         dt = time.perf_counter() - t0
         rps = counter[0] / dt
-        print(f"phase3 httpx reference (NOT used by the harness), {conc} conc: "
-              f"{counter[0]} requests in {dt:.1f}s -> {rps:.0f} rps")
+        print(
+            f"phase3 httpx reference (NOT used by the harness), {conc} conc: "
+            f"{counter[0]} requests in {dt:.1f}s -> {rps:.0f} rps"
+        )
         return rps
 
 
@@ -75,8 +80,10 @@ async def main() -> int:
     except ImportError:
         print("phase3 httpx reference skipped (httpx not installed)")
     ok = r1 > 2000.0
-    print(f"RESULT: {'PASS' if ok else 'FAIL'} "
-          f"(phase1 {r1:.0f} rps, need >2000; raw ceiling {r2:.0f} rps)")
+    print(
+        f"RESULT: {'PASS' if ok else 'FAIL'} "
+        f"(phase1 {r1:.0f} rps, need >2000; raw ceiling {r2:.0f} rps)"
+    )
     return 0 if ok else 1
 
 

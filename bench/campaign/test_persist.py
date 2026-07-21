@@ -3,7 +3,6 @@
 Run: BENCH_REDIS_PORT=6393 ~/rupy-bench-venv/bin/pytest test_persist.py -v
 Needs: redis on 6393 and Postgres per pg_setup.sh.
 """
-import json
 
 import pytest
 
@@ -12,9 +11,14 @@ import store
 
 
 def _rec(i, rid=None, sent_at=1000):
-    return {"recipient_id": rid or f"tr{i:05d}", "campaign_id": "tc",
-            "page_id": "p0", "message_id": f"m{i}", "sent_at_ms": sent_at,
-            "enqueued_first_ms": 500}
+    return {
+        "recipient_id": rid or f"tr{i:05d}",
+        "campaign_id": "tc",
+        "page_id": "p0",
+        "message_id": f"m{i}",
+        "sent_at_ms": sent_at,
+        "enqueued_first_ms": 500,
+    }
 
 
 @pytest.fixture(autouse=True)

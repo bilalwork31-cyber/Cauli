@@ -1,8 +1,8 @@
 use clap::Parser;
 
-/// rupy-worker: Rust worker runtime for rupy Python task queues (PROTOCOL §7).
+/// cauli-worker: Rust worker runtime for cauli Python task queues (PROTOCOL §7).
 #[derive(Parser, Debug, Clone)]
-#[command(name = "rupy-worker", version, about)]
+#[command(name = "cauli-worker", version, about)]
 pub struct Args {
     /// App location as module:attr (e.g. myproj.tasks:app)
     #[arg(long)]
@@ -12,7 +12,7 @@ pub struct Args {
     #[arg(long, value_delimiter = ',')]
     pub queues: Vec<String>,
 
-    /// Redis URL. Precedence: CLI > env RUPY_REDIS_URL > app.redis_url
+    /// Redis URL. Precedence: CLI > env CAULI_REDIS_URL > app.redis_url
     #[arg(long)]
     pub redis_url: Option<String>,
 
@@ -79,7 +79,7 @@ mod tests {
 
     #[test]
     fn parses_defaults() {
-        let a = Args::try_parse_from(["rupy-worker", "--app", "m.tasks:app"]).unwrap();
+        let a = Args::try_parse_from(["cauli-worker", "--app", "m.tasks:app"]).unwrap();
         assert_eq!(a.app, "m.tasks:app");
         assert!(a.queues.is_empty());
         assert_eq!(a.redis_url, None);
@@ -99,7 +99,7 @@ mod tests {
     #[test]
     fn parses_overrides_and_queue_list() {
         let a = Args::try_parse_from([
-            "rupy-worker",
+            "cauli-worker",
             "--app",
             "x:y",
             "--queues",
@@ -144,7 +144,7 @@ mod tests {
 
     #[test]
     fn missing_app_is_error() {
-        assert!(Args::try_parse_from(["rupy-worker"]).is_err());
+        assert!(Args::try_parse_from(["cauli-worker"]).is_err());
     }
 
     #[test]

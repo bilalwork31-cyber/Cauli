@@ -23,7 +23,7 @@ pub async fn fetch_loop(ctx: Arc<Ctx>, mut fetch_conn: redis::aio::ConnectionMan
             continue;
         }
         let opts = StreamReadOptions::default()
-            .group("rupy", &ctx.consumer)
+            .group("cauli", &ctx.consumer)
             .count(ctx.args.batch)
             .block(1000);
         let reply: Option<StreamReadReply> =
@@ -39,7 +39,7 @@ pub async fn fetch_loop(ctx: Arc<Ctx>, mut fetch_conn: redis::aio::ConnectionMan
         for sk in reply.keys {
             let queue = sk
                 .key
-                .strip_prefix("rupy:q:")
+                .strip_prefix("cauli:q:")
                 .unwrap_or(&sk.key)
                 .to_string();
             for entry in sk.ids {

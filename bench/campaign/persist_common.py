@@ -10,8 +10,9 @@ re-enqueue when backlog remains, 1s-delayed re-enqueue while the campaign is
 still running (bg:run flag), stop otherwise.
 
 PG access: psycopg2, one short-lived connection per drain call (thread-safe
-under rupy's thread pool and celery prefork without shared-state care).
+under cauli's thread pool and celery prefork without shared-state care).
 """
+
 import json
 import time
 
@@ -25,12 +26,12 @@ import store
 RESULTS_DB = int(__import__("os").environ.get("CAMPAIGN_RESULTS_DB", "4"))
 RESULTS_KEY = "results_raw"
 LAGS_KEY = "persist:lags"
-TIMELINE_KEY = "persist:timeline"      # hash: abs_10s_bucket -> rows persisted
+TIMELINE_KEY = "persist:timeline"  # hash: abs_10s_bucket -> rows persisted
 DRAIN_LIMIT = 500
 
 PG_DSN = __import__("os").environ.get(
-    "CAMPAIGN_PG_DSN",
-    "host=127.0.0.1 port=5432 dbname=bench user=bench password=bench")
+    "CAMPAIGN_PG_DSN", "host=127.0.0.1 port=5432 dbname=bench user=bench password=bench"
+)
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS messages (
@@ -49,8 +50,12 @@ _client = None
 def results_conn():
     global _client
     if _client is None:
-        _client = redis.Redis(host="127.0.0.1", port=campconfig.REDIS_PORT,
-                              db=RESULTS_DB, decode_responses=True)
+        _client = redis.Redis(
+            host="127.0.0.1",
+            port=campconfig.REDIS_PORT,
+            db=RESULTS_DB,
+            decode_responses=True,
+        )
     return _client
 
 
@@ -60,11 +65,16 @@ _aclients = {}
 def results_aconn():
     import asyncio
     import redis.asyncio as aredis
+
     loop = asyncio.get_running_loop()
     c = _aclients.get(id(loop))
     if c is None:
-        c = aredis.Redis(host="127.0.0.1", port=campconfig.REDIS_PORT,
-                         db=RESULTS_DB, decode_responses=True)
+        c = aredis.Redis(
+            host="127.0.0.1",
+            port=campconfig.REDIS_PORT,
+            db=RESULTS_DB,
+            decode_responses=True,
+        )
         _aclients[id(loop)] = c
     return c
 
@@ -74,8 +84,7 @@ def push_result(record):
 
 
 async def push_result_async(record):
-    await results_aconn().rpush(RESULTS_KEY,
-                                json.dumps(record, separators=(",", ":")))
+    await results_aconn().rpush(RESULTS_KEY, json.dumps(record, separators=(",", ":")))
 
 
 # --------------------------------------------------------------------- pg ----
@@ -130,9 +139,18 @@ def drain_once(limit=DRAIN_LIMIT):
                 "INSERT INTO messages (recipient_id, campaign_id, page_id, "
                 "message_id, sent_at_ms, enqueued_first_ms) VALUES %s "
                 "ON CONFLICT (recipient_id) DO NOTHING",
-                [(r["recipient_id"], r["campaign_id"], r["page_id"],
-                  r["message_id"], r["sent_at_ms"], r["enqueued_first_ms"])
-                 for r in recs])
+                [
+                    (
+                        r["recipient_id"],
+                        r["campaign_id"],
+                        r["page_id"],
+                        r["message_id"],
+                        r["sent_at_ms"],
+                        r["enqueued_first_ms"],
+                    )
+                    for r in recs
+                ],
+            )
     finally:
         c.close()
     now = int(time.time() * 1000)
@@ -149,9 +167,9 @@ def drain_and_chain(reenqueue):
     """Persister task body. reenqueue(countdown_s or None) re-enqueues self."""
     n = drain_once()
     if backlog_len() > 0:
-        reenqueue(None)          # more work: chain immediately
+        reenqueue(None)  # more work: chain immediately
     elif store.bg_active():
-        reenqueue(1.0)           # idle but campaign still running: poll in 1s
+        reenqueue(1.0)  # idle but campaign still running: poll in 1s
     return n
 
 
@@ -167,5 +185,4 @@ def collect_lags():
 
 def persist_timeline():
     """{abs_10s_bucket(int): rows(int)} from the drain-side counter."""
-    return {int(k): int(v)
-            for k, v in results_conn().hgetall(TIMELINE_KEY).items()}
+    return {int(k): int(v) for k, v in results_conn().hgetall(TIMELINE_KEY).items()}

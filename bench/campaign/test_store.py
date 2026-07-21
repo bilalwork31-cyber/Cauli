@@ -6,6 +6,7 @@ Covers: claim_batch atomicity under 8 concurrent claimers (no double claim),
 orphan reclaim after lease expiry, and the duplicates tripwire firing on a
 double-send attempt.
 """
+
 import threading
 import time
 
@@ -42,7 +43,7 @@ def test_claim_batch_atomic_under_concurrency():
     def worker():
         empty = 0
         while empty < 3:
-            got = store.claim_batch("t1", limit=25)   # default 60s lease
+            got = store.claim_batch("t1", limit=25)  # default 60s lease
             if got:
                 with lock:
                     claimed.extend(rid for rid, _ in got)
@@ -73,8 +74,7 @@ def test_orphan_reclaim_after_lease_expiry():
     assert sorted(r for r, _ in second) == sorted(r for r, _ in first)
     # a terminal row is NOT reclaimed
     rid = first[0][0]
-    store.mark_result("t2", rid, "sent", attempts=1,
-                      sent_at_ms=store.now_ms())
+    store.mark_result("t2", rid, "sent", attempts=1, sent_at_ms=store.now_ms())
     time.sleep(0.25)
     third = store.claim_batch("t2", limit=10, lease_ms=150)
     assert rid not in [r for r, _ in third]
@@ -84,9 +84,8 @@ def test_orphan_reclaim_after_lease_expiry():
 def test_retry_row_becomes_due_again():
     store.seed_campaign("t3", 1, 1)
     [(rid, _)] = store.claim_batch("t3", limit=1)
-    store.mark_result("t3", rid, "retry", attempts=1,
-                      next_due_ms=store.now_ms() + 100)
-    assert store.claim_batch("t3", limit=1) == []      # not due yet
+    store.mark_result("t3", rid, "retry", attempts=1, next_due_ms=store.now_ms() + 100)
+    assert store.claim_batch("t3", limit=1) == []  # not due yet
     time.sleep(0.15)
     again = store.claim_batch("t3", limit=1)
     assert [r for r, _ in again] == [rid]
@@ -99,15 +98,15 @@ def test_duplicate_tripwire_fires_on_double_send_attempt():
     # first (legitimate) send
     assert store.acquire_lock("t4", rid)
     assert store.begin_send("t4", rid) == 1
-    assert store.record_send_attempt("t4", rid) is True    # POST allowed
+    assert store.record_send_attempt("t4", rid) is True  # POST allowed
     store.set_sent_flag("t4", rid)
     store.mark_result("t4", rid, "sent", attempts=1, sent_at_ms=store.now_ms())
     assert store.duplicates("t4") == 0
     # a second send attempt on the same recipient (guard chain bypassed)
-    assert store.acquire_lock("t4", rid)                   # lock was released
-    assert store.sent_flag_exists("t4", rid)               # silent guard sees it
-    assert store.record_send_attempt("t4", rid) is False   # tripwire blocks
-    assert store.duplicates("t4") == 1                     # ...and counts it
+    assert store.acquire_lock("t4", rid)  # lock was released
+    assert store.sent_flag_exists("t4", rid)  # silent guard sees it
+    assert store.record_send_attempt("t4", rid) is False  # tripwire blocks
+    assert store.duplicates("t4") == 1  # ...and counts it
     # enqueued_first_ms was stamped once, on first claim
     row = store.collect_rows("t4")[0]
     assert row["status"] == "sent"

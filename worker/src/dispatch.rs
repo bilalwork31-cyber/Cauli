@@ -24,7 +24,7 @@ pub fn spawn_dispatch(ctx: Arc<Ctx>, queue: String, stream_id: String, raw: Opti
 
 /// Task id charset per PROTOCOL §2 ("32 char lowercase hex"). Rejecting
 /// anything else worker-side (audit M1) stops a crafted `id` from colliding
-/// with / overwriting another task's `rupy:result:{id}` key, from carrying
+/// with / overwriting another task's `cauli:result:{id}` key, from carrying
 /// cluster hash-tags (`{...}`), or from being a key-size DoS.
 fn valid_task_id(id: &str) -> bool {
     id.len() == 32
@@ -126,7 +126,7 @@ async fn finish(ctx: &Arc<Ctx>, queue: &str, sid: &str, mut env: Envelope, outco
     }
 }
 
-/// §4.2 steps 1-4. `countdown_ms` overrides the computed backoff (rupy.Retry).
+/// §4.2 steps 1-4. `countdown_ms` overrides the computed backoff (cauli.Retry).
 async fn schedule_retry(
     ctx: &Arc<Ctx>,
     conn: &mut redis::aio::ConnectionManager,

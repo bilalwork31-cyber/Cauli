@@ -1,12 +1,12 @@
 //! CPU task pool: child processes speaking the PROTOCOL §5.1 line-delimited
-//! JSON protocol (`{python} -m rupy._exec --app {spec}`), one in-flight
+//! JSON protocol (`{python} -m cauli._exec --app {spec}`), one in-flight
 //! request per child, kill+respawn on hard timeout or child death.
 //!
-//! Test hook (documented, M5): if env var `RUPY_EXEC_CMD` is set, it is split
+//! Test hook (documented, M5): if env var `CAULI_EXEC_CMD` is set, it is split
 //! on whitespace and used verbatim as the child argv instead of
-//! `{python} -m rupy._exec --app {spec}`. This lets the e2e suite run a
+//! `{python} -m cauli._exec --app {spec}`. This lets the e2e suite run a
 //! standalone stand-in child (tests/fixtures/fake_exec.py) without the real
-//! rupy Python package installed. Compiled in only under `cfg(test)` or the
+//! cauli Python package installed. Compiled in only under `cfg(test)` or the
 //! `test-hooks` feature -- a plain `cargo build --release` has no code path
 //! that reads this env var at all, so `cargo test --features test-hooks` is
 //! required to exercise it (see worker/Cargo.toml `[features]`).
@@ -49,14 +49,16 @@ pub struct CpuPool {
 }
 
 pub fn child_argv(python: &str, app_spec: &str) -> (String, Vec<String>) {
-    // M5: the RUPY_EXEC_CMD override is a test-only hook (e2e uses it to run
-    // tests/fixtures/fake_exec.py without the real rupy package). Compiled
+    // M5: the CAULI_EXEC_CMD override is a test-only hook (e2e uses it to run
+    // tests/fixtures/fake_exec.py without the real cauli package). Compiled
     // out entirely for a normal `cargo build --release` so a production
     // binary has no env-driven way to replace the cpu child command; only
     // `cargo test` / `--features test-hooks` builds honor it.
     #[cfg(any(test, feature = "test-hooks"))]
-    if let Ok(cmd) = std::env::var("RUPY_EXEC_CMD") {
-        tracing::warn!("RUPY_EXEC_CMD test hook active: overriding cpu child command with {cmd:?}");
+    if let Ok(cmd) = std::env::var("CAULI_EXEC_CMD") {
+        tracing::warn!(
+            "CAULI_EXEC_CMD test hook active: overriding cpu child command with {cmd:?}"
+        );
         let mut parts = cmd.split_whitespace().map(str::to_string);
         if let Some(prog) = parts.next() {
             return (prog, parts.collect());
@@ -66,7 +68,7 @@ pub fn child_argv(python: &str, app_spec: &str) -> (String, Vec<String>) {
         python.to_string(),
         vec![
             "-m".into(),
-            "rupy._exec".into(),
+            "cauli._exec".into(),
             "--app".into(),
             app_spec.into(),
         ],

@@ -1,4 +1,4 @@
-# bench: Celery vs rupy benchmark harness
+# bench: Celery vs cauli benchmark harness
 
 Honest, resource capped, reproducible benchmarks on WSL2 (Ubuntu-24.04,
 6 cores, 11GB RAM, Python 3.12.3, Redis 7). Everything here runs INSIDE WSL;
@@ -8,7 +8,7 @@ files are edited on the Windows side.
 
 | File | Purpose |
 |---|---|
-| `setup.sh` | creates the venv at `/home/blackdevil/rupy-bench-venv`, installs deps, installs the rupy package editable if `../py` exists (skips gracefully if not) |
+| `setup.sh` | creates the venv at `/home/blackdevil/rupy-bench-venv`, installs deps, installs the cauli package editable if `../py` exists (skips gracefully if not) |
 | `runner.sh` | orchestrates the whole suite sequentially; optional scenario filter arg |
 | `driver.py` | measurement engine: enqueue, wait, throughput, latency percentiles, memory sampling, stall/OOM detection, JSON output |
 | `mock_api.py` | uncapped starlette+uvicorn mock external API on 127.0.0.1:8077 (`/io` = 50ms, `/io?ms=N` variable, `/health`) |
@@ -16,7 +16,7 @@ files are edited on the Windows side.
 | `common.py` | the two canonical workloads, imported by BOTH stacks |
 | `calibrate.py` | picks `CPU_ITER` so one cpu task is ~50ms on this machine |
 | `tasks_celery.py` | Celery app (broker db0, backend db1) |
-| `tasks_rupy.py` | rupy app per PROTOCOL.md section 6 |
+| `tasks_cauli.py` | cauli app per PROTOCOL.md section 6 |
 | `test_driver.py` | unit sanity for the percentile/latency math |
 | `results/` | one JSON per scenario + `results/logs/` for every process log |
 
@@ -27,20 +27,20 @@ wsl.exe -d Ubuntu-24.04 -e bash -lc "cd /mnt/d/dev/projects/boring/rupy/bench &&
 ```
 
 Subset: `bash runner.sh S1` (prefix match on scenario names), `bash runner.sh S3b`,
-`bash runner.sh rupy` or `bash runner.sh celery` (stack match).
+`bash runner.sh cauli` or `bash runner.sh celery` (stack match).
 
 Env knobs: `BENCH_REDIS_PORT` (default 6390, never use 6379),
-`RUPY_WORKER_BIN` (default `/home/blackdevil/rupy-target/release/rupy-worker`),
+`CAULI_WORKER_BIN` (default `/home/blackdevil/rupy-target/release/cauli-worker`),
 `BENCH_VENV`, `BENCH_DRIVER_TIMEOUT` (default 600s per scenario wait).
 
-If the rupy binary or the rupy python package is missing, runner.sh logs
-"rupy binary not found", writes a `{"status":"skipped"}` marker JSON and
+If the cauli binary or the cauli python package is missing, runner.sh logs
+"cauli binary not found", writes a `{"status":"skipped"}` marker JSON and
 continues with the Celery scenarios. Rerun `setup.sh` after `../py` appears.
 
-rupy workers are launched with `--python $VENV/bin/python` and with
+cauli workers are launched with `--python $VENV/bin/python` and with
 `PYTHONPATH` set to the venv site packages plus the bench dir, so the
-embedded interpreter and the `python -m rupy._exec` cpu children can import
-`rupy`, `tasks_rupy`, `common`, `requests` and friends.
+embedded interpreter and the `python -m cauli._exec` cpu children can import
+`cauli`, `tasks_cauli`, `common`, `requests` and friends.
 
 ## Memory caps: the validated systemd-run form
 
@@ -68,9 +68,9 @@ and reads `memory.current` (sampled every 250ms), `memory.peak` and
 
 | Scenario | Task | N | Cap | Contenders |
 |---|---|---|---|---|
-| S1 io_10k_1G | io (50ms HTTP) | 10000 | 1G | celery prefork c8, c16; celery gevent c500; rupy sync io (conc 500, 64 threads); rupy async io (conc 500) |
-| S2 cpu_2k_1G | cpu (~50ms pbkdf2) | 2000 | 1G | celery prefork c6; rupy cpu workers 6 |
-| S3 io_10k_512M | io | 10000 | 512M | celery prefork c8; celery gevent c500; rupy async (conc 1000). Celery prefork is EXPECTED to OOM/thrash here; the driver survives it and records status stalled or worker_dead plus the completed count and oom_kill count |
+| S1 io_10k_1G | io (50ms HTTP) | 10000 | 1G | celery prefork c8, c16; celery gevent c500; cauli sync io (conc 500, 64 threads); cauli async io (conc 500) |
+| S2 cpu_2k_1G | cpu (~50ms pbkdf2) | 2000 | 1G | celery prefork c6; cauli cpu workers 6 |
+| S3 io_10k_512M | io | 10000 | 512M | celery prefork c8; celery gevent c500; cauli async (conc 1000). Celery prefork is EXPECTED to OOM/thrash here; the driver survives it and records status stalled or worker_dead plus the completed count and oom_kill count |
 | S4 idle_ram | none | 0 | 1G | each worker config started, 20s settle, `memory.current` recorded (per slot cost story) |
 
 Each throughput scenario is preceded by a 200 task warmup run (not recorded).
@@ -84,20 +84,20 @@ Each throughput scenario is preceded by a 200 task warmup run (not recorded).
 - CPU is uncapped for both stacks (same 6 cores, sequential runs, so CPU
   contention is identical by construction). Only memory is capped, identically.
 - Celery runs production fair: `task_acks_late=True` and
-  `worker_prefetch_multiplier=1` (matches rupy's ack after completion and
+  `worker_prefetch_multiplier=1` (matches cauli's ack after completion and
   admission gating), results stored on both stacks (`task_ignore_result=False`
-  vs rupy `store_result=True`), `result_expires=3600` vs rupy
+  vs cauli `store_result=True`), `result_expires=3600` vs cauli
   `result_ttl=3600`, JSON serialization on both, no retries on either side
-  (`max_retries=0` in tasks_rupy; Celery does not auto retry).
+  (`max_retries=0` in tasks_cauli; Celery does not auto retry).
 - Enqueue uses each stack's native `.delay()`; enqueue time is recorded and
   reported separately from the pure execution window.
 - Latency per task, same definition on both stacks (completion minus enqueue):
   Celery: backend `date_done` (UTC) minus the driver's wall clock immediately
-  before `.delay()`. rupy: `finished_at` from the result JSON minus the same
+  before `.delay()`. cauli: `finished_at` from the result JSON minus the same
   driver wall clock (which coincides with envelope `enqueued_at`, stamped by
   the client inside `.delay()`). Same clock, same machine.
 - The sync io workload uses plain `requests.get` (one connection per call) on
-  both stacks. The rupy async task uses a minimal HTTP/1.1 keepalive pool on
+  both stacks. The cauli async task uses a minimal HTTP/1.1 keepalive pool on
   raw asyncio streams (`common._AsyncHTTPPool`, one pool per loop). DEVIATION
   from the original httpx plan, measured on this machine: `httpx.AsyncClient`
   tops out near 300 rps of client side loop CPU and anti scales with

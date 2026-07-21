@@ -14,15 +14,15 @@ fi
 "$VENV/bin/pip" install -q --upgrade pip
 "$VENV/bin/pip" install -q -r "$BENCH_DIR/requirements.txt"
 
-# rupy python package: built in parallel by another agent; may not exist yet.
+# cauli python package: built in parallel by another agent; may not exist yet.
 # Guarded so setup succeeds either way; rerun setup.sh once py/ appears.
 if [ -f "$PY_PKG_DIR/pyproject.toml" ] || [ -f "$PY_PKG_DIR/setup.py" ]; then
-    echo "setup: installing rupy package (editable) from $PY_PKG_DIR"
+    echo "setup: installing cauli package (editable) from $PY_PKG_DIR"
     "$VENV/bin/pip" install -q -e "$PY_PKG_DIR"
 else
-    echo "setup: rupy package not present at $PY_PKG_DIR yet; SKIPPED."
-    echo "setup: rupy scenarios will be skipped by runner.sh until it exists (rerun setup.sh then)."
+    echo "setup: cauli package not present at $PY_PKG_DIR yet; SKIPPED."
+    echo "setup: cauli scenarios will be skipped by runner.sh until it exists (rerun setup.sh then)."
 fi
 
 echo "setup: done. venv at $VENV"
-"$VENV/bin/pip" list 2>/dev/null | grep -Ei '^(celery|redis|requests|httpx|uvicorn|starlette|psutil|pytest|gevent|rupy) ' || true
+"$VENV/bin/pip" list 2>/dev/null | grep -Ei '^(celery|redis|requests|httpx|uvicorn|starlette|psutil|pytest|gevent|cauli) ' || true

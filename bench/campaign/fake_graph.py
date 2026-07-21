@@ -17,6 +17,7 @@ FAKE_GRAPH_WORKERS.
 Latency is asyncio.sleep so the server is never CPU-bound; sustains >2000 rps
 (verified by verify_fake_graph.py).
 """
+
 import asyncio
 import os
 import random
@@ -62,10 +63,13 @@ async def me_messages(request):
         if rng.random() < 0.5:
             return JSONResponse(
                 {"error": {"code": 500, "message": "internal server error"}},
-                status_code=500)
+                status_code=500,
+            )
         return JSONResponse(
             {"error": {"code": 429, "message": "rate limited"}, "retry_after": 1},
-            status_code=429, headers={"Retry-After": "1"})
+            status_code=429,
+            headers={"Retry-After": "1"},
+        )
     return JSONResponse({"message_id": f"m_{uuid.uuid4().hex}"})
 
 
@@ -75,8 +79,10 @@ async def conversations(request):
     except ValueError:
         page = 0
     await asyncio.sleep(rng.uniform(0.150, 0.300))
-    msgs = [{"id": f"c{page}_{i}", "from": f"user{i}", "text": "fake message body"}
-            for i in range(100)]
+    msgs = [
+        {"id": f"c{page}_{i}", "from": f"user{i}", "text": "fake message body"}
+        for i in range(100)
+    ]
     return JSONResponse({"page": page, "messages": msgs})
 
 
@@ -84,11 +90,13 @@ async def health(request):
     return JSONResponse({"ok": True})
 
 
-app = Starlette(routes=[
-    Route("/me/messages", me_messages, methods=["POST"]),
-    Route("/conversations", conversations, methods=["GET"]),
-    Route("/health", health, methods=["GET"]),
-])
+app = Starlette(
+    routes=[
+        Route("/me/messages", me_messages, methods=["POST"]),
+        Route("/conversations", conversations, methods=["GET"]),
+        Route("/health", health, methods=["GET"]),
+    ]
+)
 
 
 if __name__ == "__main__":

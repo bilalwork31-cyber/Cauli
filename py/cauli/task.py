@@ -11,8 +11,8 @@ import inspect
 from typing import TYPE_CHECKING, Any, Callable
 
 if TYPE_CHECKING:
-    from rupy.app import Rupy
-    from rupy.result import AsyncResult
+    from cauli.app import Cauli
+    from cauli.result import AsyncResult
 
 _VALID_KINDS = ("io", "cpu")
 
@@ -28,7 +28,7 @@ class TaskDef:
 
     def __init__(
         self,
-        app: "Rupy",
+        app: "Cauli",
         fn: Callable[..., Any],
         *,
         name: str | None = None,

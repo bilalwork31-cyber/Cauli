@@ -1,12 +1,12 @@
-"""Integration test app: real rupy package driven by the real rupy-worker binary."""
+"""Integration test app: real cauli package driven by the real cauli-worker binary."""
 
 import asyncio
 import os
 
-from rupy import Rupy, Retry, SoftTimeLimitExceeded  # noqa: F401
+from cauli import Cauli, Retry, SoftTimeLimitExceeded  # noqa: F401
 
-app = Rupy(
-    redis_url=os.environ.get("RUPY_REDIS_URL", "redis://127.0.0.1:6394/0"),
+app = Cauli(
+    redis_url=os.environ.get("CAULI_REDIS_URL", "redis://127.0.0.1:6394/0"),
     default_queue="default",
     result_ttl=600,
 )

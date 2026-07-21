@@ -8,8 +8,9 @@ HTTP status code (the campaign logic only needs the status, same as the sync
 path which only checks requests' status_code).
 
 One pool per running event loop, connections reused LIFO, created on demand
-(in-flight count is gated by the per-page semaphores + rupy --io-concurrency).
+(in-flight count is gated by the per-page semaphores + cauli --io-concurrency).
 """
+
 import asyncio
 import json
 from urllib.parse import urlsplit
@@ -75,8 +76,7 @@ class AsyncGraphPool:
             # pooled connection went stale (server keepalive close); one retry
             conn = await self._open()
             try:
-                status = await asyncio.wait_for(self._roundtrip(conn, req),
-                                                timeout)
+                status = await asyncio.wait_for(self._roundtrip(conn, req), timeout)
             except Exception:
                 self._close(conn)
                 raise

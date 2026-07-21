@@ -3,18 +3,18 @@
 # recipients, UNCAPPED workers, redis 6393, fake_graph on 8079 with
 # ERROR_RATE=0.05, same bench pg db (truncated by the driver).
 #
-# Usage: bash verify_mini_c.sh celery|rupy
+# Usage: bash verify_mini_c.sh celery|cauli
 set -u
 set -o pipefail
 
-STACK="${1:?usage: verify_mini_c.sh celery|rupy}"
+STACK="${1:?usage: verify_mini_c.sh celery|cauli}"
 CAMP_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BENCH_DIR="$(cd "$CAMP_DIR/.." && pwd)"
 ROOT_DIR="$(cd "$BENCH_DIR/.." && pwd)"
 VENV="${BENCH_VENV:-/home/blackdevil/rupy-bench-venv}"
 PY="$VENV/bin/python"
 CELERY_BIN="$VENV/bin/celery"
-RUPY_WORKER_BIN="${RUPY_WORKER_BIN:-/home/blackdevil/rupy-target/release/rupy-worker}"
+CAULI_WORKER_BIN="${CAULI_WORKER_BIN:-/home/blackdevil/rupy-target/release/cauli-worker}"
 PORT="${BENCH_REDIS_PORT:-6393}"
 export BENCH_REDIS_PORT="$PORT"
 export PYTHONUNBUFFERED=1
@@ -23,7 +23,7 @@ export FAKE_GRAPH_PORT="$GRAPH_PORT"
 export FAKE_GRAPH_URL="http://127.0.0.1:$GRAPH_PORT"
 export SEND_DELAY=0 TICK_SECONDS=3 N_PAGES=20 ERROR_RATE=0.05 \
        APP_MAX_PER_MINUTE=1000000000 MAX_BATCHES_PER_DISPATCH=1000000 \
-       LEASE_MS=600000 RUPY_VARIANT=async
+       LEASE_MS=600000 CAULI_VARIANT=async
 LOGS="$CAMP_DIR/results/logs"
 mkdir -p "$LOGS"
 cd "$CAMP_DIR"
@@ -68,7 +68,7 @@ teardown() {
     fi
     pkill -9 -f "celery.*-A campaign_celery_c" 2>/dev/null || true
     if [ "$STACK" != "celery" ]; then
-        pkill -9 -f "rupy-worker.*campaign_rupy_c" 2>/dev/null || true
+        pkill -9 -f "cauli-worker.*campaign_cauli_c" 2>/dev/null || true
     fi
     redis-cli -p "$PORT" flushall >/dev/null 2>&1 || true
 }
@@ -93,16 +93,16 @@ wait" > "$LOGS/mini_c_celery.worker.log" 2>&1 &
     done
     [ "$ok" = "1" ] || { log "FATAL: celery workers not ready"; exit 1; }
     ;;
-  rupy)
-    setsid "$RUPY_WORKER_BIN" --app campaign_rupy_c:app \
+  cauli)
+    setsid "$CAULI_WORKER_BIN" --app campaign_cauli_c:app \
         --redis-url "redis://127.0.0.1:$PORT/0" --python "$PY" \
         --queues default,dispatch,campaign_short,campaign_long,backfill_heavy,webhook_ingest,persist \
         --io-concurrency 1000 --io-threads 16 --cpu-workers 1 \
         --visibility-timeout 300 \
-        > "$LOGS/mini_c_rupy.worker.log" 2>&1 &
+        > "$LOGS/mini_c_cauli.worker.log" 2>&1 &
     WPID=$!
     sleep 3
-    kill -0 "$WPID" 2>/dev/null || { log "FATAL: rupy worker died (see $LOGS/mini_c_rupy.worker.log)"; exit 1; }
+    kill -0 "$WPID" 2>/dev/null || { log "FATAL: cauli worker died (see $LOGS/mini_c_cauli.worker.log)"; exit 1; }
     ;;
   *) log "unknown stack $STACK"; exit 1 ;;
 esac

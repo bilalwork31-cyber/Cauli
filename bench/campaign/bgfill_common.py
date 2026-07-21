@@ -11,6 +11,7 @@ webhook_drain_tick:  claim up to 50 rows from the seeded webhook inbox list,
 Counters land in bg:ctr:* (db 3) so the driver can report that the noise
 actually ran.
 """
+
 import json
 import random
 import time
@@ -67,8 +68,8 @@ def webhook_drain_tick():
     processed = retried = dead = 0
     for raw in rows:
         row = json.loads(raw)
-        time.sleep(WEBHOOK_ROW_S)                 # fake processing
-        if random.random() < WEBHOOK_FAIL_RATE:   # injected failure
+        time.sleep(WEBHOOK_ROW_S)  # fake processing
+        if random.random() < WEBHOOK_FAIL_RATE:  # injected failure
             row["attempts"] += 1
             store.incr_bg("webhook_failures")
             if row["attempts"] >= WEBHOOK_MAX_ATTEMPTS:
@@ -82,8 +83,12 @@ def webhook_drain_tick():
         else:
             store.incr_bg("webhook_processed")
             processed += 1
-    return {"claimed": len(rows), "processed": processed,
-            "retried": retried, "dead": dead}
+    return {
+        "claimed": len(rows),
+        "processed": processed,
+        "retried": retried,
+        "dead": dead,
+    }
 
 
 def webhook_counts():

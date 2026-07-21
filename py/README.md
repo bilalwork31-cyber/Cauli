@@ -1,17 +1,17 @@
-# rupy (Python client)
+# cauli (Python client)
 
-Python client for **rupy**, a Rust background worker runtime for Python task queues.
+Python client for **cauli**, a Rust background worker runtime for Python task queues.
 Define tasks in Python, enqueue from any web framework, execute on the Rust worker.
 
 ## Install
 
-    pip install rupy    # Python >= 3.10, needs redis>=5
+    pip install cauli    # Python >= 3.10, needs redis>=5
 
 ## Define an app and tasks (myproj/tasks.py)
 
-    from rupy import Rupy
+    from cauli import Cauli
 
-    app = Rupy(redis_url="redis://localhost:6379/0", default_queue="default")
+    app = Cauli(redis_url="redis://localhost:6379/0", default_queue="default")
 
     @app.task()
     async def send_email(to: str) -> str:
@@ -36,7 +36,7 @@ Tasks stay directly callable for tests: `crunch(10)` runs inline, no broker need
 
 ## Run the worker (Rust binary)
 
-    rupy-worker --app myproj.tasks:app --queues default,emails --cpu-workers 4
+    cauli-worker --app myproj.tasks:app --queues default,emails --cpu-workers 4
 
-The URL falls back to env `RUPY_REDIS_URL`, then `redis://localhost:6379/0`.
+The URL falls back to env `CAULI_REDIS_URL`, then `redis://localhost:6379/0`.
 See `PROTOCOL.md` in the repo root for the full wire contract.

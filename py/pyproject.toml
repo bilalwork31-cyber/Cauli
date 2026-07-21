@@ -3,14 +3,14 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "rupy"
+name = "cauli"
 version = "0.1.0"
-description = "Python client for rupy, a Rust background worker runtime for Python task queues"
+description = "Python client for cauli, a Rust background worker runtime for Python task queues"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT OR Apache-2.0" }
 authors = [
-    { name = "the rupy contributors" },
+    { name = "the cauli contributors" },
 ]
 keywords = ["task-queue", "background-jobs", "redis", "worker", "async"]
 classifiers = [
@@ -35,7 +35,7 @@ dev = [
 ]
 
 [tool.setuptools]
-packages = ["rupy"]
+packages = ["cauli"]
 
 [tool.setuptools.package-data]
-rupy = ["py.typed"]
+cauli = ["py.typed"]

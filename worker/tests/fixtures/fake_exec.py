@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""Standalone stand-in for `python3 -m rupy._exec` (PROTOCOL §5.1).
+"""Standalone stand-in for `python3 -m cauli._exec` (PROTOCOL §5.1).
 
-Used by e2e tests via the documented RUPY_EXEC_CMD env hook so the cpu pool
-can be exercised without the real rupy package. Ready line, then one JSON
+Used by e2e tests via the documented CAULI_EXEC_CMD env hook so the cpu pool
+can be exercised without the real cauli package. Ready line, then one JSON
 request per line on stdin, one JSON response per line on stdout. Never crashes
 on task exceptions; reports them. Hard timeouts are enforced worker-side
 (SIGKILL), which the fx.cpu_slow task exists to provoke.
 """
+
 import json
 import os
 import sys
@@ -38,12 +39,17 @@ def main():
             continue
         rid = req.get("id")
         try:
-            result = handle(req.get("task"), req.get("args") or [], req.get("kwargs") or {})
+            result = handle(
+                req.get("task"), req.get("args") or [], req.get("kwargs") or {}
+            )
             json.dumps(result)  # serializability check
             out = {"id": rid, "ok": True, "result": result}
         except BaseException as e:
-            out = {"id": rid, "ok": False,
-                   "error": {"type": type(e).__name__, "message": str(e), "traceback": ""}}
+            out = {
+                "id": rid,
+                "ok": False,
+                "error": {"type": type(e).__name__, "message": str(e), "traceback": ""},
+            }
         sys.stdout.write(json.dumps(out) + "\n")
         sys.stdout.flush()
 
