@@ -91,6 +91,25 @@ impl Envelope {
         }
     }
 
+    /// args as a `Value` directly ("null" tolerated -> `[]`). Used by callers
+    /// (the cpu child request) that build a `Value` anyway, to avoid a
+    /// pointless string round-trip (serialize to JSON text, then reparse it
+    /// right back into a `Value` — see audit nit on `exec.rs::run_cpu_task`).
+    pub fn args_value(&self) -> Value {
+        match &self.args {
+            Value::Null => Value::Array(Vec::new()),
+            v => v.clone(),
+        }
+    }
+
+    /// kwargs as a `Value` directly ("null" tolerated -> `{}`). See `args_value`.
+    pub fn kwargs_value(&self) -> Value {
+        match &self.kwargs {
+            Value::Null => Value::Object(serde_json::Map::new()),
+            v => v.clone(),
+        }
+    }
+
     /// Effective async timeout seconds, §4.6:
     /// `min(soft_timeout_ms or timeout_ms, timeout_ms) / 1000`.
     pub fn effective_async_timeout_s(&self) -> f64 {
@@ -149,6 +168,20 @@ pub fn result_duplicate(finished_at: u64) -> String {
         "finished_at": finished_at,
     })
     .to_string()
+}
+
+/// Truncate `s` to at most `max_bytes` bytes, backing off to the nearest
+/// preceding UTF-8 char boundary so multibyte input (audit H4 — executor
+/// garbage, oversize envelopes) can never panic on a byte-index slice.
+pub fn safe_truncate(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
 }
 
 /// PROTOCOL §4.4: redelivery limit = max(3, max_retries + 1) computed per
@@ -296,5 +329,20 @@ mod tests {
         assert_eq!(v["status"], "duplicate");
         assert_eq!(v["result"], Value::Null);
         assert_eq!(v["error"], Value::Null);
+    }
+
+    /// H4 regression: a naive `&s[..512]` panics when byte 512 lands inside a
+    /// multibyte char. Build a string where that is guaranteed (3-byte chars
+    /// don't divide 512 evenly) and confirm safe_truncate never panics and
+    /// never returns a string longer than the cap.
+    #[test]
+    fn safe_truncate_never_panics_on_multibyte_boundary() {
+        let s = "€".repeat(200); // 600 bytes, 3 bytes/char; 512 is mid-char
+        let t = safe_truncate(&s, 512);
+        assert!(t.len() <= 512);
+        assert!(s.starts_with(t));
+
+        let short = "hello";
+        assert_eq!(safe_truncate(short, 512), "hello");
     }
 }

@@ -22,8 +22,10 @@ impl Counters {
             self.failed.load(Ordering::Relaxed),
             self.retried.load(Ordering::Relaxed),
             self.dlq.load(Ordering::Relaxed),
-            self.inflight_io.load(Ordering::Relaxed).max(0),
-            self.inflight_cpu.load(Ordering::Relaxed).max(0),
+            // Printed raw (no .max(0) clamp): a negative value here would be
+            // an accounting bug, and clamping it would hide the signal.
+            self.inflight_io.load(Ordering::Relaxed),
+            self.inflight_cpu.load(Ordering::Relaxed),
             rss_mb(),
         )
     }

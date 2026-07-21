@@ -3,6 +3,13 @@ name = "rupy-worker"
 version = "0.1.0"
 edition = "2021"
 description = "Rust worker runtime for rupy Python task queues"
+license = "MIT OR Apache-2.0"
+
+[features]
+default = []
+# Enables the RUPY_EXEC_CMD test hook in src/cpu.rs (audit M5). Not part of a
+# normal release build; the e2e suite needs `cargo test --features test-hooks`.
+test-hooks = []
 
 [[bin]]
 name = "rupy-worker"
@@ -20,7 +27,12 @@ rand = "0.9"
 redis = { version = "0.32", features = ["tokio-comp", "connection-manager"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["full"] }
+# Trimmed from "full" (audit dependency review) to the features actually used:
+# rt-multi-thread/macros (runtime + tokio::spawn + #[tokio::test]), sync
+# (oneshot/watch/Semaphore), time (timeout/interval/sleep), io-util
+# (AsyncBufReadExt/AsyncWriteExt/BufReader), process (child processes),
+# signal (SIGTERM/SIGINT handling).
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "process", "signal"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
@@ -28,4 +40,4 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 libc = "0.2"
 redis = { version = "0.32", features = ["tokio-comp"] }
 serde_json = "1"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

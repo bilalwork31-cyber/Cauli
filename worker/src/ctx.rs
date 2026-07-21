@@ -9,6 +9,7 @@ use redis::aio::ConnectionManager;
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tokio::sync::{watch, Semaphore};
 
@@ -35,6 +36,19 @@ impl Ctx {
     }
 }
 
+/// Decrements an `AtomicI64` inflight counter on drop, including when the
+/// scope is left by a panicking unwind. Without this (MEM-3 / H3), a panic
+/// between a counter's increment and its manual decrement leaks the slot
+/// forever, so `inflight_total` never reaches 0 and every shutdown burns the
+/// full `--drain-timeout`. Borrows the counter for the guarded scope only.
+pub struct DecrGuard<'a>(pub &'a std::sync::atomic::AtomicI64);
+
+impl Drop for DecrGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 pub fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -45,8 +59,14 @@ pub fn now_ms() -> u64 {
 /// Executor completion, normalized from shim / cpu-child response JSON.
 pub enum Outcome {
     Success(Value),
-    ForceRetry { countdown: Option<f64>, err: ErrorJson },
-    Failure { err: ErrorJson, retryable: bool },
+    ForceRetry {
+        countdown: Option<f64>,
+        err: ErrorJson,
+    },
+    Failure {
+        err: ErrorJson,
+        retryable: bool,
+    },
 }
 
 #[derive(Deserialize)]
@@ -64,10 +84,12 @@ struct PyResp {
     retryable: Option<bool>,
 }
 
-/// Parse an executor response line. `from_cpu` enables the cpu-child mapping
-/// (§5.1 children cannot carry retry/retryable flags): error type "Retry" =>
-/// forced retry (countdown unavailable over the pipe => None => computed
-/// backoff), "SerializationError" => non-retryable.
+/// Parse an executor response line. `from_cpu` enables the cpu-child mapping:
+/// an error type name of exactly "Retry" forces a retry the same as the io
+/// path (§4.2/§5.1 — the shim and `_exec.py` both duck-type on class name);
+/// countdown, when present in the response JSON, is honored for cpu tasks
+/// too (the pipe protocol carries it — see §5.1). "SerializationError" is
+/// treated as non-retryable regardless of path.
 pub fn parse_pyresp(s: &str, from_cpu: bool) -> Outcome {
     let resp: PyResp = match serde_json::from_str(s) {
         Ok(r) => r,
@@ -75,27 +97,30 @@ pub fn parse_pyresp(s: &str, from_cpu: bool) -> Outcome {
             return Outcome::Failure {
                 err: ErrorJson::new(
                     "WorkerShimError",
-                    format!("unparseable executor response ({e}): {}", &s[..s.len().min(512)]),
+                    // char-boundary safe: H4, `s` is executor-controlled garbage
+                    // and a naive byte-index slice can panic on multibyte input.
+                    format!(
+                        "unparseable executor response ({e}): {}",
+                        crate::envelope::safe_truncate(s, 512)
+                    ),
                 ),
                 retryable: true,
-            }
+            };
         }
     };
     if resp.ok {
         return Outcome::Success(resp.result);
     }
-    let err = resp
-        .error
-        .unwrap_or_else(|| ErrorJson::new("UnknownError", "executor reported failure without error"));
+    let err = resp.error.unwrap_or_else(|| {
+        ErrorJson::new("UnknownError", "executor reported failure without error")
+    });
     if resp.retry || (from_cpu && err.type_ == "Retry") {
         return Outcome::ForceRetry {
             countdown: resp.countdown,
             err,
         };
     }
-    let retryable = resp
-        .retryable
-        .unwrap_or(err.type_ != "SerializationError");
+    let retryable = resp.retryable.unwrap_or(err.type_ != "SerializationError");
     Outcome::Failure { err, retryable }
 }
 
@@ -121,7 +146,10 @@ mod tests {
             _ => panic!("expected forced retry"),
         }
         // cpu child: type name Retry alone forces retry with computed backoff
-        match parse_pyresp(r#"{"ok":false,"error":{"type":"Retry","message":"m"}}"#, true) {
+        match parse_pyresp(
+            r#"{"ok":false,"error":{"type":"Retry","message":"m"}}"#,
+            true,
+        ) {
             Outcome::ForceRetry { countdown, .. } => assert_eq!(countdown, None),
             _ => panic!("expected cpu forced retry"),
         }
@@ -160,5 +188,41 @@ mod tests {
             }
             _ => panic!("expected failure"),
         }
+    }
+
+    /// H4 regression: multibyte garbage that isn't valid JSON must not panic
+    /// on the byte-512 truncation of the error message.
+    #[test]
+    fn garbage_with_multibyte_chars_does_not_panic() {
+        let garbage = "€".repeat(200); // 600 bytes, none ASCII, not valid JSON
+        match parse_pyresp(&garbage, false) {
+            Outcome::Failure { err, retryable } => {
+                assert_eq!(err.type_, "WorkerShimError");
+                assert!(retryable);
+                assert!(err.message.len() <= garbage.len() + 64);
+            }
+            _ => panic!("expected failure"),
+        }
+    }
+
+    /// MEM-3 regression: a panic inside a DecrGuard-guarded scope must still
+    /// decrement the counter (drop runs on unwind), so a panicking dispatch
+    /// never leaks an inflight slot and shutdown drain is never stuck.
+    #[tokio::test]
+    async fn decr_guard_runs_on_panic_unwind() {
+        use std::sync::atomic::AtomicI64;
+        let counter = std::sync::Arc::new(AtomicI64::new(0));
+        counter.fetch_add(1, Ordering::SeqCst);
+        let c = counter.clone();
+        let handle = tokio::spawn(async move {
+            let _guard = DecrGuard(&c);
+            panic!("simulated dispatch panic");
+        });
+        assert!(handle.await.is_err(), "task should have panicked");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            0,
+            "guard must decrement even on panic"
+        );
     }
 }
