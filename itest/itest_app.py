@@ -1,4 +1,5 @@
 """Integration test app: real rupy package driven by the real rupy-worker binary."""
+
 import asyncio
 import os
 
@@ -27,7 +28,9 @@ def cpu_math(n):
     return n * 2
 
 
-@app.task(max_retries=5, backoff_base=0.05, backoff_factor=1.0, backoff_max=0.1, jitter=False)
+@app.task(
+    max_retries=5, backoff_base=0.05, backoff_factor=1.0, backoff_max=0.1, jitter=False
+)
 def flaky(path, fail_times):
     with open(path, "a+") as f:
         f.seek(0)
@@ -38,7 +41,9 @@ def flaky(path, fail_times):
     return {"succeeded_on_attempt": n}
 
 
-@app.task(max_retries=1, backoff_base=0.05, backoff_factor=1.0, backoff_max=0.1, jitter=False)
+@app.task(
+    max_retries=1, backoff_base=0.05, backoff_factor=1.0, backoff_max=0.1, jitter=False
+)
 def always_fail():
     raise RuntimeError("nope")
 
@@ -50,8 +55,25 @@ def counted(path):
     return "counted"
 
 
+@app.task(
+    max_retries=5, backoff_base=0.05, backoff_factor=1.0, backoff_max=0.1, jitter=False
+)
+def flaky_idemp(path, fail_times):
+    # Same shape as `flaky`, used with an idempotency_key (C1 regression):
+    # the retry must actually execute, not resolve as "duplicate" against
+    # its own earlier claim.
+    with open(path, "a+") as f:
+        f.seek(0)
+        n = len(f.read())
+        f.write("x")
+    if n < fail_times:
+        raise ValueError(f"attempt {n} fails")
+    return {"succeeded_on_attempt": n}
+
+
 @app.task(kind="cpu", soft_timeout=0.3, timeout=10, max_retries=0)
 def slow_cpu():
     import time
+
     time.sleep(5)
     return "should not get here"

@@ -32,13 +32,23 @@ pub struct Args {
     #[arg(long)]
     pub cpu_workers: Option<usize>,
 
-    /// XREADGROUP COUNT per fetch
+    /// XREADGROUP COUNT per fetch. Must be >= 1: 0 would mean "unlimited" to
+    /// Redis (audit M8); enforced in main.rs after parsing (exit 1).
     #[arg(long, default_value_t = 16)]
     pub batch: usize,
 
-    /// Visibility timeout in seconds (crash recovery, PROTOCOL §4.4)
+    /// Visibility timeout in seconds (crash recovery, PROTOCOL §4.4). Must be
+    /// at least 1: 0 would make the recovery loop reclaim every
+    /// currently-executing task on nearly every tick (audit M8); enforced in
+    /// main.rs (exit 1).
     #[arg(long, default_value_t = 60)]
     pub visibility_timeout: u64,
+
+    /// Max accepted envelope size in bytes; oversize entries are DLQ'd as
+    /// "malformed" before parsing (audit M2 — bounds the json::Value memory
+    /// amplification and processing cost of an oversized/hostile payload).
+    #[arg(long, default_value_t = 1_048_576)]
+    pub max_envelope_bytes: usize,
 
     /// Graceful shutdown drain timeout in seconds
     #[arg(long, default_value_t = 30)]
@@ -79,6 +89,7 @@ mod tests {
         assert_eq!(a.cpu_workers, None);
         assert_eq!(a.batch, 16);
         assert_eq!(a.visibility_timeout, 60);
+        assert_eq!(a.max_envelope_bytes, 1_048_576);
         assert_eq!(a.drain_timeout, 30);
         assert_eq!(a.python, "python3");
         assert_eq!(a.stats_interval, 10);

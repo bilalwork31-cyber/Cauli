@@ -1,4 +1,5 @@
 """Cross-component e2e: real rupy client + real rupy-worker binary + real rupy._exec children."""
+
 import json
 import os
 import signal
@@ -18,8 +19,20 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 
 @pytest.fixture(scope="session")
 def stack():
-    subprocess.run(["redis-server", "--port", str(PORT), "--save", "", "--appendonly", "no",
-                    "--daemonize", "yes"], check=True)
+    subprocess.run(
+        [
+            "redis-server",
+            "--port",
+            str(PORT),
+            "--save",
+            "",
+            "--appendonly",
+            "no",
+            "--daemonize",
+            "yes",
+        ],
+        check=True,
+    )
     r = redis_lib.Redis(port=PORT)
     for _ in range(50):
         try:
@@ -34,13 +47,27 @@ def stack():
     env["PATH"] = f"{VENV}/bin:" + env.get("PATH", "")
     env["RUPY_REDIS_URL"] = f"redis://127.0.0.1:{PORT}/0"
     worker = subprocess.Popen(
-        [BIN, "--app", "itest_app:app",
-         "--redis-url", f"redis://127.0.0.1:{PORT}/0",
-         "--cpu-workers", "2", "--io-concurrency", "64",
-         "--visibility-timeout", "30", "--python", f"{VENV}/bin/python",
-         "--log-level", "info"],
-        cwd=HERE, env=env,
-        stdout=open(f"{HERE}/worker.log", "wb"), stderr=subprocess.STDOUT,
+        [
+            BIN,
+            "--app",
+            "itest_app:app",
+            "--redis-url",
+            f"redis://127.0.0.1:{PORT}/0",
+            "--cpu-workers",
+            "2",
+            "--io-concurrency",
+            "64",
+            "--visibility-timeout",
+            "30",
+            "--python",
+            f"{VENV}/bin/python",
+            "--log-level",
+            "info",
+        ],
+        cwd=HERE,
+        env=env,
+        stdout=open(f"{HERE}/worker.log", "wb"),
+        stderr=subprocess.STDOUT,
     )
     os.environ["RUPY_REDIS_URL"] = f"redis://127.0.0.1:{PORT}/0"
     yield r, worker
@@ -54,13 +81,14 @@ def stack():
 
 def _app():
     import itest_app
+
     return itest_app
 
 
 def test_sync_io_roundtrip(stack):
     m = _app()
     res = m.echo.delay("hello")
-    assert res.get(timeout=30) == {"echo": "hello"}   # doubles as worker readiness gate
+    assert res.get(timeout=30) == {"echo": "hello"}  # doubles as worker readiness gate
 
 
 def test_async_io(stack):
@@ -83,6 +111,7 @@ def test_retry_then_succeed(stack):
 
 def test_final_failure_dlq_and_error(stack):
     from rupy import TaskFailedError
+
     r, _ = stack
     m = _app()
     res = m.always_fail.delay()
@@ -112,6 +141,19 @@ def test_idempotency_dedup(stack):
     assert os.path.getsize(path) == 1
 
 
+def test_idempotency_key_allows_retry(stack):
+    # C1 regression: idempotency_key + a task that fails once then succeeds
+    # must actually retry and finish "success" -- previously it silently
+    # resolved as "duplicate" against its own earlier claim, forever.
+    m = _app()
+    path = f"/tmp/rupy-itest-idemp-retry-{uuid.uuid4().hex}"
+    key = f"itest-retry-{uuid.uuid4().hex}"
+    res = m.flaky_idemp.apply_async(args=(path, 1), idempotency_key=key)
+    out = res.get(timeout=30)
+    assert out == {"succeeded_on_attempt": 1}
+    assert res.status() == "success"
+
+
 def test_countdown_delays_execution(stack):
     r, _ = stack
     m = _app()
@@ -126,13 +168,16 @@ def test_countdown_delays_execution(stack):
 
 def test_cpu_soft_timeout(stack):
     from rupy import TaskFailedError
+
     m = _app()
     res = m.slow_cpu.delay()
     t0 = time.time()
     with pytest.raises(TaskFailedError) as ei:
         res.get(timeout=30)
     assert ei.value.type == "SoftTimeLimitExceeded"
-    assert time.time() - t0 < 8  # soft-killed at ~0.3s, not the 5s sleep or 10s hard limit
+    assert (
+        time.time() - t0 < 8
+    )  # soft-killed at ~0.3s, not the 5s sleep or 10s hard limit
 
 
 def test_worker_survived_everything(stack):
