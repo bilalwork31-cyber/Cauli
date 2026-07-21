@@ -156,6 +156,135 @@ topology there is a 3 to 5 GiB fleet. rupy loads the identical app ONCE:
 - Mini smoke (2 min, 20k) passed both stacks first: celery 75.6/s / rupy
   128.4/s, dup=0, integrity exact, full drain to SendLog 20,000 == 20,000.
 
+## Symmetric topology, both frozen (raw SQL layer)
+
+The fairest possible fight: same process count, same concurrency budget,
+`gc.freeze()` applied to BOTH stacks, identical raw data layer
+(DJ_DATA_LAYER=raw: one-statement SKIP LOCKED claim, redis intent locks /
+sent flags / attempts, outcomes LPUSHed to redis, bg persisters applying
+them with raw executemany - the send hot path touches no Postgres). This
+isolates architecture from configuration. Same chaos recipe as above: 100
+campaigns / 1M recipients, uncorked dispatcher, 10-minute leases, 5% Graph
+errors at 200-500 ms, all bg noise live, 60 s warmup + exactly 600 s window,
+fresh schema + reseed per config, no memory caps.
+
+Three configs, sequential:
+
+- (a) **SYM_celery_frozen**: ONE Celery invocation, ALL queues via -Q,
+  prefork -c 6, acks_late, prefetch 1. A guarded hook
+  (CAULI_BENCH_GC_FREEZE=1 in celery_app_django) fully imports the Django
+  app in the prefork MASTER, warms lazy imports (psycopg via
+  ensure_connection, then close_all - no live connection crosses fork()),
+  then `gc.collect(); gc.freeze()` before the 6 children fork. Each child
+  keeps the production ThreadPoolExecutor(15) per batch.
+- (b) **SYM_cauli_fork**: ONE cauli worker, every task kind="cpu"
+  (DJ_CAULI_KIND=cpu): `--cpu-workers 6 --cpu-child-threads 15`. The
+  fork-server parent (PROTOCOL §5.1) imports the app once, `gc.collect() +
+  gc.freeze()`, forks 6 children at **1.4 MiB private each**; each child
+  runs 15 in-flight tasks with DJ_SEND_POOL=15 - the same 6 GILs and the
+  same per-child 15-thread budget as (a).
+- (c) **SYM_cauli_async**: ONE cauli worker, the one-process io-lane raw
+  variant (`--io-concurrency 40 --io-threads 48 --cpu-workers 1`,
+  DJ_SEND_POOL=240) - the DJR real_raw cauli leg that was interrupted
+  before completing, now measured.
+
+| metric | (a) Celery -c 6 frozen | (b) cauli fork pool 6x15 | (c) cauli one-process io |
+|---|---|---|---|
+| sends in window | 53,793 | **126,347** | 30,095 |
+| sends/s | 89.7 | **210.6 (2.35x)** | 50.2 |
+| sends per 10 s (min/mean/max) | 720 / 897 / 1075 | 1982 / 2106 / 2231 | 150 / 502 / 1658 |
+| p50 / p95 recipient wait | 352.9 s / 622.6 s | 357.8 s / 629.2 s | 319.3 s / 632.8 s (all timebox-shaped) |
+| duplicates | **0** | **0** | **0** |
+| SendLog rows == sent flags | 58,499 == 58,499 | 137,903 == 137,903 | 37,728 == 37,728 |
+| failed / skipped | 0 / 0 | 0 / 0 | 0 / 0 |
+| http retries absorbed | 3,152 | 7,283 | 1,990 |
+| persist lag p50 / p95 | 402 ms / 1.32 s | 2.11 s / 10.7 s | 5.65 s / 65.0 s |
+| cgroup peak RAM | **217.7 MiB** | 361.7 MiB | 241.0 MiB |
+| OS processes | 7 (master + 6 forks) | 8 (worker + parent + 6 forks) | 3 (worker + parent + idle fork) |
+| sum of per process peak RSS | 590.9 MiB | 661.2 MiB | 321.8 MiB |
+| sum of per process PRIVATE rss (end) | 160.9 MiB | 322.7 MiB | 193.2 MiB |
+| per child PRIVATE rss | 23.3-23.8 MiB | 38.8-52.5 MiB (1.4 MiB at fork) | n/a (idle child 1.5 MiB) |
+| claimed_total (lease reclaims) | 1.69M | 1.88M | 1.47M |
+
+Prior prod-topology rows for contrast (same raw layer / same ORM recipe):
+
+| | sends/s | cgroup peak | processes | sum peak RSS | sum USS |
+|---|---|---|---|---|---|
+| DJR_celery_raw (prod topology, 7 invocations, no freeze) | 77.1 | 971.6 MiB | 24 | 1,783.5 MiB | 657.0 MiB |
+| DJ_celery (ORM layer, prod topology) | 73.6 | 923.1 MiB | 22 | 1,668 MiB | 622 MiB |
+| DJ_rupy (ORM layer, one process sync) | 98.9 | 441.7 MiB | 2 | 471 MiB | 436 MiB |
+
+Background noise stayed live on all three: webhook inbox 500/500 done
+(34/34/32 injected failures retried, 0 dead), ghost backfill 537 / 422 /
+271 paced Graph calls with BackfillJob rows written throughout.
+
+### The per fork PRIVATE rss story (CoW proof, both stacks)
+
+Private_ (smaps_rollup) is what a process does not share with anyone - the
+copy-on-write cost of a fork. gc.freeze works, on BOTH stacks: Celery's
+frozen children end the run at ~23.5 MiB private each (the prod-topology
+children carried 69-98 MiB RSS each, 1.67-1.78 GiB summed), and cauli's
+fork children START at 1.4 MiB private and end at 39-52 MiB after 10
+minutes of 15-way concurrent work. The fleet collapses accordingly:
+Celery 971.6 -> 217.7 MiB cgroup peak for MORE throughput (89.7 vs 77.1/s;
+the prod topology wasted its 21 processes on idle dedicated queues).
+cauli_fork spends 361.7 MiB - more than frozen Celery, because each child
+holds 15 in-flight tasks (its own Postgres connections and heap for 15
+tasks vs Celery's 1) - and returns 2.35x the throughput: 1.7 MiB per
+send/s vs 2.4 for frozen Celery.
+
+### Where the remaining differences come from
+
+- (b) vs (a) is the architecture gap with configuration equalized: same 6
+  GILs, same 15 threads per process, same frozen master, same broker, same
+  task code. Celery binds one task to one process slot; a 50-send batch,
+  a ghost_job iteration sleeping 1 s, or an idle persist poll each occupy
+  a whole GIL. cauli's children multiplex 15 tasks per GIL, so sends keep
+  flowing while slow/bg tasks overlap - 90 in-flight tasks vs 6 on the
+  same processes. Broker mechanics differ too: cauli children receive work
+  over a unix socket from the Rust worker (redis streams consumed once, in
+  batches); each Celery slot round-trips the redis broker per task at
+  prefetch 1.
+- (c) shows the one-process sync-thread path is the WRONG lane for this
+  workload at scale, and honestly: it matched its smoke (115/s) for the
+  first ~70 s, then collapsed to ~40-70/s when the 12 persist chains began
+  draining their 8.8k backlog inside the same GIL as 240 send threads +
+  claims, and never recovered (per 10 s: 1658 down to 150). One GIL is the
+  ceiling and every subsystem shares it. The ORM run above (98.9/s)
+  dodged this only because its persist batches were lighter. The fork
+  pool exists precisely to end this class of tuning: (b) needed none.
+- Supervisor RAM: cauli carries a Rust worker (74.5 MiB peak RSS, 60.5
+  private, embedded CPython) + a 63 MiB frozen parent; Celery's master IS
+  a full Django process (90 MiB peak). Roughly a wash at this app size;
+  cauli's overhead is constant while Celery's master grows with the app.
+
+### Fairness notes and deviations (symmetric runs)
+
+- msgspec was installed into the bench venv for these runs: the cauli
+  client auto-detects it for envelope encode/decode; Celery kept its own
+  kombu json serializer (its default fast path). Envelope codecs are
+  therefore not identical - noted as a (small) cauli-side advantage.
+- Celery ran WITHOUT max-tasks-per-child (prod topology used 1000 on the
+  long queue): recycling would re-fork from the frozen master cheaply on
+  both stacks, but zero recycling is the cleaner CoW measurement.
+- 12 self-chaining persist tasks on all three configs (raw-layer default),
+  competing for the same worker slots on both stacks - no dedicated
+  persist worker anywhere, unlike the prod-topology raw run.
+- PRIVATE rss is sampled from /proc/PID/smaps_rollup every 60 s and at
+  shutdown; "end" values are the final sample, taken under load just
+  before SIGTERM. peak_private is the max of those samples.
+- (b)'s per-page semaphores live per child (3 per page per process), same
+  as every prefork Celery child - identical to how the prod topology
+  behaved; per-process global send pools likewise (15 per process both).
+- claimed_total > 1M on all three: 10-minute leases from the first ticks
+  expire inside the 11-minute run, orphans reclaimed (production
+  behavior). lock_skips=0, already_sent=0, dup=0 everywhere.
+- Wait percentiles remain timebox-shaped (uncorked dispatcher, drain-rate
+  proxy); sent recipients only. Single run per config, 6 shared cores.
+- Mini smokes (2 min, 20k) passed first: (a) 92.7/s, (b) 114.8/s with a
+  full 20,000 == 20,000 drain, dup=0 both. (c) reused the already-proven
+  real_raw wiring (its smoke: 115.3/s).
+
 ## Reproduce
 
 ```bash
@@ -164,6 +293,9 @@ wsl.exe -d Ubuntu-24.04 -u root -e bash -lc "bash /mnt/d/dev/projects/boring/rup
 # smoke (2 min window, 20k recipients), then the real thing (10 min, 1M)
 wsl.exe -d Ubuntu-24.04 -e bash -lc "bash /mnt/d/dev/projects/boring/rupy/bench/django_real/runner_django.sh smoke"
 wsl.exe -d Ubuntu-24.04 -e bash -lc "bash /mnt/d/dev/projects/boring/rupy/bench/django_real/runner_django.sh real"
+# raw data layer variants (DJR_*): smoke_raw / real_raw
+# symmetric topology, both frozen (SYM_*): sym_smoke / sym
+wsl.exe -d Ubuntu-24.04 -e bash -lc "bash /mnt/d/dev/projects/boring/rupy/bench/django_real/runner_django.sh sym"
 ```
 
 Raw JSON (timelines, per process RSS tables, bg counters, memory samples):

@@ -52,6 +52,27 @@ def _reset_db_connections(**kwargs):
     connections.close_all()
 
 
+# Symmetric-topology benchmark hook (env CAULI_BENCH_GC_FREEZE=1): give Celery
+# the same copy-on-write treatment cauli's fork-server parent applies (§5.1).
+# This module is imported by the prefork MASTER before it forks its children,
+# so: warm every lazily-imported module the tasks touch at runtime, make sure
+# NO live DB connection crosses fork(), then gc.collect() + gc.freeze() so the
+# warmed import image moves to the permanent GC generation and children's GC
+# never dirties those pages.
+if os.environ.get("CAULI_BENCH_GC_FREEZE") == "1":
+    import gc
+    import json as _json  # noqa: F401
+    import random as _random  # noqa: F401
+    import concurrent.futures as _cf  # noqa: F401
+
+    from django.db import connection as _conn
+
+    _conn.ensure_connection()  # warm the psycopg backend import path...
+    connections.close_all()  # ...but no live connection may cross fork()
+    gc.collect()
+    gc.freeze()
+
+
 @app.task(name="campaign.dispatch")
 def dispatch(campaign_id):
     tick = ts.dispatch_tick(campaign_id)

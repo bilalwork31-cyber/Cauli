@@ -6,8 +6,29 @@
 # Postgres db bench_django, systemd-run user scopes WITHOUT MemoryMax (scope
 # exists only for cgroup memory accounting), celery first then cauli.
 #
-# Usage: bash runner_django.sh smoke [celery|cauli]   2-min window, 20k recipients
-#        bash runner_django.sh real  [celery|cauli]   10-min window, 1M recipients
+# Usage: bash runner_django.sh smoke     [celery|cauli]  2-min window, 20k, ORM layer
+#        bash runner_django.sh real      [celery|cauli]  10-min window, 1M, ORM layer
+#        bash runner_django.sh smoke_raw [celery|cauli]  2-min window, 20k, raw layer
+#        bash runner_django.sh real_raw  [celery|cauli]  10-min window, 1M, raw layer
+#        bash runner_django.sh sym_smoke [celery_frozen|cauli_fork|cauli_async]
+#        bash runner_django.sh sym       [celery_frozen|cauli_fork|cauli_async]
+#
+# raw layer (DJ_DATA_LAYER=raw, both stacks identically): one-statement raw
+# SQL claim, redis intent locks/sent flags, outcomes LPUSHed to redis (send
+# hot path touches no Postgres), bg persisters draining DJ_PERSIST_BATCH=50
+# per drain with raw executemany, DJ_PERSIST_TASKS=4 chains (celery persist
+# worker scaled to -c 4 to match).
+#
+# sym / sym_smoke: symmetric-topology, both-frozen comparison on the raw
+# layer. Same process count and concurrency budget on both stacks:
+#   celery_frozen  ONE celery invocation, ALL queues, prefork -c 6, acks_late,
+#                  prefetch 1, gc.collect()+gc.freeze() in the master before
+#                  forking (CAULI_BENCH_GC_FREEZE=1 hook in celery_app_django)
+#   cauli_fork     ONE cauli worker, every task kind=cpu (DJ_CAULI_KIND=cpu):
+#                  --cpu-workers 6 --cpu-child-threads 15 fork-server children
+#                  forked from a gc.freeze()-d preloaded parent (§5.1)
+#   cauli_async    ONE cauli worker, the io-lane raw variant (the DJR
+#                  real_raw cauli leg: io-concurrency 40, cpu-workers 1)
 set -u
 set -o pipefail
 
@@ -37,11 +58,34 @@ export SEND_DELAY=0 TICK_SECONDS=5 N_PAGES=200 ERROR_RATE=0.05 \
 MODE="${1:-smoke}"
 FILTER="${2:-}"
 
+DATA_LAYER=orm
+SUFFIX=""
+SYM=0
 case "$MODE" in
-    smoke) N_CAMPAIGNS=20;  N_PER=1000;  WARMUP=30; WINDOW=120; PREFIX=smoke_dj ;;
-    real)  N_CAMPAIGNS=100; N_PER=10000; WARMUP=60; WINDOW=600; PREFIX=DJ ;;
-    *) echo "usage: runner_django.sh smoke|real [celery|cauli]"; exit 2 ;;
+    smoke)     N_CAMPAIGNS=20;  N_PER=1000;  WARMUP=30; WINDOW=120; PREFIX=smoke_dj ;;
+    real)      N_CAMPAIGNS=100; N_PER=10000; WARMUP=60; WINDOW=600; PREFIX=DJ ;;
+    smoke_raw) N_CAMPAIGNS=20;  N_PER=1000;  WARMUP=30; WINDOW=120; PREFIX=smoke_dj
+               DATA_LAYER=raw; SUFFIX=_raw ;;
+    real_raw)  N_CAMPAIGNS=100; N_PER=10000; WARMUP=60; WINDOW=600; PREFIX=DJR
+               DATA_LAYER=raw; SUFFIX=_raw ;;
+    sym_smoke) N_CAMPAIGNS=20;  N_PER=1000;  WARMUP=30; WINDOW=120; PREFIX=smoke_sym
+               DATA_LAYER=raw; SYM=1 ;;
+    sym)       N_CAMPAIGNS=100; N_PER=10000; WARMUP=60; WINDOW=600; PREFIX=SYM
+               DATA_LAYER=raw; SYM=1 ;;
+    *) echo "usage: runner_django.sh smoke|real|smoke_raw|real_raw|sym_smoke|sym [filter]"; exit 2 ;;
 esac
+
+export DJ_DATA_LAYER="$DATA_LAYER"
+export DJ_PERSIST_BATCH="${DJ_PERSIST_BATCH:-50}"
+if [ "$DATA_LAYER" = "raw" ]; then PERSIST_C_DEFAULT=12; else PERSIST_C_DEFAULT=2; fi
+PERSIST_C="${DJ_PERSIST_TASKS:-$PERSIST_C_DEFAULT}"
+export DJ_PERSIST_TASKS="$PERSIST_C"
+# celery persist worker concurrency: enough slots for the chains, capped at 4
+# forks so the raw run does not inflate celery RAM (4 concurrent drains at
+# batch 50 measured 144 ms p50 lag in smoke - celery persisters are not
+# admission-starved the way one-process cauli chains are).
+CELERY_PERSIST_C="$PERSIST_C"
+[ "$CELERY_PERSIST_C" -gt 4 ] && CELERY_PERSIST_C=4
 
 mkdir -p "$LOGS"
 cd "$DJ_DIR"
@@ -168,18 +212,19 @@ celery_cmd() {   # production topology + persist + DEDICATED bg-fill workers
 $c -n long@%h     -Q campaign_long -c 4 --max-tasks-per-child=1000 & \
 $c -n short@%h    -Q campaign_short -c 2 & \
 $c -n dispatch@%h -Q dispatch --pool=solo & \
-$c -n persist@%h  -Q persist -c 2 & \
+$c -n persist@%h  -Q persist -c $CELERY_PERSIST_C & \
 $c -n backfill@%h -Q backfill_heavy -c 2 & \
 $c -n webhook@%h  -Q webhook_ingest -c 2 & \
 wait"
 }
 
-wait_ready() {            # wait_ready <stack> (celery: 7 pongs)
+CELERY_PONGS=7            # nodes expected to pong (prod topology: 7; sym: 1)
+wait_ready() {            # wait_ready <stack>
     if [ "$1" = "celery" ]; then
         local n=0
         for _ in $(seq 1 120); do
             n="$("$CELERY_BIN" -A celery_app_django inspect ping --timeout 2 2>/dev/null | grep -c 'OK' || true)"
-            [ "$n" -ge 7 ] && return 0
+            [ "$n" -ge "$CELERY_PONGS" ] && return 0
             kill -0 "$WORKER_PID" 2>/dev/null || return 1
             sleep 1
         done
@@ -197,7 +242,7 @@ match_filter() {
 }
 
 run_stack() {             # run_stack <stack>
-    local stack="$1" name="${PREFIX}_$1"
+    local stack="$1" name="${PREFIX}_$1${SUFFIX}"
     match_filter "$stack" || return 0
     if [ "$stack" = "cauli" ] && [ ! -x "$CAULI_WORKER_BIN" ]; then
         log "SKIP $name: no cauli binary"
@@ -247,7 +292,87 @@ run_stack() {             # run_stack <stack>
     redis-cli -p "$PORT" flushall >/dev/null
 }
 
-log "django_real $MODE suite start (filter='${FILTER:-all}') redis=$PORT graph=$GRAPH_PORT lease=${LEASE_MS}ms"
-run_stack celery
-run_stack cauli
+# ---- symmetric topology, both frozen (sym / sym_smoke modes) ----------------
+CELERY_Q_ALL="celery,dispatch,campaign_short,campaign_long,backfill_heavy,webhook_ingest,persist"
+
+run_sym() {               # run_sym <celery_frozen|cauli_fork|cauli_async>
+    local cfg="$1" name="${PREFIX}_$1" stack=cauli started=1 rc=0
+    [ "$cfg" = "celery_frozen" ] && stack=celery
+    match_filter "$cfg" || return 0
+    if [ "$stack" = "cauli" ] && [ ! -x "$CAULI_WORKER_BIN" ]; then
+        log "SKIP $name: no cauli binary"
+        return 0
+    fi
+    log "=== $name stack=$stack campaigns=$N_CAMPAIGNS per=$N_PER pages=$N_PAGES warmup=${WARMUP}s window=${WINDOW}s"
+    redis-cli -p "$PORT" flushall >/dev/null
+    log "$name: seeding fresh schema"
+    "$PY" driver_django.py seed --campaigns "$N_CAMPAIGNS" --per "$N_PER" \
+        --pages "$N_PAGES" 2>&1 | tee -a "$LOGS/$name.driver.log" | grep -E '^\[dj\]' \
+        || { log "ERROR $name: seed failed"; return 1; }
+    case "$cfg" in
+        celery_frozen)
+            # ONE worker invocation, ALL queues, prefork -c 6, gc.freeze in
+            # the master pre-fork (CAULI_BENCH_GC_FREEZE hook). Each child
+            # still runs the ThreadPoolExecutor(15) send pool per batch.
+            CELERY_PONGS=1
+            start_scoped "$name" bash -c "CAULI_BENCH_GC_FREEZE=1 exec \"$CELERY_BIN\" \
+-A celery_app_django worker --loglevel=WARNING -Q $CELERY_Q_ALL -c 6" && started=0
+            ;;
+        cauli_fork)
+            # Same 6 GILs / same per-child 15-thread budget as celery -c 6:
+            # every task kind=cpu on 6 fork-server children (forked from ONE
+            # preloaded gc.freeze()-d parent), 15 in-flight tasks per child,
+            # DJ_SEND_POOL=15 per child process = celery's per-child pool.
+            export DJ_CAULI_KIND=cpu DJ_SEND_POOL=15
+            start_scoped "$name" "$CAULI_WORKER_BIN" --app cauli_app_django:app \
+                --redis-url "$CAULI_URL" --python "$PY" --queues "$CAULI_QUEUES" \
+                --io-concurrency 64 --io-threads 8 --batch 8 \
+                --cpu-workers 6 --cpu-child-threads 15 \
+                --visibility-timeout 300 && started=0
+            ;;
+        cauli_async)
+            # The DJR real_raw cauli leg: one process, io lane, sync send
+            # threads over the raw redis/SQL layer (see real_raw notes above).
+            export DJ_SEND_POOL=240
+            start_scoped "$name" "$CAULI_WORKER_BIN" --app cauli_app_django:app \
+                --redis-url "$CAULI_URL" --python "$PY" --queues "$CAULI_QUEUES" \
+                --io-concurrency 40 --io-threads 48 --batch 8 --cpu-workers 1 \
+                --visibility-timeout 300 && started=0
+            ;;
+        *) log "unknown sym config $cfg"; return 2 ;;
+    esac
+    if [ "$started" != "0" ] || ! wait_ready "$stack"; then
+        log "ERROR $name: worker failed/never ready (see $LOGS/$name.worker.log)"
+        printf '{"scenario":"%s","status":"start_failed"}\n' "$name" > "$RESULTS/$name.json"
+        rc=1
+    else
+        log "$name: worker ready pid=$WORKER_PID cgroup=$CGPATH"
+        "$PY" driver_django.py run --stack "$stack" --scenario "$name" \
+            --warmup "$WARMUP" --window "$WINDOW" --tick "$TICK_SECONDS" \
+            --cgroup-path "$CGPATH" --pid "$WORKER_PID" \
+            2>&1 | tee -a "$LOGS/$name.driver.log" | grep -E '^\[dj\]' \
+            || log "warn: $name run exited nonzero (recorded in JSON)"
+    fi
+    stop_scoped "$name"
+    if [ "$rc" = "0" ]; then
+        log "$name: finalizing (post-stop drain + integrity)"
+        "$PY" driver_django.py finalize --scenario "$name" \
+            2>&1 | tee -a "$LOGS/$name.driver.log" | grep -E '^\[dj\]' \
+            || log "warn: $name finalize exited nonzero (recorded in JSON)"
+    fi
+    unset DJ_CAULI_KIND DJ_SEND_POOL
+    CELERY_PONGS=7
+    redis-cli -p "$PORT" flushall >/dev/null
+    return $rc
+}
+
+log "django_real $MODE suite start (filter='${FILTER:-all}') layer=$DATA_LAYER redis=$PORT graph=$GRAPH_PORT lease=${LEASE_MS}ms"
+if [ "$SYM" = "1" ]; then
+    run_sym celery_frozen
+    run_sym cauli_fork
+    run_sym cauli_async
+else
+    run_stack celery
+    run_stack cauli
+fi
 log "suite done; results in $RESULTS"

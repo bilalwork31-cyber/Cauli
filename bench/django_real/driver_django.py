@@ -163,6 +163,21 @@ class ProcSampler:
         except (OSError, ValueError):
             return []
 
+    @staticmethod
+    def _smaps_private(pid):
+        """Private_Clean + Private_Dirty (+ Private_Hugetlb) from
+        /proc/PID/smaps_rollup, bytes: the pages this process does NOT share,
+        i.e. the copy-on-write / gc.freeze proof for forked children."""
+        try:
+            total = 0
+            with open(f"/proc/{pid}/smaps_rollup") as f:
+                for line in f:
+                    if line.startswith("Private_"):
+                        total += int(line.split()[1])  # kB
+            return total * 1024
+        except (OSError, ValueError, IndexError):
+            return None
+
     def _sample(self, full):
         for pid in self._pids():
             try:
@@ -178,6 +193,8 @@ class ProcSampler:
                         "last_rss": 0,
                         "uss": None,
                         "pss": None,
+                        "private": None,
+                        "peak_private": 0,
                     }
                     self.procs[pid] = d
                 d["last_rss"] = rss
@@ -189,6 +206,10 @@ class ProcSampler:
                         d["pss"] = getattr(mfi, "pss", None)
                     except Exception:
                         pass
+                    priv = self._smaps_private(pid)
+                    if priv is not None:
+                        d["private"] = priv
+                        d["peak_private"] = max(d["peak_private"], priv)
             except Exception:
                 continue
 
@@ -220,6 +241,8 @@ class ProcSampler:
             "n_processes_seen": len(rows),
             "total_peak_rss_bytes": sum(d["peak_rss"] for d in rows),
             "total_last_uss_bytes": sum(d["uss"] for d in rows if d["uss"]) or None,
+            "total_last_private_bytes": sum(d["private"] for d in rows if d["private"])
+            or None,
             "processes": rows,
         }
 
@@ -244,8 +267,9 @@ def cmd_run(args):
     redis_store.set_bg_active(True)
     t0 = time.time()
     mod.ghost_job.apply_async(queue="backfill_heavy")
-    mod.persist_drain.apply_async(queue="persist")
-    mod.persist_drain.apply_async(queue="persist")
+    n_persist = int(os.environ.get("DJ_PERSIST_TASKS", "2"))
+    for _ in range(n_persist):
+        mod.persist_drain.apply_async(queue="persist")
     marker_ms = None
     end_ms = None
     next_tick = t0
@@ -255,7 +279,8 @@ def cmd_run(args):
     last_log = 0.0
     prev_done, prev_t = 0, t0
     log(
-        f"run start stack={args.stack} campaigns={len(all_cids)} n={total} "
+        f"run start stack={args.stack} layer={ts.DATA_LAYER} "
+        f"campaigns={len(all_cids)} n={total} persist_tasks={n_persist} "
         f"warmup={args.warmup}s window={args.window}s tick={args.tick}s"
     )
     while True:
@@ -305,6 +330,13 @@ def cmd_run(args):
     blob = {
         "scenario": args.scenario,
         "stack": args.stack,
+        "data_layer": ts.DATA_LAYER,
+        "persist_tasks": n_persist,
+        "persist_batch": (
+            int(os.environ.get("DJ_PERSIST_BATCH", "50"))
+            if ts.RAW
+            else persist_common.DRAIN_LIMIT
+        ),
         "status": status,
         "campaigns": len(all_cids),
         "n_total": total,

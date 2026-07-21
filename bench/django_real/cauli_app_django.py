@@ -6,6 +6,13 @@ All tasks are sync kind="io" (Django ORM is synchronous) and run on cauli's
 worker thread pool; send concurrency inside a batch comes from the shared
 process-global send pool (DJ_SEND_POOL) + the same per-page semaphores as
 Celery.
+
+DJ_CAULI_KIND=cpu (symmetric-topology benchmark) registers every task
+kind="cpu" instead: all work runs on the fork-server child pool
+(--cpu-workers N x --cpu-child-threads M), i.e. N frozen forked GILs with M
+in-flight tasks each - the same process/thread budget shape as Celery
+prefork -c N with its per-batch thread pool. Registry kind is authoritative
+worker-side (PROTOCOL §2), so the worker's env decides the lane.
 """
 
 import os
@@ -18,6 +25,7 @@ import tasks_shared as ts
 import store as redis_store
 
 _PORT = int(os.environ.get("BENCH_REDIS_PORT", "6396"))
+_KIND = os.environ.get("DJ_CAULI_KIND", "io").strip().lower()
 
 app = Cauli(
     redis_url=f"redis://127.0.0.1:{_PORT}/0",
@@ -29,7 +37,7 @@ app = Cauli(
 
 @app.task(
     name="campaign.dispatch",
-    kind="io",
+    kind=_KIND,
     queue="dispatch",
     max_retries=0,
     timeout=120.0,
@@ -44,7 +52,7 @@ def dispatch(campaign_id):
 
 @app.task(
     name="campaign.send_batch",
-    kind="io",
+    kind=_KIND,
     max_retries=0,
     timeout=900.0,
     store_result=False,
@@ -55,7 +63,7 @@ def send_batch(campaign_id, batch):
 
 @app.task(
     name="persist.drain",
-    kind="io",
+    kind=_KIND,
     queue="persist",
     max_retries=0,
     timeout=300.0,
@@ -70,7 +78,7 @@ def persist_drain():
 
 @app.task(
     name="bgfill.ghost_job",
-    kind="io",
+    kind=_KIND,
     queue="backfill_heavy",
     max_retries=0,
     timeout=300.0,
@@ -85,7 +93,7 @@ def ghost_job():
 
 @app.task(
     name="webhook.drain",
-    kind="io",
+    kind=_KIND,
     queue="webhook_ingest",
     max_retries=0,
     timeout=120.0,
