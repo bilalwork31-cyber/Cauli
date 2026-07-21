@@ -23,6 +23,7 @@ import glob
 import heapq
 import importlib
 import json
+import math
 import os
 import sys
 import threading
@@ -51,6 +52,90 @@ _rr = 0
 _callback = None  # Rust completion callback: cb(token:int, outcome_json:str)
 
 _set_async_exc = ctypes.pythonapi.PyThreadState_SetAsyncExc
+
+
+# --------------------------------------------------------------------------
+# per-task JSON codec (optional msgspec acceleration, stdlib json fallback)
+# --------------------------------------------------------------------------
+
+
+def _validate_json_types(obj):
+    """Reject non-JSON types and non-finite floats (mirrors cauli._codec).
+
+    msgspec natively serializes set/datetime/... (which the stdlib rejects
+    with TypeError) and encodes NaN/Infinity as null; this walk keeps both
+    backends accepting/rejecting the same inputs so a task returning a set
+    is a SerializationError regardless of the installed codec.
+    """
+    t = type(obj)
+    if t is str or t is int or t is bool or obj is None:
+        return
+    if t is float:
+        if math.isfinite(obj):
+            return
+        raise ValueError("Out of range float values are not JSON compliant")
+    if t is dict:
+        for k, v in obj.items():
+            _validate_json_types(k)
+            _validate_json_types(v)
+        return
+    if t is list or t is tuple:
+        for v in obj:
+            _validate_json_types(v)
+        return
+    if isinstance(obj, (str, int)):
+        return
+    if isinstance(obj, float):
+        return _validate_json_types(float(obj))
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            _validate_json_types(k)
+            _validate_json_types(v)
+        return
+    if isinstance(obj, (list, tuple)):
+        for v in obj:
+            _validate_json_types(v)
+        return
+    raise TypeError("Object of type %s is not JSON serializable" % (t.__name__,))
+
+
+def _loads(s):
+    return json.loads(s)
+
+
+def _dumps_str(obj):
+    # allow_nan=False keeps NaN/Infinity a loud SerializationError on both
+    # codec backends (msgspec would encode them as null; serde_json on the
+    # Rust side cannot parse the stdlib's NaN literal either way).
+    return json.dumps(obj, separators=(",", ":"), allow_nan=False)
+
+
+def _init_codec():
+    """Switch the per-task codec to msgspec when available (never required).
+
+    Called at the end of load_app, AFTER the venv site-packages have been
+    added to sys.path -- a module-level import attempt would run too early
+    and always miss a venv-installed msgspec. Honors CAULI_DISABLE_MSGSPEC.
+    """
+    global _loads, _dumps_str
+    if os.environ.get("CAULI_DISABLE_MSGSPEC"):
+        return
+    try:
+        import msgspec.json as _mj
+    except Exception:
+        return
+    dec = _mj.Decoder()
+    enc = _mj.Encoder()
+
+    def loads(s):
+        return dec.decode(s)
+
+    def dumps_str(obj):
+        _validate_json_types(obj)
+        return enc.encode(obj).decode("utf-8")
+
+    _loads = loads
+    _dumps_str = dumps_str
 
 
 def _tb_of(exc):
@@ -84,7 +169,7 @@ def _outcome_json(out):
     serialization attempt instead of two.
     """
     try:
-        return json.dumps(out)
+        return _dumps_str(out)
     except (TypeError, ValueError) as e:
         return json.dumps(
             {
@@ -150,6 +235,10 @@ def load_app(app_spec, extra_paths_json):
             "jitter": bool(getattr(td, "jitter", True)),
             "store_result": bool(getattr(td, "store_result", True)),
         }
+
+    # Now that venv site-packages are importable, opt the per-task codec into
+    # msgspec if it is installed there (stdlib json otherwise; never required).
+    _init_codec()
 
     return json.dumps(
         {
@@ -256,8 +345,8 @@ def _run_sync_inner(name, args_json, kwargs_json, soft_timeout_ms):
             },
         }
     fn = getattr(td, "fn")
-    args = json.loads(args_json)
-    kwargs = json.loads(kwargs_json)
+    args = _loads(args_json)
+    kwargs = _loads(kwargs_json)
 
     tid = threading.get_ident()
     gen = _thread_gen.get(tid, 0)
@@ -339,8 +428,8 @@ async def _arun(token, name, args_json, kwargs_json, timeout_s):
             }
         else:
             fn = getattr(td, "fn")
-            args = json.loads(args_json)
-            kwargs = json.loads(kwargs_json)
+            args = _loads(args_json)
+            kwargs = _loads(kwargs_json)
             try:
                 rv = await asyncio.wait_for(fn(*args, **kwargs), timeout_s)
                 out = _finish_value(rv)

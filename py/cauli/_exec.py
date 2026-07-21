@@ -20,13 +20,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import importlib
-import json
 import os
 import signal
 import sys
 import traceback
 from typing import Any, TextIO
 
+from cauli import _codec
 from cauli.exceptions import SoftTimeLimitExceeded
 
 _TRACEBACK_CAP = 8192  # max chars of formatted traceback kept in error JSON (section 8)
@@ -134,25 +134,26 @@ def _execute(app: Any, request: dict[str, Any]) -> dict[str, Any]:
     return {"id": request_id, "ok": True, "result": result}
 
 
-def _write_line(out: TextIO, payload: dict[str, Any]) -> None:
-    """Serialize and emit one protocol line, always flushing.
+def _serialize_response(payload: dict[str, Any]) -> str:
+    """Serialize one protocol line (without the trailing newline).
 
     A non JSON serializable result degrades to a SerializationError response
     for the same request id (section 5.1).
     """
     try:
-        line = json.dumps(payload, separators=(",", ":"), allow_nan=False)
-    except (TypeError, ValueError) as exc:
+        return _codec.encode_str(payload)
+    except _codec.ENCODE_ERRORS as exc:
         error = {
             "type": "SerializationError",
             "message": f"task result is not JSON serializable: {exc}",
             "traceback": _format_traceback(exc),
         }
-        line = json.dumps(
-            {"id": payload.get("id"), "ok": False, "error": error},
-            separators=(",", ":"),
-        )
-    out.write(line + "\n")
+        return _codec.encode_str({"id": payload.get("id"), "ok": False, "error": error})
+
+
+def _write_line(out: TextIO, payload: dict[str, Any]) -> None:
+    """Serialize and emit one protocol line, always flushing."""
+    out.write(_serialize_response(payload) + "\n")
     out.flush()
 
 
@@ -190,8 +191,8 @@ def main(argv: list[str] | None = None) -> int:
         if not line:
             continue
         try:
-            request = json.loads(line)
-        except ValueError as exc:
+            request = _codec.decode(line)
+        except _codec.DECODE_ERRORS as exc:
             _write_line(
                 proto,
                 {

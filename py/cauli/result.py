@@ -5,10 +5,10 @@ Reads ``cauli:result:{task_id}`` per PROTOCOL.md sections 6 and 8.
 
 from __future__ import annotations
 
-import json
 import time
 from typing import TYPE_CHECKING, Any
 
+from cauli import _codec
 from cauli.exceptions import TaskFailedError
 
 if TYPE_CHECKING:
@@ -32,7 +32,7 @@ class AsyncResult:
         raw = self.app._get_redis().get(f"cauli:result:{self.id}")
         if raw is None:
             return None
-        return json.loads(raw)
+        return _codec.decode(raw)
 
     def status(self) -> str:
         """Return ``"pending" | "success" | "failure" | "duplicate"``.
