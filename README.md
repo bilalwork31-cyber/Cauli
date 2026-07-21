@@ -79,6 +79,31 @@ r.get(timeout=10)
 rupy-worker --app myproj.tasks:app --io-concurrency 500 --cpu-workers 6
 ```
 
+Requires Redis >= 7.0 as the broker and result backend.
+
+## Semantics & limits
+
+- **At-least-once delivery.** A task can run more than once (worker crash + redelivery, or a
+  connection drop mid-completion-write). Design tasks to be safe to repeat, or use
+  `idempotency_key` to dedupe.
+- **`--visibility-timeout` must exceed your longest task's `timeout`.** The worker warns at
+  startup if a registered task's timeout doesn't satisfy this, and the recovery loop itself
+  only reclaims an entry once it has been idle longer than its own task timeout (not just the
+  visibility floor) — but a badly undersized visibility_timeout still means genuine crash
+  recovery is slower than it needs to be. See PROTOCOL.md §4.4.
+- **A sync (thread-pool) task's hard timeout cannot kill the thread.** CPython has no safe way
+  to force-stop a running thread; on hard timeout the worker marks the task failed and moves
+  on, spawning a replacement thread so pool capacity isn't lost, but the original call keeps
+  running in the background until it returns on its own. Prefer `kind="cpu"` for work that
+  must be forcibly killable, or cooperative code that checks a deadline for long sync tasks.
+- **Task tracebacks and results are stored in plaintext in Redis** (`rupy:result:*`, DLQ
+  entries). Anyone with read access to your Redis instance can see them — don't put secrets or
+  PII in exception messages or task arguments/return values if that's a concern for your
+  deployment.
+- **The worker's working directory is on `sys.path`.** `--app` imports are resolved with CWD
+  prepended (so relative app modules just work); don't run `rupy-worker` from a directory an
+  untrusted party can write to.
+
 ## Repository layout
 
 - `PROTOCOL.md` — the wire/behavior contract (envelope JSON, Redis keys, worker semantics)
@@ -90,3 +115,8 @@ rupy-worker --app myproj.tasks:app --io-concurrency 500 --cpu-workers 6
 
 v0.1: Redis broker only, no chains/chords, no cron/beat, no priorities. See PROTOCOL.md §9.
 Worker targets Linux; the client library is cross platform.
+
+## License
+
+Licensed under either of Apache-2.0 or MIT at your option. See `LICENSE-APACHE` and
+`LICENSE-MIT`.

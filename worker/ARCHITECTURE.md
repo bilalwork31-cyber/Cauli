@@ -37,17 +37,36 @@ against Redis Streams per PROTOCOL.md. Module map:
   N daemon threads each running `loop.run_forever()`; `submit_async` uses
   `run_coroutine_threadsafe` + `asyncio.wait_for(coro, effective_s)` and pushes
   completion into a Rust `PyCFunction` closure -> tokio oneshot (no polling).
+  Soft timeouts for sync tasks are serviced by ONE shared watchdog thread (a
+  min-heap of (deadline, tid, generation)) rather than a `threading.Timer` per
+  call, so hot-path soft-timeout usage does not spawn thousands of OS threads
+  per second. The Rust side gives up waiting on an async completion after
+  `timeout_ms + grace` and drops its pending-map slot (`PyRuntime::cancel`) so
+  a wedged event-loop thread that never actually finishes the coroutine
+  cannot leak that bookkeeping forever (the coroutine itself, if truly
+  wedged on a synchronous blocking call, cannot be recovered from Rust --
+  `pending_async` in the stats line makes a growing count of these visible).
 - **Sync io pool** (`--io-threads`): Rust-spawned OS threads; each takes the
   GIL only around the shim `run_sync` call; CPython releases it during blocking
   I/O, so io parallelism is real. Soft timeout: shim watchdog `threading.Timer`
-  injecting `SoftTimeLimitExceeded` via `PyThreadState_SetAsyncExc`.
+  injecting `SoftTimeLimitExceeded` via `PyThreadState_SetAsyncExc`, fenced by
+  a per-thread generation counter so a timer that fires late (after its own
+  task already finished) cannot land inside a later task on the same thread.
+  The job queue is a bounded crossbeam channel (capacity = `--io-concurrency`);
+  a queued job whose dispatcher already hard-timed-out is skipped rather than
+  executed late ("zombie execution") when a thread reaches it, and a hard
+  timeout spawns a replacement thread immediately so pool capacity is
+  restored even though the wedged original thread can never be killed.
 - **Cpu pool** (`--cpu-workers`): children `{python} -m rupy._exec --app {spec}`,
   line-delimited JSON, one in-flight per child, ready-line handshake, SIGKILL +
   respawn on hard timeout ("TimeoutError") or death ("WorkerLost"), both
   retryable. Children get `PR_SET_PDEATHSIG=SIGKILL` so a SIGKILLed worker
-  cannot leak them; remaining children are killed on exit paths.
+  cannot leak them; remaining children are killed on exit paths (skipping any
+  tracked pid of 0, which would otherwise signal this process's own group).
   **Test hook:** env `RUPY_EXEC_CMD` (whitespace-split argv) replaces the child
-  command verbatim, used by e2e to run `tests/fixtures/fake_exec.py`.
+  command verbatim, used by e2e to run `tests/fixtures/fake_exec.py`. Compiled
+  in only under `cfg(test)` / the `test-hooks` cargo feature -- a normal
+  `cargo build --release` has no code path that reads this env var.
 
 ## Admission / backpressure
 
@@ -76,18 +95,21 @@ retried counts scheduled retries; dlq counts every DLQ write.
 
 1. **Sync hard timeout cannot kill the thread** (§4.6, documented in protocol):
    the task is failed on the retry path and the thread result abandoned; the
-   pool slot stays occupied until the Python call returns.
-2. **cpu Retry countdown**: §5.1 error JSON has no countdown field, so a cpu
-   task raising `Retry` is recognized by error type name and retried with the
-   COMPUTED backoff (countdown lost over the pipe).
-3. **No result key** is written for `malformed` / `unregistered` /
+   ORIGINAL OS thread stays occupied until the Python call returns (which may
+   be never, e.g. a blocking call with no timeout, or a C extension ignoring
+   the soft-timeout injection) -- but the pool's CAPACITY does not shrink: a
+   replacement thread is spawned immediately, and if the original thread ever
+   does return, it just resumes serving as extra headroom. A job still
+   sitting in the queue when its own dispatcher already gave up is skipped
+   rather than run late.
+2. **No result key** is written for `malformed` / `unregistered` /
    `redelivery_limit` DLQ entries: §4 / §4.4 specify only the DLQ write, so a
    client `get()` on such a task waits until timeout. Spec followed literally.
-4. **Non-JSON `-m rupy._exec` responses** are treated as retryable
+3. **Non-JSON `-m rupy._exec` responses** are treated as retryable
    WorkerShimError failures rather than crashing the pool.
-5. Usage errors print via clap but exit 1 (spec: 1 = fatal config error;
+4. Usage errors print via clap but exit 1 (spec: 1 = fatal config error;
    clap's default 2 is overridden). `--help`/`--version` exit 0.
-6. Second signal exits 130 immediately; cpu children die with the worker via
+5. Second signal exits 130 immediately; cpu children die with the worker via
    PDEATHSIG rather than explicit reaping on that path.
 
 ## Ops quickstart
@@ -97,9 +119,13 @@ rupy-worker --app myproj.tasks:app --queues default,emails \
     --redis-url redis://127.0.0.1:6379/0 --cpu-workers 4 --log-level info
 ```
 
-Redis URL precedence: `--redis-url` > `RUPY_REDIS_URL` > `app.redis_url`.
+Redis URL precedence: `--redis-url` > `RUPY_REDIS_URL` > `app.redis_url` (logged with
+userinfo redacted, e.g. `redis://***@host/0` -- never logs a plaintext password).
 Stats line every `--stats-interval`s:
-`stats: fetched=N ok=N failed=N retried=N dlq=N inflight_io=N inflight_cpu=N rss_mb=N`.
+`stats: fetched=N ok=N failed=N retried=N dlq=N inflight_io=N inflight_cpu=N rss_mb=N
+sync_live=N sync_abandoned=N pending_async=N`.
 SIGTERM/SIGINT: stop fetching, drain up to `--drain-timeout`, exit 0; second
 signal exits 130. SIGKILL is safe: pending entries are re-claimed by another
-worker after `--visibility-timeout` (§4.4).
+worker after `--visibility-timeout` (§4.4) -- but only once idle beyond
+`max(visibility_timeout, task timeout_ms + grace)`, so a legitimately
+still-running long task is not reclaimed out from under itself.
