@@ -75,9 +75,36 @@ def slow(seconds=30.0):
     return "slow-done"
 
 
+def slow_counted(counter_file, seconds=30.0):
+    """Records one invocation (append-only counter) BEFORE sleeping, so a test
+    can detect duplicate concurrent execution even while the task is still
+    in flight (used by the H1 visibility-timeout regression test)."""
+    n = 0
+    if os.path.exists(counter_file):
+        with open(counter_file) as f:
+            n = int(f.read().strip() or 0)
+    n += 1
+    with open(counter_file, "w") as f:
+        f.write(str(n))
+    time.sleep(float(seconds))
+    return n
+
+
 async def aslow(seconds=30.0):
     await asyncio.sleep(float(seconds))
     return "aslow-done"
+
+
+async def async_block(seconds=3.0):
+    """A coroutine that blocks synchronously instead of awaiting.
+
+    Wedges the ONE event loop thread it runs on: with no `await`, asyncio
+    cannot run any other callback on that thread -- including its own
+    `wait_for` timeout check -- until this call returns. Used to force the
+    Rust-side backstop timeout path (MEM-1 regression: without cancel(), that
+    path used to leak a pending-completion map entry forever)."""
+    time.sleep(float(seconds))
+    return "unreachable-in-time"
 
 
 def soft_slow(total=5.0):
@@ -120,7 +147,9 @@ app.add(TaskDef("fx.fail", fail))
 app.add(TaskDef("fx.flaky", flaky))
 app.add(TaskDef("fx.retry_once", retry_once))
 app.add(TaskDef("fx.slow", slow))
+app.add(TaskDef("fx.slow_counted", slow_counted))
 app.add(TaskDef("fx.aslow", aslow, is_async=True))
+app.add(TaskDef("fx.async_block", async_block, is_async=True))
 app.add(TaskDef("fx.soft_slow", soft_slow))
 app.add(TaskDef("fx.bad_return", bad_return))
 app.add(TaskDef("fx.cpu_echo", cpu_echo, kind="cpu"))

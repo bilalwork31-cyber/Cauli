@@ -70,13 +70,39 @@ fn real_main() -> i32 {
             return 1;
         }
     }
+    // M8: floor CLI values that would otherwise storm-duplicate or fetch
+    // unbounded amounts of work (0 is not a safe "unlimited" here).
+    if args.batch == 0 {
+        error!("--batch must be >= 1 (0 means unlimited XREADGROUP fetch)");
+        return 1;
+    }
+    if args.visibility_timeout == 0 {
+        error!("--visibility-timeout must be >= 1 (0 reclaims every in-flight task on nearly every tick)");
+        return 1;
+    }
     info!(
         "rupy-worker starting: app={} queues={:?} redis={} tasks={}",
         args.app,
         queues,
-        redis_url,
+        redact_redis_url(&redis_url),
         appcfg.tasks.len()
     );
+    // H1 operator diagnostic: loops::recovery_loop's per-envelope idle check
+    // already prevents reclaiming a still-running task regardless of this
+    // default, but a task whose registered timeout_ms is >= the visibility
+    // floor is a strong signal of a misconfigured deployment (the invariant
+    // documented in PROTOCOL.md §4.4: visibility_timeout should exceed your
+    // longest task) — warn loudly at startup so operators catch it early.
+    let vt_ms = args.visibility_timeout * 1000;
+    for (name, spec) in &appcfg.tasks {
+        if spec.timeout_ms >= vt_ms {
+            warn!(
+                task = %name, timeout_ms = spec.timeout_ms, visibility_timeout_s = args.visibility_timeout,
+                "task timeout_ms >= visibility_timeout*1000 (PROTOCOL.md §4.4 invariant \
+                 violated) -- consider raising --visibility-timeout"
+            );
+        }
+    }
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -95,14 +121,17 @@ async fn run_worker(
     let client = match redis::Client::open(redis_url.as_str()) {
         Ok(c) => c,
         Err(e) => {
-            error!("bad redis url {redis_url:?}: {e}");
+            error!("bad redis url {:?}: {e}", redact_redis_url(&redis_url));
             return 1;
         }
     };
     let mut write_conn = match ConnectionManager::new(client.clone()).await {
         Ok(c) => c,
         Err(e) => {
-            error!("cannot connect to redis at {redis_url}: {e}");
+            error!(
+                "cannot connect to redis at {}: {e}",
+                redact_redis_url(&redis_url)
+            );
             return 1;
         }
     };
@@ -121,17 +150,24 @@ async fn run_worker(
 
     let counters = Arc::new(stats::Counters::default());
     let cpu_workers = args.cpu_workers.unwrap_or_else(|| {
-        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
     });
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    // PROTOCOL §1: "{hostname}:{pid}" (any unique string is acceptable) --
+    // no per-loop/per-thread `n` component exists in this worker (one fetch
+    // loop per process), so it is dropped rather than hardcoded to a
+    // meaningless constant.
     let consumer = format!(
-        "{}:{}:0",
+        "{}:{}",
         gethostname::gethostname().to_string_lossy(),
         std::process::id()
     );
+    let io_concurrency = args.io_concurrency.max(1);
     let ctx = Arc::new(Ctx {
-        io_sem: Arc::new(tokio::sync::Semaphore::new(args.io_concurrency.max(1))),
-        sync_pool: pyrt::SyncPool::start(pyrt.clone(), args.io_threads),
+        io_sem: Arc::new(tokio::sync::Semaphore::new(io_concurrency)),
+        sync_pool: pyrt::SyncPool::start(pyrt.clone(), args.io_threads, io_concurrency),
         cpu: cpu::start(cpu_workers, &args.python, &args.app, counters.clone()),
         registry: appcfg.tasks,
         redis: write_conn,
@@ -184,4 +220,38 @@ fn spawn_signal_task(shutdown_tx: watch::Sender<bool>) {
         warn!("second signal: forced exit 130");
         std::process::exit(130);
     });
+}
+
+/// Mask `user:password@` userinfo before a redis URL reaches logs or error
+/// messages (audit M4 — `redis://user:password@host/0` is a common shape and
+/// the password would otherwise land in plaintext logs).
+fn redact_redis_url(url: &str) -> String {
+    if let Some(scheme_end) = url.find("://") {
+        let after_scheme = &url[scheme_end + 3..];
+        if let Some(at) = after_scheme.find('@') {
+            return format!("{}://***@{}", &url[..scheme_end], &after_scheme[at + 1..]);
+        }
+    }
+    url.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redacts_userinfo() {
+        assert_eq!(
+            redact_redis_url("redis://user:hunter2@host.example:6379/0"),
+            "redis://***@host.example:6379/0"
+        );
+    }
+
+    #[test]
+    fn leaves_urls_without_userinfo_alone() {
+        assert_eq!(
+            redact_redis_url("redis://host.example:6379/0"),
+            "redis://host.example:6379/0"
+        );
+    }
 }
