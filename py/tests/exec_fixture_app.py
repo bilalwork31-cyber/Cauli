@@ -4,6 +4,7 @@ The child is spawned with cwd = this directory, so `--app exec_fixture_app:app`
 resolves via the CWD sys.path entry. The redis URL points at a dead port on
 purpose: _exec must never touch redis.
 """
+
 import asyncio
 import time
 
@@ -36,6 +37,30 @@ def sleepy(seconds):
 @app.task(name="retryme", kind="cpu")
 def retryme(countdown=None):
     raise Retry(countdown)
+
+
+class _DuckRetry(Exception):
+    """A duck-typed lookalike of rupy.Retry that does NOT subclass it.
+
+    Used to regression-test M6: `_exec.py` must recognize a forced retry by
+    class NAME + `.countdown` (matching worker/src/shim.py's rule), not by
+    `isinstance(exc, rupy.exceptions.Retry)` -- the old isinstance-based
+    check would silently miss this and treat it as a plain failure. Renamed
+    (rather than defined as `class Retry`) so it does not shadow the real
+    `Retry` imported above, which `retryme` still needs.
+    """
+
+    def __init__(self, countdown=None):
+        super().__init__("duck retry")
+        self.countdown = countdown
+
+
+_DuckRetry.__name__ = "Retry"
+
+
+@app.task(name="duck_retryme", kind="cpu")
+def duck_retryme(countdown=None):
+    raise _DuckRetry(countdown)
 
 
 @app.task(name="unser", kind="cpu")
