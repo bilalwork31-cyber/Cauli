@@ -1,7 +1,9 @@
 """Test 3: task options land in TaskDef attrs AND the envelope; queue precedence; idempotency_key."""
+
 from __future__ import annotations
 
 import json
+import threading
 
 from rupy import Rupy
 
@@ -123,4 +125,43 @@ def test_redis_url_resolution(monkeypatch):
 
     monkeypatch.setenv("RUPY_REDIS_URL", "redis://envhost:6399/2")
     assert Rupy().redis_url == "redis://envhost:6399/2"
-    assert Rupy(redis_url="redis://explicit:1234/0").redis_url == "redis://explicit:1234/0"
+    assert (
+        Rupy(redis_url="redis://explicit:1234/0").redis_url == "redis://explicit:1234/0"
+    )
+
+
+def test_repr_redacts_credentials():
+    # M4 regression: a redis URL with embedded credentials must never appear
+    # in plaintext in repr() (logs/tracebacks commonly include repr output).
+    app = Rupy(redis_url="redis://user:hunter2@dbhost:6379/0")
+    r = repr(app)
+    assert "hunter2" not in r
+    assert "user:hunter2" not in r
+    assert "redis://***@dbhost:6379/0" in r
+
+    # URLs without userinfo are left alone.
+    app2 = Rupy(redis_url="redis://dbhost:6379/0")
+    assert "redis://dbhost:6379/0" in repr(app2)
+
+
+def test_get_redis_is_thread_safe(redis_url):
+    # L6 regression: concurrent first-use must not race to build two
+    # separate redis-py clients (one pool would leak).
+    app = Rupy(redis_url=redis_url)
+    seen: list[object] = []
+    barrier = threading.Barrier(8)
+
+    def worker():
+        barrier.wait()
+        seen.append(app._get_redis())
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert len(seen) == 8
+    assert all(client is seen[0] for client in seen), (
+        "all threads must observe the same client"
+    )

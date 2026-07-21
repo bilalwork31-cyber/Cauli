@@ -2,6 +2,7 @@
 
 Reads ``rupy:result:{task_id}`` per PROTOCOL.md sections 6 and 8.
 """
+
 from __future__ import annotations
 
 import json
@@ -22,8 +23,8 @@ class AsyncResult:
     in that case.
     """
 
-    def __init__(self, id: str, app: "Rupy") -> None:
-        self.id: str = id
+    def __init__(self, task_id: str, app: "Rupy") -> None:
+        self.id: str = task_id
         self.app = app
         self.duplicate: bool = False
 
@@ -51,6 +52,13 @@ class AsyncResult:
         - failure: raises :class:`TaskFailedError` (with .type/.message/.traceback).
         - duplicate: sets ``self.duplicate = True`` and returns ``None``.
         - still pending when ``timeout`` (seconds) expires: raises TimeoutError.
+
+        This is poll-based (default ``poll_interval`` 0.05s), not push/blocking
+        redis-side. Without ``timeout``, ``get()`` can block forever by design:
+        a malformed/unregistered/redelivery-limit-exhausted task, or one
+        enqueued with ``store_result=False``, never gets a result key at all
+        (see PROTOCOL.md §4/§4.4 and ARCHITECTURE.md limitation #3). Passing an
+        explicit ``timeout`` is recommended for anything but throwaway scripts.
         """
         deadline = None if timeout is None else time.monotonic() + timeout
         while True:
@@ -71,7 +79,9 @@ class AsyncResult:
                     "InvalidResult", f"unrecognized result status {status!r}", None
                 )
             if deadline is not None and time.monotonic() >= deadline:
-                raise TimeoutError(f"task {self.id} still pending after {timeout} seconds")
+                raise TimeoutError(
+                    f"task {self.id} still pending after {timeout} seconds"
+                )
             time.sleep(poll_interval)
 
     def __repr__(self) -> str:

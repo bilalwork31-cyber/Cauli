@@ -20,11 +20,13 @@ Outcome JSON shapes:
 import asyncio
 import ctypes
 import glob
+import heapq
 import importlib
 import json
 import os
 import sys
 import threading
+import time
 import traceback
 
 _MAX_TB = 8192
@@ -32,15 +34,21 @@ _MAX_TB = 8192
 try:  # pragma: no cover - only when the real rupy package is importable
     from rupy import SoftTimeLimitExceeded  # type: ignore
 except Exception:
-    class SoftTimeLimitExceeded(BaseException):
-        """Soft time limit exceeded (local stand-in for rupy.SoftTimeLimitExceeded)."""
+
+    class SoftTimeLimitExceeded(Exception):
+        """Soft time limit exceeded (local stand-in for rupy.SoftTimeLimitExceeded).
+
+        Derives from Exception (not BaseException) to match the real
+        rupy.SoftTimeLimitExceeded (audit L5): a task's `except Exception`
+        must catch this in the fallback case too.
+        """
 
 
-_registry = {}          # task name -> duck-typed TaskDef object
-_loops = []             # asyncio loops, one per dedicated daemon thread
+_registry = {}  # task name -> duck-typed TaskDef object
+_loops = []  # asyncio loops, one per dedicated daemon thread
 _loops_lock = threading.Lock()
 _rr = 0
-_callback = None        # Rust completion callback: cb(token:int, outcome_json:str)
+_callback = None  # Rust completion callback: cb(token:int, outcome_json:str)
 
 _set_async_exc = ctypes.pythonapi.PyThreadState_SetAsyncExc
 
@@ -63,19 +71,32 @@ def _is_retry(exc):
 
 
 def _finish_value(rv):
-    try:
-        json.dumps(rv)
-    except (TypeError, ValueError) as e:
-        return {
-            "ok": False,
-            "retryable": False,
-            "error": {
-                "type": "SerializationError",
-                "message": "task return value is not JSON serializable: %s" % (e,),
-                "traceback": "",
-            },
-        }
     return {"ok": True, "result": rv}
+
+
+def _outcome_json(out):
+    """Serialize an outcome dict exactly once.
+
+    Previously `_finish_value` did a throwaway `json.dumps(rv)` just to probe
+    serializability, then the caller dumped the whole outcome again -- every
+    successful result was JSON-encoded twice. Encoding once here and catching
+    the failure gives the same SerializationError outcome (section 8) for one
+    serialization attempt instead of two.
+    """
+    try:
+        return json.dumps(out)
+    except (TypeError, ValueError) as e:
+        return json.dumps(
+            {
+                "ok": False,
+                "retryable": False,
+                "error": {
+                    "type": "SerializationError",
+                    "message": "task return value is not JSON serializable: %s" % (e,),
+                    "traceback": "",
+                },
+            }
+        )
 
 
 def _finish_exc(exc):
@@ -99,6 +120,7 @@ def load_app(app_spec, extra_paths_json):
     venv = os.environ.get("VIRTUAL_ENV")
     if venv:
         import site
+
         for sp in glob.glob(os.path.join(venv, "lib", "python*", "site-packages")):
             # addsitedir (not sys.path.append) so .pth hooks run — editable
             # installs (pip install -e) are invisible without them
@@ -129,13 +151,15 @@ def load_app(app_spec, extra_paths_json):
             "store_result": bool(getattr(td, "store_result", True)),
         }
 
-    return json.dumps({
-        "redis_url": str(getattr(app, "redis_url", "redis://localhost:6379/0")),
-        "default_queue": str(getattr(app, "default_queue", "default")),
-        "result_ttl": int(getattr(app, "result_ttl", 3600)),
-        "idemp_ttl": int(getattr(app, "idemp_ttl", 86400)),
-        "tasks": tasks_out,
-    })
+    return json.dumps(
+        {
+            "redis_url": str(getattr(app, "redis_url", "redis://localhost:6379/0")),
+            "default_queue": str(getattr(app, "default_queue", "default")),
+            "result_ttl": int(getattr(app, "result_ttl", 3600)),
+            "idemp_ttl": int(getattr(app, "idemp_ttl", 86400)),
+            "tasks": tasks_out,
+        }
+    )
 
 
 # --------------------------------------------------------------------------
@@ -143,16 +167,78 @@ def load_app(app_spec, extra_paths_json):
 # entry; CPython releases the GIL itself during blocking I/O in the task)
 # --------------------------------------------------------------------------
 
-def _inject_soft(tid):
+_gen_lock = threading.Lock()
+_thread_gen = {}  # tid -> generation fencing stale soft-timeout injections
+
+# MEM-4: one shared watchdog thread services every soft_timeout deadline via a
+# min-heap of (deadline, tid, gen), instead of spawning a dedicated
+# threading.Timer (and its own OS thread) per sync task call. At hot-path
+# rates (hundreds of tasks/s with soft_timeout set) that was thousands of
+# thread creations per second; a single background thread sleeping until the
+# next deadline scales to however many tasks are in flight with no per-call
+# thread spawn/teardown cost.
+_watchdog_heap = []  # heap of (deadline_monotonic, tid, gen)
+_watchdog_cond = threading.Condition()
+_watchdog_started = False
+
+
+def _watchdog_loop():
+    while True:
+        with _watchdog_cond:
+            while not _watchdog_heap:
+                _watchdog_cond.wait()
+            deadline, tid, gen = _watchdog_heap[0]
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                _watchdog_cond.wait(timeout=remaining)
+                continue
+            heapq.heappop(_watchdog_heap)
+        _inject_soft(tid, gen)
+
+
+def _ensure_watchdog_started():
+    global _watchdog_started
+    if _watchdog_started:
+        return
+    with _watchdog_cond:
+        if not _watchdog_started:
+            _watchdog_started = True
+            t = threading.Thread(
+                target=_watchdog_loop, name="rupy-soft-timeout-watchdog", daemon=True
+            )
+            t.start()
+
+
+def _schedule_soft_timeout(tid, gen, soft_timeout_ms):
+    _ensure_watchdog_started()
+    deadline = time.monotonic() + soft_timeout_ms / 1000.0
+    with _watchdog_cond:
+        heapq.heappush(_watchdog_heap, (deadline, tid, gen))
+        _watchdog_cond.notify()
+
+
+def _inject_soft(tid, gen):
+    # M3 stale-timer guard: a deadline scheduled for a PREVIOUS task on this
+    # pool thread fires (from the watchdog heap) after that task already
+    # finished. Only inject if this thread is still on the generation that
+    # armed it -- otherwise the exception would land inside whatever task the
+    # thread has since moved on to. The watchdog does not (and structurally
+    # cannot cheaply) remove heap entries early, so EVERY scheduled deadline
+    # reaches this check; the generation compare is what makes that safe.
+    with _gen_lock:
+        if _thread_gen.get(tid, 0) != gen:
+            return
     _set_async_exc(ctypes.c_ulong(tid), ctypes.py_object(SoftTimeLimitExceeded))
 
 
 def run_sync(name, args_json, kwargs_json, soft_timeout_ms):
     try:
-        return json.dumps(_run_sync_inner(name, args_json, kwargs_json, soft_timeout_ms))
+        return _outcome_json(
+            _run_sync_inner(name, args_json, kwargs_json, soft_timeout_ms)
+        )
     except BaseException as e:  # late soft-timeout injection race, anything else
         try:
-            return json.dumps(_finish_exc(e))
+            return _outcome_json(_finish_exc(e))
         except Exception:
             return '{"ok": false, "retryable": true, "error": {"type": "WorkerShimError", "message": "shim failure", "traceback": ""}}'
 
@@ -163,28 +249,37 @@ def _run_sync_inner(name, args_json, kwargs_json, soft_timeout_ms):
         return {
             "ok": False,
             "retryable": False,
-            "error": {"type": "Unregistered", "message": "unknown task %s" % (name,), "traceback": ""},
+            "error": {
+                "type": "Unregistered",
+                "message": "unknown task %s" % (name,),
+                "traceback": "",
+            },
         }
     fn = getattr(td, "fn")
     args = json.loads(args_json)
     kwargs = json.loads(kwargs_json)
 
     tid = threading.get_ident()
-    timer = None
+    gen = _thread_gen.get(tid, 0)
     if soft_timeout_ms is not None and soft_timeout_ms > 0:
-        timer = threading.Timer(soft_timeout_ms / 1000.0, _inject_soft, (tid,))
-        timer.daemon = True
-        timer.start()
+        _schedule_soft_timeout(tid, gen, soft_timeout_ms)
     try:
         rv = fn(*args, **kwargs)
         out = _finish_value(rv)
     except BaseException as e:
         out = _finish_exc(e)
     finally:
-        if timer is not None:
-            timer.cancel()
-            # Clear a pending async exc that raced past cancel() (best effort).
-            _set_async_exc(ctypes.c_ulong(tid), None)
+        # Bump the generation (M3): fences off a watchdog deadline for THIS
+        # invocation (already scheduled above, if any) so it cannot land
+        # inside whatever task this thread picks up next. The residual window
+        # where the deadline fires after fn() returns but before this finally
+        # block runs -- flipping a successful execution into a
+        # SoftTimeLimitExceeded failure -- is inherent to
+        # PyThreadState_SetAsyncExc and not fixed by the generation counter
+        # (it is the SAME generation); documented in PROTOCOL.md §4.6.
+        with _gen_lock:
+            _thread_gen[tid] = gen + 1
+        _set_async_exc(ctypes.c_ulong(tid), None)
     return out
 
 
@@ -192,6 +287,7 @@ def _run_sync_inner(name, args_json, kwargs_json, soft_timeout_ms):
 # async execution (dedicated daemon threads running asyncio loops; completion
 # is pushed to Rust via the registered callback -> mpsc channel, no polling)
 # --------------------------------------------------------------------------
+
 
 def _loop_main(loop):
     asyncio.set_event_loop(loop)
@@ -203,8 +299,9 @@ def start_loops(n):
     with _loops_lock:
         for i in range(n):
             loop = asyncio.new_event_loop()
-            t = threading.Thread(target=_loop_main, args=(loop,),
-                                 name="rupy-aio-%d" % i, daemon=True)
+            t = threading.Thread(
+                target=_loop_main, args=(loop,), name="rupy-aio-%d" % i, daemon=True
+            )
             t.start()
             _loops.append(loop)
     return len(_loops)
@@ -223,7 +320,8 @@ def submit_async(token, name, args_json, kwargs_json, timeout_s):
         loop = _loops[_rr % len(_loops)]
         _rr += 1
     asyncio.run_coroutine_threadsafe(
-        _arun(token, name, args_json, kwargs_json, timeout_s), loop)
+        _arun(token, name, args_json, kwargs_json, timeout_s), loop
+    )
 
 
 async def _arun(token, name, args_json, kwargs_json, timeout_s):
@@ -233,7 +331,11 @@ async def _arun(token, name, args_json, kwargs_json, timeout_s):
             out = {
                 "ok": False,
                 "retryable": False,
-                "error": {"type": "Unregistered", "message": "unknown task %s" % (name,), "traceback": ""},
+                "error": {
+                    "type": "Unregistered",
+                    "message": "unknown task %s" % (name,),
+                    "traceback": "",
+                },
             }
         else:
             fn = getattr(td, "fn")
@@ -260,6 +362,6 @@ async def _arun(token, name, args_json, kwargs_json, timeout_s):
     cb = _callback
     if cb is not None:
         try:
-            cb(token, json.dumps(out))
+            cb(token, _outcome_json(out))
         except Exception:
             traceback.print_exc()

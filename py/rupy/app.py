@@ -4,11 +4,13 @@ Implements the client enqueue rules from PROTOCOL.md sections 2 and 3.
 The attribute names ``_tasks``, ``redis_url``, ``default_queue``,
 ``result_ttl``, ``idemp_ttl`` are read by the Rust worker (section 6).
 """
+
 from __future__ import annotations
 
 import json
 import os
 import re
+import threading
 import time
 import uuid
 from typing import Any, Callable
@@ -32,6 +34,23 @@ def _dumps(obj: Any) -> str:
     return json.dumps(obj, separators=(",", ":"), allow_nan=False)
 
 
+def _redact_redis_url(url: str) -> str:
+    """Mask ``user:password@`` userinfo before a redis URL reaches logs/repr.
+
+    ``redis://user:password@host/0`` is a common shape; without this the
+    password would appear in plaintext wherever ``repr(app)`` or a log line
+    includes ``redis_url`` (audit M4).
+    """
+    scheme_sep = url.find("://")
+    if scheme_sep == -1:
+        return url
+    after = url[scheme_sep + 3 :]
+    at = after.find("@")
+    if at == -1:
+        return url
+    return f"{url[:scheme_sep]}://***@{after[at + 1 :]}"
+
+
 class Rupy:
     """The application: holds config, the task registry, and a lazy Redis client."""
 
@@ -43,17 +62,27 @@ class Rupy:
         idemp_ttl: int = 86400,
     ) -> None:
         # Resolution order: explicit arg > env RUPY_REDIS_URL > default.
-        self.redis_url: str = redis_url or os.environ.get("RUPY_REDIS_URL") or _DEFAULT_REDIS_URL
+        self.redis_url: str = (
+            redis_url or os.environ.get("RUPY_REDIS_URL") or _DEFAULT_REDIS_URL
+        )
         self.default_queue: str = default_queue
         self.result_ttl: int = result_ttl
         self.idemp_ttl: int = idemp_ttl
         self._tasks: dict[str, TaskDef] = {}
         self._redis: redis.Redis | None = None
+        self._redis_lock = threading.Lock()
 
     def _get_redis(self) -> redis.Redis:
-        """Lazily create the redis-py client (no connection is made until first command)."""
+        """Lazily create the redis-py client (no connection is made until first command).
+
+        Double-checked locking (audit L6): without the lock, two threads
+        racing the first call could each build their own client, and one
+        pool would leak.
+        """
         if self._redis is None:
-            self._redis = redis.Redis.from_url(self.redis_url)
+            with self._redis_lock:
+                if self._redis is None:
+                    self._redis = redis.Redis.from_url(self.redis_url)
         return self._redis
 
     def task(
@@ -158,5 +187,5 @@ class Rupy:
     def __repr__(self) -> str:
         return (
             f"<Rupy default_queue={self.default_queue!r} "
-            f"tasks={len(self._tasks)} redis_url={self.redis_url!r}>"
+            f"tasks={len(self._tasks)} redis_url={_redact_redis_url(self.redis_url)!r}>"
         )

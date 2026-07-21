@@ -4,6 +4,7 @@ See PROTOCOL.md sections 4.2, 6 and 8. ``Retry`` and ``SoftTimeLimitExceeded``
 are part of the wire contract: the Rust worker matches them by the classes
 exposed as ``rupy.Retry`` / ``rupy.SoftTimeLimitExceeded``.
 """
+
 from __future__ import annotations
 
 
@@ -42,14 +43,14 @@ class TaskFailedError(Exception):
 
     def __init__(
         self,
-        type: str | None = None,
+        type_: str | None = None,
         message: str | None = None,
-        traceback: str | None = None,
+        traceback_: str | None = None,
     ) -> None:
-        super().__init__(type, message, traceback)
-        self.type = type
+        super().__init__(type_, message, traceback_)
+        self.type = type_
         self.message = message
-        self.traceback = traceback
+        self.traceback = traceback_
 
     def __str__(self) -> str:
         text = f"{self.type}: {self.message}"
