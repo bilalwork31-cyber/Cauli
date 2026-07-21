@@ -1,4 +1,5 @@
 """Test 4: AsyncResult against result JSONs written directly to redis (PROTOCOL.md section 8)."""
+
 from __future__ import annotations
 
 import json
@@ -29,7 +30,12 @@ def test_success(app, redis_client):
     _write_result(
         redis_client,
         ar.id,
-        {"status": "success", "result": {"n": 5, "ok": [1, 2]}, "error": None, "finished_at": 123},
+        {
+            "status": "success",
+            "result": {"n": 5, "ok": [1, 2]},
+            "error": None,
+            "finished_at": 123,
+        },
     )
     assert ar.status() == "success"
     assert ar.get(timeout=1) == {"n": 5, "ok": [1, 2]}
@@ -44,7 +50,11 @@ def test_failure_raises_taskfailederror_with_attrs(app, redis_client):
         {
             "status": "failure",
             "result": None,
-            "error": {"type": "ValueError", "message": "bad input", "traceback": "Traceback (most recent call last):\n..."},
+            "error": {
+                "type": "ValueError",
+                "message": "bad input",
+                "traceback": "Traceback (most recent call last):\n...",
+            },
             "finished_at": 123,
         },
     )
@@ -61,7 +71,9 @@ def test_failure_raises_taskfailederror_with_attrs(app, redis_client):
 def test_duplicate_returns_none_and_sets_flag(app, redis_client):
     ar = _ar(app)
     _write_result(
-        redis_client, ar.id, {"status": "duplicate", "result": None, "error": None, "finished_at": 123}
+        redis_client,
+        ar.id,
+        {"status": "duplicate", "result": None, "error": None, "finished_at": 123},
     )
     assert ar.duplicate is False
     assert ar.status() == "duplicate"
@@ -83,7 +95,9 @@ def test_get_polls_until_late_result_arrives(app, redis_client):
     def write_later():
         time.sleep(0.4)
         _write_result(
-            redis_client, ar.id, {"status": "success", "result": "late", "error": None, "finished_at": 1}
+            redis_client,
+            ar.id,
+            {"status": "success", "result": "late", "error": None, "finished_at": 1},
         )
 
     writer = threading.Thread(target=write_later)
@@ -93,4 +107,6 @@ def test_get_polls_until_late_result_arrives(app, redis_client):
         assert ar.get(timeout=5) == "late"
     finally:
         writer.join()
-    assert time.monotonic() - t0 >= 0.3, "get() must actually have waited for the result"
+    assert time.monotonic() - t0 >= 0.3, (
+        "get() must actually have waited for the result"
+    )

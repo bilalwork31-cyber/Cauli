@@ -1,4 +1,5 @@
 """Test 5: decorated tasks stay directly callable without a broker."""
+
 from __future__ import annotations
 
 import asyncio

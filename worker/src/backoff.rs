@@ -16,7 +16,13 @@ pub fn base_backoff_ms(attempt: u32, base_ms: u64, factor: f64, max_ms: u64) -> 
 
 /// Full §4.2 computation. If `jitter`: `d_ms = uniform(0.5 * d_ms, d_ms)`
 /// (jitter applied AFTER the max clamp, exactly as the formula reads).
-pub fn compute_backoff_ms(attempt: u32, base_ms: u64, factor: f64, max_ms: u64, jitter: bool) -> u64 {
+pub fn compute_backoff_ms(
+    attempt: u32,
+    base_ms: u64,
+    factor: f64,
+    max_ms: u64,
+    jitter: bool,
+) -> u64 {
     let d = base_backoff_ms(attempt, base_ms, factor, max_ms);
     let d = if jitter && d > 0.0 {
         rand::rng().random_range((0.5 * d)..=d)
@@ -62,13 +68,22 @@ mod tests {
         let mut max_seen = 0u64;
         for _ in 0..2_000 {
             let d = compute_backoff_ms(2, 1_000, 2.0, 60_000, true); // base d = 2000
-            assert!((1_000..=2_000).contains(&d), "jittered {d} out of [1000,2000]");
+            assert!(
+                (1_000..=2_000).contains(&d),
+                "jittered {d} out of [1000,2000]"
+            );
             min_seen = min_seen.min(d);
             max_seen = max_seen.max(d);
         }
         // with 2000 samples we should see spread across the range
-        assert!(min_seen < 1_200, "min_seen {min_seen} suggests jitter not spreading low");
-        assert!(max_seen > 1_800, "max_seen {max_seen} suggests jitter not spreading high");
+        assert!(
+            min_seen < 1_200,
+            "min_seen {min_seen} suggests jitter not spreading low"
+        );
+        assert!(
+            max_seen > 1_800,
+            "max_seen {max_seen} suggests jitter not spreading high"
+        );
     }
 
     #[test]
