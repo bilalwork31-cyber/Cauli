@@ -141,6 +141,20 @@ def cpu_slow(seconds=30.0):
     return "slow-done"
 
 
+def cpu_slow_pid(seconds=1.0):  # fake_exec: sleep then report pid/tid
+    time.sleep(float(seconds))
+    return {}
+
+
+def cpu_soft_slow(total=5.0):  # fake_exec: sliced sleep, soft-timeout target
+    time.sleep(float(total))
+    return "soft-done"
+
+
+def cpu_die_once(counter_file):  # fake_exec: os._exit(9) once, then "revived"
+    return "revived"
+
+
 class App:
     def __init__(self):
         self.redis_url = "redis://127.0.0.1:6392/0"
@@ -167,3 +181,6 @@ app.add(TaskDef("fx.soft_slow", soft_slow))
 app.add(TaskDef("fx.bad_return", bad_return))
 app.add(TaskDef("fx.cpu_echo", cpu_echo, kind="cpu"))
 app.add(TaskDef("fx.cpu_slow", cpu_slow, kind="cpu"))
+app.add(TaskDef("fx.cpu_slow_pid", cpu_slow_pid, kind="cpu"))
+app.add(TaskDef("fx.cpu_soft_slow", cpu_soft_slow, kind="cpu"))
+app.add(TaskDef("fx.cpu_die_once", cpu_die_once, kind="cpu"))

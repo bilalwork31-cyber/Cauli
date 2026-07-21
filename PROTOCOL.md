@@ -13,7 +13,9 @@ many Python tasks concurrently:
   asyncio event loop thread(s); sync io tasks on a Python thread pool (the GIL is released
   during blocking I/O by CPython itself).
 - **cpu tasks** run on a small pool of child Python processes (`python3 -m cauli._exec`),
-  sized to CPU cores, fed over a line delimited JSON pipe protocol.
+  sized to CPU cores, fed over a line delimited JSON protocol. By default the children are
+  forked from ONE preloaded, `gc.freeze()`-d fork-server parent (§5.1) so respawns are cheap
+  and the warmed import image is shared copy-on-write.
 
 Broker and result backend: Redis >= 7.0. At least once delivery via Redis Streams consumer
 groups. All timestamps are integer unix epoch **milliseconds** unless stated otherwise.
@@ -110,7 +112,8 @@ The wire format is plain JSON; clients MAY produce/parse it with any compliant J
   `XREADGROUP GROUP cauli {consumer} COUNT {batch} BLOCK 1000 STREAMS cauli:q:{q1} cauli:q:{q2} ... > > ...`
   Batch default 16. Only fetch when free execution slots exist (per class admission below;
   a simple global gate on io slots is acceptable but do not let cpu backlog starve io fetch
-  indefinitely: bound in-worker cpu backlog to `2 * cpu_workers` pending items).
+  indefinitely: bound in-worker cpu backlog to twice the cpu pool's in-flight capacity,
+  i.e. `2 * cpu_workers * cpu_child_threads` pending items).
 - Parse envelope from field `e`. Malformed JSON: XACK + XADD to DLQ with reason
   `"malformed"` (best effort raw payload in `e`), continue.
 - Unknown task name (not in registry): DLQ with reason `"unregistered"`, XACK. No retry.
@@ -257,9 +260,14 @@ would be strictly worse than running it; the worker logs a warning and proceeds.
   sync-io capacity is restored immediately rather than shrinking permanently. If the job was
   still queued (not yet dequeued) when its own hard timeout fired, a worker thread skips
   running it instead of executing it late with no one listening ("zombie execution").
-- cpu task: soft timeout enforced inside the child via SIGALRM raising
-  `cauli.SoftTimeLimitExceeded`; hard timeout enforced by the worker: SIGKILL the child,
-  respawn it, mark failure (retryable) with error type `"TimeoutError"`.
+- cpu task: soft timeout enforced inside the child: SIGALRM raising
+  `cauli.SoftTimeLimitExceeded` when the child executes single threaded
+  (`--cpu-child-threads 1`, and always in stdio fallback mode); with M > 1 worker threads a
+  shared watchdog thread injects it per request via `PyThreadState_SetAsyncExc` (SIGALRM only
+  ever fires in a process's main thread), with the same generation fencing and the same
+  residual injection race as the sync-io path above. Hard timeout enforced by the worker:
+  SIGKILL the child, replace it (a replacement fork in fork-server mode, a fresh spawn in
+  stdio mode), mark failure (retryable) with error type `"TimeoutError"`.
 
 ### 4.7 Graceful shutdown
 
@@ -274,27 +282,73 @@ exit immediately (code 130).
 - `--io-threads N` (default 64): Python thread pool for sync io tasks.
 - `--io-concurrency N` (default 256): max in flight io tasks total (semaphore, admission gate).
 - `--cpu-workers N` (default = cores): child processes for cpu tasks.
+- `--cpu-child-threads M` (default 1): worker threads per cpu child (fork-server mode); each
+  child accepts up to M requests in flight.
 
 ### 5.1 cpu child protocol (`python3 -m cauli._exec`)
 
-Spawn: `{python} -m cauli._exec --app {module:attr}`. Child imports the app, prints exactly one
-ready line on stdout: `{"ready": true, "pid": 1234}\n`, then reads requests line by line from
-stdin and answers one line per request on stdout. stderr is passthrough logging.
+Both modes below speak the same line delimited JSON request/response shapes; only the
+transport and the number of requests in flight differ.
 
 Request:  `{"id": "...", "task": "...", "args": [...], "kwargs": {...}, "soft_timeout_ms": null}\n`
 Response: `{"id": "...", "ok": true, "result": <json>}\n`
       or: `{"id": "...", "ok": false, "error": {"type": "...", "message": "...", "traceback": "..."}}\n`
       or: `{"id": "...", "ok": false, "retry": true, "countdown": <float|null>, "error": {...}}\n`
 
-The third shape is a forced retry (a task raised `cauli.Retry`, recognized per §4.2's duck-typed
-rule): `countdown` DOES cross the pipe (a float seconds value, or `null` to use the computed
+`id` is a worker chosen correlation string, echoed verbatim in the response (the worker uses
+`{envelope id}.{sequence}`; the child attaches no meaning to it). The third response shape is
+a forced retry (a task raised `cauli.Retry`, recognized per §4.2's duck-typed rule):
+`countdown` DOES cross the pipe (a float seconds value, or `null` to use the computed
 backoff) — it is not lost or unavailable here, despite what an earlier draft of this document
 and worker/ARCHITECTURE.md once claimed.
 
-One request in flight per child. Non JSON serializable result → treated as error
-`{"type": "SerializationError", ...}`. Child must never crash on task exceptions; it reports
-them. Worker kills/respawns child on hard timeout or child death (child death = task failure,
-retryable, error type `"WorkerLost"`).
+A non JSON serializable result → error `{"type": "SerializationError", ...}`. The child must
+never crash on task exceptions; it reports them. Child death mid-request = task failure,
+retryable, error type `"WorkerLost"`.
+
+#### Fork-server mode (default)
+
+The worker binds a unix stream socket listener at a private path and spawns ONE parent
+process per pool:
+
+`{python} -m cauli._exec --app {module:attr} --fork-server --connect {socket_path}
+--child-threads {M}`
+
+- The PARENT imports the app once, runs `gc.collect()` then `gc.freeze()` (the warmed import
+  image moves to the permanent GC generation, so children fork copy-on-write and their —
+  default, enabled — GC never scans or dirties frozen objects), prints exactly one line
+  `{"server": true, "pid": P}\n` on stdout, then serves its stdin/stdout control channel:
+  request `{"cmd": "fork"}\n` → `fork()` → reply `{"forked": <child_pid>}\n` (or
+  `{"error": "..."}\n` for a failed fork / unrecognized command). The parent reaps children
+  (SIGCHLD), exits 0 on stdin EOF, and sets `PR_SET_PDEATHSIG` so it dies with the worker.
+  App state created at import time is shared by ALL children of a parent; import-time side
+  effects that must not survive a fork (open connections, background threads) are the app
+  author's responsibility, the standard preload/fork caveat.
+- Each forked CHILD re-arms `PR_SET_PDEATHSIG` (fork clears it), connects to
+  `{socket_path}`, sends the ready line `{"ready": true, "pid": N, "concurrency": M}\n` over
+  that connection, then speaks the request/response protocol on it. Up to the advertised
+  concurrency requests may be in flight per child; responses may arrive out of order and are
+  matched by `id`. Soft timeout inside the child: SIGALRM when M = 1; a watchdog thread +
+  `PyThreadState_SetAsyncExc` per request when M > 1 (§4.6). Socket EOF → child exits 0.
+- The worker maintains `--cpu-workers` serving children by requesting forks (a replacement
+  is requested whenever a child dies or is killed — respawns are cheap: no re-import). Hard
+  timeout of any in flight request: SIGKILL the child by pid, fail that request as
+  `"TimeoutError"`, fail the child's other in flight requests as `"WorkerLost"` (retryable),
+  request a replacement fork. If the parent's control channel fails mid-run, the worker
+  respawns the parent (its children died with it via PDEATHSIG and are re-forked).
+- stderr of the parent and of every child is passthrough logging.
+
+#### Stdio mode (fallback)
+
+Entered with `--no-fork-server`, or automatically when fork-server startup fails (listener
+bind failure, parent spawn failure, or no `{"server": ...}` line within the handshake
+timeout).
+
+Spawn per child: `{python} -m cauli._exec --app {module:attr}`. Each child imports the app
+itself, prints exactly one ready line on stdout: `{"ready": true, "pid": 1234}\n`, then reads
+requests line by line from stdin and answers one line per request on stdout, ONE request in
+flight per child. stderr is passthrough logging. Soft timeout via SIGALRM. Worker
+kills/respawns the child on hard timeout or child death (each respawn re-imports the app).
 
 ## 6. Python public API (`py/`)
 
@@ -356,6 +410,7 @@ inline, no queue) so the same code is testable without a broker.
 ```
 cauli-worker --app myproj.tasks:app [--queues default,emails] [--redis-url URL]
             [--io-loops 1] [--io-threads 64] [--io-concurrency 256] [--cpu-workers N]
+            [--cpu-child-threads 1] [--no-fork-server]
             [--batch 16] [--visibility-timeout 60] [--max-envelope-bytes 1048576]
             [--drain-timeout 30] [--python python3] [--stats-interval 10] [--log-level info]
 ```
@@ -369,6 +424,8 @@ cauli-worker --app myproj.tasks:app [--queues default,emails] [--redis-url URL]
   would mean "unlimited" to Redis's `XREADGROUP COUNT`, and `--visibility-timeout 0` would make
   the recovery loop (§4.4) reclaim every currently-executing task on nearly every tick.
 - `--max-envelope-bytes` (default 1 MiB): see §2.
+- `--cpu-child-threads` (default 1): per-child request concurrency, `--no-fork-server`:
+  force the stdio child mode — both per §5.1.
 - `--stats-interval`: seconds between one line stats logs:
   `stats: fetched=N ok=N failed=N retried=N dlq=N inflight_io=N inflight_cpu=N rss_mb=N
   sync_live=N sync_abandoned=N pending_async=N`. `sync_live` is the sync-io thread pool's
