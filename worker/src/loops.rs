@@ -37,7 +37,11 @@ pub async fn fetch_loop(ctx: Arc<Ctx>, mut fetch_conn: redis::aio::ConnectionMan
             };
         let Some(reply) = reply else { continue };
         for sk in reply.keys {
-            let queue = sk.key.strip_prefix("rupy:q:").unwrap_or(&sk.key).to_string();
+            let queue = sk
+                .key
+                .strip_prefix("rupy:q:")
+                .unwrap_or(&sk.key)
+                .to_string();
             for entry in sk.ids {
                 let raw = entry
                     .map
@@ -67,6 +71,18 @@ pub async fn mover_loop(ctx: Arc<Ctx>) {
 }
 
 /// §4.4 recovery: every visibility_timeout/2 per queue.
+///
+/// H1 fix: `--visibility-timeout` is a FLOOR, not the reclaim threshold for
+/// every task. XPENDING IDLE uses it to shortlist candidates, but before
+/// actually reclaiming (XCLAIM) any of them we peek the envelope (read-only;
+/// does not touch the PEL) and require idle >= max(visibility_timeout_ms,
+/// envelope.timeout_ms + grace). Without this, a single worker running a
+/// legitimate long task (timeout_ms > visibility_timeout) would XCLAIM its
+/// OWN in-flight entry and execute it a second time, concurrently, in the
+/// same process — a production trap with the documented defaults (60s
+/// visibility vs 300s default task timeout). Unparseable envelopes fall back
+/// to the visibility_timeout floor alone (best we can do without knowing
+/// their real timeout).
 pub async fn recovery_loop(ctx: Arc<Ctx>) {
     let vt_ms = ctx.args.visibility_timeout * 1000;
     let period = Duration::from_millis((vt_ms / 2).max(500));
@@ -87,6 +103,32 @@ pub async fn recovery_loop(ctx: Arc<Ctx>) {
                 }
             };
             for (entry_id, _consumer, idle, delivery_count) in pend {
+                let peeked = match broker::peek_entry(&mut conn, q, &entry_id).await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        warn!(queue = %q, entry = %entry_id, "peek (XRANGE) failed: {e}");
+                        continue;
+                    }
+                };
+                let Some(raw_opt) = peeked else {
+                    continue; // entry vanished (acked/claimed elsewhere) since XPENDING
+                };
+                let parsed = raw_opt
+                    .as_deref()
+                    .and_then(|r| serde_json::from_str::<Envelope>(r).ok());
+                let required_idle_ms = match &parsed {
+                    Some(env) => vt_ms.max(
+                        env.timeout_ms
+                            .saturating_add(crate::exec::BACKSTOP_GRACE_MS),
+                    ),
+                    None => vt_ms,
+                };
+                if idle < required_idle_ms {
+                    // Still within its own timeout budget: legitimately
+                    // running, not stuck. Do not reclaim yet.
+                    continue;
+                }
+
                 let claimed =
                     match broker::xclaim_entry(&mut conn, q, &ctx.consumer, vt_ms, &entry_id).await
                     {
@@ -97,9 +139,6 @@ pub async fn recovery_loop(ctx: Arc<Ctx>) {
                             continue;
                         }
                     };
-                let parsed = claimed
-                    .as_deref()
-                    .and_then(|r| serde_json::from_str::<Envelope>(r).ok());
                 let limit = redelivery_limit(parsed.as_ref());
                 if delivery_count > limit {
                     warn!(
@@ -113,12 +152,11 @@ pub async fn recovery_loop(ctx: Arc<Ctx>) {
                         claimed.as_deref().unwrap_or(""),
                         "redelivery_limit",
                         None,
-                        None,
                     )
                     .await;
                 } else {
                     info!(
-                        queue = %q, entry = %entry_id, idle, delivery_count,
+                        queue = %q, entry = %entry_id, idle, delivery_count, required_idle_ms,
                         "claimed pending entry; re-executing"
                     );
                     // Same code path as a fresh delivery; retries NOT incremented.
@@ -129,12 +167,25 @@ pub async fn recovery_loop(ctx: Arc<Ctx>) {
     }
 }
 
-/// §7 stats line every --stats-interval seconds.
+/// §7 stats line every --stats-interval seconds. `sync_live`/`sync_abandoned`
+/// (H2) make sync-pool thread loss observable instead of a silent capacity
+/// drip: sync_live is the pool's current thread count (initial + spawned
+/// replacements), sync_abandoned is the cumulative count of hard-timeout
+/// abandonments that triggered a replacement. `pending_async` (MEM-1) is the
+/// async runtime's pending-completion map size; a number that only grows
+/// signals a wedged event-loop thread even though `cancel` stops the
+/// Rust-side bookkeeping from leaking on its own.
 pub async fn stats_loop(ctx: Arc<Ctx>) {
     let mut tick = tokio::time::interval(Duration::from_secs(ctx.args.stats_interval.max(1)));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tick.tick().await;
-        info!("{}", ctx.counters.stats_line());
+        info!(
+            "{} sync_live={} sync_abandoned={} pending_async={}",
+            ctx.counters.stats_line(),
+            ctx.sync_pool.live_threads.load(Ordering::Relaxed),
+            ctx.sync_pool.abandoned.load(Ordering::Relaxed),
+            ctx.pyrt.pending_len()
+        );
     }
 }
