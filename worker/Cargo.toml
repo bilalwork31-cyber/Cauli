@@ -31,8 +31,8 @@ serde_json = "1"
 # rt-multi-thread/macros (runtime + tokio::spawn + #[tokio::test]), sync
 # (oneshot/watch/Semaphore), time (timeout/interval/sleep), io-util
 # (AsyncBufReadExt/AsyncWriteExt/BufReader), process (child processes),
-# signal (SIGTERM/SIGINT handling).
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "process", "signal"] }
+# signal (SIGTERM/SIGINT handling), net (UnixListener for the cpu fork server).
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "process", "signal", "net"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

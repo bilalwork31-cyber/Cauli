@@ -34,6 +34,34 @@ def sleepy(seconds):
     return "done"
 
 
+@app.task(name="sleepy_slices", kind="cpu")
+def sleepy_slices(seconds):
+    # Sliced sleep: an injected async exception (threaded soft timeout via
+    # PyThreadState_SetAsyncExc) only lands between bytecodes, never inside
+    # one long C-level time.sleep call.
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        time.sleep(0.02)
+    return "done"
+
+
+@app.task(name="pidinfo", kind="cpu")
+def pidinfo():
+    import os
+    import threading
+
+    return {"pid": os.getpid(), "tid": threading.get_ident()}
+
+
+@app.task(name="freeze_count", kind="cpu")
+def freeze_count():
+    # In a fork-server child this must be > 0: the parent froze its warmed
+    # import image before forking (gc.freeze -> permanent generation).
+    import gc
+
+    return gc.get_freeze_count()
+
+
 @app.task(name="retryme", kind="cpu")
 def retryme(countdown=None):
     raise Retry(countdown)

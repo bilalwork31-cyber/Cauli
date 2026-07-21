@@ -137,12 +137,20 @@ pub async fn run_async_task(ctx: &Arc<Ctx>, env: &Envelope) -> Outcome {
     }
 }
 
-/// Cpu task via the child pool (§5.1). Backlog is a bounded channel of
-/// 2 * cpu_workers; when full, this dispatch task blocks on send while the
-/// fetch loop pauses via the overflow counter.
+/// Cpu task via the child pool (§5.1). Backlog is a bounded channel sized to
+/// twice the pool's in-flight capacity; when full, this dispatch task blocks
+/// on send while the fetch loop pauses via the overflow counter.
 pub async fn run_cpu_task(ctx: &Arc<Ctx>, env: &Envelope) -> Outcome {
+    // Wire correlation id: envelope id + a process-unique suffix. Fork-server
+    // children can have several requests in flight and answer out of order,
+    // so responses are matched by this id; the suffix keeps it unique even if
+    // the same envelope id is ever in flight twice (crafted duplicates, §4.4
+    // races). The Rust side never parses meaning out of it, and result keys
+    // always use the envelope id, never this.
+    static CPU_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let wire_id = format!("{}.{:x}", env.id, CPU_SEQ.fetch_add(1, Ordering::Relaxed));
     let req = serde_json::json!({
-        "id": env.id,
+        "id": wire_id,
         "task": env.task,
         // env.args/kwargs directly (Value), not a serialize-then-reparse
         // round trip through the *_json() string helpers (audit nit).
@@ -153,6 +161,7 @@ pub async fn run_cpu_task(ctx: &Arc<Ctx>, env: &Envelope) -> Outcome {
     .to_string();
     let (tx, rx) = oneshot::channel();
     let job = crate::cpu::CpuJob {
+        id: wire_id,
         req_line: req,
         timeout_ms: env.timeout_ms,
         resp: tx,

@@ -13,7 +13,7 @@ against Redis Streams per PROTOCOL.md. Module map:
 | `src/ctx.rs` | shared context, executor response -> Outcome normalization |
 | `src/pyrt.rs` | pyo3 glue: interpreter init, shim import, sync io thread pool, async submit bridge |
 | `src/shim.py` | embedded Python shim (include_str!): app loading, run_sync, asyncio loops, soft-timeout watchdog |
-| `src/cpu.rs` | §5.1 child process pool, kill+respawn, `CAULI_EXEC_CMD` test hook |
+| `src/cpu.rs` | §5.1 cpu pool: fork-server (unix socket, multiplexed) + stdio fallback, kill+respawn, `CAULI_EXEC_CMD` test hook |
 | `src/broker.rs` | Redis key layout, group setup, mover Lua, pipelined completion writes |
 | `src/envelope.rs` | §2 envelope (unknown-field preserving), §8 result/error JSON, redelivery limit |
 | `src/backoff.rs` | §4.2 backoff math (jitter after clamp) |
@@ -57,21 +57,40 @@ against Redis Streams per PROTOCOL.md. Module map:
   executed late ("zombie execution") when a thread reaches it, and a hard
   timeout spawns a replacement thread immediately so pool capacity is
   restored even though the wedged original thread can never be killed.
-- **Cpu pool** (`--cpu-workers`): children `{python} -m cauli._exec --app {spec}`,
-  line-delimited JSON, one in-flight per child, ready-line handshake, SIGKILL +
-  respawn on hard timeout ("TimeoutError") or death ("WorkerLost"), both
-  retryable. Children get `PR_SET_PDEATHSIG=SIGKILL` so a SIGKILLed worker
-  cannot leak them; remaining children are killed on exit paths (skipping any
-  tracked pid of 0, which would otherwise signal this process's own group).
+- **Cpu pool** (`--cpu-workers`, `--cpu-child-threads`): fork-server mode by
+  default (§5.1). ONE parent (`{python} -m cauli._exec --app {spec}
+  --fork-server --connect {sock} --child-threads {M}`) imports the app once,
+  `gc.collect()` + `gc.freeze()`, then forks a child per `{"cmd":"fork"}`
+  control line; children connect to the worker's tokio `UnixListener`, send
+  `{"ready": true, "pid", "concurrency"}` and serve the line protocol on the
+  socket. Per child, one `serve_child` task multiplexes up to `concurrency`
+  requests (pending map keyed by wire id, per-request hard-timeout deadlines
+  via a single earliest-deadline sleep in the select loop). Hard timeout:
+  SIGKILL by pid, expired requests fail "TimeoutError", the rest "WorkerLost"
+  (both retryable), then a replacement fork (cheap: no re-import). Child
+  death (socket EOF): all in flight "WorkerLost" + replacement fork. Parent
+  control-channel failure mid-run: parent respawned with 1s backoff (its
+  children died via PDEATHSIG; slots re-request forks). Fork-server startup
+  failure (bind/spawn/handshake) falls back to **stdio mode** — also forced
+  by `--no-fork-server`: spawn per child, one in flight over stdin/stdout,
+  SIGKILL + full respawn on hard timeout or death (the pre-fork-server
+  behavior, preserved verbatim). The parent and children carry
+  `PR_SET_PDEATHSIG=SIGKILL` (children re-arm it after fork since fork clears
+  it) so a SIGKILLed worker cannot leak them; remaining executor pids are
+  killed on exit paths (skipping any tracked pid <= 1, which would otherwise
+  signal this process's own group) and the listener socket file is removed.
   **Test hook:** env `CAULI_EXEC_CMD` (whitespace-split argv) replaces the child
-  command verbatim, used by e2e to run `tests/fixtures/fake_exec.py`. Compiled
-  in only under `cfg(test)` / the `test-hooks` cargo feature -- a normal
-  `cargo build --release` has no code path that reads this env var.
+  command verbatim (fork-server flags are appended to the override argv),
+  used by e2e to run `tests/fixtures/fake_exec.py`, which implements both
+  modes. Compiled in only under `cfg(test)` / the `test-hooks` cargo feature
+  -- a normal `cargo build --release` has no code path that reads this env
+  var.
 
 ## Admission / backpressure
 
 Global io semaphore `--io-concurrency` gates io execution. Cpu backlog is a
-bounded channel of `2 * cpu_workers`; a dispatch that finds it full parks on
+bounded channel of `2 * cpu_workers * cpu_child_threads` (twice the pool's
+in-flight capacity); a dispatch that finds it full parks on
 `send().await` and raises an overflow flag. The fetch loop only issues
 XREADGROUP when io permits exist AND overflow == 0. Io fetch can therefore
 pause while a cpu flood drains, but never indefinitely: cpu children always

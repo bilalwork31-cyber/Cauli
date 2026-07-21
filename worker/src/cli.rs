@@ -32,6 +32,17 @@ pub struct Args {
     #[arg(long)]
     pub cpu_workers: Option<usize>,
 
+    /// Worker threads per cpu child (fork-server mode). M > 1 pipelines up
+    /// to M requests per child; responses are matched by id (PROTOCOL §5.1)
+    #[arg(long, default_value_t = 1)]
+    pub cpu_child_threads: usize,
+
+    /// Disable the fork-server cpu child model: spawn each child directly
+    /// over stdio, one request in flight per child (PROTOCOL §5.1 fallback
+    /// mode). Also entered automatically if fork-server startup fails
+    #[arg(long, default_value_t = false)]
+    pub no_fork_server: bool,
+
     /// XREADGROUP COUNT per fetch. Must be >= 1: 0 would mean "unlimited" to
     /// Redis (audit M8); enforced in main.rs after parsing (exit 1).
     #[arg(long, default_value_t = 16)]
@@ -87,6 +98,8 @@ mod tests {
         assert_eq!(a.io_threads, 64);
         assert_eq!(a.io_concurrency, 256);
         assert_eq!(a.cpu_workers, None);
+        assert_eq!(a.cpu_child_threads, 1);
+        assert!(!a.no_fork_server);
         assert_eq!(a.batch, 16);
         assert_eq!(a.visibility_timeout, 60);
         assert_eq!(a.max_envelope_bytes, 1_048_576);

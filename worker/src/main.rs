@@ -165,10 +165,19 @@ async fn run_worker(
         std::process::id()
     );
     let io_concurrency = args.io_concurrency.max(1);
+    let cpu_pool = cpu::start(
+        cpu_workers,
+        args.cpu_child_threads,
+        &args.python,
+        &args.app,
+        args.no_fork_server,
+        counters.clone(),
+    )
+    .await;
     let ctx = Arc::new(Ctx {
         io_sem: Arc::new(tokio::sync::Semaphore::new(io_concurrency)),
         sync_pool: pyrt::SyncPool::start(pyrt.clone(), args.io_threads, io_concurrency),
-        cpu: cpu::start(cpu_workers, &args.python, &args.app, counters.clone()),
+        cpu: cpu_pool,
         registry: appcfg.tasks,
         redis: write_conn,
         counters,
