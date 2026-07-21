@@ -18,8 +18,22 @@ pub fn dlq_key(queue: &str) -> String {
 pub fn result_key(id: &str) -> String {
     format!("rupy:result:{id}")
 }
+/// Deterministic FNV-1a 64-bit hash, hex-encoded. Folds an app-supplied
+/// idempotency_key (arbitrary length/charset — attacker/app controlled per
+/// audit M1) into a bounded, redis-key-safe token: neutralizes cluster
+/// hash-tag injection (`{...}`) and unbounded key-size DoS. Not cryptographic;
+/// callers only need stability across workers, not adversarial resistance.
+fn fnv1a_hex(s: &str) -> String {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in s.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    format!("{h:016x}")
+}
+
 pub fn idemp_key(key: &str) -> String {
-    format!("rupy:idemp:{key}")
+    format!("rupy:idemp:{}", fnv1a_hex(key))
 }
 
 /// PROTOCOL §4.3 delayed mover script (verbatim).
@@ -68,23 +82,55 @@ pub async fn run_mover(
     Ok(n)
 }
 
-/// §4.5 idempotency guard. Returns true if this task claimed the key (execute),
-/// false if the key already exists (duplicate).
+/// §4.5 idempotency guard outcome.
+#[derive(Debug, PartialEq, Eq)]
+pub enum IdempClaim {
+    /// Fresh claim: no one held the key. Execute.
+    Fresh,
+    /// The key is already held by THIS task's own id (a retry re-enqueues the
+    /// same id, and a crash-redelivered claim per §4.4 does too). This is our
+    /// own earlier claim, not someone else's: proceed with execution (fixes
+    /// audit C1 — without this, a task's own retry finds its own claim and
+    /// silently resolves as "duplicate" forever, so retry + idempotency_key
+    /// could never be used together).
+    MineAgain,
+    /// The key is held by a DIFFERENT task id: a genuine duplicate.
+    Duplicate,
+}
+
+/// §4.5 idempotency guard. Atomic via a single Lua script: `SET NX`, and on
+/// failure `GET` the existing value to distinguish "my own claim" (proceed)
+/// from "someone else's claim" (duplicate) — see `IdempClaim`.
+const IDEMP_CLAIM_LUA: &str = r#"
+local ok = redis.call('SET', KEYS[1], ARGV[1], 'NX', 'EX', ARGV[2])
+if ok then
+  return 1
+end
+local cur = redis.call('GET', KEYS[1])
+if cur == ARGV[1] then
+  return 2
+end
+return 0
+"#;
+
 pub async fn idemp_claim(
     conn: &mut ConnectionManager,
     key: &str,
     task_id: &str,
     ttl_s: u64,
-) -> Result<bool> {
-    let r: Option<String> = redis::cmd("SET")
-        .arg(idemp_key(key))
+) -> Result<IdempClaim> {
+    let script = redis::Script::new(IDEMP_CLAIM_LUA);
+    let code: i64 = script
+        .key(idemp_key(key))
         .arg(task_id)
-        .arg("NX")
-        .arg("EX")
         .arg(ttl_s)
-        .query_async(conn)
+        .invoke_async(conn)
         .await?;
-    Ok(r.is_some())
+    Ok(match code {
+        1 => IdempClaim::Fresh,
+        2 => IdempClaim::MineAgain,
+        _ => IdempClaim::Duplicate,
+    })
 }
 
 /// §4.1 success: [SET result EX ttl]? + XACK + XDEL, one pipeline.
@@ -209,6 +255,38 @@ pub async fn xpending_idle(
     Ok(r)
 }
 
+/// §4.4 (H1) non-destructive peek at one pending entry's envelope: XRANGE by
+/// exact id does not touch the PEL (no idle-time reset, no delivery_count
+/// bump, no ownership change) — unlike XCLAIM. Used to read an entry's own
+/// `timeout_ms` BEFORE deciding whether it is actually stuck (idle long
+/// enough relative to ITS OWN timeout, not just the visibility_timeout
+/// floor) so a legitimately still-running long task is never reclaimed out
+/// from under itself. Returns None if the entry no longer exists (already
+/// acked/claimed elsewhere); Some(None) if it exists but has no `e` field.
+pub async fn peek_entry(
+    conn: &mut ConnectionManager,
+    queue: &str,
+    entry_id: &str,
+) -> Result<Option<Option<String>>> {
+    use redis::streams::StreamRangeReply;
+    let reply: StreamRangeReply = redis::cmd("XRANGE")
+        .arg(q_key(queue))
+        .arg(entry_id)
+        .arg(entry_id)
+        .query_async(conn)
+        .await?;
+    for id in reply.ids {
+        if id.id == entry_id {
+            let raw = id
+                .map
+                .get("e")
+                .and_then(|v| redis::from_redis_value::<String>(v).ok());
+            return Ok(Some(raw));
+        }
+    }
+    Ok(None)
+}
+
 /// §4.4 XCLAIM one entry; returns the envelope field `e` if the claim
 /// succeeded and the entry still exists (None means someone else won or the
 /// entry vanished). The raw payload is returned even if it is not valid JSON.
@@ -238,4 +316,35 @@ pub async fn xclaim_entry(
         }
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn idemp_key_is_deterministic_and_bounded() {
+        // M1: same input -> same key, always, regardless of process/host
+        // (idempotency must agree across workers).
+        assert_eq!(idemp_key("order-42"), idemp_key("order-42"));
+        assert_ne!(idemp_key("order-42"), idemp_key("order-43"));
+
+        // Bounded length regardless of input size or content (neutralizes
+        // key-size DoS and cluster hash-tag injection via `{...}`).
+        let huge = "x".repeat(1_000_000);
+        let hostile = "{tag}".repeat(1000);
+        for input in ["", "a", "order-42", &huge, &hostile] {
+            let k = idemp_key(input);
+            assert!(k.starts_with("rupy:idemp:"));
+            assert_eq!(
+                k.len(),
+                "rupy:idemp:".len() + 16,
+                "hash must be a fixed 16 hex chars"
+            );
+            assert!(
+                !k.contains('{') && !k.contains('}'),
+                "no hash-tag characters may survive"
+            );
+        }
+    }
 }

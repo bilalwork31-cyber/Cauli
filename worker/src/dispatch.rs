@@ -1,7 +1,7 @@
 //! Per-entry dispatch: parse -> idempotency -> route -> execute -> finish.
 
 use crate::broker;
-use crate::ctx::{now_ms, Ctx, Outcome};
+use crate::ctx::{now_ms, Ctx, DecrGuard, Outcome};
 use crate::envelope::{self, Envelope, ErrorJson};
 use crate::exec;
 use std::sync::atomic::Ordering;
@@ -14,35 +14,60 @@ pub fn spawn_dispatch(ctx: Arc<Ctx>, queue: String, stream_id: String, raw: Opti
     ctx.counters.fetched.fetch_add(1, Ordering::Relaxed);
     ctx.counters.inflight_total.fetch_add(1, Ordering::SeqCst);
     tokio::spawn(async move {
+        // Panic-safe (MEM-3/H3): a panic anywhere in `process` must still
+        // release this slot, or `inflight_total` never reaches 0 and every
+        // shutdown burns the full --drain-timeout.
+        let _guard = DecrGuard(&ctx.counters.inflight_total);
         process(&ctx, &queue, &stream_id, raw).await;
-        ctx.counters.inflight_total.fetch_sub(1, Ordering::SeqCst);
     });
+}
+
+/// Task id charset per PROTOCOL §2 ("32 char lowercase hex"). Rejecting
+/// anything else worker-side (audit M1) stops a crafted `id` from colliding
+/// with / overwriting another task's `rupy:result:{id}` key, from carrying
+/// cluster hash-tags (`{...}`), or from being a key-size DoS.
+fn valid_task_id(id: &str) -> bool {
+    id.len() == 32
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 async fn process(ctx: &Arc<Ctx>, queue: &str, sid: &str, raw: Option<String>) {
     let raw = match raw {
         Some(r) => r,
-        None => return dlq_terminal(ctx, queue, sid, "", "malformed", None, None).await,
+        None => return dlq_terminal(ctx, queue, sid, "", "malformed", None).await,
     };
+    // M2: bound parse/amplification cost before serde ever sees the payload.
+    if raw.len() > ctx.args.max_envelope_bytes {
+        let preview = envelope::safe_truncate(&raw, 4096);
+        warn!(
+            len = raw.len(),
+            cap = ctx.args.max_envelope_bytes,
+            "envelope exceeds max size -> DLQ"
+        );
+        return dlq_terminal(ctx, queue, sid, preview, "malformed", None).await;
+    }
     let env = match serde_json::from_str::<Envelope>(&raw) {
-        Ok(e) if !e.id.is_empty() && !e.task.is_empty() => e,
-        _ => return dlq_terminal(ctx, queue, sid, &raw, "malformed", None, None).await,
+        Ok(e) if !e.id.is_empty() && !e.task.is_empty() && valid_task_id(&e.id) => e,
+        _ => return dlq_terminal(ctx, queue, sid, &raw, "malformed", None).await,
     };
     let Some(spec) = ctx.registry.get(&env.task).cloned() else {
         debug!(task = %env.task, id = %env.id, "unregistered task -> DLQ");
-        return dlq_terminal(ctx, queue, sid, &raw, "unregistered", None, None).await;
+        return dlq_terminal(ctx, queue, sid, &raw, "unregistered", None).await;
     };
 
     // §4.5 idempotency guard, claimed at execution start.
     if let Some(key) = env.idempotency_key.clone() {
         let mut conn = ctx.redis.clone();
         match broker::idemp_claim(&mut conn, &key, &env.id, ctx.idemp_ttl).await {
-            Ok(true) => {}
-            Ok(false) => {
+            Ok(broker::IdempClaim::Fresh) | Ok(broker::IdempClaim::MineAgain) => {}
+            Ok(broker::IdempClaim::Duplicate) => {
                 let rj = envelope::result_duplicate(now_ms());
                 let store = env.store_result.then_some(rj.as_str());
                 if let Err(e) =
-                    broker::finish_duplicate(&mut conn, queue, sid, &env.id, store, ctx.result_ttl).await
+                    broker::finish_duplicate(&mut conn, queue, sid, &env.id, store, ctx.result_ttl)
+                        .await
                 {
                     error!(id = %env.id, "duplicate finish write failed: {e}");
                 }
@@ -51,6 +76,7 @@ async fn process(ctx: &Arc<Ctx>, queue: &str, sid: &str, raw: Option<String>) {
             }
             Err(e) => {
                 // Fail open: at-least-once semantics allow execution; log it.
+                // (PROTOCOL §4.5 documents this as an explicit, deliberate choice.)
                 warn!(id = %env.id, "idempotency SET failed ({e}); executing anyway");
             }
         }
@@ -119,7 +145,13 @@ async fn schedule_retry(
             env.jitter,
         )
     });
-    let fire_at = now_ms() + d_ms;
+    // saturating_add: H3 — an attacker-chosen backoff_max_ms/countdown near
+    // u64::MAX must not wrap fire_at to a tiny score (which would fire the
+    // retry immediately, hot-looping until max_retries).
+    let fire_at = now_ms().saturating_add(d_ms);
+    // Infallible: `env` round-tripped through serde_json moments ago (parsed
+    // from valid JSON, so no NaN/Infinity survived), so re-serializing it
+    // cannot fail.
     let ej = serde_json::to_string(env).expect("envelope serialize");
     if let Err(e) = broker::finish_retry(conn, queue, sid, &ej, fire_at).await {
         error!(id = %env.id, "retry write failed: {e}");
@@ -138,12 +170,14 @@ async fn final_failure(
     err: &ErrorJson,
     now: u64,
 ) {
+    // Infallible: same reasoning as schedule_retry above.
     let ej = serde_json::to_string(env).expect("envelope serialize");
     let rj = envelope::result_failure(err, now);
     let result = env
         .store_result
         .then_some((env.id.as_str(), rj.as_str(), ctx.result_ttl));
-    if let Err(e) = broker::finish_dlq(conn, queue, sid, &ej, "max_retries", Some(err), result).await
+    if let Err(e) =
+        broker::finish_dlq(conn, queue, sid, &ej, "max_retries", Some(err), result).await
     {
         error!(id = %env.id, "dlq write failed: {e}");
     }
@@ -160,11 +194,33 @@ pub async fn dlq_terminal(
     raw_e: &str,
     reason: &str,
     err: Option<&ErrorJson>,
-    _unused: Option<()>,
 ) {
     let mut conn = ctx.redis.clone();
     if let Err(e) = broker::finish_dlq(&mut conn, queue, sid, raw_e, reason, err, None).await {
         error!(reason, "terminal dlq write failed: {e}");
     }
     ctx.counters.dlq.fetch_add(1, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn valid_task_id_accepts_32_lowercase_hex() {
+        assert!(valid_task_id("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
+        assert!(valid_task_id("0123456789abcdef0123456789abcdef"));
+    }
+
+    #[test]
+    fn valid_task_id_rejects_malformed_ids() {
+        assert!(!valid_task_id(""));
+        assert!(!valid_task_id("too-short"));
+        assert!(!valid_task_id(&"a".repeat(33))); // too long
+        assert!(!valid_task_id(&"a".repeat(31))); // too short
+        assert!(!valid_task_id(&"A".repeat(32))); // uppercase rejected
+        assert!(!valid_task_id(&"g".repeat(32))); // right length, non-hex letter
+                                                  // right length, one invalid char (hash-tag injection attempt)
+        assert!(!valid_task_id(&format!("{{{}", "a".repeat(31))));
+    }
 }
