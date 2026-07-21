@@ -4,6 +4,7 @@ The attribute names on :class:`TaskDef` are a wire contract (PROTOCOL.md
 section 6): the Rust worker reads them via ``getattr`` through the embedded
 interpreter. Do not rename them.
 """
+
 from __future__ import annotations
 
 import inspect
@@ -45,9 +46,13 @@ class TaskDef:
         if kind is None:
             kind = "io"
         if kind not in _VALID_KINDS:
-            raise ValueError(f"invalid task kind {kind!r}: must be one of {_VALID_KINDS}")
+            raise ValueError(
+                f"invalid task kind {kind!r}: must be one of {_VALID_KINDS}"
+            )
         timeout_ms = int(round(timeout * 1000))
-        soft_timeout_ms = None if soft_timeout is None else int(round(soft_timeout * 1000))
+        soft_timeout_ms = (
+            None if soft_timeout is None else int(round(soft_timeout * 1000))
+        )
         if soft_timeout_ms is not None and soft_timeout_ms >= timeout_ms:
             raise ValueError(
                 f"soft_timeout ({soft_timeout}s) must be strictly less than timeout ({timeout}s)"

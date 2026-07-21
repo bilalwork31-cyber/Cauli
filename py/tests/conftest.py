@@ -14,7 +14,9 @@ REDIS_URL = f"redis://127.0.0.1:{REDIS_PORT}/0"
 
 
 def _try_connect(url: str) -> redis_lib.Redis | None:
-    client = redis_lib.Redis.from_url(url, socket_connect_timeout=0.25, socket_timeout=5)
+    client = redis_lib.Redis.from_url(
+        url, socket_connect_timeout=0.25, socket_timeout=5
+    )
     try:
         client.ping()
     except Exception:

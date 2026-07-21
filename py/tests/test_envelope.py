@@ -1,4 +1,5 @@
 """Test 1: delay() XADDs a single-field 'e' envelope matching PROTOCOL.md section 2 exactly."""
+
 from __future__ import annotations
 
 import json
@@ -26,7 +27,9 @@ def test_delay_xadds_exact_envelope(app, redis_client):
     assert set(fields.keys()) == {b"e"}, "stream entry must have exactly one field 'e'"
 
     env = json.loads(fields[b"e"])
-    assert set(env.keys()) == ENVELOPE_KEYS, "envelope must have exactly the 18 spec fields"
+    assert set(env.keys()) == ENVELOPE_KEYS, (
+        "envelope must have exactly the 18 spec fields"
+    )
 
     assert env["v"] == 1
     assert isinstance(env["id"], str) and re.fullmatch(r"[0-9a-f]{32}", env["id"])

@@ -1,4 +1,5 @@
 """Shared test helpers: the exact envelope contract and the _exec child driver."""
+
 from __future__ import annotations
 
 import json

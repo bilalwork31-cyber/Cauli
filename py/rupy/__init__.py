@@ -5,6 +5,7 @@ Define tasks with ``@app.task(...)``, enqueue with ``.delay()`` /
 (execution, retries, timeouts) happens in the Rust ``rupy-worker`` process.
 See PROTOCOL.md for the full wire contract.
 """
+
 from rupy.app import Rupy
 from rupy.exceptions import Retry, SoftTimeLimitExceeded, TaskFailedError
 from rupy.result import AsyncResult
