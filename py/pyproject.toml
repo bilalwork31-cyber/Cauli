@@ -33,6 +33,12 @@ dependencies = [
 dev = [
     "pytest>=8",
 ]
+# Optional JSON codec acceleration (cauli._codec); the wire format is
+# unchanged, and everything works without it. Disable at runtime with
+# CAULI_DISABLE_MSGSPEC=1.
+speed = [
+    "msgspec>=0.18",
+]
 
 [tool.setuptools]
 packages = ["cauli"]

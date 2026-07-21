@@ -7,7 +7,6 @@ The attribute names ``_tasks``, ``redis_url``, ``default_queue``,
 
 from __future__ import annotations
 
-import json
 import os
 import re
 import threading
@@ -17,6 +16,7 @@ from typing import Any, Callable
 
 import redis
 
+from cauli import _codec
 from cauli.result import AsyncResult
 from cauli.task import TaskDef
 
@@ -28,10 +28,11 @@ def _now_ms() -> int:
     return time.time_ns() // 1_000_000
 
 
-def _dumps(obj: Any) -> str:
-    # allow_nan=False: NaN/Infinity are not valid JSON and would poison the
-    # Rust-side parser; fail loudly at enqueue time instead.
-    return json.dumps(obj, separators=(",", ":"), allow_nan=False)
+def _dumps(obj: Any) -> "bytes | str":
+    # _codec rejects NaN/Infinity on both backends: they are not valid JSON
+    # and would poison the Rust-side parser; fail loudly at enqueue time
+    # instead. Returns bytes (msgspec) or str (stdlib); redis accepts both.
+    return _codec.encode(obj)
 
 
 def _redact_redis_url(url: str) -> str:

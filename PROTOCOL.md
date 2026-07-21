@@ -101,6 +101,9 @@ client-produced). Two worker-side gates apply before an entry is ever executed:
 
 No client-side idempotency check (the worker enforces it at execution time).
 
+The wire format is plain JSON; clients MAY produce/parse it with any compliant JSON codec
+(the bundled client uses msgspec when installed, stdlib `json` otherwise).
+
 ## 4. Worker delivery loop
 
 - One consumer group read loop:
