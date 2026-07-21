@@ -84,7 +84,7 @@ impl PyRuntime {
 
         let (shim, cfg_json) = Python::attach(|py| -> Result<(Py<PyModule>, String)> {
             let code = CString::new(include_str!("shim.py")).expect("shim.py contains NUL byte");
-            let m = PyModule::from_code(py, code.as_c_str(), c"shim.py", c"rupy_worker_shim")
+            let m = PyModule::from_code(py, code.as_c_str(), c"shim.py", c"cauli_worker_shim")
                 .map_err(|e| anyhow!("failed to load embedded shim: {}", pyerr_string(py, &e)))?;
 
             let cfg: String = m
@@ -101,7 +101,7 @@ impl PyRuntime {
 
             let cb = PyCFunction::new_closure(
                 py,
-                Some(c"rupy_complete"),
+                Some(c"cauli_complete"),
                 None,
                 move |args: &Bound<'_, PyTuple>,
                       _kwargs: Option<&Bound<'_, PyDict>>|
@@ -298,7 +298,7 @@ impl SyncPool {
         let live = self.live_threads.clone();
         live.fetch_add(1, Ordering::Relaxed);
         std::thread::Builder::new()
-            .name(format!("rupy-sync-{idx}"))
+            .name(format!("cauli-sync-{idx}"))
             .spawn(move || {
                 while let Ok(job) = rx.recv() {
                     if job.resp.is_closed() {

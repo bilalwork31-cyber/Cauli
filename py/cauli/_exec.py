@@ -1,6 +1,6 @@
-"""rupy._exec: the cpu child process (PROTOCOL.md section 5.1).
+"""cauli._exec: the cpu child process (PROTOCOL.md section 5.1).
 
-Spawned by the Rust worker as ``{python} -m rupy._exec --app module:attr``.
+Spawned by the Rust worker as ``{python} -m cauli._exec --app module:attr``.
 Prints exactly one ready line ``{"ready": true, "pid": N}`` on stdout, then
 reads one JSON request per line from stdin and writes one JSON response per
 line to stdout, flushing after every line. stderr is passthrough logging.
@@ -12,7 +12,7 @@ Robustness notes:
 - The child never crashes on task exceptions; it reports them. EOF on stdin
   exits 0. Import/startup errors exit nonzero before the ready line.
 - Soft timeout: SIGALRM via ``signal.setitimer(ITIMER_REAL)`` raising
-  ``rupy.SoftTimeLimitExceeded`` in the task, disarmed in a finally block.
+  ``cauli.SoftTimeLimitExceeded`` in the task, disarmed in a finally block.
 """
 
 from __future__ import annotations
@@ -27,7 +27,7 @@ import sys
 import traceback
 from typing import Any, TextIO
 
-from rupy.exceptions import SoftTimeLimitExceeded
+from cauli.exceptions import SoftTimeLimitExceeded
 
 _TRACEBACK_CAP = 8192  # max chars of formatted traceback kept in error JSON (section 8)
 
@@ -56,9 +56,9 @@ def _is_retry(exc: BaseException) -> bool:
     exactly "Retry" exposing a ``.countdown`` attribute is treated as a
     forced retry. This mirrors worker/src/shim.py's `_is_retry` exactly (by
     name, not `isinstance`), so cpu and io tasks agree on the SAME rule
-    regardless of which `Retry` class raised it -- the app's own `rupy.Retry`,
-    or an embedded duck-type in a test fixture with no rupy import at all.
-    Previously this module used `isinstance(exc, rupy.exceptions.Retry)`,
+    regardless of which `Retry` class raised it -- the app's own `cauli.Retry`,
+    or an embedded duck-type in a test fixture with no cauli import at all.
+    Previously this module used `isinstance(exc, cauli.exceptions.Retry)`,
     which silently disagreed with the shim's name-based rule and with the
     Rust cpu-mapping (ctx.rs), which only ever sees the type name string.
     """
@@ -69,7 +69,7 @@ def _load_app(spec: str) -> Any:
     module_name, sep, attr = spec.partition(":")
     if not sep or not module_name or not attr:
         print(
-            f"rupy._exec: invalid --app {spec!r} (expected module:attr)",
+            f"cauli._exec: invalid --app {spec!r} (expected module:attr)",
             file=sys.stderr,
         )
         raise SystemExit(2)
@@ -81,7 +81,7 @@ def _load_app(spec: str) -> Any:
         return getattr(module, attr)
     except AttributeError:
         print(
-            f"rupy._exec: module {module_name!r} has no attribute {attr!r}",
+            f"cauli._exec: module {module_name!r} has no attribute {attr!r}",
             file=sys.stderr,
         )
         raise SystemExit(2) from None
@@ -158,7 +158,7 @@ def _write_line(out: TextIO, payload: dict[str, Any]) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        prog="python -m rupy._exec", description="rupy cpu child process"
+        prog="python -m cauli._exec", description="cauli cpu child process"
     )
     parser.add_argument("--app", required=True, metavar="module:attr")
     ns = parser.parse_args(argv)

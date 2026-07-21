@@ -1,4 +1,4 @@
-"""Fixture app imported by the rupy._exec child in subprocess tests.
+"""Fixture app imported by the cauli._exec child in subprocess tests.
 
 The child is spawned with cwd = this directory, so `--app exec_fixture_app:app`
 resolves via the CWD sys.path entry. The redis URL points at a dead port on
@@ -8,9 +8,9 @@ purpose: _exec must never touch redis.
 import asyncio
 import time
 
-from rupy import Retry, Rupy
+from cauli import Retry, Cauli
 
-app = Rupy(redis_url="redis://127.0.0.1:1/0")
+app = Cauli(redis_url="redis://127.0.0.1:1/0")
 
 
 @app.task(name="add", kind="cpu")
@@ -40,11 +40,11 @@ def retryme(countdown=None):
 
 
 class _DuckRetry(Exception):
-    """A duck-typed lookalike of rupy.Retry that does NOT subclass it.
+    """A duck-typed lookalike of cauli.Retry that does NOT subclass it.
 
     Used to regression-test M6: `_exec.py` must recognize a forced retry by
     class NAME + `.countdown` (matching worker/src/shim.py's rule), not by
-    `isinstance(exc, rupy.exceptions.Retry)` -- the old isinstance-based
+    `isinstance(exc, cauli.exceptions.Retry)` -- the old isinstance-based
     check would silently miss this and treat it as a plain failure. Renamed
     (rather than defined as `class Retry`) so it does not shadow the real
     `Retry` imported above, which `retryme` still needs.

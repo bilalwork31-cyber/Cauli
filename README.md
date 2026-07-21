@@ -1,4 +1,4 @@
-# rupy
+# cauli
 
 A high throughput, low RAM background worker runtime for the Python ecosystem
 (Django, FastAPI, Flask, plain scripts). Tasks are written in Python. The worker is a
@@ -11,9 +11,9 @@ Celery's prefork model pins one concurrency slot to one forked OS process. Each 
 carries the full application (commonly ~150 to 250MB RSS), so 100 concurrent slots can
 cost 25GB of RAM, and most of those processes spend their lives blocked on network I/O.
 
-rupy splits concurrency by workload class:
+cauli splits concurrency by workload class:
 
-| Workload | Celery prefork | rupy |
+| Workload | Celery prefork | cauli |
 |---|---|---|
 | I/O bound (http, db, email, s3) | 1 slot = 1 process | 1 slot = 1 async task or pooled thread inside ONE process |
 | CPU bound | 1 slot = 1 process | small child process pool sized to cores (more than cores buys nothing) |
@@ -25,7 +25,7 @@ forks, while CPU tasks still get true multicore parallelism.
 
 ```
                     ┌────────────────────────────────────────────────┐
-  Django/FastAPI    │  rupy-worker (one Rust process, tokio)         │
+  Django/FastAPI    │  cauli-worker (one Rust process, tokio)         │
   ────────────►     │                                                │
   app.task.delay()  │  fetch / ack / retry / DLQ / delayed mover /   │
         │           │  reclaim-on-crash / idempotency / results      │
@@ -34,7 +34,7 @@ forks, while CPU tasks still get true multicore parallelism.
    consumer groups  │        │                    │                  │
                     │        ▼                    ▼                  │
                     │  embedded CPython     child process pool       │
-                    │  - asyncio loop(s)    python -m rupy._exec     │
+                    │  - asyncio loop(s)    python -m cauli._exec     │
                     │    for async tasks    (cpu tasks, N = cores,   │
                     │  - thread pool for     hard-kill on timeout)   │
                     │    sync I/O tasks                              │
@@ -50,9 +50,9 @@ Optional idempotency keys dedupe execution. Results land in Redis with a TTL.
 
 ```python
 # myproj/tasks.py
-from rupy import Rupy
+from cauli import Cauli
 
-app = Rupy(redis_url="redis://localhost:6379/0")
+app = Cauli(redis_url="redis://localhost:6379/0")
 
 @app.task(max_retries=5)
 def send_email(to: str):
@@ -76,7 +76,7 @@ r.get(timeout=10)
 
 ```bash
 # one process, 500 concurrent I/O slots, 6 CPU executors
-rupy-worker --app myproj.tasks:app --io-concurrency 500 --cpu-workers 6
+cauli-worker --app myproj.tasks:app --io-concurrency 500 --cpu-workers 6
 ```
 
 Requires Redis >= 7.0 as the broker and result backend.
@@ -96,20 +96,20 @@ Requires Redis >= 7.0 as the broker and result backend.
   on, spawning a replacement thread so pool capacity isn't lost, but the original call keeps
   running in the background until it returns on its own. Prefer `kind="cpu"` for work that
   must be forcibly killable, or cooperative code that checks a deadline for long sync tasks.
-- **Task tracebacks and results are stored in plaintext in Redis** (`rupy:result:*`, DLQ
+- **Task tracebacks and results are stored in plaintext in Redis** (`cauli:result:*`, DLQ
   entries). Anyone with read access to your Redis instance can see them — don't put secrets or
   PII in exception messages or task arguments/return values if that's a concern for your
   deployment.
 - **The worker's working directory is on `sys.path`.** `--app` imports are resolved with CWD
-  prepended (so relative app modules just work); don't run `rupy-worker` from a directory an
+  prepended (so relative app modules just work); don't run `cauli-worker` from a directory an
   untrusted party can write to.
 
 ## Repository layout
 
 - `PROTOCOL.md` — the wire/behavior contract (envelope JSON, Redis keys, worker semantics)
-- `worker/` — Rust worker binary (`rupy-worker`)
-- `py/` — Python package `rupy` (client API + cpu child executor)
-- `bench/` — Celery vs rupy benchmark harness (WSL, cgroup capped)
+- `worker/` — Rust worker binary (`cauli-worker`)
+- `py/` — Python package `cauli` (client API + cpu child executor)
+- `bench/` — Celery vs cauli benchmark harness (WSL, cgroup capped)
 
 ## Status
 

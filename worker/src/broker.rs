@@ -7,16 +7,16 @@ use anyhow::Result;
 use redis::aio::ConnectionManager;
 
 pub fn q_key(queue: &str) -> String {
-    format!("rupy:q:{queue}")
+    format!("cauli:q:{queue}")
 }
 pub fn delayed_key(queue: &str) -> String {
-    format!("rupy:delayed:{queue}")
+    format!("cauli:delayed:{queue}")
 }
 pub fn dlq_key(queue: &str) -> String {
-    format!("rupy:dlq:{queue}")
+    format!("cauli:dlq:{queue}")
 }
 pub fn result_key(id: &str) -> String {
-    format!("rupy:result:{id}")
+    format!("cauli:result:{id}")
 }
 /// Deterministic FNV-1a 64-bit hash, hex-encoded. Folds an app-supplied
 /// idempotency_key (arbitrary length/charset — attacker/app controlled per
@@ -33,7 +33,7 @@ fn fnv1a_hex(s: &str) -> String {
 }
 
 pub fn idemp_key(key: &str) -> String {
-    format!("rupy:idemp:{}", fnv1a_hex(key))
+    format!("cauli:idemp:{}", fnv1a_hex(key))
 }
 
 /// PROTOCOL §4.3 delayed mover script (verbatim).
@@ -51,7 +51,7 @@ pub async fn ensure_groups(conn: &mut ConnectionManager, queues: &[String]) -> R
         let r: redis::RedisResult<String> = redis::cmd("XGROUP")
             .arg("CREATE")
             .arg(q_key(q))
-            .arg("rupy")
+            .arg("cauli")
             .arg("0")
             .arg("MKSTREAM")
             .query_async(conn)
@@ -229,7 +229,7 @@ pub async fn finish_dlq(
 fn add_ack_del(pipe: &mut redis::Pipeline, queue: &str, stream_id: &str) {
     pipe.cmd("XACK")
         .arg(q_key(queue))
-        .arg("rupy")
+        .arg("cauli")
         .arg(stream_id)
         .ignore();
     pipe.cmd("XDEL").arg(q_key(queue)).arg(stream_id).ignore();
@@ -244,7 +244,7 @@ pub async fn xpending_idle(
 ) -> Result<Vec<(String, String, u64, u64)>> {
     let r: Vec<(String, String, u64, u64)> = redis::cmd("XPENDING")
         .arg(q_key(queue))
-        .arg("rupy")
+        .arg("cauli")
         .arg("IDLE")
         .arg(min_idle_ms)
         .arg("-")
@@ -300,7 +300,7 @@ pub async fn xclaim_entry(
     use redis::streams::StreamClaimReply;
     let reply: StreamClaimReply = redis::cmd("XCLAIM")
         .arg(q_key(queue))
-        .arg("rupy")
+        .arg("cauli")
         .arg(consumer)
         .arg(min_idle_ms)
         .arg(entry_id)
@@ -335,10 +335,10 @@ mod tests {
         let hostile = "{tag}".repeat(1000);
         for input in ["", "a", "order-42", &huge, &hostile] {
             let k = idemp_key(input);
-            assert!(k.starts_with("rupy:idemp:"));
+            assert!(k.starts_with("cauli:idemp:"));
             assert_eq!(
                 k.len(),
-                "rupy:idemp:".len() + 16,
+                "cauli:idemp:".len() + 16,
                 "hash must be a fixed 16 hex chars"
             );
             assert!(

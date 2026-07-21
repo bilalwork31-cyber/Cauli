@@ -135,7 +135,7 @@ async fn h1_visibility_floor_does_not_reclaim_long_task(c: &mut redis::aio::Mult
     let mut w = Worker::spawn("h1q", &["--visibility-timeout", "1"]);
     wait_group(c, "h1q", 20).await;
 
-    let cf = format!("/tmp/rupy-h1-{}", unique_id());
+    let cf = format!("/tmp/cauli-h1-{}", unique_id());
     let (id, e) = envelope("fx.slow_counted", "h1q", |v| v["args"] = json!([cf, 4.0]));
     xadd(c, "h1q", &e.to_string()).await;
     wait_inflight(c, "h1q", 10).await;
@@ -200,7 +200,7 @@ async fn h2_sync_pool_survives_hard_timeout_abandonment(c: &mut redis::aio::Mult
     // failure result must not be disturbed when that happens.
     tokio::time::sleep(std::time::Duration::from_millis(3200)).await;
     let a_final: String = redis::cmd("GET")
-        .arg(format!("rupy:result:{id_a}"))
+        .arg(format!("cauli:result:{id_a}"))
         .query_async(c)
         .await
         .unwrap();
@@ -217,8 +217,8 @@ async fn h2_sync_pool_survives_hard_timeout_abandonment(c: &mut redis::aio::Mult
 
 async fn xpending_count(c: &mut redis::aio::MultiplexedConnection, queue: &str) -> i64 {
     let v: redis::Value = redis::cmd("XPENDING")
-        .arg(format!("rupy:q:{queue}"))
-        .arg("rupy")
+        .arg(format!("cauli:q:{queue}"))
+        .arg("cauli")
         .query_async(c)
         .await
         .unwrap();

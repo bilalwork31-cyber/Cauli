@@ -17,9 +17,9 @@ def test_countdown_zadds_delayed_not_stream(app, redis_client):
     t1 = now_ms()
 
     # No XADD happened: the ready stream must not even exist.
-    assert redis_client.exists("rupy:q:default") == 0
+    assert redis_client.exists("cauli:q:default") == 0
 
-    members = redis_client.zrange("rupy:delayed:default", 0, -1, withscores=True)
+    members = redis_client.zrange("cauli:delayed:default", 0, -1, withscores=True)
     assert len(members) == 1
     raw, score = members[0]
     env = json.loads(raw)
@@ -47,10 +47,10 @@ def test_fractional_countdown(app, redis_client):
     ping.apply_async(countdown=0.5)
     t1 = now_ms()
 
-    members = redis_client.zrange("rupy:delayed:default", 0, -1, withscores=True)
+    members = redis_client.zrange("cauli:delayed:default", 0, -1, withscores=True)
     assert len(members) == 1
     raw, score = members[0]
     env = json.loads(raw)
     assert t0 + 500 <= score <= t1 + 500
     assert env["not_before"] == int(score)
-    assert redis_client.exists("rupy:q:default") == 0
+    assert redis_client.exists("cauli:q:default") == 0

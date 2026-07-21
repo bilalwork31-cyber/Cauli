@@ -57,7 +57,7 @@ fn real_main() -> i32 {
     let redis_url = args
         .redis_url
         .clone()
-        .or_else(|| std::env::var("RUPY_REDIS_URL").ok())
+        .or_else(|| std::env::var("CAULI_REDIS_URL").ok())
         .unwrap_or_else(|| appcfg.redis_url.clone());
     let queues: Vec<String> = if args.queues.is_empty() {
         vec![appcfg.default_queue.clone()]
@@ -81,7 +81,7 @@ fn real_main() -> i32 {
         return 1;
     }
     info!(
-        "rupy-worker starting: app={} queues={:?} redis={} tasks={}",
+        "cauli-worker starting: app={} queues={:?} redis={} tasks={}",
         args.app,
         queues,
         redact_redis_url(&redis_url),

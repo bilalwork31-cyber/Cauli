@@ -7,7 +7,7 @@ import time
 import pytest
 import redis as redis_lib
 
-from rupy import Rupy
+from cauli import Cauli
 
 REDIS_PORT = 6391  # throwaway test instance; never the shared 6379
 REDIS_URL = f"redis://127.0.0.1:{REDIS_PORT}/0"
@@ -64,6 +64,6 @@ def redis_client(redis_url):
 
 
 @pytest.fixture()
-def app(redis_url, redis_client) -> Rupy:
-    """A Rupy app bound to the flushed throwaway redis."""
-    return Rupy(redis_url=redis_url)
+def app(redis_url, redis_client) -> Cauli:
+    """A Cauli app bound to the flushed throwaway redis."""
+    return Cauli(redis_url=redis_url)

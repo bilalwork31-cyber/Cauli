@@ -1,4 +1,4 @@
-"""Rupy application object: task registry + enqueue.
+"""Cauli application object: task registry + enqueue.
 
 Implements the client enqueue rules from PROTOCOL.md sections 2 and 3.
 The attribute names ``_tasks``, ``redis_url``, ``default_queue``,
@@ -17,8 +17,8 @@ from typing import Any, Callable
 
 import redis
 
-from rupy.result import AsyncResult
-from rupy.task import TaskDef
+from cauli.result import AsyncResult
+from cauli.task import TaskDef
 
 _DEFAULT_REDIS_URL = "redis://localhost:6379/0"
 _QUEUE_NAME_RE = re.compile(r"[a-zA-Z0-9_.-]+\Z")
@@ -51,7 +51,7 @@ def _redact_redis_url(url: str) -> str:
     return f"{url[:scheme_sep]}://***@{after[at + 1 :]}"
 
 
-class Rupy:
+class Cauli:
     """The application: holds config, the task registry, and a lazy Redis client."""
 
     def __init__(
@@ -61,9 +61,9 @@ class Rupy:
         result_ttl: int = 3600,
         idemp_ttl: int = 86400,
     ) -> None:
-        # Resolution order: explicit arg > env RUPY_REDIS_URL > default.
+        # Resolution order: explicit arg > env CAULI_REDIS_URL > default.
         self.redis_url: str = (
-            redis_url or os.environ.get("RUPY_REDIS_URL") or _DEFAULT_REDIS_URL
+            redis_url or os.environ.get("CAULI_REDIS_URL") or _DEFAULT_REDIS_URL
         )
         self.default_queue: str = default_queue
         self.result_ttl: int = result_ttl
@@ -143,9 +143,9 @@ class Rupy:
         """Build the envelope and enqueue it (PROTOCOL.md section 3).
 
         Queue precedence: call-site ``queue`` > task queue > app default_queue.
-        With ``countdown``: ZADD to ``rupy:delayed:{queue}`` (score = fire time,
+        With ``countdown``: ZADD to ``cauli:delayed:{queue}`` (score = fire time,
         mirrored into ``not_before``); no XADD. Otherwise XADD to
-        ``rupy:q:{queue}`` with the single field ``e``.
+        ``cauli:q:{queue}`` with the single field ``e``.
         """
         queue_name = queue or task.queue or self.default_queue
         if not _QUEUE_NAME_RE.match(queue_name):
@@ -179,13 +179,13 @@ class Rupy:
         if countdown is not None:
             fire_at = now + int(round(countdown * 1000))
             envelope["not_before"] = fire_at
-            client.zadd(f"rupy:delayed:{queue_name}", {_dumps(envelope): fire_at})
+            client.zadd(f"cauli:delayed:{queue_name}", {_dumps(envelope): fire_at})
         else:
-            client.xadd(f"rupy:q:{queue_name}", {"e": _dumps(envelope)})
+            client.xadd(f"cauli:q:{queue_name}", {"e": _dumps(envelope)})
         return AsyncResult(task_id, self)
 
     def __repr__(self) -> str:
         return (
-            f"<Rupy default_queue={self.default_queue!r} "
+            f"<Cauli default_queue={self.default_queue!r} "
             f"tasks={len(self._tasks)} redis_url={_redact_redis_url(self.redis_url)!r}>"
         )

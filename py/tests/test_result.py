@@ -9,11 +9,11 @@ import uuid
 
 import pytest
 
-from rupy import AsyncResult, TaskFailedError
+from cauli import AsyncResult, TaskFailedError
 
 
 def _write_result(redis_client, task_id, doc):
-    redis_client.set(f"rupy:result:{task_id}", json.dumps(doc))
+    redis_client.set(f"cauli:result:{task_id}", json.dumps(doc))
 
 
 def _ar(app):

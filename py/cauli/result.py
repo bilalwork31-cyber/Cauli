@@ -1,6 +1,6 @@
 """AsyncResult: a handle to a task's eventual result.
 
-Reads ``rupy:result:{task_id}`` per PROTOCOL.md sections 6 and 8.
+Reads ``cauli:result:{task_id}`` per PROTOCOL.md sections 6 and 8.
 """
 
 from __future__ import annotations
@@ -9,10 +9,10 @@ import json
 import time
 from typing import TYPE_CHECKING, Any
 
-from rupy.exceptions import TaskFailedError
+from cauli.exceptions import TaskFailedError
 
 if TYPE_CHECKING:
-    from rupy.app import Rupy
+    from cauli.app import Cauli
 
 
 class AsyncResult:
@@ -23,13 +23,13 @@ class AsyncResult:
     in that case.
     """
 
-    def __init__(self, task_id: str, app: "Rupy") -> None:
+    def __init__(self, task_id: str, app: "Cauli") -> None:
         self.id: str = task_id
         self.app = app
         self.duplicate: bool = False
 
     def _load(self) -> dict[str, Any] | None:
-        raw = self.app._get_redis().get(f"rupy:result:{self.id}")
+        raw = self.app._get_redis().get(f"cauli:result:{self.id}")
         if raw is None:
             return None
         return json.loads(raw)

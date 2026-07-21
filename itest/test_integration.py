@@ -1,4 +1,4 @@
-"""Cross-component e2e: real rupy client + real rupy-worker binary + real rupy._exec children."""
+"""Cross-component e2e: real cauli client + real cauli-worker binary + real cauli._exec children."""
 
 import json
 import os
@@ -12,8 +12,8 @@ import redis as redis_lib
 
 PORT = 6394
 HOME = os.path.expanduser("~")
-BIN = os.environ.get("RUPY_WORKER_BIN", f"{HOME}/rupy-target/release/rupy-worker")
-VENV = os.environ.get("RUPY_VENV", f"{HOME}/rupy-venv")
+BIN = os.environ.get("CAULI_WORKER_BIN", f"{HOME}/rupy-target/release/cauli-worker")
+VENV = os.environ.get("CAULI_VENV", f"{HOME}/rupy-venv")
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 
@@ -45,7 +45,7 @@ def stack():
     env = dict(os.environ)
     env["VIRTUAL_ENV"] = VENV
     env["PATH"] = f"{VENV}/bin:" + env.get("PATH", "")
-    env["RUPY_REDIS_URL"] = f"redis://127.0.0.1:{PORT}/0"
+    env["CAULI_REDIS_URL"] = f"redis://127.0.0.1:{PORT}/0"
     worker = subprocess.Popen(
         [
             BIN,
@@ -69,7 +69,7 @@ def stack():
         stdout=open(f"{HERE}/worker.log", "wb"),
         stderr=subprocess.STDOUT,
     )
-    os.environ["RUPY_REDIS_URL"] = f"redis://127.0.0.1:{PORT}/0"
+    os.environ["CAULI_REDIS_URL"] = f"redis://127.0.0.1:{PORT}/0"
     yield r, worker
     worker.send_signal(signal.SIGTERM)
     try:
@@ -103,14 +103,14 @@ def test_cpu_child_real_exec(stack):
 
 def test_retry_then_succeed(stack):
     m = _app()
-    path = f"/tmp/rupy-itest-flaky-{uuid.uuid4().hex}"
+    path = f"/tmp/cauli-itest-flaky-{uuid.uuid4().hex}"
     out = m.flaky.delay(path, 2).get(timeout=30)
     assert out == {"succeeded_on_attempt": 2}
     assert os.path.getsize(path) == 3  # 2 failures + 1 success
 
 
 def test_final_failure_dlq_and_error(stack):
-    from rupy import TaskFailedError
+    from cauli import TaskFailedError
 
     r, _ = stack
     m = _app()
@@ -119,14 +119,14 @@ def test_final_failure_dlq_and_error(stack):
         res.get(timeout=30)
     assert ei.value.type == "RuntimeError"
     assert "nope" in ei.value.message
-    entries = r.xrange("rupy:dlq:default")
+    entries = r.xrange("cauli:dlq:default")
     ids = [json.loads(fields[b"e"])["id"] for _, fields in entries]
     assert res.id in ids
 
 
 def test_idempotency_dedup(stack):
     m = _app()
-    path = f"/tmp/rupy-itest-idemp-{uuid.uuid4().hex}"
+    path = f"/tmp/cauli-itest-idemp-{uuid.uuid4().hex}"
     key = f"itest-{uuid.uuid4().hex}"
     r1 = m.counted.apply_async(args=(path,), idempotency_key=key)
     r2 = m.counted.apply_async(args=(path,), idempotency_key=key)
@@ -146,7 +146,7 @@ def test_idempotency_key_allows_retry(stack):
     # must actually retry and finish "success" -- previously it silently
     # resolved as "duplicate" against its own earlier claim, forever.
     m = _app()
-    path = f"/tmp/rupy-itest-idemp-retry-{uuid.uuid4().hex}"
+    path = f"/tmp/cauli-itest-idemp-retry-{uuid.uuid4().hex}"
     key = f"itest-retry-{uuid.uuid4().hex}"
     res = m.flaky_idemp.apply_async(args=(path, 1), idempotency_key=key)
     out = res.get(timeout=30)
@@ -162,12 +162,12 @@ def test_countdown_delays_execution(stack):
     assert res.get(timeout=15) == {"echo": "later"}
     elapsed = time.time() - t0
     assert elapsed >= 1.15, f"ran too early: {elapsed:.2f}s"
-    raw = json.loads(r.get(f"rupy:result:{res.id}"))
+    raw = json.loads(r.get(f"cauli:result:{res.id}"))
     assert raw["status"] == "success"
 
 
 def test_cpu_soft_timeout(stack):
-    from rupy import TaskFailedError
+    from cauli import TaskFailedError
 
     m = _app()
     res = m.slow_cpu.delay()

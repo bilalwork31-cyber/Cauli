@@ -1,18 +1,18 @@
 [package]
-name = "rupy-worker"
+name = "cauli-worker"
 version = "0.1.0"
 edition = "2021"
-description = "Rust worker runtime for rupy Python task queues"
+description = "Rust worker runtime for cauli Python task queues"
 license = "MIT OR Apache-2.0"
 
 [features]
 default = []
-# Enables the RUPY_EXEC_CMD test hook in src/cpu.rs (audit M5). Not part of a
+# Enables the CAULI_EXEC_CMD test hook in src/cpu.rs (audit M5). Not part of a
 # normal release build; the e2e suite needs `cargo test --features test-hooks`.
 test-hooks = []
 
 [[bin]]
-name = "rupy-worker"
+name = "cauli-worker"
 path = "src/main.rs"
 
 [dependencies]

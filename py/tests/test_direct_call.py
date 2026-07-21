@@ -5,12 +5,12 @@ from __future__ import annotations
 import asyncio
 import inspect
 
-from rupy import Rupy
+from cauli import Cauli
 
 
-def _offline_app() -> Rupy:
+def _offline_app() -> Cauli:
     # Dead port on purpose: direct calls must never touch redis.
-    return Rupy(redis_url="redis://127.0.0.1:1/0")
+    return Cauli(redis_url="redis://127.0.0.1:1/0")
 
 
 def test_sync_task_direct_call():

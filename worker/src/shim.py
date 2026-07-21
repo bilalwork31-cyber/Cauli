@@ -1,4 +1,4 @@
-"""rupy worker embedded shim.
+"""cauli worker embedded shim.
 
 Loaded once by the Rust worker via PyModule::from_code. Owns ALL Python-side
 complexity so the pyo3 surface stays "call function, pass strings, get strings".
@@ -31,15 +31,15 @@ import traceback
 
 _MAX_TB = 8192
 
-try:  # pragma: no cover - only when the real rupy package is importable
-    from rupy import SoftTimeLimitExceeded  # type: ignore
+try:  # pragma: no cover - only when the real cauli package is importable
+    from cauli import SoftTimeLimitExceeded  # type: ignore
 except Exception:
 
     class SoftTimeLimitExceeded(Exception):
-        """Soft time limit exceeded (local stand-in for rupy.SoftTimeLimitExceeded).
+        """Soft time limit exceeded (local stand-in for cauli.SoftTimeLimitExceeded).
 
         Derives from Exception (not BaseException) to match the real
-        rupy.SoftTimeLimitExceeded (audit L5): a task's `except Exception`
+        cauli.SoftTimeLimitExceeded (audit L5): a task's `except Exception`
         must catch this in the fallback case too.
         """
 
@@ -204,7 +204,7 @@ def _ensure_watchdog_started():
         if not _watchdog_started:
             _watchdog_started = True
             t = threading.Thread(
-                target=_watchdog_loop, name="rupy-soft-timeout-watchdog", daemon=True
+                target=_watchdog_loop, name="cauli-soft-timeout-watchdog", daemon=True
             )
             t.start()
 
@@ -300,7 +300,7 @@ def start_loops(n):
         for i in range(n):
             loop = asyncio.new_event_loop()
             t = threading.Thread(
-                target=_loop_main, args=(loop,), name="rupy-aio-%d" % i, daemon=True
+                target=_loop_main, args=(loop,), name="cauli-aio-%d" % i, daemon=True
             )
             t.start()
             _loops.append(loop)

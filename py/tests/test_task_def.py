@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import pytest
 
-from rupy import Rupy, TaskDef
+from cauli import Cauli, TaskDef
 
 
-def _offline_app() -> Rupy:
-    return Rupy(redis_url="redis://127.0.0.1:1/0")
+def _offline_app() -> Cauli:
+    return Cauli(redis_url="redis://127.0.0.1:1/0")
 
 
 def test_is_async_detection():
