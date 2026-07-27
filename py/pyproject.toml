@@ -28,6 +28,12 @@ classifiers = [
 dependencies = [
     "redis>=5",
 ]
+# [project.urls] intentionally omitted: needs the project's real, published
+# repo URL, which isn't ours to invent. Add e.g.
+#   [project.urls]
+#   Repository = "https://github.com/<org>/<repo>"
+# once the repo has a public home (see the matching note in
+# worker/Cargo.toml).
 
 [project.optional-dependencies]
 dev = [

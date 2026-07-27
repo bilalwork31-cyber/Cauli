@@ -3,7 +3,14 @@ name = "cauli-worker"
 version = "0.1.0"
 edition = "2021"
 description = "Rust worker runtime for cauli Python task queues"
+readme = "README.md"
 license = "MIT OR Apache-2.0"
+keywords = ["task-queue", "background-jobs", "redis", "worker", "celery"]
+categories = ["asynchronous", "concurrency"]
+# `repository` intentionally omitted: needs the project's real, published
+# repo URL, which isn't ours to invent (matches the prior release-mechanics
+# pass in FIXES.md). Add it here and to py/pyproject.toml's [project.urls]
+# once the repo has a public home.
 
 [features]
 default = []

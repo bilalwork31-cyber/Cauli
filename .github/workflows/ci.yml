@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  worker:
+    name: worker (rust)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Install redis-server
+        run: sudo apt-get update && sudo apt-get install -y redis-server
+      - name: cargo fmt --check
+        working-directory: worker
+        run: cargo fmt --check
+      - name: cargo clippy (default features)
+        working-directory: worker
+        run: cargo clippy --all-targets -- -D warnings
+      - name: cargo clippy (test-hooks feature)
+        working-directory: worker
+        run: cargo clippy --all-targets --features test-hooks -- -D warnings
+      - name: cargo test --release --features test-hooks
+        working-directory: worker
+        run: cargo test --release --features test-hooks
+      - name: cargo audit
+        # Advisory-db fetch is occasionally flaky in CI; don't fail the
+        # whole build over a transient network issue on an advisory-only
+        # check. A real hit still shows up loudly in the job log.
+        continue-on-error: true
+        working-directory: worker
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit
+
+  py:
+    name: py (client, python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install redis-server
+        run: sudo apt-get update && sudo apt-get install -y redis-server
+      - name: Install cauli (editable, dev + speed extras) and ruff
+        run: |
+          pip install -e "py[dev,speed]"
+          pip install ruff==0.15.22
+      - name: ruff check
+        run: ruff check py/ worker/src/shim.py itest/
+      - name: ruff format --check
+        run: ruff format --check py/ worker/src/shim.py itest/
+      - name: pytest
+        working-directory: py
+        run: pytest -q
+
+  itest:
+    name: itest (cross-component)
+    runs-on: ubuntu-latest
+    needs: [worker, py]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install redis-server
+        run: sudo apt-get update && sudo apt-get install -y redis-server
+      - name: Build release worker
+        working-directory: worker
+        run: cargo build --release --bin cauli-worker
+      - name: Install cauli (editable) and pytest
+        run: pip install -e py pytest
+      - name: Run itest
+        working-directory: itest
+        env:
+          CAULI_WORKER_BIN: ${{ github.workspace }}/worker/target/release/cauli-worker
+          CAULI_VENV: ${{ env.pythonLocation }}
+        run: pytest -q

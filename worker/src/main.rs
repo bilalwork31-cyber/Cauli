@@ -80,6 +80,17 @@ fn real_main() -> i32 {
         error!("--visibility-timeout must be >= 1 (0 reclaims every in-flight task on nearly every tick)");
         return 1;
     }
+    // FS-10: an absurd value (e.g. a typo'd extra digit) would eagerly
+    // allocate a `2 * cpu_workers * cpu_child_threads`-sized channel and ask
+    // Python to start that many threads per child; reject early with a clear
+    // message instead of an opaque allocation failure or a Python startup hang.
+    if args.cpu_child_threads == 0 || args.cpu_child_threads > 1024 {
+        error!(
+            "--cpu-child-threads must be within [1, 1024] (got {})",
+            args.cpu_child_threads
+        );
+        return 1;
+    }
     info!(
         "cauli-worker starting: app={} queues={:?} redis={} tasks={}",
         args.app,
@@ -190,7 +201,7 @@ async fn run_worker(
         args,
     });
 
-    spawn_signal_task(shutdown_tx);
+    spawn_signal_task(shutdown_tx, ctx.cpu.clone());
     tokio::spawn(loops::mover_loop(ctx.clone()));
     tokio::spawn(loops::recovery_loop(ctx.clone()));
     tokio::spawn(loops::stats_loop(ctx.clone()));
@@ -213,7 +224,7 @@ async fn run_worker(
     0
 }
 
-fn spawn_signal_task(shutdown_tx: watch::Sender<bool>) {
+fn spawn_signal_task(shutdown_tx: watch::Sender<bool>, cpu_pool: cpu::CpuPool) {
     tokio::spawn(async move {
         let mut term = signal(SignalKind::terminate()).expect("SIGTERM handler");
         let mut int = signal(SignalKind::interrupt()).expect("SIGINT handler");
@@ -227,6 +238,11 @@ fn spawn_signal_task(shutdown_tx: watch::Sender<bool>) {
             _ = int.recv() => {},
         }
         warn!("second signal: forced exit 130");
+        // FS-8: this path bypasses run_worker's normal drain-then-cleanup
+        // tail entirely (process::exit below never returns), so it must do
+        // its own cpu pool cleanup or the fork-server socket file (and,
+        // absent PDEATHSIG, its children) would be abandoned.
+        cpu::kill_children(&cpu_pool);
         std::process::exit(130);
     });
 }

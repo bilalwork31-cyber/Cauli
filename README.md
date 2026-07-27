@@ -21,6 +21,21 @@ cauli splits concurrency by workload class:
 Result: hundreds to thousands of in flight I/O tasks in roughly the RAM of two Celery
 forks, while CPU tasks still get true multicore parallelism.
 
+## Install
+
+```bash
+pip install cauli               # client: Python >= 3.10, needs redis>=5
+pip install 'cauli[speed]'      # optional: msgspec-accelerated JSON codec (wire format unchanged)
+```
+
+The worker is a separate Rust binary, built from source (no crates.io/prebuilt release yet):
+
+```bash
+cd worker
+cargo build --release --bin cauli-worker
+# binary at target/release/cauli-worker
+```
+
 ## Architecture
 
 ```
@@ -80,6 +95,12 @@ cauli-worker --app myproj.tasks:app --io-concurrency 500 --cpu-workers 6
 ```
 
 Requires Redis >= 7.0 as the broker and result backend.
+
+Cpu tasks run in a forked child-process pool by default (one warmed, `gc.freeze()`d parent;
+children fork copy-on-write, so respawning after a crash or hard timeout is cheap). Add
+`--cpu-child-threads M` to pipeline up to M requests per child on workloads that release the
+GIL (e.g. blocking network calls inside a `kind="cpu"` task); `--no-fork-server` falls back to
+one process per cpu task (also entered automatically if fork-server startup fails).
 
 ## Semantics & limits
 

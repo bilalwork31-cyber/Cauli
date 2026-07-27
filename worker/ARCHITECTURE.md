@@ -63,22 +63,38 @@ against Redis Streams per PROTOCOL.md. Module map:
   `gc.collect()` + `gc.freeze()`, then forks a child per `{"cmd":"fork"}`
   control line; children connect to the worker's tokio `UnixListener`, send
   `{"ready": true, "pid", "concurrency"}` and serve the line protocol on the
-  socket. Per child, one `serve_child` task multiplexes up to `concurrency`
-  requests (pending map keyed by wire id, per-request hard-timeout deadlines
-  via a single earliest-deadline sleep in the select loop). Hard timeout:
-  SIGKILL by pid, expired requests fail "TimeoutError", the rest "WorkerLost"
-  (both retryable), then a replacement fork (cheap: no re-import). Child
-  death (socket EOF): all in flight "WorkerLost" + replacement fork. Parent
-  control-channel failure mid-run: parent respawned with 1s backoff (its
-  children died via PDEATHSIG; slots re-request forks). Fork-server startup
-  failure (bind/spawn/handshake) falls back to **stdio mode** — also forced
-  by `--no-fork-server`: spawn per child, one in flight over stdin/stdout,
-  SIGKILL + full respawn on hard timeout or death (the pre-fork-server
-  behavior, preserved verbatim). The parent and children carry
-  `PR_SET_PDEATHSIG=SIGKILL` (children re-arm it after fork since fork clears
-  it) so a SIGKILLed worker cannot leak them; remaining executor pids are
-  killed on exit paths (skipping any tracked pid <= 1, which would otherwise
-  signal this process's own group) and the listener socket file is removed.
+  socket. The listener lives inside a private `0700` directory and every
+  accepted connection is checked against the worker's own uid via
+  `SO_PEERCRED` (the kernel-reported peer pid, not the client-claimed one,
+  is what gets tracked/killed) before it is trusted as a real child; a
+  child's advertised concurrency is clamped to the configured
+  `--cpu-child-threads` so it cannot defeat the backlog bound. Per child, one
+  `serve_child` task multiplexes up to `concurrency` requests (pending map
+  keyed by wire id, per-request hard-timeout deadlines via a single
+  earliest-deadline sleep in the select loop; handing a request to the child
+  is itself bounded by a write timeout, so a child that stops draining its
+  socket without dying is detected instead of silently wedging the slot).
+  Hard timeout: SIGKILL by pid, expired requests fail "TimeoutError", the
+  rest "WorkerLost" (both retryable), then a replacement fork (cheap: no
+  re-import). Child death (socket EOF): all in flight "WorkerLost" +
+  replacement fork; that pid is never SIGKILLed (the fork-server parent has
+  already reaped it via SIGCHLD, so the pid may already be reused). A fork
+  request is retried until it succeeds: a parseable refusal from a healthy
+  parent (e.g. transient EAGAIN/ENOMEM) retries with backoff and never
+  touches the parent; a genuine control-channel failure respawns the parent
+  (its children died via PDEATHSIG) and retries the same request against the
+  fresh one, rather than dropping it for the requesting slot's 60s backstop
+  to notice. Fork-server startup failure (bind/spawn/handshake) falls back
+  to **stdio mode** — also forced by `--no-fork-server`: spawn per child, one
+  in flight over stdin/stdout, SIGKILL + full respawn on hard timeout or
+  death (the pre-fork-server behavior, preserved verbatim). The parent and
+  children carry `PR_SET_PDEATHSIG=SIGKILL` (children re-arm it after fork
+  since fork clears it) so a SIGKILLed worker cannot leak them; remaining
+  executor pids are killed on exit paths (skipping any tracked pid <= 1,
+  which would otherwise signal this process's own group) and the listener
+  socket file and its private directory are removed on every exit path,
+  including a forced double-signal exit and a bind-succeeded-but-handshake-
+  failed startup abort.
   **Test hook:** env `CAULI_EXEC_CMD` (whitespace-split argv) replaces the child
   command verbatim (fork-server flags are appended to the override argv),
   used by e2e to run `tests/fixtures/fake_exec.py`, which implements both
@@ -128,8 +144,10 @@ retried counts scheduled retries; dlq counts every DLQ write.
    WorkerShimError failures rather than crashing the pool.
 4. Usage errors print via clap but exit 1 (spec: 1 = fatal config error;
    clap's default 2 is overridden). `--help`/`--version` exit 0.
-5. Second signal exits 130 immediately; cpu children die with the worker via
-   PDEATHSIG rather than explicit reaping on that path.
+5. Second signal exits 130: the cpu pool is explicitly killed (same cleanup
+   as the normal exit path, including the fork-server socket file) before
+   the process exits; PDEATHSIG is the backstop if that step is ever skipped
+   (e.g. a SIGKILLed worker), not the primary mechanism.
 
 ## Ops quickstart
 

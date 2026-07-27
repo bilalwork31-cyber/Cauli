@@ -10,8 +10,14 @@
 //! matched by `id`, possibly out of order). Hard timeout: SIGKILL the child
 //! by pid and request a replacement fork (cheap: no re-import). Child death
 //! fails its in-flight requests as WorkerLost (retryable). If the parent's
-//! control channel breaks mid-run the parent is respawned; if fork-server
-//! startup fails outright the pool falls back to stdio mode.
+//! control channel breaks mid-run the parent is respawned and the fork
+//! request that was in flight is retried against the fresh parent, rather
+//! than dropped for the requesting slot's `FORK_WAIT` backstop to notice; a
+//! *healthy* parent's transient fork refusal (EAGAIN/ENOMEM) retries with
+//! backoff and never touches the parent. If fork-server startup fails
+//! outright the pool falls back to stdio mode. The listener socket lives in
+//! a private (0700) directory and every accepted connection is checked
+//! against our own uid (SO_PEERCRED) before it is trusted as a real child.
 //!
 //! **Stdio mode (fallback, `--no-fork-server`):** each child is spawned
 //! directly (`{python} -m cauli._exec --app {spec}`), speaks the protocol on
@@ -32,6 +38,7 @@
 use crate::stats::Counters;
 use anyhow::Context;
 use std::collections::HashMap;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -49,7 +56,10 @@ use tracing::{info, warn};
 /// ready line, and a control-channel fork reply.
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long a pool slot waits for a requested fork to connect before asking
-/// again (covers a lost fork request across a parent respawn).
+/// again. `parent_control_loop` already retries a request internally until
+/// it succeeds (FS-3/FS-6), so this is a backstop for the rarer case where
+/// the fork itself succeeded but the resulting child never completed its
+/// ready handshake (e.g. it crashed between connect() and its ready line).
 const FORK_WAIT: Duration = Duration::from_secs(60);
 
 pub enum CpuOutcome {
@@ -183,7 +193,19 @@ pub fn kill_children(pool: &CpuPool) {
         kill_pid(pid);
     }
     if let Some(p) = &pool.sock_path {
-        let _ = std::fs::remove_file(p.as_path());
+        cleanup_sock_path(p);
+    }
+}
+
+/// Remove the fork-server socket file and its private containing directory
+/// (FS-8). Called on every path that can leave a bound socket behind: clean
+/// shutdown, forced double-signal exit, and fork-server startup failure
+/// after a successful bind. `remove_dir` only succeeds once the directory is
+/// empty, so this is safe to call from a partial-startup path too.
+fn cleanup_sock_path(p: &std::path::Path) {
+    let _ = std::fs::remove_file(p);
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::remove_dir(dir);
     }
 }
 
@@ -228,12 +250,22 @@ struct ChildConn {
     concurrency: usize,
 }
 
-fn fork_sock_path() -> PathBuf {
+/// Create a private (0700) directory under the system temp dir and return a
+/// socket path inside it (FS-1). Connecting to a unix-domain socket on Linux
+/// also requires search/write permission on its containing directory, so a
+/// 0700 directory alone already stops any other local uid from reaching the
+/// socket; the SO_PEERCRED check in `read_child_ready` is defense in depth
+/// on top of that (belt-and-suspenders against a umask/platform surprise).
+fn fork_sock_path() -> anyhow::Result<PathBuf> {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    std::env::temp_dir().join(format!("cauli-cpu-{}-{nanos:x}.sock", std::process::id()))
+    let dir = std::env::temp_dir().join(format!("cauli-cpu-{}-{nanos:x}", std::process::id()));
+    std::fs::create_dir(&dir).with_context(|| format!("create {}", dir.display()))?;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("chmod 0700 {}", dir.display()))?;
+    Ok(dir.join("cpu.sock"))
 }
 
 fn spawn_parent(
@@ -297,15 +329,20 @@ async fn start_fork_server(
     counters: Arc<Counters>,
     pids: Arc<Mutex<Vec<u32>>>,
 ) -> anyhow::Result<PathBuf> {
-    let sock_path = fork_sock_path();
-    let _ = std::fs::remove_file(&sock_path);
+    let sock_path = fork_sock_path()?;
     let listener = UnixListener::bind(&sock_path)
         .with_context(|| format!("bind unix listener at {}", sock_path.display()))?;
+    // FS-1 defense in depth: explicitly restrict the socket file itself too,
+    // rather than relying solely on whatever the platform's default bind()
+    // mode (subject to umask) happens to produce.
+    std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("chmod 0600 {}", sock_path.display()))?;
 
     let mut parent = spawn_parent(&prog, &argv, &sock_path, child_threads)?;
     if let Err(e) = wait_server_ready(&mut parent).await {
         let _ = parent.child.start_kill();
         let _ = parent.child.wait().await;
+        cleanup_sock_path(&sock_path); // FS-8: don't abandon a bound socket on startup failure
         return Err(e);
     }
     info!(
@@ -326,7 +363,7 @@ async fn start_fork_server(
         child_threads,
         pids.clone(),
     ));
-    tokio::spawn(acceptor_loop(listener, conn_tx));
+    tokio::spawn(acceptor_loop(listener, conn_tx, child_threads));
     for i in 0..workers {
         tokio::spawn(slot_loop(
             i,
@@ -341,11 +378,14 @@ async fn start_fork_server(
 }
 
 /// Owns the fork-server parent: writes one `{"cmd":"fork"}` per request from
-/// the pool slots and reads the `{"forked": pid}` reply. A control-channel
-/// failure mid-run (parent crashed/killed) respawns the parent; its children
-/// died with it (PDEATHSIG), so the slots' connection EOFs re-request forks
-/// which the fresh parent then serves. The failed request itself is dropped:
-/// the requesting slot re-asks after FORK_WAIT.
+/// the pool slots and reads the reply. FS-3/FS-6: a request is retried until
+/// it succeeds instead of being dropped on the first setback. A parseable
+/// `{"error": ...}` reply from a HEALTHY parent (e.g. transient
+/// EAGAIN/ENOMEM) retries with backoff and never touches the parent process;
+/// a genuine control-channel failure (parent crashed/killed) respawns the
+/// parent and then retries the SAME request against the fresh one, so the
+/// requesting slot is served promptly instead of waiting out its FORK_WAIT
+/// backstop.
 async fn parent_control_loop(
     mut parent: ParentProc,
     mut fork_rx: mpsc::Receiver<()>,
@@ -363,42 +403,70 @@ async fn parent_control_loop(
             track_pid(&pids, parent.pid, false);
             return;
         }
-        match request_fork(&mut parent).await {
-            Ok(pid) => info!("cpu: fork-server forked child pid={pid}"),
-            Err(e) => {
-                warn!("cpu: fork-server control channel failed ({e:#}); respawning parent");
-                let _ = parent.child.start_kill();
-                let _ = parent.child.wait().await;
-                track_pid(&pids, parent.pid, false);
-                loop {
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                    match spawn_parent(&prog, &argv, &sock_path, child_threads) {
-                        Ok(mut p) => {
-                            match wait_server_ready(&mut p).await {
-                                Ok(()) => {
-                                    info!("cpu: fork-server parent respawned pid={}", p.pid);
-                                    track_pid(&pids, p.pid, true);
-                                    parent = p;
-                                    break;
-                                }
-                                Err(e) => {
-                                    warn!("cpu: fork-server parent respawn not ready ({e:#}); retrying");
-                                    let _ = p.child.start_kill();
-                                    let _ = p.child.wait().await;
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            warn!("cpu: fork-server parent respawn failed ({e:#}); retrying")
-                        }
-                    }
+        let mut backoff = Duration::from_millis(100);
+        loop {
+            match request_fork(&mut parent).await {
+                Ok(ForkResult::Forked(pid)) => {
+                    info!("cpu: fork-server forked child pid={pid}");
+                    break;
+                }
+                Ok(ForkResult::Refused(err)) => {
+                    warn!("cpu: fork refused by a healthy parent ({err}); retrying in {backoff:?}");
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(Duration::from_secs(2));
+                }
+                Err(e) => {
+                    warn!("cpu: fork-server control channel failed ({e:#}); respawning parent");
+                    let _ = parent.child.start_kill();
+                    let _ = parent.child.wait().await;
+                    track_pid(&pids, parent.pid, false);
+                    parent = respawn_parent(&prog, &argv, &sock_path, child_threads, &pids).await;
+                    // loop back and retry request_fork against the fresh parent
                 }
             }
         }
     }
 }
 
-async fn request_fork(parent: &mut ParentProc) -> anyhow::Result<u32> {
+/// Block until a fresh fork-server parent is spawned and ready, retrying
+/// once a second. Used after the control channel breaks.
+async fn respawn_parent(
+    prog: &str,
+    argv: &[String],
+    sock_path: &PathBuf,
+    child_threads: usize,
+    pids: &Arc<Mutex<Vec<u32>>>,
+) -> ParentProc {
+    loop {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        match spawn_parent(prog, argv, sock_path, child_threads) {
+            Ok(mut p) => match wait_server_ready(&mut p).await {
+                Ok(()) => {
+                    info!("cpu: fork-server parent respawned pid={}", p.pid);
+                    track_pid(pids, p.pid, true);
+                    return p;
+                }
+                Err(e) => {
+                    warn!("cpu: fork-server parent respawn not ready ({e:#}); retrying");
+                    let _ = p.child.start_kill();
+                    let _ = p.child.wait().await;
+                }
+            },
+            Err(e) => warn!("cpu: fork-server parent respawn failed ({e:#}); retrying"),
+        }
+    }
+}
+
+enum ForkResult {
+    /// The parent forked a child successfully.
+    Forked(u32),
+    /// The parent is healthy and replied with a parseable `{"error": ...}`
+    /// (e.g. transient EAGAIN/ENOMEM) -- FS-3: this must NOT be treated the
+    /// same as a dead/unreachable parent (no kill, no respawn).
+    Refused(String),
+}
+
+async fn request_fork(parent: &mut ParentProc) -> anyhow::Result<ForkResult> {
     parent
         .stdin
         .write_all(b"{\"cmd\":\"fork\"}\n")
@@ -410,22 +478,33 @@ async fn request_fork(parent: &mut ParentProc) -> anyhow::Result<u32> {
         .context("read fork reply")?
         .context("fork-server parent closed stdout")?;
     let v: serde_json::Value = serde_json::from_str(&line).context("unparseable fork reply")?;
-    match v["forked"].as_u64() {
-        Some(pid) if pid > 1 => Ok(pid as u32),
-        _ => anyhow::bail!("fork request refused: {line}"),
+    if let Some(pid) = v["forked"].as_u64().filter(|&p| p > 1) {
+        return Ok(ForkResult::Forked(pid as u32));
     }
+    if let Some(err) = v.get("error") {
+        let msg = err
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| err.to_string());
+        return Ok(ForkResult::Refused(msg));
+    }
+    anyhow::bail!("unexpected fork reply: {line}")
 }
 
 /// Accept forked-child connections and complete their ready handshake off the
 /// accept path (a child that never sends its ready line must not stall other
 /// children's handshakes).
-async fn acceptor_loop(listener: UnixListener, conn_tx: async_channel::Sender<ChildConn>) {
+async fn acceptor_loop(
+    listener: UnixListener,
+    conn_tx: async_channel::Sender<ChildConn>,
+    child_threads: usize,
+) {
     loop {
         match listener.accept().await {
             Ok((stream, _addr)) => {
                 let tx = conn_tx.clone();
                 tokio::spawn(async move {
-                    match read_child_ready(stream).await {
+                    match read_child_ready(stream, child_threads).await {
                         Ok(conn) => {
                             let _ = tx.send(conn).await;
                         }
@@ -442,9 +521,27 @@ async fn acceptor_loop(listener: UnixListener, conn_tx: async_channel::Sender<Ch
 }
 
 /// Read `{"ready": true, "pid": N, "concurrency": M}` from a fresh child
-/// connection. The same buffered reader is kept for the serving loop so no
-/// bytes can be lost between handshake and first response.
-async fn read_child_ready(stream: tokio::net::UnixStream) -> anyhow::Result<ChildConn> {
+/// connection. FS-1: the private 0700 socket directory already keeps other
+/// uids out; this additionally verifies the connecting process's
+/// kernel-reported credentials (SO_PEERCRED) match our own uid before
+/// trusting anything it says, and prefers the kernel-reported peer pid over
+/// the JSON-claimed one (which is otherwise attacker-controlled) for
+/// tracking/kill decisions. FS-2: concurrency is clamped to the configured
+/// `child_threads` so a hostile/buggy value can't defeat the pool's backlog
+/// bound. The same buffered reader is kept for the serving loop so no bytes
+/// can be lost between handshake and first response.
+async fn read_child_ready(
+    stream: tokio::net::UnixStream,
+    child_threads: usize,
+) -> anyhow::Result<ChildConn> {
+    let peer = stream.peer_cred().context("read peer credentials")?;
+    let our_uid = unsafe { libc::getuid() };
+    if peer.uid() != our_uid {
+        anyhow::bail!(
+            "rejected connection from uid {} (expected {our_uid})",
+            peer.uid()
+        );
+    }
     let (read, write) = stream.into_split();
     let mut lines = BufReader::new(read).lines();
     let line = timeout(READY_TIMEOUT, lines.next_line())
@@ -456,11 +553,23 @@ async fn read_child_ready(stream: tokio::net::UnixStream) -> anyhow::Result<Chil
     if v["ready"] != serde_json::Value::Bool(true) {
         anyhow::bail!("bad ready line: {line}");
     }
-    let pid = match v["pid"].as_u64() {
-        Some(p) if p > 1 => p as u32,
-        _ => anyhow::bail!("ready line without a usable pid: {line}"),
-    };
+    let claimed_pid = v["pid"].as_u64().filter(|&p| p > 1).map(|p| p as u32);
+    let pid = peer
+        .pid()
+        .and_then(|p| u32::try_from(p).ok())
+        .filter(|&p| p > 1)
+        .or(claimed_pid)
+        .ok_or_else(|| anyhow::anyhow!("ready line without a usable pid: {line}"))?;
+    if let (Some(kernel_pid), Some(json_pid)) = (peer.pid(), claimed_pid) {
+        if kernel_pid as u64 != json_pid as u64 {
+            warn!(
+                "cpu: forked child claimed pid={json_pid} but kernel reports pid={kernel_pid}; \
+                 using the kernel-verified value"
+            );
+        }
+    }
     let concurrency = v["concurrency"].as_u64().unwrap_or(1).max(1) as usize;
+    let concurrency = concurrency.min(child_threads);
     Ok(ChildConn {
         lines,
         write,
@@ -508,10 +617,16 @@ struct Pending {
 }
 
 enum ChildGone {
-    /// EOF / read or write error: the child process died.
-    Died,
+    /// EOF observed on read: the child process has already exited and been
+    /// reaped by the fork-server parent's SIGCHLD handler (FS-7) -- its pid
+    /// may already be reused by an unrelated process, so it must NOT be
+    /// SIGKILLed again.
+    Exited,
     /// A request exceeded its hard timeout: SIGKILL the child.
     HardTimeout,
+    /// A write to the child's socket failed or stalled past its budget
+    /// (FS-4): the child is presumed wedged, not confirmed exited. SIGKILL it.
+    Wedged,
     /// The job channel closed: worker shutdown.
     Shutdown,
 }
@@ -561,7 +676,7 @@ async fn serve_child(
                             "cpu[{idx}] pid={pid}: child connection closed ({} in flight -> WorkerLost)",
                             pending.len()
                         );
-                        break ChildGone::Died;
+                        break ChildGone::Exited;
                     }
                 }
             }
@@ -570,19 +685,42 @@ async fn serve_child(
                     Ok(job) => {
                         let mut l = job.req_line;
                         l.push('\n');
-                        if let Err(e) = write.write_all(l.as_bytes()).await {
-                            warn!("cpu[{idx}] pid={pid}: write failed: {e}");
-                            let _ = job.resp.send(CpuOutcome::Lost);
-                            break ChildGone::Died;
+                        // FS-4: write_all here runs OUTSIDE the select! race
+                        // once entered (the arm body is a plain await, not
+                        // part of the racing set), so an unbounded write
+                        // would suspend response reads AND hard-timeout
+                        // enforcement for everything already pending on this
+                        // child. A child that stops draining its socket must
+                        // be detected and treated as gone, not silently wedge
+                        // the slot forever.
+                        let write_budget =
+                            Duration::from_millis(job.timeout_ms).min(Duration::from_secs(5));
+                        match timeout(write_budget, write.write_all(l.as_bytes())).await {
+                            Ok(Ok(())) => {
+                                counters.inflight_cpu.fetch_add(1, Ordering::Relaxed);
+                                // H3-style saturation: a crafted/huge timeout_ms
+                                // must not overflow Instant math into a panic or
+                                // a near-zero deadline.
+                                let deadline = Instant::now()
+                                    .checked_add(Duration::from_millis(job.timeout_ms))
+                                    .unwrap_or_else(|| Instant::now() + Duration::from_secs(86_400 * 365));
+                                pending.insert(job.id, Pending { resp: job.resp, deadline });
+                            }
+                            Ok(Err(e)) => {
+                                warn!("cpu[{idx}] pid={pid}: write failed: {e}");
+                                let _ = job.resp.send(CpuOutcome::Lost);
+                                break ChildGone::Wedged;
+                            }
+                            Err(_) => {
+                                warn!(
+                                    "cpu[{idx}] pid={pid}: write stalled past {write_budget:?} \
+                                     ({} in flight); SIGKILL + replacement fork",
+                                    pending.len()
+                                );
+                                let _ = job.resp.send(CpuOutcome::Lost);
+                                break ChildGone::Wedged;
+                            }
                         }
-                        counters.inflight_cpu.fetch_add(1, Ordering::Relaxed);
-                        // H3-style saturation: a crafted/huge timeout_ms must
-                        // not overflow Instant math into a panic or a
-                        // near-zero deadline.
-                        let deadline = Instant::now()
-                            .checked_add(Duration::from_millis(job.timeout_ms))
-                            .unwrap_or_else(|| Instant::now() + Duration::from_secs(86_400 * 365));
-                        pending.insert(job.id, Pending { resp: job.resp, deadline });
                     }
                     Err(_) => break ChildGone::Shutdown,
                 }
@@ -599,10 +737,14 @@ async fn serve_child(
         }
     };
 
-    // The child is gone (or being disposed of): SIGKILL is idempotent and the
-    // fork-server parent reaps it. Resolve every in-flight request: expired
-    // ones as Timeout, the rest as Lost (retryable WorkerLost).
-    kill_pid(pid);
+    // Resolve every in-flight request: expired ones as Timeout, the rest as
+    // Lost (retryable WorkerLost). FS-7: only SIGKILL when the child is not
+    // confirmed already exited -- on a read-EOF (`Exited`) the fork-server
+    // parent has already reaped this pid via SIGCHLD, so it may already be
+    // reused by an unrelated process; SIGKILLing it again would be wrong.
+    if !matches!(gone, ChildGone::Exited) {
+        kill_pid(pid);
+    }
     let now = Instant::now();
     for (_, p) in pending.drain() {
         let out = match gone {

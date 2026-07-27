@@ -308,8 +308,13 @@ retryable, error type `"WorkerLost"`.
 
 #### Fork-server mode (default)
 
-The worker binds a unix stream socket listener at a private path and spawns ONE parent
-process per pool:
+The worker binds a unix stream socket listener inside a private, `0700`-permission directory
+under the system temp dir (so no other local uid can even reach the socket) and spawns ONE
+parent process per pool. Every accepted connection is additionally checked against the
+worker's own uid via `SO_PEERCRED` before it is trusted as a real forked child — the kernel-
+reported peer pid is used for tracking/kill decisions in preference to the client-claimed one.
+The socket file and its containing directory are removed on every worker exit path (clean
+drain, forced double-signal exit, and fork-server startup failure after a successful bind).
 
 `{python} -m cauli._exec --app {module:attr} --fork-server --connect {socket_path}
 --child-threads {M}`
@@ -334,8 +339,14 @@ process per pool:
   is requested whenever a child dies or is killed — respawns are cheap: no re-import). Hard
   timeout of any in flight request: SIGKILL the child by pid, fail that request as
   `"TimeoutError"`, fail the child's other in flight requests as `"WorkerLost"` (retryable),
-  request a replacement fork. If the parent's control channel fails mid-run, the worker
-  respawns the parent (its children died with it via PDEATHSIG and are re-forked).
+  request a replacement fork. A dead child's pid is never SIGKILLed a second time (it may
+  already be reused by an unrelated process once the fork-server parent reaps it via
+  SIGCHLD); a child that stops draining its socket without dying (write stalls past a bounded
+  budget) is treated as gone and killed the same as a hard timeout. A fork request is retried
+  until it succeeds instead of being dropped: a parseable fork refusal from a HEALTHY parent
+  (e.g. transient EAGAIN/ENOMEM) retries with backoff and never touches the parent process; a
+  genuine control-channel failure respawns the parent (its children died with it via
+  PDEATHSIG) and then retries the SAME fork request against the fresh parent.
 - stderr of the parent and of every child is passthrough logging.
 
 #### Stdio mode (fallback)
