@@ -33,7 +33,8 @@ pub struct Args {
     pub cpu_workers: Option<usize>,
 
     /// Worker threads per cpu child (fork-server mode). M > 1 pipelines up
-    /// to M requests per child; responses are matched by id (PROTOCOL §5.1)
+    /// to M requests per child; responses are matched by id (PROTOCOL §5.1).
+    /// Must be within [1, 1024] (FS-10 — enforced in main.rs after parsing).
     #[arg(long, default_value_t = 1)]
     pub cpu_child_threads: usize,
 

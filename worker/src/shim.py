@@ -60,12 +60,17 @@ _set_async_exc = ctypes.pythonapi.PyThreadState_SetAsyncExc
 
 
 def _validate_json_types(obj):
-    """Reject non-JSON types and non-finite floats (mirrors cauli._codec).
+    """Reject non-JSON types, non-finite floats, and non-str dict keys
+    (mirrors cauli._codec).
 
     msgspec natively serializes set/datetime/... (which the stdlib rejects
     with TypeError) and encodes NaN/Infinity as null; this walk keeps both
     backends accepting/rejecting the same inputs so a task returning a set
-    is a SerializationError regardless of the installed codec.
+    is a SerializationError regardless of the installed codec. Dict keys:
+    the stdlib silently coerces a non-str key (bool -> "true"/"false", etc.)
+    but msgspec rejects some of those outright (verified: a bool key raises
+    TypeError there), so both backends require str keys here instead of
+    trying to replicate the stdlib's coercion.
     """
     t = type(obj)
     if t is str or t is int or t is bool or obj is None:
@@ -76,7 +81,8 @@ def _validate_json_types(obj):
         raise ValueError("Out of range float values are not JSON compliant")
     if t is dict:
         for k, v in obj.items():
-            _validate_json_types(k)
+            if type(k) is not str:
+                raise TypeError("dict keys must be str, got %s" % (type(k).__name__,))
             _validate_json_types(v)
         return
     if t is list or t is tuple:
@@ -89,7 +95,8 @@ def _validate_json_types(obj):
         return _validate_json_types(float(obj))
     if isinstance(obj, dict):
         for k, v in obj.items():
-            _validate_json_types(k)
+            if not isinstance(k, str):
+                raise TypeError("dict keys must be str, got %s" % (type(k).__name__,))
             _validate_json_types(v)
         return
     if isinstance(obj, (list, tuple)):
@@ -104,6 +111,10 @@ def _loads(s):
 
 
 def _dumps_str(obj):
+    # CD-3: validate here too (not just the msgspec _init_codec branch below)
+    # so a non-str dict key is rejected identically whether or not msgspec
+    # ends up installed -- see _validate_json_types.
+    _validate_json_types(obj)
     # allow_nan=False keeps NaN/Infinity a loud SerializationError on both
     # codec backends (msgspec would encode them as null; serde_json on the
     # Rust side cannot parse the stdlib's NaN literal either way).
@@ -170,7 +181,12 @@ def _outcome_json(out):
     """
     try:
         return _dumps_str(out)
-    except (TypeError, ValueError) as e:
+    except (TypeError, ValueError, RecursionError) as e:
+        # CD-2: a self-referential or pathologically deep task result makes
+        # _validate_json_types' unbounded recursion hit Python's recursion
+        # limit; RecursionError is a normal, catchable exception but is not
+        # a ValueError/TypeError, so it must be listed explicitly here too
+        # (mirrors py/cauli/_codec.py's ENCODE_ERRORS).
         return json.dumps(
             {
                 "ok": False,

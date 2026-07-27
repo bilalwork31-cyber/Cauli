@@ -117,3 +117,18 @@ def test_scalars_and_bignums(codec):
     for value in (0, -1, 2**80, 1.5, "", "x", True, False, None, [], {}):
         assert codec.decode(codec.encode(value)) == value
     assert math.isclose(codec.decode(codec.encode(1e308)), 1e308)
+
+
+def test_non_str_dict_keys_rejected_identically(codec):
+    """CD-3: msgspec and the stdlib do NOT agree on non-str dict key
+    handling -- the stdlib silently coerces (bool -> "true"/"false", etc.)
+    but msgspec rejects some of those outright (verified empirically: a
+    bool key raises "Only dicts with str-like or number-like keys are
+    supported" there). Replicating the stdlib's exact coercion for msgspec
+    would need a full tree rebuild on every encode for an edge case with no
+    real caller (task args/kwargs keys are always str already). Simpler and
+    safer: both backends must reject a non-str key the same way, rather
+    than one silently succeeding where the other raises."""
+    for key in (1, 2.5, True, False, None):
+        with pytest.raises(TypeError):
+            codec.encode({key: "v"})

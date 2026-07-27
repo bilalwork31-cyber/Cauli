@@ -44,6 +44,7 @@ import heapq
 import importlib
 import os
 import queue
+import random
 import signal
 import socket
 import sys
@@ -368,6 +369,20 @@ def _fork_server_main(app_spec: str, sock_path: str, child_threads: int) -> int:
 
     signal.signal(signal.SIGCHLD, _reap_children)
 
+    # FS-9 diagnostic: forking a multi-threaded process is a classic footgun
+    # (only the forking thread survives in the child; a lock held by any
+    # other thread at fork time stays locked forever in every child). The
+    # app import above is the only thing that could have started a
+    # background thread before this point -- warn loudly rather than let it
+    # surface later as an unexplained per-child deadlock.
+    if threading.active_count() > 1:
+        _log(
+            f"cauli._exec: WARNING: {threading.active_count()} threads active "
+            "at fork-server startup (app import started a background thread?); "
+            "every forked child inherits only the forking thread and can "
+            "deadlock on a lock held by one of the others at fork time"
+        )
+
     _write_line(proto, {"server": True, "pid": os.getpid()})
     rss, _private = _rss_kb()
     _log(
@@ -420,6 +435,13 @@ def _forked_child_main(
     os.dup2(devnull, 0)
     os.close(devnull)
 
+    # FS-9: every child forked from the same warmed parent otherwise inherits
+    # the IDENTICAL `random` module state, so unseeded `random` calls (jitter,
+    # sampling, non-crypto ids) produce the SAME sequence in every sibling.
+    # Reseed from OS entropy right after fork, before any task can run.
+    # secrets/uuid4 are unaffected either way (both read urandom directly).
+    random.seed()
+
     _set_pdeathsig()  # fork cleared it; re-arm against the fork-server parent
     if os.getppid() == 1:
         return 0  # the parent died inside the fork window; nothing to serve
@@ -440,6 +462,45 @@ def _forked_child_main(
         return _serve_socket_threaded(app, sock, child_threads)
     except (BrokenPipeError, ConnectionResetError):
         return 0  # the worker went away mid-write; normal on kill paths
+
+
+def _safe_handle_and_respond(
+    app: Any,
+    line: str,
+    writer: "_SocketWriter",
+    watchdog: _SoftTimeoutWatchdog | None = None,
+) -> None:
+    """`_handle_request_line` + `writer.write_response`, guarded end to end.
+
+    FS-5: a soft-timeout injection can land between `_handle_request_line`
+    returning and the response actually being written (during
+    `_serialize_response`'s json.dumps, or inside `sendall`) -- that window
+    is outside `_handle_request_line`'s own BaseException guard. Left
+    unguarded, it silently kills the calling thread (M > 1: one of the M
+    worker threads, with its in-flight request never answered until the
+    caller's own hard timeout) or the whole child (M == 1). Mirrors the
+    defensive `except BaseException` shim.py already uses around every
+    Python-visible completion path on the io side.
+    """
+    try:
+        resp = _handle_request_line(app, line, watchdog=watchdog)
+    except BaseException as exc:
+        try:
+            req = _codec.decode(line)
+            rid = req.get("id") if isinstance(req, dict) else None
+        except Exception:
+            rid = None
+        resp = {"id": rid, "ok": False, "error": _error_json(exc)}
+    try:
+        writer.write_response(resp)
+    except BaseException:
+        pass  # connection likely gone; the caller's read-EOF check ends serving
+    if watchdog is not None:
+        # Belt-and-suspenders: make sure this thread's generation has moved
+        # on before it picks up another request, even on the exception path
+        # above (narrows the residual same-generation race a hair further;
+        # see PROTOCOL.md section 4.6).
+        watchdog.disarm()
 
 
 class _SocketWriter:
@@ -469,7 +530,7 @@ def _serve_socket_single(app: Any, sock: socket.socket) -> int:
         line = line.strip()
         if not line:
             continue
-        writer.write_response(_handle_request_line(app, line))
+        _safe_handle_and_respond(app, line, writer)
 
 
 def _serve_socket_threaded(app: Any, sock: socket.socket, threads: int) -> int:
@@ -484,7 +545,7 @@ def _serve_socket_threaded(app: Any, sock: socket.socket, threads: int) -> int:
     def worker_loop() -> None:
         while True:
             line = requests.get()
-            writer.write_response(_handle_request_line(app, line, watchdog=watchdog))
+            _safe_handle_and_respond(app, line, writer, watchdog=watchdog)
 
     for i in range(threads):
         threading.Thread(
