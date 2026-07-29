@@ -5,8 +5,11 @@
 //! - The GIL is only ever taken on dedicated OS threads (sync pool) or inside
 //!   `spawn_blocking` (async submit). Tokio worker threads never hold the GIL
 //!   while doing broker I/O.
-//! - All Python-side complexity lives in the embedded shim (src/shim.py):
-//!   the pyo3 surface is "call function, pass strings, get strings".
+//! - All Python-side complexity lives in the embedded shim (src/shim.py).
+//! - Task arguments and outcomes cross as real Python objects, converted by
+//!   src/pyjson.rs. The shim contains no per-task JSON codec: encoding and
+//!   decoding there would run while holding the GIL that every in-process
+//!   task shares, and so came straight out of io throughput.
 
 use crate::ctx::Outcome;
 use crate::envelope::ErrorJson;
@@ -46,17 +49,8 @@ pub struct AppConfig {
 
 pub struct PyRuntime {
     shim: Py<PyModule>,
-    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<String>>>>,
+    pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Outcome>>>>,
     next_token: AtomicU64,
-}
-
-fn synth_error_json(type_: &str, msg: &str) -> String {
-    serde_json::json!({
-        "ok": false,
-        "retryable": true,
-        "error": {"type": type_, "message": msg, "traceback": ""},
-    })
-    .to_string()
 }
 
 /// Normalize the shim's outcome dict (a real Python object, not JSON text)
@@ -145,7 +139,7 @@ impl PyRuntime {
         #[allow(deprecated)]
         pyo3::prepare_freethreaded_python();
 
-        let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<String>>>> =
+        let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Outcome>>>> =
             Arc::new(Mutex::new(HashMap::new()));
 
         let pending_cb = pending.clone();
@@ -175,10 +169,18 @@ impl PyRuntime {
                 move |args: &Bound<'_, PyTuple>,
                       _kwargs: Option<&Bound<'_, PyDict>>|
                       -> PyResult<()> {
+                    // Runs on the asyncio loop thread WITH THE GIL HELD. The
+                    // outcome arrives as a real dict, so the shim no longer
+                    // encodes JSON here and no string is copied across.
+                    //
+                    // Convert BEFORE taking the mutex: this lock is also taken
+                    // (GIL-free) by submit_async and cancel, and blocking on it
+                    // while holding the GIL would stall the whole event loop,
+                    // not just this task.
                     let token: u64 = args.get_item(0)?.extract()?;
-                    let payload: String = args.get_item(1)?.extract()?;
+                    let outcome = outcome_from_py(&args.get_item(1)?);
                     if let Some(tx) = pending_cb.lock().unwrap().remove(&token) {
-                        let _ = tx.send(payload);
+                        let _ = tx.send(outcome);
                     }
                     Ok(())
                 },
@@ -258,32 +260,33 @@ impl PyRuntime {
     pub fn submit_async(
         &self,
         name: &str,
-        args_json: &str,
-        kwargs_json: &str,
+        args: &Value,
+        kwargs: &Value,
         timeout_s: f64,
-    ) -> (u64, oneshot::Receiver<String>) {
+    ) -> (u64, oneshot::Receiver<Outcome>) {
         let token = self.next_token.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(token, tx);
 
         let submit_err: Option<String> = Python::attach(|py| {
-            match self
-                .shim
-                .bind(py)
-                .getattr("submit_async")
-                .and_then(|f| f.call1((token, name, args_json, kwargs_json, timeout_s)))
-            {
-                Ok(_) => None,
-                Err(e) => Some(pyerr_string(py, &e)),
-            }
+            let scheduled = (|| -> PyResult<()> {
+                let a = crate::pyjson::json_to_py(py, args, 0)?;
+                let k = crate::pyjson::json_to_py(py, kwargs, 0)?;
+                self.shim
+                    .bind(py)
+                    .getattr("submit_async")?
+                    .call1((token, name, a, k, timeout_s))?;
+                Ok(())
+            })();
+            scheduled.err().map(|e| pyerr_string(py, &e))
         });
 
         if let Some(msg) = submit_err {
             if let Some(tx) = self.pending.lock().unwrap().remove(&token) {
-                let _ = tx.send(synth_error_json(
-                    "WorkerShimError",
-                    &format!("submit_async failed: {msg}"),
-                ));
+                let _ = tx.send(Outcome::Failure {
+                    err: ErrorJson::new("WorkerShimError", format!("submit_async failed: {msg}")),
+                    retryable: true,
+                });
             }
         }
         (token, rx)

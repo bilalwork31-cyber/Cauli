@@ -39,18 +39,23 @@ def redis_client(port: int, db: int) -> redis_lib.Redis:
     return redis_lib.Redis(host="127.0.0.1", port=port, db=db)
 
 
-def get_task(stack: str):
+def get_task(stack: str, task: str):
     if stack == "celery":
         import tasks_celery as mod
 
-        return mod.cpu_task
+        # Celery has no async lane; its io arm is the sync task.
+        return {"cpu": mod.cpu_task, "io": mod.io_task, "io_async": mod.io_task}[task]
     import tasks_cauli as mod
 
-    return mod.cpu_task
+    return {
+        "cpu": mod.cpu_task,
+        "io": mod.io_task,
+        "io_async": mod.io_task_async,
+    }[task]
 
 
 def phase_enqueue(args) -> int:
-    task = get_task(args.stack)
+    task = get_task(args.stack, args.task)
     t0 = time.time()
     for _ in range(args.n):
         task.delay()
@@ -88,6 +93,7 @@ def phase_drain(args) -> int:
     out = {
         "scenario": args.scenario,
         "stack": args.stack,
+        "task": args.task,
         "n": args.n,
         "done": done,
         "cpu_iter": int(os.environ.get("BENCH_CPU_ITER", "94000")),
@@ -134,6 +140,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="drain-rate driver (worker capacity)")
     ap.add_argument("--stack", required=True, choices=["celery", "cauli"])
     ap.add_argument("--phase", required=True, choices=["enqueue", "drain"])
+    ap.add_argument("--task", default="cpu", choices=["cpu", "io", "io_async"])
     ap.add_argument("--n", type=int, default=8000)
     ap.add_argument("--scenario", default="drain")
     ap.add_argument(

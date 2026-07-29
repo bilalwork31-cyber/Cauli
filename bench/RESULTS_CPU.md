@@ -78,27 +78,43 @@ free — a child death fails everything staged behind it as retryable
 `WorkerLost`, and a staged task waits out the tasks ahead of it, so deep
 prefetch trades tail latency and redelivery volume for throughput.
 
-## IO, same suite, same machine state (`runner.sh S1`, 10k tasks, 1 GiB cap)
+## IO, drain-rate method (`bench/drain_io.sh`, 10k tasks, 1 GiB cap)
+
+The same isolation as the cpu table. These supersede the `exec_tps` figures
+below: async `exec_tps` was measured at 18177.9, 14083.7 and 8928.2 across
+three runs of the same configuration, because the async lane outpaces the
+driver and lands squarely in the regime where that metric stops being valid.
+
+| arm | drain tps (steady) | ratio vs Celery best |
+|---|---|---|
+| celery prefork 16 | 268.7 | 1x |
+| celery gevent 500 | 106.4 | 0.40x |
+| **cauli sync io 500** | **616.1** | **2.29x** |
+| **cauli async io 500** | **4430.2** | **16.5x** |
+
+**Ceiling caveat:** the io task is an HTTP GET against the local mock API's
+50 ms endpoint, and the mock API, the driver and the worker all share the same
+6 cores. cauli async drained 10,000 tasks in 3.0 s wall against a theoretical
+floor of ~1.0 s at 500 concurrent, so the async figure is bounded by the mock
+API rather than by the runtime. Read it as "at least this fast", not capacity.
+
+The sync lane went **514.8 → 694.1 tps (+34.8%)** in the closed-loop harness
+when JSON encode/decode was removed from the GIL-held path; a repeat run
+measured 691.9, and the two prior runs of the old code measured 507.6 and
+514.8, so the gain is well outside spread.
+
+gevent performed poorly under these equal-semantics settings (acks_late,
+prefetch 1), consistent with the note in `RESULTS.md`.
+
+### Older closed-loop figures, kept for continuity (`runner.sh S1`)
 
 | arm | exec_tps | peak MiB |
 |---|---|---|
 | celery prefork 8 | 158.4 | 220.2 |
 | celery prefork 16 | 361.1 | 407.4 |
 | celery gevent 500 | 86.5 | 56.2 |
-| cauli sync io 500 | 514.8 → **694.1** | 64.9 |
-| **cauli async io 500** | 14083.7 – 18177.9 | 81.0 |
-
-cauli async is 39x–50x Celery's best arm at 5x less RAM. The sync lane went
-**514.8 → 694.1 tps (+34.8%)** when the JSON encode/decode was removed from
-the GIL-held path (commit "Remove JSON from the GIL-held sync task path"),
-taking it from 1.43x to **1.92x** Celery at 6.3x less RAM. Prior runs of the
-old sync code measured 507.6 and 514.8, so that gain is well outside spread.
-
-Note gevent performed poorly under these equal-semantics settings (acks_late,
-prefetch 1), consistent with the note in `RESULTS.md`. The async `exec_tps`
-figures carry the driver-artifact caveat above and are the least trustworthy
-numbers here; the sync lane's is measured well below saturation and is not
-artifact-prone.
+| cauli sync io 500 | 514.8 → 691.9 | 64.9 |
+| cauli async io 500 | 8928.2 – 18177.9 (unstable, see above) | 81.0 |
 
 ## Caveats (read before quoting any of this)
 

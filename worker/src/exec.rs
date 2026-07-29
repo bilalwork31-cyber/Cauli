@@ -116,8 +116,10 @@ pub async fn run_async_task(ctx: &Arc<Ctx>, env: &Envelope) -> Outcome {
     let (token, rx) = {
         let rt = ctx.pyrt.clone();
         let name = env.task.clone();
-        let a = env.args_json();
-        let k = env.kwargs_json();
+        // Parsed values, converted to Python objects inside submit_async: no
+        // JSON text is produced here or parsed on the loop thread.
+        let a = env.args_ref().clone();
+        let k = env.kwargs_ref().clone();
         // GIL taken briefly off the tokio worker threads
         match tokio::task::spawn_blocking(move || rt.submit_async(&name, &a, &k, effective_s)).await
         {
@@ -134,7 +136,8 @@ pub async fn run_async_task(ctx: &Arc<Ctx>, env: &Envelope) -> Outcome {
     // not wrap this backstop to a near-zero duration (spurious TimeoutError).
     let backstop_ms = env.timeout_ms.saturating_add(BACKSTOP_GRACE_MS);
     match timeout(Duration::from_millis(backstop_ms), rx).await {
-        Ok(Ok(s)) => parse_pyresp(&s, false),
+        // Already normalized by the completion callback (pyrt::outcome_from_py).
+        Ok(Ok(outcome)) => outcome,
         Ok(Err(_)) => fail("WorkerLost", "async completion channel dropped".into()),
         Err(_) => {
             // MEM-1: stop waiting AND drop the pending-completion slot, so a
