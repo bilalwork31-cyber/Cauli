@@ -42,13 +42,18 @@ Issues = "https://github.com/bilalwork31-cyber/Cauli/issues"
 dev = [
     "pytest>=8",
 ]
+# Opt-in Django integration (cauli.contrib.django, TaskDef.delay_on_commit).
+# Core never imports django; this extra just pins a floor for users who do.
+django = [
+    "django>=4.2",
+]
 # `speed` is retained as an empty alias so `pip install 'cauli[speed]'` from
 # older docs or pinned scripts keeps working; msgspec moved into the required
 # dependencies above and is no longer optional.
 speed = []
 
 [tool.setuptools]
-packages = ["cauli"]
+packages = ["cauli", "cauli.contrib"]
 
 [tool.setuptools.package-data]
 cauli = ["py.typed"]

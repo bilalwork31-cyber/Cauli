@@ -111,5 +111,62 @@ class TaskDef:
             idempotency_key=idempotency_key,
         )
 
+    def delay_on_commit(self, *args: Any, **kwargs: Any) -> None:
+        """Enqueue only after the current Django database transaction commits.
+
+        The footgun this prevents: ``task.delay(obj.id)`` inside
+        ``transaction.atomic()`` publishes IMMEDIATELY — the worker can pick
+        the task up and query for a row the transaction has not committed yet
+        (task fails or reads stale data), and if the transaction rolls back,
+        the task runs anyway, referencing a row that never existed. This
+        method hands the enqueue to ``django.db.transaction.on_commit``: it
+        publishes only if (and when) the surrounding transaction commits, and
+        never publishes on rollback. Outside an atomic block Django runs
+        ``on_commit`` callbacks immediately, so it degrades to ``delay``.
+
+        Returns ``None`` (not an :class:`~cauli.result.AsyncResult`): no task
+        id exists until the commit actually publishes. Requires Django;
+        raises RuntimeError otherwise. Uses the default database alias — use
+        :meth:`apply_async_on_commit` for a specific one.
+        """
+        self.apply_async_on_commit(args=args, kwargs=kwargs)
+
+    def apply_async_on_commit(
+        self,
+        args: tuple[Any, ...] | list[Any] = (),
+        kwargs: dict[str, Any] | None = None,
+        countdown: float | None = None,
+        queue: str | None = None,
+        idempotency_key: str | None = None,
+        using: str | None = None,
+    ) -> None:
+        """:meth:`apply_async`, deferred to Django's transaction commit.
+
+        Same enqueue options as :meth:`apply_async`, same commit/rollback
+        semantics and ``None`` return as :meth:`delay_on_commit`. ``using``
+        selects the database alias whose transaction to hook (default
+        database when ``None``).
+        """
+        try:
+            from django.db import transaction
+        except ImportError as exc:  # pragma: no cover - exercised without django
+            raise RuntimeError(
+                "delay_on_commit/apply_async_on_commit require Django "
+                "(the enqueue is deferred via django.db.transaction.on_commit); "
+                "install django or use delay/apply_async"
+            ) from exc
+        frozen_args = tuple(args)
+        frozen_kwargs = dict(kwargs or {})
+        transaction.on_commit(
+            lambda: self.apply_async(
+                frozen_args,
+                frozen_kwargs,
+                countdown=countdown,
+                queue=queue,
+                idempotency_key=idempotency_key,
+            ),
+            using=using,
+        )
+
     def __repr__(self) -> str:
         return f"<TaskDef {self.name} kind={self.kind} queue={self.queue!r}>"

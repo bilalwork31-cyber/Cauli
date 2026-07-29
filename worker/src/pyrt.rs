@@ -386,6 +386,29 @@ impl SyncPool {
         std::thread::Builder::new()
             .name(format!("cauli-sync-{idx}"))
             .spawn(move || {
+                // Pin ONE persistent CPython thread state to this OS thread
+                // for its whole lifetime. Without this, each `Python::attach`
+                // below (a PyGILState_Ensure/Release pair on a non-Python
+                // thread) creates and then DESTROYS a fresh thread state per
+                // task, which wipes `threading.local` storage between tasks
+                // — and everything the Python ecosystem builds on it: Django
+                // caches its DB connection per thread (`CONN_MAX_AGE` is
+                // meaningless if the cache dies with every task, and each
+                // task then leaks a fresh connection until GC reaps the
+                // orphaned one), as do requests.Session patterns, SQLAlchemy
+                // scoped_session, etc. The initial Ensure registers the
+                // state in CPython's gilstate TSS (never Released, so never
+                // destroyed while the thread lives); SaveThread releases the
+                // GIL before entering the blocking recv loop. Subsequent
+                // attaches find and reuse the registered state.
+                //
+                // SAFETY: the interpreter is initialized (PyRuntime::init)
+                // before any pool starts, and this pairs Ensure with an
+                // immediate SaveThread so the GIL is not held around recv().
+                unsafe {
+                    pyo3::ffi::PyGILState_Ensure();
+                    pyo3::ffi::PyEval_SaveThread();
+                }
                 while let Ok(job) = rx.recv() {
                     if job.resp.is_closed() {
                         // The dispatcher already abandoned this job (hard

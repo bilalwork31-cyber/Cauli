@@ -70,8 +70,106 @@ async fn e2e_sigterm_drain_and_sigkill_recovery() {
     h2_sync_pool_survives_hard_timeout_abandonment(&mut c).await;
     m8_cli_floors_reject_zero();
     mem1_async_backstop_fires_cleanly(&mut c).await;
+    bulk_recovery_drains_backlog_per_tick(&mut c).await;
 
     stop_redis();
+}
+
+/// Recovery-throughput regression: after a `kill -9` with ~200 tasks in
+/// flight, the recovery loop must reclaim the WHOLE eligible backlog per
+/// tick, not one `--batch`-sized page. Pre-fix, reclaim trickled at 16
+/// entries per visibility_timeout/2 tick (~12 extra ticks for this load),
+/// which shows up here as (a) a first-to-last result spread of ~12s instead
+/// of execution-bound ~3s and (b) a total recovery time several times the
+/// idle-threshold + execution floor.
+async fn bulk_recovery_drains_backlog_per_tick(c: &mut redis::aio::MultiplexedConnection) {
+    const N: usize = 192;
+    let pool_flags = [
+        "--io-threads",
+        "64",
+        "--io-concurrency",
+        "256",
+        "--visibility-timeout",
+        "2",
+    ];
+    let mut w1 = Worker::spawn("bulkq", &pool_flags);
+    wait_group(c, "bulkq", 20).await;
+
+    // 1s sleepers, timeout_ms 5000 (covers the ~2s worst in-pool queue wait
+    // behind 64 threads), so required_idle = max(2000, 5000+2000) = 7s.
+    let mut ids = Vec::with_capacity(N);
+    for _ in 0..N {
+        let (id, e) = envelope("fx.slow", "bulkq", |v| {
+            v["args"] = json!([1.0]);
+            v["timeout_ms"] = json!(5000);
+        });
+        xadd(c, "bulkq", &e.to_string()).await;
+        ids.push(id);
+    }
+    // all delivered (in w1's PEL) before any completes (first ack at ~1s)
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while (xpending_count(c, "bulkq").await as usize) < N {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "tasks never became pending"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    w1.signal(libc::SIGKILL);
+    let _ = w1.wait_code(10);
+    assert_eq!(xpending_count(c, "bulkq").await as usize, N);
+
+    let w2 = Worker::spawn("bulkq", &pool_flags);
+    let t0 = std::time::Instant::now();
+    let mut first_result_at: Option<std::time::Duration> = None;
+    let mut remaining: std::collections::HashSet<String> = ids.iter().cloned().collect();
+    let deadline = t0 + std::time::Duration::from_secs(30);
+    while !remaining.is_empty() && std::time::Instant::now() < deadline {
+        let keys: Vec<String> = remaining
+            .iter()
+            .map(|id| format!("cauli:result:{id}"))
+            .collect();
+        let found: Vec<Option<String>> =
+            redis::cmd("MGET").arg(&keys).query_async(c).await.unwrap();
+        let done: Vec<String> = remaining
+            .iter()
+            .zip(&found)
+            .filter(|(_, f)| f.is_some())
+            .map(|(id, _)| id.clone())
+            .collect();
+        if !done.is_empty() && first_result_at.is_none() {
+            first_result_at = Some(t0.elapsed());
+        }
+        for id in done {
+            remaining.remove(&id);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let total = t0.elapsed();
+    assert!(
+        remaining.is_empty(),
+        "{} of {N} tasks still unrecovered after {total:?}",
+        remaining.len()
+    );
+    let spread = total - first_result_at.unwrap();
+    // Idle threshold ~7s + one 1s tick + 3s of execution waves ≈ 11-12s new;
+    // the pre-fix trickle needed ~12 additional ticks (~21s total, ~12s
+    // spread). Bounds sit between the two with margin on both sides.
+    assert!(
+        total < std::time::Duration::from_secs(17),
+        "recovery took {total:?}; per-tick reclaim is trickling again (pre-fix behavior ~21s)"
+    );
+    assert!(
+        spread < std::time::Duration::from_secs(7),
+        "first-to-last result spread {spread:?} looks claim-bound, not execution-bound"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert_eq!(
+        xpending_count(c, "bulkq").await,
+        0,
+        "every reclaimed entry must be acked"
+    );
+    drop(w2);
 }
 
 /// MEM-1 regression: when an async task's event-loop thread is wedged by a

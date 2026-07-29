@@ -122,6 +122,69 @@ one process per cpu task (also entered automatically if fork-server startup fail
 `--cpu-prefetch` (default 4) controls how many requests are staged in each child ahead of
 what it is executing; raise it for small tasks, lower it for long ones.
 
+## Lifecycle hooks
+
+Per-task and per-process hooks run on every execution path (sync thread pool, asyncio loops,
+cpu children) — see PROTOCOL.md §4.8:
+
+```python
+@app.before_task          # runs in the task's own thread/process, before it
+def setup(): ...
+
+@app.after_task           # runs after every task, all outcome paths
+def teardown(): ...
+
+@app.process_init         # once per cauli-managed process, before any task
+def init(): ...
+```
+
+A hook that raises is logged and skipped; it never fails the task. This is the extension
+point framework integrations build on — cauli core depends on no framework.
+
+## Django
+
+The opt-in integration lives in `cauli.contrib.django` (`pip install 'cauli[django]'`):
+
+```python
+# myproj/cauli.py
+from cauli.contrib.django import autodiscover_tasks, django_app
+
+app = django_app()          # or django_app("myproj.settings")
+autodiscover_tasks(app)     # imports <app>.tasks across INSTALLED_APPS
+
+# myproj/store/tasks.py  (any INSTALLED_APPS package)
+from myproj.cauli import app
+
+@app.task()
+def refresh_prices(sku_id): ...
+```
+
+```bash
+DJANGO_SETTINGS_MODULE=myproj.settings cauli-worker --app myproj.cauli:app
+```
+
+`django_app()` reads config from Django settings (`CAULI_REDIS_URL`, `CAULI_DEFAULT_QUEUE`,
+`CAULI_RESULT_TTL`, `CAULI_IDEMP_TTL`), calls `django.setup()` when needed, and registers DB
+connection lifecycle hooks with Celery-fixup parity: `close_old_connections` before and after
+every task, so `CONN_MAX_AGE` is honored and a connection gone stale across a database
+restart or failover is replaced instead of poisoning the worker thread that cached it (set
+`CONN_HEALTH_CHECKS = True` so the very first task after a restart succeeds). Import-time
+connections are closed once per process — in the fork-server parent before the first fork —
+so forked cpu children can never share one inherited socket.
+
+Enqueueing inside a transaction is the classic footgun (`delay()` publishes immediately; the
+worker can run the task before the row it references is committed, or after the transaction
+rolled back entirely). Every task therefore has an on-commit variant, mirroring Celery 5.4:
+
+```python
+with transaction.atomic():
+    order = Order.objects.create(...)
+    send_receipt.delay_on_commit(order.id)   # publishes only if this commits
+```
+
+`delay_on_commit(...)`/`apply_async_on_commit(...)` return `None` (no task id exists until
+commit) and require Django only when actually called.
+
 ## Measured
 
 Drain-rate benchmarks, 6 workers on 6 shared cores, **both stacks tuned at their own optimum**
