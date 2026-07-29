@@ -111,16 +111,20 @@ Drain-rate benchmarks, 6 workers on 6 shared cores, **both stacks tuned at their
 
 | Workload | Celery best | cauli best | ratio |
 |---|---|---|---|
-| CPU, 0.5 ms tasks | 672.9/s | 6057.9/s | 9.0x |
-| CPU, 2 ms tasks | 630.1/s | 1733.0/s | 2.75x |
+| CPU, 0.5 ms tasks | 673–827/s | 5730–6058/s | 6.9x – 9.0x |
+| CPU, 2 ms tasks | 630–853/s | 1733–1778/s | 2.1x – 2.8x |
 | CPU, 51 ms tasks | 67.8/s | 72.6/s | ~parity |
-| IO, async | 361.1/s | 18177.9/s | 50x, at 5x less RAM |
+| IO, sync | 361/s | 694/s | 1.9x, at 6.3x less RAM |
+| IO, async | 361/s | 14084–18178/s | 39x – 50x, at 5x less RAM |
 
 **The 51 ms row is the honest one to read first.** Once a CPU task is big enough, both stacks
 are simply core-bound and parity is the ceiling: 6 cores of hashing is 6 cores of hashing
 whoever schedules it. cauli's advantage is per-task overhead, so it grows as tasks get smaller
-and vanishes as they get larger. Benchmarks are single-run on a contended box; treat anything
-under ~5% as noise.
+and vanishes as they get larger.
+
+Ratios are ranges across independent measurement rounds, not single figures — the benchmark box
+is contended and each cell is one run (Celery's own 2 ms arm moved 630 → 853 between rounds).
+Treat anything under ~5% as noise.
 
 ## Semantics & limits
 
