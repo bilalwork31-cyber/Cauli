@@ -336,19 +336,34 @@ def _inject_soft(tid, gen):
     _set_async_exc(ctypes.c_ulong(tid), ctypes.py_object(SoftTimeLimitExceeded))
 
 
-def run_sync(name, args_json, kwargs_json, soft_timeout_ms):
+def run_sync(name, args, kwargs, soft_timeout_ms):
+    """Run one sync task. `args`/`kwargs` arrive as real Python objects and the
+    outcome dict is returned as a real Python object.
+
+    No JSON is produced or parsed anywhere on this path. Rust converts in both
+    directions (src/pyjson.rs), because every instruction here holds the GIL
+    that all in-process tasks share -- the two `json.loads` calls and the
+    validate-plus-encode that used to live here were charged directly against
+    total io throughput.
+    """
     try:
-        return _outcome_json(
-            _run_sync_inner(name, args_json, kwargs_json, soft_timeout_ms)
-        )
+        return _run_sync_inner(name, args, kwargs, soft_timeout_ms)
     except BaseException as e:  # late soft-timeout injection race, anything else
         try:
-            return _outcome_json(_finish_exc(e))
+            return _finish_exc(e)
         except Exception:
-            return '{"ok": false, "retryable": true, "error": {"type": "WorkerShimError", "message": "shim failure", "traceback": ""}}'
+            return {
+                "ok": False,
+                "retryable": True,
+                "error": {
+                    "type": "WorkerShimError",
+                    "message": "shim failure",
+                    "traceback": "",
+                },
+            }
 
 
-def _run_sync_inner(name, args_json, kwargs_json, soft_timeout_ms):
+def _run_sync_inner(name, args, kwargs, soft_timeout_ms):
     td = _registry.get(name)
     if td is None:
         return {
@@ -361,8 +376,6 @@ def _run_sync_inner(name, args_json, kwargs_json, soft_timeout_ms):
             },
         }
     fn = getattr(td, "fn")
-    args = _loads(args_json)
-    kwargs = _loads(kwargs_json)
 
     tid = threading.get_ident()
     gen = _thread_gen.get(tid, 0)

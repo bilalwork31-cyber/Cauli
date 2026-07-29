@@ -56,8 +56,10 @@ pub async fn run_sync_task(ctx: &Arc<Ctx>, env: &Envelope) -> Outcome {
         .sync_pool
         .submit(SyncJob {
             name: env.task.clone(),
-            args_json: env.args_json(),
-            kwargs_json: env.kwargs_json(),
+            // Already-parsed values, not re-serialized JSON text: the pool
+            // thread converts straight into Python objects.
+            args: env.args_ref().clone(),
+            kwargs: env.kwargs_ref().clone(),
             soft_timeout_ms: env.soft_timeout_ms,
             resp: tx,
         })
@@ -73,7 +75,9 @@ pub async fn run_sync_task(ctx: &Arc<Ctx>, env: &Envelope) -> Outcome {
     }
 
     match timeout(Duration::from_millis(env.timeout_ms), rx).await {
-        Ok(Ok(s)) => parse_pyresp(&s, false),
+        // Already a normalized Outcome: the shim returned a Python object and
+        // pyrt converted it directly, so there is no response text to parse.
+        Ok(Ok(outcome)) => outcome,
         Ok(Err(_)) => fail("WorkerLost", "sync executor thread vanished".into()),
         Err(_) => {
             // `rx` is dropped right here (the timeout()'s inner future is

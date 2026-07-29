@@ -7,6 +7,7 @@ mod dispatch;
 mod envelope;
 mod exec;
 mod loops;
+mod pyjson;
 mod pyrt;
 mod stats;
 
