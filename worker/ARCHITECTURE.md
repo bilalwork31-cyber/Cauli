@@ -7,12 +7,12 @@ against Redis Streams per PROTOCOL.md. Module map:
 |---|---|
 | `src/main.rs` | Bootstrap: CLI, tracing, Python init, redis connect, spawns all loops, §4.7 drain, exit codes |
 | `src/cli.rs` | clap CLI per §7 + queue name validation |
-| `src/loops.rs` | fetch loop (XREADGROUP), delayed mover (§4.3), recovery (§4.4), stats |
+| `src/loops.rs` | fetch loop (XREADGROUP), delayed mover (§4.3), recovery (§4.4, full-backlog drain per tick), stats |
 | `src/dispatch.rs` | per-entry pipeline: parse -> idempotency (§4.5) -> route -> finish (§4.1/§4.2) |
 | `src/exec.rs` | sync-thread / async-loop / cpu-child execution, timeouts (§4.6) |
 | `src/ctx.rs` | shared context, executor response -> Outcome normalization |
 | `src/pyrt.rs` | pyo3 glue: interpreter init, shim import, sync io thread pool, async submit bridge |
-| `src/shim.py` | embedded Python shim (include_str!): app loading, run_sync, asyncio loops, soft-timeout watchdog |
+| `src/shim.py` | embedded Python shim (include_str!): app loading, run_sync, asyncio loops, soft-timeout watchdog, §4.8 lifecycle hooks |
 | `src/cpu.rs` | §5.1 cpu pool: fork-server (unix socket, multiplexed) + stdio fallback, kill+respawn, `CAULI_EXEC_CMD` test hook |
 | `src/broker.rs` | Redis key layout, group setup, mover Lua, pipelined completion writes |
 | `src/envelope.rs` | §2 envelope (unknown-field preserving), §8 result/error JSON, redelivery limit |
@@ -25,7 +25,16 @@ against Redis Streams per PROTOCOL.md. Module map:
   `XREADGROUP ... BLOCK 1000` over all queues (dedicated ConnectionManager so
   BLOCK never stalls writes), pipelined ack/retry/DLQ writers, 250ms delayed
   mover (single EVAL per queue), XPENDING/XCLAIM recovery every
-  visibility_timeout/2, stats loop, signal task.
+  visibility_timeout/2, stats loop, signal task. The recovery tick drains the
+  ENTIRE eligible backlog, round-robin across queues in cursor-paged
+  XPENDING pages of 128 (exclusive `(id` resume so entries skipped by the H1
+  per-envelope idle check are not re-read within a tick), with the envelope
+  peeks (XRANGE) and claims (XCLAIM) pipelined per page and page fetch gated
+  on the same admission criteria as the fetch loop. It used to reuse the
+  fetch `--batch` (16) as its per-tick cap — after a kill -9 with 200 tasks
+  in flight, reclaim trickled at ~32/10s (~74s to recover work that re-runs
+  in ~5s); the drain design recovers the same load in one tick
+  (measured 74.0s -> 15.8s total, of which ~10s is the H1 idle threshold).
 - **Embedded CPython** via pyo3 auto-initialize; `prepare_freethreaded_python()`
   at startup before the runtime. The GIL is NEVER held on tokio worker threads
   during broker I/O: sync tasks run on dedicated OS threads, async submission
@@ -40,7 +49,11 @@ against Redis Streams per PROTOCOL.md. Module map:
   Soft timeouts for sync tasks are serviced by ONE shared watchdog thread (a
   min-heap of (deadline, tid, generation)) rather than a `threading.Timer` per
   call, so hot-path soft-timeout usage does not spawn thousands of OS threads
-  per second. The Rust side gives up waiting on an async completion after
+  per second. §4.8 lifecycle hooks are duck-read off the app at `load_app`
+  (live list references) and run around every task: before hooks pre-arm /
+  after hooks post-disarm on the sync path, and on the loop thread for async
+  tasks (awaitable-returning hooks are awaited); a raising hook is logged and
+  skipped, never failing the task. The Rust side gives up waiting on an async completion after
   `timeout_ms + grace` and drops its pending-map slot (`PyRuntime::cancel`) so
   a wedged event-loop thread that never actually finishes the coroutine
   cannot leak that bookkeeping forever (the coroutine itself, if truly
@@ -48,7 +61,13 @@ against Redis Streams per PROTOCOL.md. Module map:
   `pending_async` in the stats line makes a growing count of these visible).
 - **Sync io pool** (`--io-threads`): Rust-spawned OS threads; each takes the
   GIL only around the shim `run_sync` call; CPython releases it during blocking
-  I/O, so io parallelism is real. Soft timeout: shim watchdog `threading.Timer`
+  I/O, so io parallelism is real. Each pool thread pins ONE persistent CPython
+  thread state at spawn (`PyGILState_Ensure` + `PyEval_SaveThread`, never
+  released): without it, every `Python::attach` created and destroyed a fresh
+  thread state per task, silently wiping `threading.local` between tasks —
+  Django's per-thread connection cache could never hit (a new DB connection
+  per task, the old one orphaned until GC), and any thread-local pattern
+  ported from Celery broke the same way. Soft timeout: shim watchdog `threading.Timer`
   injecting `SoftTimeLimitExceeded` via `PyThreadState_SetAsyncExc`, fenced by
   a per-thread generation counter so a timer that fires late (after its own
   task already finished) cannot land inside a later task on the same thread.

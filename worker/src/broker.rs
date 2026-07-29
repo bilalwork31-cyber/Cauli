@@ -244,11 +244,17 @@ fn add_ack_del(pipe: &mut redis::Pipeline, queue: &str, stream_id: &str) {
     pipe.cmd("XDEL").arg(&qk).arg(stream_id).ignore();
 }
 
-/// §4.4 extended XPENDING: (entry_id, consumer, idle_ms, delivery_count).
+/// §4.4 extended XPENDING page: (entry_id, consumer, idle_ms, delivery_count).
+/// `start` pages through the PEL: `"-"` for the first page, then `"(<last>"`
+/// (exclusive range, XRANGE syntax) to resume after a page's final entry —
+/// the recovery loop must not restart from `"-"` within one tick, or entries
+/// it skipped (still legitimately running per their own timeout) would make
+/// the drain loop spin on the same page forever.
 pub async fn xpending_idle(
     conn: &mut ConnectionManager,
     queue: &str,
     min_idle_ms: u64,
+    start: &str,
     count: usize,
 ) -> Result<Vec<(String, String, u64, u64)>> {
     let r: Vec<(String, String, u64, u64)> = redis::cmd("XPENDING")
@@ -256,7 +262,7 @@ pub async fn xpending_idle(
         .arg("cauli")
         .arg("IDLE")
         .arg(min_idle_ms)
-        .arg("-")
+        .arg(start)
         .arg("+")
         .arg(count)
         .query_async(conn)
@@ -264,67 +270,79 @@ pub async fn xpending_idle(
     Ok(r)
 }
 
-/// §4.4 (H1) non-destructive peek at one pending entry's envelope: XRANGE by
-/// exact id does not touch the PEL (no idle-time reset, no delivery_count
-/// bump, no ownership change) — unlike XCLAIM. Used to read an entry's own
-/// `timeout_ms` BEFORE deciding whether it is actually stuck (idle long
-/// enough relative to ITS OWN timeout, not just the visibility_timeout
-/// floor) so a legitimately still-running long task is never reclaimed out
-/// from under itself. Returns None if the entry no longer exists (already
-/// acked/claimed elsewhere); Some(None) if it exists but has no `e` field.
-pub async fn peek_entry(
-    conn: &mut ConnectionManager,
-    queue: &str,
-    entry_id: &str,
-) -> Result<Option<Option<String>>> {
-    use redis::streams::StreamRangeReply;
-    let reply: StreamRangeReply = redis::cmd("XRANGE")
-        .arg(q_key(queue))
-        .arg(entry_id)
-        .arg(entry_id)
-        .query_async(conn)
-        .await?;
-    for id in reply.ids {
-        if id.id == entry_id {
-            let raw = id
-                .map
-                .get("e")
-                .and_then(|v| redis::from_redis_value::<String>(v).ok());
-            return Ok(Some(raw));
-        }
-    }
-    Ok(None)
+fn raw_e_field(map: &std::collections::HashMap<String, redis::Value>) -> Option<String> {
+    map.get("e")
+        .and_then(|v| redis::from_redis_value::<String>(v).ok())
 }
 
-/// §4.4 XCLAIM one entry; returns the envelope field `e` if the claim
-/// succeeded and the entry still exists (None means someone else won or the
-/// entry vanished). The raw payload is returned even if it is not valid JSON.
-pub async fn xclaim_entry(
+/// §4.4 (H1) non-destructive peek at pending entries' envelopes, one
+/// pipelined round trip for the whole page: XRANGE by exact id does not
+/// touch the PEL (no idle-time reset, no delivery_count bump, no ownership
+/// change) — unlike XCLAIM. Used to read each entry's own `timeout_ms`
+/// BEFORE deciding whether it is actually stuck (idle long enough relative
+/// to ITS OWN timeout, not just the visibility_timeout floor) so a
+/// legitimately still-running long task is never reclaimed out from under
+/// itself. Per entry: None if it no longer exists (already acked/claimed
+/// elsewhere); Some(None) if it exists but has no `e` field.
+pub async fn peek_entries(
+    conn: &mut ConnectionManager,
+    queue: &str,
+    entry_ids: &[String],
+) -> Result<Vec<Option<Option<String>>>> {
+    use redis::streams::StreamRangeReply;
+    let qk = q_key(queue);
+    let mut pipe = redis::pipe();
+    for id in entry_ids {
+        pipe.cmd("XRANGE").arg(&qk).arg(id).arg(id);
+    }
+    let replies: Vec<StreamRangeReply> = pipe.query_async(conn).await?;
+    Ok(entry_ids
+        .iter()
+        .zip(replies)
+        .map(|(entry_id, reply)| {
+            reply
+                .ids
+                .iter()
+                .find(|sid| sid.id == *entry_id)
+                .map(|sid| raw_e_field(&sid.map))
+        })
+        .collect())
+}
+
+/// §4.4 XCLAIM a batch of entries, one pipelined round trip; per entry,
+/// returns the envelope field `e` if the claim succeeded and the entry still
+/// exists (None means someone else won or the entry vanished). The raw
+/// payload is returned even if it is not valid JSON.
+pub async fn xclaim_entries(
     conn: &mut ConnectionManager,
     queue: &str,
     consumer: &str,
     min_idle_ms: u64,
-    entry_id: &str,
-) -> Result<Option<Option<String>>> {
+    entry_ids: &[String],
+) -> Result<Vec<Option<Option<String>>>> {
     use redis::streams::StreamClaimReply;
-    let reply: StreamClaimReply = redis::cmd("XCLAIM")
-        .arg(q_key(queue))
-        .arg("cauli")
-        .arg(consumer)
-        .arg(min_idle_ms)
-        .arg(entry_id)
-        .query_async(conn)
-        .await?;
-    for sid in reply.ids {
-        if sid.id == entry_id {
-            let raw = sid
-                .map
-                .get("e")
-                .and_then(|v| redis::from_redis_value::<String>(v).ok());
-            return Ok(Some(raw));
-        }
+    let qk = q_key(queue);
+    let mut pipe = redis::pipe();
+    for id in entry_ids {
+        pipe.cmd("XCLAIM")
+            .arg(&qk)
+            .arg("cauli")
+            .arg(consumer)
+            .arg(min_idle_ms)
+            .arg(id);
     }
-    Ok(None)
+    let replies: Vec<StreamClaimReply> = pipe.query_async(conn).await?;
+    Ok(entry_ids
+        .iter()
+        .zip(replies)
+        .map(|(entry_id, reply)| {
+            reply
+                .ids
+                .iter()
+                .find(|sid| sid.id == *entry_id)
+                .map(|sid| raw_e_field(&sid.map))
+        })
+        .collect())
 }
 
 #[cfg(test)]

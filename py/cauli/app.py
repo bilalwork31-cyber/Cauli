@@ -70,6 +70,13 @@ class Cauli:
         self.result_ttl: int = result_ttl
         self.idemp_ttl: int = idemp_ttl
         self._tasks: dict[str, TaskDef] = {}
+        # Lifecycle hooks (PROTOCOL.md section 4.8). The worker reads these
+        # exact attribute names by getattr through the embedded interpreter
+        # and in the cpu child executor; keep them as plain lists of zero-arg
+        # callables. Registration order is call order.
+        self._before_task_hooks: list[Callable[[], Any]] = []
+        self._after_task_hooks: list[Callable[[], Any]] = []
+        self._process_init_hooks: list[Callable[[], Any]] = []
         self._redis: redis.Redis | None = None
         self._redis_lock = threading.Lock()
 
@@ -85,6 +92,47 @@ class Cauli:
                 if self._redis is None:
                     self._redis = redis.Redis.from_url(self.redis_url)
         return self._redis
+
+    def before_task(self, fn: Callable[[], Any]) -> Callable[[], Any]:
+        """Register ``fn`` to run immediately before EVERY task executes.
+
+        Usable as a decorator (``@app.before_task``) or a plain call
+        (``app.before_task(close_old_connections)``). ``fn`` is called with
+        no arguments, in the same thread/process that is about to run the
+        task, on every execution path: the worker's sync io thread pool, its
+        embedded asyncio loop threads, and the forked/stdio cpu children.
+
+        On the asyncio path a hook may return an awaitable; the worker awaits
+        it on the loop thread (sync-pool and cpu paths call hooks purely
+        synchronously and ignore a returned awaitable).
+
+        A hook that raises is logged (stderr) and skipped; it never fails the
+        task and never stops the remaining hooks from running. Registration
+        order is call order. Typical use: per-task resource lifecycle such as
+        Django's ``close_old_connections`` (see ``cauli.contrib.django``).
+        """
+        self._before_task_hooks.append(fn)
+        return fn
+
+    def after_task(self, fn: Callable[[], Any]) -> Callable[[], Any]:
+        """Register ``fn`` to run after EVERY task finishes (success, failure
+        or timeout inside the task). Same calling convention, execution
+        contexts and error handling as :meth:`before_task`."""
+        self._after_task_hooks.append(fn)
+        return fn
+
+    def process_init(self, fn: Callable[[], Any]) -> Callable[[], Any]:
+        """Register ``fn`` to run once in every cauli-managed Python process
+        after the app is imported and before any task executes.
+
+        Runs in: the worker's embedded interpreter (at app load), each forked
+        cpu child (right after fork, before serving), each stdio-mode cpu
+        child (after import), and the fork-server parent (before the first
+        fork — so resources opened at import time can be closed before any
+        child can inherit them). Same error handling as :meth:`before_task`.
+        """
+        self._process_init_hooks.append(fn)
+        return fn
 
     def task(
         self,

@@ -184,9 +184,19 @@ client does not run it — single source: worker only. The client merely ZADDs).
 
 Every `visibility_timeout / 2` (visibility_timeout default 60s, CLI flag), per queue:
 
-1. `XPENDING cauli:q:{queue} cauli IDLE {visibility_timeout_ms} - + {batch}` (extended form,
-   returns entry id, consumer, idle ms, delivery_count). `visibility_timeout` is a FLOOR here,
-   not itself the reclaim threshold for every task — see the per-envelope check below.
+1. `XPENDING cauli:q:{queue} cauli IDLE {visibility_timeout_ms} {start} + {count}` (extended
+   form, returns entry id, consumer, idle ms, delivery_count). `visibility_timeout` is a FLOOR
+   here, not itself the reclaim threshold for every task — see the per-envelope check below.
+   Each tick must drain the ENTIRE eligible backlog, not one fixed-size page: page through the
+   PEL with `start` = `-` for the first page and the exclusive form `({last_id}` afterwards
+   (the worker uses pages of 128; reusing the fetch `--batch` here was a bug — after a
+   `kill -9` with a few hundred tasks in flight, reclaim trickled back at `batch` entries per
+   half-visibility-period while the worker sat otherwise idle). The exclusive cursor also
+   guarantees termination: entries skipped by the per-envelope check below are not re-read
+   within the same tick. Implementations should pipeline the per-page peeks and claims (steps
+   2-4) rather than issuing one round trip per entry, and should gate page fetching on the
+   same admission criteria as §4 fetch (free io capacity, cpu backlog not overflowing) so a
+   huge reclaimed backlog queues in Redis rather than in worker memory.
 2. For each candidate entry, peek its envelope (`XRANGE` by exact id — read-only, does not
    touch the PEL) and compute `required_idle_ms = max(visibility_timeout_ms, envelope.timeout_ms
    + grace_ms)` (grace_ms = 2000; if the envelope cannot be parsed, `required_idle_ms` falls
@@ -279,6 +289,52 @@ up to `--drain-timeout` (default 30s) for in flight tasks; then exit 0. Unfinish
 pending in the consumer group and are recovered via §4.4 by the next worker. Second signal:
 exit immediately (code 130).
 
+### 4.8 Task lifecycle hooks
+
+The app object may expose three optional attributes, each a list of zero-argument callables
+(the worker duck-reads them with `getattr(..., default empty)` like every other §6 attribute;
+the Python client registers them via `app.before_task(fn)`, `app.after_task(fn)`,
+`app.process_init(fn)`, all usable as decorators):
+
+- `_before_task_hooks` — run immediately before EVERY task executes, in the same
+  thread/process that is about to run it, on every execution path: the sync io thread pool,
+  the embedded asyncio loop threads, and the cpu children (both fork-server and stdio modes).
+  They run BEFORE the soft timeout is armed, so hook time is not charged against the task's
+  soft budget and a soft-timeout injection can never land inside a hook.
+- `_after_task_hooks` — run after EVERY task finishes, on every outcome path (success, task
+  exception, forced retry, soft timeout), after the soft-timeout disarm. A sync task's result
+  is reported only after its after-hooks return.
+- `_process_init_hooks` — run once per cauli-managed Python process, after the app import and
+  before any task can execute: in the worker's embedded interpreter (at `load_app`), in the
+  fork-server parent (BEFORE the first fork, so a resource opened as an import side effect —
+  e.g. a DB connection from a module-level query — is closed before any child can inherit its
+  fd), in each forked child (right after fork), and in each stdio child (after import).
+
+Hooks do NOT run for entries that never execute: malformed, unregistered, duplicate-resolved
+(§4.5), or redelivery-limit DLQ entries.
+
+Error handling: a hook that raises is reported on stderr and skipped — it never fails the
+task and never prevents the remaining hooks from running (`Exception` is caught;
+`SystemExit`/`KeyboardInterrupt` propagate). Registration order is call order. The worker
+holds references to the app's live hook LISTS, so hooks appended after startup are honored.
+
+On the asyncio path hooks run on the event loop thread; a hook may return an awaitable and
+the worker awaits it there (the sync-pool and cpu paths ignore a returned awaitable). Keep
+loop-thread hooks fast — they run between tasks on a shared event loop.
+
+Purpose: per-task resource lifecycle for frameworks WITHOUT cauli core depending on any
+framework. The bundled `cauli.contrib.django` registers Django's `close_old_connections`
+before/after every task (Celery-fixup parity: `CONN_MAX_AGE` honored, stale connections
+replaced after a DB restart when `CONN_HEALTH_CHECKS` is on) and `connections.close_all` as a
+process-init hook.
+
+Related sync-pool invariant: each sync io pool thread keeps ONE persistent CPython thread
+state for its whole lifetime. `threading.local` storage therefore survives across tasks on
+that thread — Django's per-thread connection cache (and anything else built on thread-locals)
+behaves exactly as it does under any long-lived thread. (Prior to this being pinned down, the
+embedded runtime created and destroyed a thread state per task, silently wiping thread-local
+state between tasks; treat that as a bug class, not a knob.)
+
 ## 5. Execution classes
 
 - `--io-loops N` (default 1): threads each running an asyncio event loop for async tasks.
@@ -307,7 +363,8 @@ and worker/ARCHITECTURE.md once claimed.
 
 A non JSON serializable result → error `{"type": "SerializationError", ...}`. The child must
 never crash on task exceptions; it reports them. Child death mid-request = task failure,
-retryable, error type `"WorkerLost"`.
+retryable, error type `"WorkerLost"`. Children run the §4.8 before/after task hooks around
+every request they execute, and the §4.8 process-init hooks per that section's timing rules.
 
 #### Fork-server mode (default)
 
@@ -405,6 +462,34 @@ r.get(timeout=None, poll_interval=0.05)
     # raises TimeoutError if timeout expires while still pending.
 ```
 
+Lifecycle hook registration (§4.8), each usable as a decorator and returning `fn` unchanged:
+
+```python
+app.before_task(fn)     # fn() before every task, in the task's thread/process
+app.after_task(fn)      # fn() after every task, all outcome paths
+app.process_init(fn)    # fn() once per cauli-managed process, before any task
+```
+
+Django-only enqueue helpers on every task object (lazy Django import; RuntimeError without
+Django installed — cauli core takes no Django dependency):
+
+```python
+send_email.delay_on_commit(*args, **kwargs)          # -> None
+send_email.apply_async_on_commit(args=(), kwargs=None, countdown=None,
+                                 queue=None, idempotency_key=None,
+                                 using=None)          # -> None
+```
+
+Both defer the enqueue to `django.db.transaction.on_commit`: the task is published only if
+the surrounding transaction commits, never on rollback (the footgun prevented: `delay()`
+inside `atomic()` publishes immediately, so the worker can execute against a row that is not
+committed yet — or that never will be). Outside an atomic block the enqueue happens
+immediately. Return `None`, not an AsyncResult: no task id exists until commit time. The
+opt-in `cauli.contrib.django` module additionally provides `django_app()` (settings-driven
+config: `CAULI_REDIS_URL`, `CAULI_DEFAULT_QUEUE`, `CAULI_RESULT_TTL`, `CAULI_IDEMP_TTL`;
+registers the §4.8 DB connection hooks), `install_db_hooks(app)` and
+`autodiscover_tasks(app)`.
+
 Worker introspection contract (Rust reads these exact attributes via the embedded interpreter):
 
 - `app._tasks` → `dict[str, TaskDef]`
@@ -413,6 +498,8 @@ Worker introspection contract (Rust reads these exact attributes via the embedde
   `timeout_ms: int`, `soft_timeout_ms: int|None`, `backoff_base_ms: int`,
   `backoff_factor: float`, `backoff_max_ms: int`, `jitter: bool`, `store_result: bool`
 - `app.redis_url: str`, `app.default_queue: str`, `app.result_ttl: int`, `app.idemp_ttl: int`
+- Optional lifecycle hook lists (§4.8): `app._before_task_hooks`,
+  `app._after_task_hooks`, `app._process_init_hooks` → `list[callable]` (absent == empty)
 - Exceptions: `cauli.Retry(countdown: float|None)` (attribute `.countdown`),
   `cauli.SoftTimeLimitExceeded`.
 
@@ -506,8 +593,13 @@ pytest -q
 # cross-component integration (real client + real worker binary + real cpu children)
 cd itest
 pip install -e ../py
-pytest -q test_integration.py   # needs the release worker binary built above on PATH
+pytest -q                        # needs the release worker binary built above on PATH
                                  # or set CAULI_WORKER_BIN=/path/to/cauli-worker
+# test_django.py additionally needs django + psycopg (pip install 'django>=4.2'
+# 'psycopg[binary]') and the postgres server binaries (initdb/pg_ctl, e.g.
+# apt install postgresql-16) — it stands up a throwaway user-owned postgres
+# on port 54329 and a throwaway redis on 6395; it skips itself when either
+# dependency is missing.
 ```
 
 Building on a slow or network filesystem: set `CARGO_TARGET_DIR` to a local path before running

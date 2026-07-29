@@ -6,11 +6,26 @@ purpose: _exec must never touch redis.
 """
 
 import asyncio
+import os
 import time
 
 from cauli import Retry, Cauli
 
 app = Cauli(redis_url="redis://127.0.0.1:1/0")
+
+# Env-gated lifecycle hooks: test_hooks.py points CAULI_TEST_HOOKLOG at a file
+# and asserts the _exec child runs process_init once at startup and
+# before/after around each request (PROTOCOL.md section 4.8).
+_hooklog = os.environ.get("CAULI_TEST_HOOKLOG")
+if _hooklog:
+
+    def _mark(phase):
+        with open(_hooklog, "a") as f:
+            f.write(f"{phase} {os.getpid()}\n")
+
+    app.process_init(lambda: _mark("process_init"))
+    app.before_task(lambda: _mark("before"))
+    app.after_task(lambda: _mark("after"))
 
 
 @app.task(name="add", kind="cpu")

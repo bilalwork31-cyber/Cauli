@@ -62,6 +62,44 @@ _loops_lock = threading.Lock()
 _rr = 0
 _callback = None  # Rust completion callback: cb(token:int, outcome:dict)
 
+# Per-task lifecycle hooks (PROTOCOL §4.8), duck-read off the app object at
+# load_app time. These are references to the app's own LISTS, not copies, so
+# hooks registered after startup are still honored. Zero-arg callables; a
+# hook that raises is logged and skipped, never failing the task.
+_before_hooks = ()
+_after_hooks = ()
+
+
+def _run_hooks(hooks, where):
+    for hook in hooks:
+        try:
+            hook()
+        except Exception:
+            print(
+                "cauli-worker: %s hook %r raised (ignored):" % (where, hook),
+                file=sys.stderr,
+            )
+            traceback.print_exc()
+
+
+async def _run_hooks_async(hooks, where):
+    # Async-path variant: a hook may return an awaitable (e.g. one built on
+    # asgiref's sync_to_async so it runs in the same executor thread Django's
+    # async ORM uses); it is awaited on the loop thread. Sync hooks behave
+    # exactly as on the other paths.
+    for hook in hooks:
+        try:
+            r = hook()
+            if r is not None and hasattr(r, "__await__"):
+                await r
+        except Exception:
+            print(
+                "cauli-worker: %s hook %r raised (ignored):" % (where, hook),
+                file=sys.stderr,
+            )
+            traceback.print_exc()
+
+
 _set_async_exc = ctypes.pythonapi.PyThreadState_SetAsyncExc
 
 
@@ -118,6 +156,15 @@ def load_app(app_spec, extra_paths_json):
         attr = "app"
     mod = importlib.import_module(module_name)
     app = getattr(mod, attr)
+
+    # Lifecycle hooks (PROTOCOL §4.8), by getattr like everything else here:
+    # keep the app's list objects so post-startup registrations are seen.
+    global _before_hooks, _after_hooks
+    _before_hooks = getattr(app, "_before_task_hooks", ())
+    _after_hooks = getattr(app, "_after_task_hooks", ())
+    # Process-init hooks run once in this (embedded) interpreter, before any
+    # task executes — the worker process is itself an execution context.
+    _run_hooks(getattr(app, "_process_init_hooks", ()), "process_init")
 
     tasks_out = {}
     for name, td in dict(getattr(app, "_tasks")).items():
@@ -259,6 +306,11 @@ def _run_sync_inner(name, args, kwargs, soft_timeout_ms):
         }
     fn = getattr(td, "fn")
 
+    # Before hooks (PROTOCOL §4.8) run on THIS pool thread before the soft
+    # timeout is armed: hook time is not charged against the soft budget and
+    # an injection cannot land inside a hook. After hooks run after the
+    # disarm below, on every outcome path.
+    _run_hooks(_before_hooks, "before_task")
     tid = threading.get_ident()
     gen = _thread_gen.get(tid, 0)
     if soft_timeout_ms is not None and soft_timeout_ms > 0:
@@ -280,6 +332,7 @@ def _run_sync_inner(name, args, kwargs, soft_timeout_ms):
         with _gen_lock:
             _thread_gen[tid] = gen + 1
         _set_async_exc(ctypes.c_ulong(tid), None)
+        _run_hooks(_after_hooks, "after_task")
     return out
 
 
@@ -339,6 +392,10 @@ async def _arun(token, name, args, kwargs, timeout_s):
             }
         else:
             fn = getattr(td, "fn")
+            # Before/after hooks (PROTOCOL §4.8) on the loop thread, outside
+            # the wait_for window (hook time is not charged against the task
+            # timeout). Awaitable-returning hooks are awaited.
+            await _run_hooks_async(_before_hooks, "before_task")
             try:
                 rv = await asyncio.wait_for(fn(*args, **kwargs), timeout_s)
                 out = _finish_value(rv)
@@ -354,6 +411,8 @@ async def _arun(token, name, args, kwargs, timeout_s):
                 }
             except BaseException as e:
                 out = _finish_exc(e)
+            finally:
+                await _run_hooks_async(_after_hooks, "after_task")
     except BaseException as e:  # defensive: never lose a completion
         out = {"ok": False, "retryable": True, "error": _error_dict(e)}
 

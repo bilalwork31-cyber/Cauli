@@ -54,6 +54,7 @@ import traceback
 from typing import Any, TextIO
 
 from cauli import _codec
+from cauli._hooks import run_hooks
 from cauli.exceptions import SoftTimeLimitExceeded
 
 _TRACEBACK_CAP = 8192  # max chars of formatted traceback kept in error JSON (section 8)
@@ -209,34 +210,43 @@ def _execute(
         bool(soft_timeout_ms) and watchdog is None and hasattr(signal, "setitimer")
     )
     use_watchdog = bool(soft_timeout_ms) and watchdog is not None
+    # Per-task lifecycle hooks (PROTOCOL.md section 4.8): before hooks run on
+    # THIS thread before the soft timeout is armed (hook time is not charged
+    # against the task's soft budget, and an injection cannot land inside a
+    # hook); after hooks run in the outer finally, after the disarm, on every
+    # outcome path (success, task exception, forced retry).
+    run_hooks(getattr(app, "_before_task_hooks", ()), "before_task")
     try:
-        if use_alarm:
-            signal.setitimer(signal.ITIMER_REAL, float(soft_timeout_ms) / 1000.0)
-        elif use_watchdog:
-            watchdog.arm(float(soft_timeout_ms))
         try:
-            if task.is_async:
-                result = asyncio.run(task.fn(*args, **kwargs))
-            else:
-                result = task.fn(*args, **kwargs)
-        finally:
             if use_alarm:
-                signal.setitimer(signal.ITIMER_REAL, 0.0)
+                signal.setitimer(signal.ITIMER_REAL, float(soft_timeout_ms) / 1000.0)
             elif use_watchdog:
-                watchdog.disarm()
-    except BaseException as exc:  # the child must never crash on task errors
-        if _is_retry(exc):
-            cd = getattr(exc, "countdown", None)
-            countdown = None if cd is None else float(cd)
-            return {
-                "id": request_id,
-                "ok": False,
-                "retry": True,
-                "countdown": countdown,
-                "error": _error_json(exc),
-            }
-        return {"id": request_id, "ok": False, "error": _error_json(exc)}
-    return {"id": request_id, "ok": True, "result": result}
+                watchdog.arm(float(soft_timeout_ms))
+            try:
+                if task.is_async:
+                    result = asyncio.run(task.fn(*args, **kwargs))
+                else:
+                    result = task.fn(*args, **kwargs)
+            finally:
+                if use_alarm:
+                    signal.setitimer(signal.ITIMER_REAL, 0.0)
+                elif use_watchdog:
+                    watchdog.disarm()
+        except BaseException as exc:  # the child must never crash on task errors
+            if _is_retry(exc):
+                cd = getattr(exc, "countdown", None)
+                countdown = None if cd is None else float(cd)
+                return {
+                    "id": request_id,
+                    "ok": False,
+                    "retry": True,
+                    "countdown": countdown,
+                    "error": _error_json(exc),
+                }
+            return {"id": request_id, "ok": False, "error": _error_json(exc)}
+        return {"id": request_id, "ok": True, "result": result}
+    finally:
+        run_hooks(getattr(app, "_after_task_hooks", ()), "after_task")
 
 
 def _handle_request_line(
@@ -372,6 +382,15 @@ def _fork_server_main(app_spec: str, sock_path: str, child_threads: int) -> int:
     _set_pdeathsig()
     app = _load_app(app_spec)  # import errors: nonzero exit before the server line
 
+    # Process-init hooks run in the parent BEFORE the first fork (PROTOCOL.md
+    # section 4.8): resources opened as an import side effect (e.g. a Django
+    # DB connection created by a module-level query) must be closed here, or
+    # every forked child would inherit the SAME underlying socket fd and two
+    # children writing to it would corrupt the stream. Each forked child runs
+    # them again after fork (belt and suspenders; a no-op when the parent
+    # already cleaned up).
+    run_hooks(getattr(app, "_process_init_hooks", ()), "process_init")
+
     # The CoW payoff: collect import-time garbage once, then freeze every
     # object created so far into the permanent generation. Children fork from
     # this warmed image; their (default, enabled) GC never scans -- and so
@@ -458,6 +477,12 @@ def _forked_child_main(
     if os.getppid() == 1:
         return 0  # the parent died inside the fork window; nothing to serve
     signal.signal(signal.SIGCHLD, signal.SIG_DFL)
+
+    # Process-init hooks, again, in THIS child (PROTOCOL.md section 4.8):
+    # the parent already ran them pre-fork, so anything reaching this call is
+    # a resource created between then and the fork — or a hook that is simply
+    # idempotent (the Django contrib's connections.close_all() is).
+    run_hooks(getattr(app, "_process_init_hooks", ()), "process_init")
 
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.connect(sock_path)
@@ -632,6 +657,10 @@ def main(argv: list[str] | None = None) -> int:
         pass
 
     app = _load_app(ns.app)  # import errors propagate: nonzero exit before ready line
+
+    # Process-init hooks (PROTOCOL.md section 4.8): once per stdio child,
+    # after the app import, before any task can execute.
+    run_hooks(getattr(app, "_process_init_hooks", ()), "process_init")
 
     if hasattr(signal, "SIGALRM"):
         signal.signal(signal.SIGALRM, _on_alarm)
