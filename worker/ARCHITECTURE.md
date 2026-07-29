@@ -74,6 +74,16 @@ against Redis Streams per PROTOCOL.md. Module map:
   earliest-deadline sleep in the select loop; handing a request to the child
   is itself bounded by a write timeout, so a child that stops draining its
   socket without dying is detected instead of silently wedging the slot).
+  `--cpu-prefetch` (default 4) stages that many extra requests in each child's
+  socket buffer beyond the ones it executes, so a child that finishes a task
+  reads its next one immediately instead of idling for a full round trip
+  (socket write, tokio wakeup, select iteration, channel recv, socket write,
+  child wakeup). A staged request's hard-timeout clock does NOT start until
+  the request ahead of it completes, or a queued task could be declared timed
+  out having never run. Worth 4.1x at 0.5ms tasks and nothing at 51ms
+  (bench/RESULTS_CPU.md); the cost is that a child death fails everything
+  staged behind it as retryable WorkerLost, and staged tasks wait out the
+  queue ahead of them.
   Hard timeout: SIGKILL by pid, expired requests fail "TimeoutError", the
   rest "WorkerLost" (both retryable), then a replacement fork (cheap: no
   re-import). Child death (socket EOF): all in flight "WorkerLost" +

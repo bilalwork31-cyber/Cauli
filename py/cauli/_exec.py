@@ -262,21 +262,31 @@ def _handle_request_line(
         return {"id": request_id, "ok": False, "error": _error_json(exc)}
 
 
-def _serialize_response(payload: dict[str, Any]) -> str:
-    """Serialize one protocol line (without the trailing newline).
+def _serialize_response_bytes(payload: dict[str, Any]) -> bytes:
+    """Serialize one protocol line as UTF-8 bytes (no trailing newline).
 
     A non JSON serializable result degrades to a SerializationError response
     for the same request id (section 5.1).
+
+    Bytes, not str: this is the socket path's serializer and ``sendall`` wants
+    bytes. Producing str here cost a full transcode of every single response
+    (see ``_codec.encode_bytes``).
     """
     try:
-        return _codec.encode_str(payload)
+        return _codec.encode_bytes(payload)
     except _codec.ENCODE_ERRORS as exc:
         error = {
             "type": "SerializationError",
             "message": f"task result is not JSON serializable: {exc}",
             "traceback": _format_traceback(exc),
         }
-        return _codec.encode_str({"id": payload.get("id"), "ok": False, "error": error})
+        return _codec.encode_bytes({"id": payload.get("id"), "ok": False, "error": error})
+
+
+def _serialize_response(payload: dict[str, Any]) -> str:
+    """:func:`_serialize_response_bytes` as text, for the stdio fallback mode's
+    text-mode protocol stream (not a hot path; the socket path uses bytes)."""
+    return _serialize_response_bytes(payload).decode("utf-8")
 
 
 def _write_line(out: TextIO, payload: dict[str, Any]) -> None:
@@ -511,7 +521,8 @@ class _SocketWriter:
         self._lock = threading.Lock()
 
     def write_response(self, payload: dict[str, Any]) -> None:
-        data = (_serialize_response(payload) + "\n").encode("utf-8")
+        # Straight to bytes: no str round trip, one concat, one sendall.
+        data = _serialize_response_bytes(payload) + b"\n"
         with self._lock:
             self._sock.sendall(data)
 

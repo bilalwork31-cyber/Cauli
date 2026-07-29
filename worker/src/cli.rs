@@ -38,6 +38,19 @@ pub struct Args {
     #[arg(long, default_value_t = 1)]
     pub cpu_child_threads: usize,
 
+    /// Extra cpu requests pre-staged in each child's socket buffer beyond the
+    /// ones it is executing. Keeps a child from idling for a full IPC round
+    /// trip between tasks; its next read returns immediately. 0 disables.
+    ///
+    /// Measured drain rate, 6 children on 6 cores: for ~0.5ms tasks depth 64
+    /// is 4.1x depth 0; for ~2ms tasks depth 16 is 1.13x depth 3; for ~51ms
+    /// tasks every depth is within noise (the task dwarfs the round trip).
+    /// Deeper is not free: a child death fails everything staged behind it as
+    /// retryable WorkerLost, and a staged task waits out the tasks ahead of
+    /// it, so raise this for small tasks and leave it low for long ones.
+    #[arg(long, default_value_t = 4)]
+    pub cpu_prefetch: usize,
+
     /// Disable the fork-server cpu child model: spawn each child directly
     /// over stdio, one request in flight per child (PROTOCOL §5.1 fallback
     /// mode). Also entered automatically if fork-server startup fails

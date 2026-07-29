@@ -122,19 +122,43 @@ pub fn child_argv(python: &str, app_spec: &str) -> (String, Vec<String>) {
     )
 }
 
+/// A pool with no executors at all, for an app that registers no
+/// `kind = "cpu"` task.
+///
+/// Routing is by REGISTRY kind, not envelope kind (dispatch.rs: "registry
+/// authoritative over envelope kind"), so when no registered task is cpu-kind
+/// `exec::run_cpu_task` is unreachable by construction -- no fork-server
+/// parent, no children, and none of their RAM. The channel is created with
+/// its receiver dropped so the defensive path (if this ever did get reached)
+/// fails fast and loudly as `WorkerLost` rather than parking forever on a
+/// send nobody will service.
+pub fn disabled() -> CpuPool {
+    let (tx, rx) = async_channel::bounded::<CpuJob>(1);
+    drop(rx);
+    CpuPool {
+        tx,
+        overflow: Arc::new(AtomicUsize::new(0)),
+        child_pids: Arc::new(Mutex::new(Vec::new())),
+        sock_path: None,
+    }
+}
+
 /// Start the cpu pool. Tries fork-server mode unless `no_fork_server`; any
 /// startup failure there (listener bind, parent spawn, no server-ready line)
 /// logs a warning and falls back to stdio mode.
 pub async fn start(
     workers: usize,
     child_threads: usize,
+    prefetch: usize,
     python: &str,
     app_spec: &str,
     no_fork_server: bool,
     counters: Arc<Counters>,
 ) -> CpuPool {
     let child_threads = child_threads.max(1);
-    // Backlog bound: 2 in-flight-capacities worth of pending items.
+    // Backlog bound: 2 in-flight-capacities worth of pending items. Prefetched
+    // requests live in the children, not this channel, so they are counted in
+    // the per-child queue depth rather than here.
     let cap = (2 * workers * child_threads).max(1);
     let (tx, rx) = async_channel::bounded::<CpuJob>(cap);
     let overflow = Arc::new(AtomicUsize::new(0));
@@ -143,10 +167,13 @@ pub async fn start(
 
     if !no_fork_server {
         match start_fork_server(
-            workers,
-            child_threads,
-            prog.clone(),
-            argv.clone(),
+            PoolCfg {
+                workers,
+                child_threads,
+                prefetch,
+                prog: prog.clone(),
+                argv: argv.clone(),
+            },
             rx.clone(),
             counters.clone(),
             pids.clone(),
@@ -320,15 +347,31 @@ async fn wait_server_ready(parent: &mut ParentProc) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Pool shape: how many children, how each one is launched, and how deeply
+/// each is fed. Grouped rather than passed as a parameter run, which both
+/// reads better and keeps the fork-server entry point under clippy's argument
+/// limit as the knobs grow.
+pub struct PoolCfg {
+    pub workers: usize,
+    pub child_threads: usize,
+    pub prefetch: usize,
+    pub prog: String,
+    pub argv: Vec<String>,
+}
+
 async fn start_fork_server(
-    workers: usize,
-    child_threads: usize,
-    prog: String,
-    argv: Vec<String>,
+    cfg: PoolCfg,
     rx: async_channel::Receiver<CpuJob>,
     counters: Arc<Counters>,
     pids: Arc<Mutex<Vec<u32>>>,
 ) -> anyhow::Result<PathBuf> {
+    let PoolCfg {
+        workers,
+        child_threads,
+        prefetch,
+        prog,
+        argv,
+    } = cfg;
     let sock_path = fork_sock_path()?;
     let listener = UnixListener::bind(&sock_path)
         .with_context(|| format!("bind unix listener at {}", sock_path.display()))?;
@@ -369,6 +412,7 @@ async fn start_fork_server(
             i,
             fork_tx.clone(),
             conn_rx.clone(),
+            prefetch,
             rx.clone(),
             counters.clone(),
             pids.clone(),
@@ -585,6 +629,7 @@ async fn slot_loop(
     idx: usize,
     fork_tx: mpsc::Sender<()>,
     conn_rx: async_channel::Receiver<ChildConn>,
+    prefetch: usize,
     rx: async_channel::Receiver<CpuJob>,
     counters: Arc<Counters>,
     pids: Arc<Mutex<Vec<u32>>>,
@@ -605,7 +650,7 @@ async fn slot_loop(
             "cpu[{idx}]: fork child serving pid={} concurrency={}",
             conn.pid, conn.concurrency
         );
-        if !serve_child(idx, conn, &rx, &counters, &pids).await {
+        if !serve_child(idx, conn, prefetch, &rx, &counters, &pids).await {
             return; // job channel closed: worker exiting
         }
     }
@@ -613,7 +658,56 @@ async fn slot_loop(
 
 struct Pending {
     resp: oneshot::Sender<CpuOutcome>,
-    deadline: Instant,
+    timeout_ms: u64,
+    /// `None` while this request is still sitting unread in the child's socket
+    /// buffer behind earlier work (a prefetched request), `Some` once the
+    /// child is believed to have actually started executing it.
+    ///
+    /// A prefetched request must NOT have its hard-timeout clock running while
+    /// an earlier request is still computing -- otherwise a queued task could
+    /// be declared timed out having never executed a single instruction.
+    deadline: Option<Instant>,
+}
+
+/// H3-style saturation: a crafted/huge `timeout_ms` must not overflow `Instant`
+/// math into a panic or wrap to a near-zero deadline.
+fn deadline_for(timeout_ms: u64) -> Instant {
+    Instant::now()
+        .checked_add(Duration::from_millis(timeout_ms))
+        .unwrap_or_else(|| Instant::now() + Duration::from_secs(86_400 * 365))
+}
+
+/// Start the hard-timeout clock on the oldest not-yet-started requests until
+/// `concurrency` of them are running. Called after every send and after every
+/// completion: a prefetched request's clock starts when the request ahead of
+/// it finishes, which is the moment the child actually picks it up.
+fn arm_started(
+    pending: &mut HashMap<String, Pending>,
+    order: &std::collections::VecDeque<String>,
+    concurrency: usize,
+) {
+    let mut armed = pending.values().filter(|p| p.deadline.is_some()).count();
+    for id in order.iter() {
+        if armed >= concurrency {
+            return;
+        }
+        if let Some(p) = pending.get_mut(id) {
+            if p.deadline.is_none() {
+                p.deadline = Some(deadline_for(p.timeout_ms));
+                armed += 1;
+            }
+        }
+    }
+}
+
+/// Extracts just the `id` from a child response line, borrowing it out of the
+/// source string. serde skips every other field (including the result) without
+/// building or allocating it -- `parse_pyresp` does the real parse afterwards,
+/// and only for a line we've matched to a pending request.
+#[derive(serde::Deserialize)]
+struct IdOnly<'a> {
+    #[serde(borrow, default)]
+    id: Option<&'a str>,
 }
 
 enum ChildGone {
@@ -631,13 +725,23 @@ enum ChildGone {
     Shutdown,
 }
 
-/// Serve one child connection, multiplexing up to `concurrency` requests in
-/// flight (pending map keyed by request id). Returns false when the worker is
-/// shutting down (job channel closed), true when the slot should fork a
-/// replacement child.
+/// Serve one child connection, keeping up to `concurrency` requests EXECUTING
+/// and up to `prefetch` more pre-staged in the child's socket buffer (pending
+/// map keyed by request id, FIFO order tracked separately). Returns false when
+/// the worker is shutting down (job channel closed), true when the slot should
+/// fork a replacement child.
+///
+/// Prefetch is what keeps a child busy back to back. Without it, a child that
+/// finishes a task writes its response and then sits idle for a full round
+/// trip -- socket write, tokio wakeup, select-loop iteration, channel recv,
+/// socket write, child wakeup -- before the next request even reaches it. That
+/// dead time is pure lost throughput on cpu-bound work, and at small task
+/// sizes it can rival the task itself. With a request already queued behind
+/// the current one, the child's next read returns immediately.
 async fn serve_child(
     idx: usize,
     conn: ChildConn,
+    prefetch: usize,
     rx: &async_channel::Receiver<CpuJob>,
     counters: &Arc<Counters>,
     pids: &Arc<Mutex<Vec<u32>>>,
@@ -650,20 +754,35 @@ async fn serve_child(
     } = conn;
     track_pid(pids, pid, true);
     let mut pending: HashMap<String, Pending> = HashMap::new();
+    // Send order, so we can tell which pending requests the child has actually
+    // reached (it reads its socket in order) and which are still queued.
+    let mut order: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+    let queue_depth = concurrency.saturating_add(prefetch);
 
     let gone = loop {
-        let next_deadline = pending.values().map(|p| p.deadline).min();
+        let next_deadline = pending.values().filter_map(|p| p.deadline).min();
         tokio::select! {
             line = lines.next_line() => {
                 match line {
                     Ok(Some(l)) => {
-                        let rid = serde_json::from_str::<serde_json::Value>(&l)
+                        // Read ONLY the correlation id. The previous
+                        // `from_str::<Value>` built a full tree for the entire
+                        // response -- including the task's whole result -- and
+                        // threw it away, then `parse_pyresp` parsed the same
+                        // line a second time. `IdOnly` borrows the id out of
+                        // `l` and skips every other field without allocating.
+                        let rid = serde_json::from_str::<IdOnly>(&l)
                             .ok()
-                            .and_then(|v| v.get("id").and_then(|x| x.as_str()).map(str::to_string));
-                        match rid.and_then(|id| pending.remove(&id)) {
-                            Some(p) => {
+                            .and_then(|v| v.id);
+                        match rid.and_then(|id| pending.remove_entry(id)) {
+                            Some((done_id, p)) => {
                                 let _ = p.resp.send(CpuOutcome::Resp(l));
                                 counters.inflight_cpu.fetch_sub(1, Ordering::Relaxed);
+                                order.retain(|x| *x != done_id);
+                                // The child just freed a slot: whatever it was
+                                // holding prefetched starts executing now, so
+                                // start that request's clock now too.
+                                arm_started(&mut pending, &order, concurrency);
                             }
                             None => warn!(
                                 "cpu[{idx}] pid={pid}: response with unknown or missing id: {}",
@@ -680,7 +799,7 @@ async fn serve_child(
                     }
                 }
             }
-            job = rx.recv(), if pending.len() < concurrency => {
+            job = rx.recv(), if pending.len() < queue_depth => {
                 match job {
                     Ok(job) => {
                         let mut l = job.req_line;
@@ -698,13 +817,17 @@ async fn serve_child(
                         match timeout(write_budget, write.write_all(l.as_bytes())).await {
                             Ok(Ok(())) => {
                                 counters.inflight_cpu.fetch_add(1, Ordering::Relaxed);
-                                // H3-style saturation: a crafted/huge timeout_ms
-                                // must not overflow Instant math into a panic or
-                                // a near-zero deadline.
-                                let deadline = Instant::now()
-                                    .checked_add(Duration::from_millis(job.timeout_ms))
-                                    .unwrap_or_else(|| Instant::now() + Duration::from_secs(86_400 * 365));
-                                pending.insert(job.id, Pending { resp: job.resp, deadline });
+                                order.push_back(job.id.clone());
+                                pending.insert(job.id, Pending {
+                                    resp: job.resp,
+                                    timeout_ms: job.timeout_ms,
+                                    // Armed by arm_started below only if the
+                                    // child has capacity to run it right now;
+                                    // otherwise it is prefetched and its clock
+                                    // starts when the request ahead completes.
+                                    deadline: None,
+                                });
+                                arm_started(&mut pending, &order, concurrency);
                             }
                             Ok(Err(e)) => {
                                 warn!("cpu[{idx}] pid={pid}: write failed: {e}");
@@ -748,7 +871,10 @@ async fn serve_child(
     let now = Instant::now();
     for (_, p) in pending.drain() {
         let out = match gone {
-            ChildGone::HardTimeout if p.deadline <= now => CpuOutcome::Timeout,
+            // Only the request that actually blew its deadline is a Timeout;
+            // a prefetched sibling that never started (deadline None) is
+            // collateral damage and must stay retryable WorkerLost.
+            ChildGone::HardTimeout if p.deadline.is_some_and(|d| d <= now) => CpuOutcome::Timeout,
             _ => CpuOutcome::Lost,
         };
         let _ = p.resp.send(out);

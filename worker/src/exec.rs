@@ -4,12 +4,24 @@
 use crate::ctx::{parse_pyresp, Ctx, DecrGuard, Outcome};
 use crate::envelope::{Envelope, ErrorJson};
 use crate::pyrt::SyncJob;
+use serde::Serialize;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
 use tracing::warn;
+
+/// The §5.1 cpu request line, serialized from borrowed envelope fields so the
+/// args/kwargs trees are never copied on the way to the child.
+#[derive(Serialize)]
+struct CpuRequest<'a> {
+    id: &'a str,
+    task: &'a str,
+    args: &'a serde_json::Value,
+    kwargs: &'a serde_json::Value,
+    soft_timeout_ms: Option<u64>,
+}
 
 /// Grace window added on top of an envelope's own `timeout_ms` for Rust-side
 /// backstop timeouts (the async completion channel, and — H1 — the recovery
@@ -149,16 +161,22 @@ pub async fn run_cpu_task(ctx: &Arc<Ctx>, env: &Envelope) -> Outcome {
     // always use the envelope id, never this.
     static CPU_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let wire_id = format!("{}.{:x}", env.id, CPU_SEQ.fetch_add(1, Ordering::Relaxed));
-    let req = serde_json::json!({
-        "id": wire_id,
-        "task": env.task,
-        // env.args/kwargs directly (Value), not a serialize-then-reparse
-        // round trip through the *_json() string helpers (audit nit).
-        "args": env.args_value(),
-        "kwargs": env.kwargs_value(),
-        "soft_timeout_ms": env.soft_timeout_ms,
+    // Serialize straight from borrowed envelope fields. The previous `json!`
+    // form deep-copied args and kwargs TWICE per task: once in
+    // `args_value()`/`kwargs_value()` (an explicit `.clone()` of the Value
+    // tree) and again inside `json!`, whose expression rule is
+    // `to_value(&expr)` -- a second full rebuild. A borrowing Serialize impl
+    // copies neither; the bytes go from the parsed tree to the wire directly.
+    let req = serde_json::to_string(&CpuRequest {
+        id: &wire_id,
+        task: &env.task,
+        args: env.args_ref(),
+        kwargs: env.kwargs_ref(),
+        soft_timeout_ms: env.soft_timeout_ms,
     })
-    .to_string();
+    // Infallible: every field is either a &str or a Value already parsed from
+    // valid JSON (so no NaN/Infinity can be present).
+    .expect("cpu request serialize");
     let (tx, rx) = oneshot::channel();
     let job = crate::cpu::CpuJob {
         id: wire_id,
