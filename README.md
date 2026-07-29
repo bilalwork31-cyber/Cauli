@@ -114,8 +114,11 @@ Drain-rate benchmarks, 6 workers on 6 shared cores, **both stacks tuned at their
 | CPU, 0.5 ms tasks | 673–827/s | 5730–6058/s | 6.9x – 9.0x |
 | CPU, 2 ms tasks | 630–853/s | 1733–1778/s | 2.1x – 2.8x |
 | CPU, 51 ms tasks | 67.8/s | 72.6/s | ~parity |
-| IO, sync | 361/s | 694/s | 1.9x, at 6.3x less RAM |
-| IO, async | 361/s | 14084–18178/s | 39x – 50x, at 5x less RAM |
+| IO, sync | 268.7/s | 616.1/s | 2.3x, at 6.3x less RAM |
+| IO, async | 268.7/s | 4430.2/s | 16.5x, at 5x less RAM |
+
+The IO async figure is bounded by the benchmark's mock HTTP endpoint and the shared cores, not
+by the worker — read it as "at least this fast".
 
 **The 51 ms row is the honest one to read first.** Once a CPU task is big enough, both stacks
 are simply core-bound and parity is the ceiling: 6 cores of hashing is 6 cores of hashing

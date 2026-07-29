@@ -75,21 +75,10 @@ pub struct Envelope {
 }
 
 impl Envelope {
-    /// args as a JSON array string ("null" tolerated -> "[]").
-    pub fn args_json(&self) -> String {
-        match &self.args {
-            Value::Null => "[]".to_string(),
-            v => v.to_string(),
-        }
-    }
-
-    /// kwargs as a JSON object string ("null" tolerated -> "{}").
-    pub fn kwargs_json(&self) -> String {
-        match &self.kwargs {
-            Value::Null => "{}".to_string(),
-            v => v.to_string(),
-        }
-    }
+    // `args_json()` / `kwargs_json()` are gone: nothing serializes task
+    // arguments to JSON text any more. Both execution paths hand the parsed
+    // values to `pyjson::json_to_py`, and the cpu path serializes borrowed
+    // values straight onto the wire.
 
     /// args as a BORROWED `Value` ("null" tolerated -> a shared empty array).
     /// Callers that serialize (the cpu child request) go straight from the
@@ -278,8 +267,10 @@ mod tests {
         assert_eq!(e.idempotency_key, None);
         assert!(e.store_result);
         assert_eq!(e.not_before, None);
-        assert_eq!(e.args_json(), "[]");
-        assert_eq!(e.kwargs_json(), "{}");
+        // null args/kwargs normalize to an empty array/object rather than
+        // reaching a task as None.
+        assert_eq!(e.args_ref(), &Value::Array(vec![]));
+        assert_eq!(e.kwargs_ref(), &Value::Object(serde_json::Map::new()));
     }
 
     #[test]

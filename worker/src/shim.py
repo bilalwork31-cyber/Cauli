@@ -3,18 +3,30 @@
 Loaded once by the Rust worker via PyModule::from_code. Owns ALL Python-side
 complexity so the pyo3 surface stays "call function, pass strings, get strings".
 
-Contract with Rust (all payloads are JSON strings):
-  load_app(app_spec, extra_paths_json) -> app config JSON (see below)
-  run_sync(name, args_json, kwargs_json, soft_timeout_ms) -> outcome JSON
+Contract with Rust:
+  load_app(app_spec, extra_paths_json) -> app config JSON (startup only)
+  run_sync(name, args, kwargs, soft_timeout_ms) -> outcome dict
   start_loops(n)                      -> spawn N daemon threads running asyncio loops
-  set_callback(cb)                    -> register Rust completion callback cb(token, outcome_json)
-  submit_async(token, name, args_json, kwargs_json, timeout_s) -> schedules coroutine;
+  set_callback(cb)                    -> register Rust completion callback cb(token, outcome)
+  submit_async(token, name, args, kwargs, timeout_s) -> schedules coroutine;
       completion is push-style via the registered callback (no polling).
 
-Outcome JSON shapes:
-  {"ok": true,  "result": <json>}
-  {"ok": false, "retry": true, "countdown": <float|null>, "error": {...}}
-  {"ok": false, "retryable": <bool>, "error": {"type": ..., "message": ..., "traceback": ...}}
+Task arguments and outcomes cross as REAL PYTHON OBJECTS, not JSON strings.
+Rust converts in both directions (worker/src/pyjson.rs). This module therefore
+contains no per-task JSON codec at all: it used to carry its own copy of
+cauli._codec (a validator, a stdlib/msgspec switch, and an encoder), and every
+task paid two `json.loads` plus a validate-and-encode pass **while holding the
+GIL** that all in-process tasks share. `load_app`'s config is the one
+remaining JSON payload, and it crosses exactly once at startup.
+
+Outcome dict shapes:
+  {"ok": True,  "result": <any JSON-representable value>}
+  {"ok": False, "retry": True, "countdown": <float|None>, "error": {...}}
+  {"ok": False, "retryable": <bool>, "error": {"type": ..., "message": ..., "traceback": ...}}
+
+A result that cannot be represented as JSON is rejected on the Rust side and
+becomes a non-retryable SerializationError, the same classification the
+deleted encoder produced.
 """
 
 import asyncio
@@ -23,7 +35,6 @@ import glob
 import heapq
 import importlib
 import json
-import math
 import os
 import sys
 import threading
@@ -49,104 +60,9 @@ _registry = {}  # task name -> duck-typed TaskDef object
 _loops = []  # asyncio loops, one per dedicated daemon thread
 _loops_lock = threading.Lock()
 _rr = 0
-_callback = None  # Rust completion callback: cb(token:int, outcome_json:str)
+_callback = None  # Rust completion callback: cb(token:int, outcome:dict)
 
 _set_async_exc = ctypes.pythonapi.PyThreadState_SetAsyncExc
-
-
-# --------------------------------------------------------------------------
-# per-task JSON codec (optional msgspec acceleration, stdlib json fallback)
-# --------------------------------------------------------------------------
-
-
-def _validate_json_types(obj):
-    """Reject non-JSON types, non-finite floats, and non-str dict keys
-    (mirrors cauli._codec).
-
-    msgspec natively serializes set/datetime/... (which the stdlib rejects
-    with TypeError) and encodes NaN/Infinity as null; this walk keeps both
-    backends accepting/rejecting the same inputs so a task returning a set
-    is a SerializationError regardless of the installed codec. Dict keys:
-    the stdlib silently coerces a non-str key (bool -> "true"/"false", etc.)
-    but msgspec rejects some of those outright (verified: a bool key raises
-    TypeError there), so both backends require str keys here instead of
-    trying to replicate the stdlib's coercion.
-    """
-    t = type(obj)
-    if t is str or t is int or t is bool or obj is None:
-        return
-    if t is float:
-        if math.isfinite(obj):
-            return
-        raise ValueError("Out of range float values are not JSON compliant")
-    if t is dict:
-        for k, v in obj.items():
-            if type(k) is not str:
-                raise TypeError("dict keys must be str, got %s" % (type(k).__name__,))
-            _validate_json_types(v)
-        return
-    if t is list or t is tuple:
-        for v in obj:
-            _validate_json_types(v)
-        return
-    if isinstance(obj, (str, int)):
-        return
-    if isinstance(obj, float):
-        return _validate_json_types(float(obj))
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            if not isinstance(k, str):
-                raise TypeError("dict keys must be str, got %s" % (type(k).__name__,))
-            _validate_json_types(v)
-        return
-    if isinstance(obj, (list, tuple)):
-        for v in obj:
-            _validate_json_types(v)
-        return
-    raise TypeError("Object of type %s is not JSON serializable" % (t.__name__,))
-
-
-def _loads(s):
-    return json.loads(s)
-
-
-def _dumps_str(obj):
-    # CD-3: validate here too (not just the msgspec _init_codec branch below)
-    # so a non-str dict key is rejected identically whether or not msgspec
-    # ends up installed -- see _validate_json_types.
-    _validate_json_types(obj)
-    # allow_nan=False keeps NaN/Infinity a loud SerializationError on both
-    # codec backends (msgspec would encode them as null; serde_json on the
-    # Rust side cannot parse the stdlib's NaN literal either way).
-    return json.dumps(obj, separators=(",", ":"), allow_nan=False)
-
-
-def _init_codec():
-    """Switch the per-task codec to msgspec when available (never required).
-
-    Called at the end of load_app, AFTER the venv site-packages have been
-    added to sys.path -- a module-level import attempt would run too early
-    and always miss a venv-installed msgspec. Honors CAULI_DISABLE_MSGSPEC.
-    """
-    global _loads, _dumps_str
-    if os.environ.get("CAULI_DISABLE_MSGSPEC"):
-        return
-    try:
-        import msgspec.json as _mj
-    except Exception:
-        return
-    dec = _mj.Decoder()
-    enc = _mj.Encoder()
-
-    def loads(s):
-        return dec.decode(s)
-
-    def dumps_str(obj):
-        _validate_json_types(obj)
-        return enc.encode(obj).decode("utf-8")
-
-    _loads = loads
-    _dumps_str = dumps_str
 
 
 def _tb_of(exc):
@@ -168,36 +84,6 @@ def _is_retry(exc):
 
 def _finish_value(rv):
     return {"ok": True, "result": rv}
-
-
-def _outcome_json(out):
-    """Serialize an outcome dict exactly once.
-
-    Previously `_finish_value` did a throwaway `json.dumps(rv)` just to probe
-    serializability, then the caller dumped the whole outcome again -- every
-    successful result was JSON-encoded twice. Encoding once here and catching
-    the failure gives the same SerializationError outcome (section 8) for one
-    serialization attempt instead of two.
-    """
-    try:
-        return _dumps_str(out)
-    except (TypeError, ValueError, RecursionError) as e:
-        # CD-2: a self-referential or pathologically deep task result makes
-        # _validate_json_types' unbounded recursion hit Python's recursion
-        # limit; RecursionError is a normal, catchable exception but is not
-        # a ValueError/TypeError, so it must be listed explicitly here too
-        # (mirrors py/cauli/_codec.py's ENCODE_ERRORS).
-        return json.dumps(
-            {
-                "ok": False,
-                "retryable": False,
-                "error": {
-                    "type": "SerializationError",
-                    "message": "task return value is not JSON serializable: %s" % (e,),
-                    "traceback": "",
-                },
-            }
-        )
 
 
 def _finish_exc(exc):
@@ -251,10 +137,6 @@ def load_app(app_spec, extra_paths_json):
             "jitter": bool(getattr(td, "jitter", True)),
             "store_result": bool(getattr(td, "store_result", True)),
         }
-
-    # Now that venv site-packages are importable, opt the per-task codec into
-    # msgspec if it is installed there (stdlib json otherwise; never required).
-    _init_codec()
 
     return json.dumps(
         {
@@ -430,19 +312,19 @@ def set_callback(cb):
     _callback = cb
 
 
-def submit_async(token, name, args_json, kwargs_json, timeout_s):
+def submit_async(token, name, args, kwargs, timeout_s):
+    """Schedule one async task. `args`/`kwargs` are already Python objects
+    (converted in Rust); nothing on this path touches JSON."""
     global _rr
     with _loops_lock:
         if not _loops:
             raise RuntimeError("start_loops() was not called")
         loop = _loops[_rr % len(_loops)]
         _rr += 1
-    asyncio.run_coroutine_threadsafe(
-        _arun(token, name, args_json, kwargs_json, timeout_s), loop
-    )
+    asyncio.run_coroutine_threadsafe(_arun(token, name, args, kwargs, timeout_s), loop)
 
 
-async def _arun(token, name, args_json, kwargs_json, timeout_s):
+async def _arun(token, name, args, kwargs, timeout_s):
     try:
         td = _registry.get(name)
         if td is None:
@@ -457,8 +339,6 @@ async def _arun(token, name, args_json, kwargs_json, timeout_s):
             }
         else:
             fn = getattr(td, "fn")
-            args = _loads(args_json)
-            kwargs = _loads(kwargs_json)
             try:
                 rv = await asyncio.wait_for(fn(*args, **kwargs), timeout_s)
                 out = _finish_value(rv)
@@ -480,6 +360,10 @@ async def _arun(token, name, args_json, kwargs_json, timeout_s):
     cb = _callback
     if cb is not None:
         try:
-            cb(token, _outcome_json(out))
+            # The outcome dict itself, not JSON text: Rust normalizes it in the
+            # callback (pyrt::outcome_from_py), which runs right here on this
+            # loop thread. A non-serializable result becomes SerializationError
+            # there, exactly as the old encode-and-catch did.
+            cb(token, out)
         except Exception:
             traceback.print_exc()
