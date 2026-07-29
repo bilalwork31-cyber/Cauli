@@ -12,13 +12,13 @@ set -u
 set -o pipefail
 
 BENCH_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-VENV="${BENCH_VENV:-/home/blackdevil/rupy-bench-venv}"
+VENV="${BENCH_VENV:-$HOME/rupy-bench-venv}"
 PY="$VENV/bin/python"
 CELERY_BIN="$VENV/bin/celery"
 PORT="${BENCH_REDIS_PORT:-6390}"
 export BENCH_REDIS_PORT="$PORT"
 export PYTHONUNBUFFERED=1
-CAULI_WORKER_BIN="${CAULI_WORKER_BIN:-/home/blackdevil/rupy-target/release/cauli-worker}"
+CAULI_WORKER_BIN="${CAULI_WORKER_BIN:-$HOME/rupy-target/release/cauli-worker}"
 RESULTS="$BENCH_DIR/results"
 LOGS="$RESULTS/logs"
 

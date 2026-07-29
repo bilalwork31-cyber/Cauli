@@ -8,7 +8,7 @@ files are edited on the Windows side.
 
 | File | Purpose |
 |---|---|
-| `setup.sh` | creates the venv at `/home/blackdevil/rupy-bench-venv`, installs deps, installs the cauli package editable if `../py` exists (skips gracefully if not) |
+| `setup.sh` | creates the venv at `$HOME/rupy-bench-venv`, installs deps, installs the cauli package editable if `../py` exists (skips gracefully if not) |
 | `runner.sh` | orchestrates the whole suite sequentially; optional scenario filter arg |
 | `driver.py` | measurement engine: enqueue, wait, throughput, latency percentiles, memory sampling, stall/OOM detection, JSON output |
 | `mock_api.py` | uncapped starlette+uvicorn mock external API on 127.0.0.1:8077 (`/io` = 50ms, `/io?ms=N` variable, `/health`) |
@@ -23,14 +23,14 @@ files are edited on the Windows side.
 ## Run everything
 
 ```
-wsl.exe -d Ubuntu-24.04 -e bash -lc "cd /mnt/d/dev/projects/boring/rupy/bench && bash setup.sh && bash runner.sh"
+wsl.exe -d Ubuntu-24.04 -e bash -lc "cd /path/to/cauli/bench && bash setup.sh && bash runner.sh"
 ```
 
 Subset: `bash runner.sh S1` (prefix match on scenario names), `bash runner.sh S3b`,
 `bash runner.sh cauli` or `bash runner.sh celery` (stack match).
 
 Env knobs: `BENCH_REDIS_PORT` (default 6390, never use 6379),
-`CAULI_WORKER_BIN` (default `/home/blackdevil/rupy-target/release/cauli-worker`),
+`CAULI_WORKER_BIN` (default `$HOME/rupy-target/release/cauli-worker`),
 `BENCH_VENV`, `BENCH_DRIVER_TIMEOUT` (default 600s per scenario wait).
 
 If the cauli binary or the cauli python package is missing, runner.sh logs
@@ -120,10 +120,10 @@ Each throughput scenario is preceded by a 200 task warmup run (not recorded).
 ## Verification utilities
 
 ```
-bash -lc "cd .../bench && /home/blackdevil/rupy-bench-venv/bin/python mock_api.py &"   # then:
-/home/blackdevil/rupy-bench-venv/bin/python verify_api.py     # >2000 rps check
-/home/blackdevil/rupy-bench-venv/bin/python calibrate.py      # CPU_ITER calibration
-/home/blackdevil/rupy-bench-venv/bin/python -m pytest -q test_driver.py
+bash -lc "cd .../bench && $HOME/rupy-bench-venv/bin/python mock_api.py &"   # then:
+$HOME/rupy-bench-venv/bin/python verify_api.py     # >2000 rps check
+$HOME/rupy-bench-venv/bin/python calibrate.py      # CPU_ITER calibration
+$HOME/rupy-bench-venv/bin/python -m pytest -q test_driver.py
 ```
 
 For manual verification runs use redis port 6393 (`BENCH_REDIS_PORT=6393`) so

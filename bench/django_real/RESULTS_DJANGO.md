@@ -289,13 +289,13 @@ send/s vs 2.4 for frozen Celery.
 
 ```bash
 # one-time (as root): creates bench_django, max_connections=400
-wsl.exe -d Ubuntu-24.04 -u root -e bash -lc "bash /mnt/d/dev/projects/boring/rupy/bench/django_real/pg_setup_django.sh"
+wsl.exe -d Ubuntu-24.04 -u root -e bash -lc "bash /path/to/cauli/bench/django_real/pg_setup_django.sh"
 # smoke (2 min window, 20k recipients), then the real thing (10 min, 1M)
-wsl.exe -d Ubuntu-24.04 -e bash -lc "bash /mnt/d/dev/projects/boring/rupy/bench/django_real/runner_django.sh smoke"
-wsl.exe -d Ubuntu-24.04 -e bash -lc "bash /mnt/d/dev/projects/boring/rupy/bench/django_real/runner_django.sh real"
+wsl.exe -d Ubuntu-24.04 -e bash -lc "bash /path/to/cauli/bench/django_real/runner_django.sh smoke"
+wsl.exe -d Ubuntu-24.04 -e bash -lc "bash /path/to/cauli/bench/django_real/runner_django.sh real"
 # raw data layer variants (DJR_*): smoke_raw / real_raw
 # symmetric topology, both frozen (SYM_*): sym_smoke / sym
-wsl.exe -d Ubuntu-24.04 -e bash -lc "bash /mnt/d/dev/projects/boring/rupy/bench/django_real/runner_django.sh sym"
+wsl.exe -d Ubuntu-24.04 -e bash -lc "bash /path/to/cauli/bench/django_real/runner_django.sh sym"
 ```
 
 Raw JSON (timelines, per process RSS tables, bg counters, memory samples):

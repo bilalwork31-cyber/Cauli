@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # One-time Postgres setup for the django_real benchmark. Run as root:
-#   wsl.exe -d Ubuntu-24.04 -u root -e bash -lc "bash /mnt/d/dev/projects/boring/rupy/bench/django_real/pg_setup_django.sh"
+#   wsl.exe -d Ubuntu-24.04 -u root -e bash -lc "bash /path/to/cauli/bench/django_real/pg_setup_django.sh"
 # Follows bench/campaign/pg_setup.sh conventions. Idempotent:
 #   - ensures cluster 16/main is online (created by pg_setup.sh already)
 #   - creates database bench_django owned by role bench (role exists from pg_setup.sh)

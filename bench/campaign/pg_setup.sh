@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # One-time Postgres 16 setup for scenario C. Run as root:
-#   wsl.exe -d Ubuntu-24.04 -u root -e bash -lc "bash /mnt/d/dev/projects/boring/rupy/bench/campaign/pg_setup.sh"
+#   wsl.exe -d Ubuntu-24.04 -u root -e bash -lc "bash /path/to/cauli/bench/campaign/pg_setup.sh"
 # Idempotent: ensures cluster 16/main runs, role bench/bench, db bench,
 # md5 host auth for bench on 127.0.0.1.
 set -e

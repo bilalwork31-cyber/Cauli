@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # One time setup for the benchmark harness. Run inside WSL Ubuntu-24.04:
-#   cd /mnt/d/dev/projects/boring/rupy/bench && bash setup.sh
+#   cd /path/to/cauli/bench && bash setup.sh
 set -e
 
-VENV="${BENCH_VENV:-/home/blackdevil/rupy-bench-venv}"
+VENV="${BENCH_VENV:-$HOME/rupy-bench-venv}"
 BENCH_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PY_PKG_DIR="$(dirname "$BENCH_DIR")/py"
 

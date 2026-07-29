@@ -97,7 +97,7 @@ rupy client published 4,500 to 7,100 tasks/s; Celery's publisher managed 1,330 t
 
 ```bash
 wsl.exe -d Ubuntu-24.04 -e bash -lc \
-  "cd /mnt/d/dev/projects/boring/rupy/bench && bash setup.sh && bash runner.sh"
+  "cd /path/to/cauli/bench && bash setup.sh && bash runner.sh"
 ```
 
 Raw per scenario JSON (all samples, percentiles, memory timelines): `bench/results/*.json`.

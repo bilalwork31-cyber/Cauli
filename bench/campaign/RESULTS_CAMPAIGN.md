@@ -68,9 +68,9 @@ per page concurrency budget in one process: 3x throughput, 5x lower median wait.
 
 ```bash
 # A/B
-wsl.exe -d Ubuntu-24.04 -e bash -lc "bash /mnt/d/dev/projects/boring/rupy/bench/campaign/runner_campaign.sh"
+wsl.exe -d Ubuntu-24.04 -e bash -lc "bash /path/to/cauli/bench/campaign/runner_campaign.sh"
 # C (Postgres role/db set up once via pg_setup.sh)
-wsl.exe -d Ubuntu-24.04 -e bash -lc "BENCH_DRIVER_TIMEOUT=5400 bash /mnt/d/dev/projects/boring/rupy/bench/campaign/runner_c.sh"
+wsl.exe -d Ubuntu-24.04 -e bash -lc "BENCH_DRIVER_TIMEOUT=5400 bash /path/to/cauli/bench/campaign/runner_c.sh"
 ```
 
 Raw JSON with timelines and histograms: bench/campaign/results/*.json. Logs: results/logs/.
