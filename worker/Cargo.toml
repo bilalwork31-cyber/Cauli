@@ -43,6 +43,15 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+[profile.release]
+# Cross-crate inlining across the hot path (envelope parse -> conversion ->
+# broker write), which is spread over several modules and dependencies.
+# Deliberately NOT panic = "abort": the dispatch path relies on unwinding, both
+# for DecrGuard's panic-safe inflight accounting and so a panic in one task
+# cannot take down the worker.
+lto = "fat"
+codegen-units = 1
+
 [dev-dependencies]
 libc = "0.2"
 redis = { version = "0.32", features = ["tokio-comp"] }

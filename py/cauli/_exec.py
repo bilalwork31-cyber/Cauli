@@ -280,7 +280,9 @@ def _serialize_response_bytes(payload: dict[str, Any]) -> bytes:
             "message": f"task result is not JSON serializable: {exc}",
             "traceback": _format_traceback(exc),
         }
-        return _codec.encode_bytes({"id": payload.get("id"), "ok": False, "error": error})
+        return _codec.encode_bytes(
+            {"id": payload.get("id"), "ok": False, "error": error}
+        )
 
 
 def _serialize_response(payload: dict[str, Any]) -> str:

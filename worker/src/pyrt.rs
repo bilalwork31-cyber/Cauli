@@ -8,10 +8,13 @@
 //! - All Python-side complexity lives in the embedded shim (src/shim.py):
 //!   the pyo3 surface is "call function, pass strings, get strings".
 
+use crate::ctx::Outcome;
+use crate::envelope::ErrorJson;
 use anyhow::{anyhow, Context, Result};
 use pyo3::prelude::*;
 use pyo3::types::{PyCFunction, PyDict, PyModule, PyTuple};
 use serde::Deserialize;
+use serde_json::Value;
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -54,6 +57,72 @@ fn synth_error_json(type_: &str, msg: &str) -> String {
         "error": {"type": type_, "message": msg, "traceback": ""},
     })
     .to_string()
+}
+
+/// Normalize the shim's outcome dict (a real Python object, not JSON text)
+/// into an `Outcome`. Mirrors `ctx::parse_pyresp` field for field so the two
+/// entry points cannot drift; the only difference is where the data comes
+/// from. On a successful task exactly ONE traversal happens: the result
+/// object into a `Value`.
+fn outcome_from_py(obj: &Bound<'_, PyAny>) -> Outcome {
+    let get = |k: &str| obj.get_item(k).ok();
+    let flag = |k: &str| {
+        get(k)
+            .and_then(|v| v.extract::<bool>().ok())
+            .unwrap_or(false)
+    };
+
+    if flag("ok") {
+        let result = match get("result") {
+            Some(r) => match crate::pyjson::py_to_json(&r, 0) {
+                Ok(v) => v,
+                Err(e) => {
+                    // Same classification the Python codec produced: a result
+                    // that cannot be represented is terminal, not retryable
+                    // (retrying re-runs the task to fail identically).
+                    return Outcome::Failure {
+                        err: ErrorJson::new(
+                            "SerializationError",
+                            format!("task result is not JSON serializable: {}", e.0),
+                        ),
+                        retryable: false,
+                    };
+                }
+            },
+            None => Value::Null,
+        };
+        return Outcome::Success(result);
+    }
+
+    let err = get("error")
+        .and_then(|e| {
+            let f = |k: &str| {
+                e.get_item(k)
+                    .ok()
+                    .and_then(|v| v.extract::<String>().ok())
+                    .unwrap_or_default()
+            };
+            let type_ = f("type");
+            (!type_.is_empty()).then(|| ErrorJson {
+                type_,
+                message: f("message"),
+                traceback: f("traceback"),
+            })
+        })
+        .unwrap_or_else(|| {
+            ErrorJson::new("UnknownError", "executor reported failure without error")
+        });
+
+    if flag("retry") {
+        return Outcome::ForceRetry {
+            countdown: get("countdown").and_then(|c| c.extract::<f64>().ok()),
+            err,
+        };
+    }
+    let retryable = get("retryable")
+        .and_then(|r| r.extract::<bool>().ok())
+        .unwrap_or(err.type_ != "SerializationError");
+    Outcome::Failure { err, retryable }
 }
 
 fn pyerr_string(py: Python<'_>, e: &PyErr) -> String {
@@ -146,27 +215,38 @@ impl PyRuntime {
 
     /// Blocking sync task execution. MUST be called from a dedicated OS thread
     /// (the sync io pool), never from a tokio worker thread.
+    ///
+    /// Arguments cross as real Python objects and the outcome comes back as a
+    /// real Python object: no JSON text is produced or parsed on this path in
+    /// either direction. That matters because every instruction executed here
+    /// holds the GIL, which all in-process tasks share -- the two `json.loads`
+    /// calls and the encode that used to live in the shim were subtracted
+    /// straight from total io throughput (see src/pyjson.rs).
     pub fn run_sync_blocking(
         &self,
         name: &str,
-        args_json: &str,
-        kwargs_json: &str,
+        args: &Value,
+        kwargs: &Value,
         soft_timeout_ms: Option<u64>,
-    ) -> String {
+    ) -> Outcome {
         Python::attach(|py| {
-            let r = self
-                .shim
-                .bind(py)
-                .getattr("run_sync")
-                .and_then(|f| f.call1((name, args_json, kwargs_json, soft_timeout_ms)))
-                .and_then(|v| v.extract::<String>());
-            match r {
-                Ok(s) => s,
-                Err(e) => synth_error_json(
+            let call = (|| -> PyResult<Outcome> {
+                let a = crate::pyjson::json_to_py(py, args, 0)?;
+                let k = crate::pyjson::json_to_py(py, kwargs, 0)?;
+                let out =
+                    self.shim
+                        .bind(py)
+                        .getattr("run_sync")?
+                        .call1((name, a, k, soft_timeout_ms))?;
+                Ok(outcome_from_py(&out))
+            })();
+            call.unwrap_or_else(|e| Outcome::Failure {
+                err: ErrorJson::new(
                     "WorkerShimError",
-                    &format!("run_sync failed: {}", pyerr_string(py, &e)),
+                    format!("run_sync failed: {}", pyerr_string(py, &e)),
                 ),
-            }
+                retryable: true,
+            })
         })
     }
 
@@ -250,10 +330,13 @@ impl PyRuntime {
 
 pub struct SyncJob {
     pub name: String,
-    pub args_json: String,
-    pub kwargs_json: String,
+    /// Parsed args/kwargs, NOT JSON text: the conversion into Python objects
+    /// happens on the pool thread under the GIL, and no encode/decode step
+    /// exists on either side of the boundary any more (src/pyjson.rs).
+    pub args: Value,
+    pub kwargs: Value,
     pub soft_timeout_ms: Option<u64>,
-    pub resp: oneshot::Sender<String>,
+    pub resp: oneshot::Sender<Outcome>,
 }
 
 pub struct SyncPool {
@@ -309,8 +392,8 @@ impl SyncPool {
                     }
                     let out = rt.run_sync_blocking(
                         &job.name,
-                        &job.args_json,
-                        &job.kwargs_json,
+                        &job.args,
+                        &job.kwargs,
                         job.soft_timeout_ms,
                     );
                     let _ = job.resp.send(out);
