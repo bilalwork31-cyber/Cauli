@@ -1,4 +1,22 @@
-# cauli
+<p align="center">
+  <img src="assets/cauli-logo.png" alt="Cauli" width="200">
+</p>
+
+<h1 align="center">cauli</h1>
+
+<p align="center">
+  A high throughput, low RAM background worker runtime for Python.<br>
+  Tasks in Python. Worker in Rust.
+</p>
+
+<p align="center">
+  <a href="#license"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue" alt="License"></a>
+  <img src="https://img.shields.io/badge/python-3.10%2B-blue" alt="Python 3.10+">
+  <img src="https://img.shields.io/badge/broker-Redis%20%E2%89%A5%207.0-red" alt="Redis 7+">
+  <img src="https://img.shields.io/badge/worker-Linux-lightgrey" alt="Linux worker">
+</p>
+
+---
 
 A high throughput, low RAM background worker runtime for the Python ecosystem
 (Django, FastAPI, Flask, plain scripts). Tasks are written in Python. The worker is a
@@ -31,7 +49,8 @@ pip install 'cauli[speed]'      # optional: msgspec-accelerated JSON codec (wire
 The worker is a separate Rust binary, built from source (no crates.io/prebuilt release yet):
 
 ```bash
-cd worker
+git clone https://github.com/bilalwork31-cyber/Cauli.git
+cd Cauli/worker
 cargo build --release --bin cauli-worker
 # binary at target/release/cauli-worker
 ```
