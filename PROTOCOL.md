@@ -103,8 +103,11 @@ client-produced). Two worker-side gates apply before an entry is ever executed:
 
 No client-side idempotency check (the worker enforces it at execution time).
 
-The wire format is plain JSON; clients MAY produce/parse it with any compliant JSON codec
-(the bundled client uses msgspec when installed, stdlib `json` otherwise).
+The wire format is plain JSON; clients MAY produce/parse it with any compliant JSON codec.
+The bundled client uses msgspec (a required dependency, not an optional accelerator) and
+additionally validates the object tree against the JSON type set before encoding, because
+msgspec on its own would encode `NaN`/`Infinity` as `null`, accept `set` and `bytes`, and
+coerce non-`str` dict keys — none of which this protocol defines.
 
 ## 4. Worker delivery loop
 
