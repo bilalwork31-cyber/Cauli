@@ -36,11 +36,16 @@ its bottleneck is billiard's per-task overhead, not IPC idle time.
 
 ## Results (steady-state drain tps, 6 workers / 6 children)
 
+Two independent measurement rounds, both arms tuned. Ratios are given as a
+**range across rounds**, not a single figure: this box is contended and each
+cell is one run, so a single ratio would imply precision that is not there.
+Celery's own arm moved 630 -> 853 at 2 ms between rounds.
+
 | task size | Celery best | cauli best | ratio |
 |---|---|---|---|
-| **51 ms** (n=2000) | 67.8 (mult 1) | 72.6 (prefetch 0) | **1.07x — parity** |
-| **2 ms** (n=20000) | 630.1 (mult 4) | 1733.0 (prefetch 16) | **2.75x** |
-| **0.5 ms** (n=40000) | 672.9 (mult 4) | 6057.9 (prefetch 64) | **9.00x** |
+| **51 ms** (n=2000) | 67.8 (mult 1) | 72.6 (prefetch 0) | **~1.07x — parity** |
+| **2 ms** (n=20000) | 630.1 / 852.6 (mult 4) | 1733.0 / 1778.4 (prefetch 16) | **2.1x – 2.8x** |
+| **0.5 ms** (n=40000) | 672.9 / 826.5 (mult 4) | 6057.9 / 5730.2 (prefetch 64) | **6.9x – 9.0x** |
 
 Peak RSS, same runs: cauli ~61 MiB vs Celery ~178 MiB (**2.9x less**).
 
@@ -80,12 +85,20 @@ prefetch trades tail latency and redelivery volume for throughput.
 | celery prefork 8 | 158.4 | 220.2 |
 | celery prefork 16 | 361.1 | 407.4 |
 | celery gevent 500 | 86.5 | 56.2 |
-| cauli sync io 500 | 514.8 | 65.2 |
-| **cauli async io 500** | **18177.9** | 82.2 |
+| cauli sync io 500 | 514.8 → **694.1** | 64.9 |
+| **cauli async io 500** | 14083.7 – 18177.9 | 81.0 |
 
-cauli async is 50.3x Celery's best arm at 5x less RAM; the sync lane is 1.43x
-at 6.2x less RAM. Note gevent performed poorly under these equal-semantics
-settings (acks_late, prefetch 1), consistent with the note in `RESULTS.md`.
+cauli async is 39x–50x Celery's best arm at 5x less RAM. The sync lane went
+**514.8 → 694.1 tps (+34.8%)** when the JSON encode/decode was removed from
+the GIL-held path (commit "Remove JSON from the GIL-held sync task path"),
+taking it from 1.43x to **1.92x** Celery at 6.3x less RAM. Prior runs of the
+old sync code measured 507.6 and 514.8, so that gain is well outside spread.
+
+Note gevent performed poorly under these equal-semantics settings (acks_late,
+prefetch 1), consistent with the note in `RESULTS.md`. The async `exec_tps`
+figures carry the driver-artifact caveat above and are the least trustworthy
+numbers here; the sync lane's is measured well below saturation and is not
+artifact-prone.
 
 ## Caveats (read before quoting any of this)
 
