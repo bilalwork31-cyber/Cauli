@@ -1,6 +1,10 @@
 # Build artifacts
 target/
 *.egg-info/
+build/
+dist/
+*.whl
+*.tar.gz
 
 # Python
 __pycache__/
