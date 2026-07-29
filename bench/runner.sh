@@ -284,6 +284,39 @@ run_scenario S1e_cauli_async_io500  cauli   1G io_async 10000 -- "${CAULI[@]}" -
 # S2: 2k cpu tasks, 1G cap
 run_scenario S2a_celery_prefork6   celery 1G cpu 2000 -- "${CEL[@]}" -c 6 -P prefork
 run_scenario S2b_cauli_cpu6         cauli   1G cpu 2000 -- "${CAULI[@]}" --cpu-workers 6
+# S2c/S2d: prefetch A/B in the SAME suite run, so machine state is identical
+# and the only variable is --cpu-prefetch. Comparing against a number recorded
+# on another day cannot attribute a delta to a code change.
+run_scenario S2c_cauli_cpu6_pf0     cauli   1G cpu 2000 -- "${CAULI[@]}" --cpu-workers 6 --cpu-prefetch 0
+run_scenario S2d_cauli_cpu6_pf1     cauli   1G cpu 2000 -- "${CAULI[@]}" --cpu-workers 6 --cpu-prefetch 1
+
+# S5: cpu TASK SIZE sweep. S2's single 51ms size is the regime where per-task
+# overhead is ~2% of the work, so both stacks are simply core bound there and
+# the number says nothing about dispatch cost. Sweeping the size down makes
+# per-task overhead the dominant term and shows where each runtime's IPC
+# actually lands. Same task body, same iteration count per size, both stacks
+# (BENCH_CPU_ITER is read by common.py, which both import).
+#
+# Reported as a curve, not a single headline: at 51ms the two are at parity by
+# construction and that stays in the results.
+run_cpu_size() {          # run_cpu_size <label> <iters> <n>
+    local label="$1" iters="$2" n="$3"
+    export BENCH_CPU_ITER="$iters"
+    log "--- cpu size sweep: $label (BENCH_CPU_ITER=$iters, n=$n)"
+    run_scenario "S5${label}a_celery_prefork6" celery 1G cpu "$n" -- "${CEL[@]}" -c 6 -P prefork
+    # prefetch A/B at every size: at 51ms it is provably noise, but per-task
+    # IPC cost is exactly what shrinks with task size, so this is where it
+    # either earns its complexity or gets deleted.
+    run_scenario "S5${label}b_cauli_pf0"       cauli   1G cpu "$n" -- "${CAULI[@]}" --cpu-workers 6 --cpu-prefetch 0
+    run_scenario "S5${label}c_cauli_pf1"       cauli   1G cpu "$n" -- "${CAULI[@]}" --cpu-workers 6 --cpu-prefetch 1
+    run_scenario "S5${label}d_cauli_pf3"       cauli   1G cpu "$n" -- "${CAULI[@]}" --cpu-workers 6 --cpu-prefetch 3
+    unset BENCH_CPU_ITER
+}
+
+# ~2ms and ~0.5ms tasks; more tasks per run so the measurement window stays
+# meaningful rather than being dominated by startup.
+run_cpu_size small 3700 8000
+run_cpu_size tiny   920 15000
 
 # S3: 10k io tasks under 512M stress (celery prefork expected to OOM/thrash;
 # the driver survives that and records status=stalled/worker_dead + counts)

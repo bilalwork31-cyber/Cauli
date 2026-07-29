@@ -26,7 +26,15 @@ MOCK_API = os.environ.get("BENCH_MOCK_API", "http://127.0.0.1:8077/io")
 # Measured 2026-07-20: 94000 iterations = 51.0 ms median per call (target 50 ms,
 # ~19.6 calls/sec/core; medians of 3x15 reps: 50.9/52.0/51.0 ms). Re-run
 # calibrate.py and update this constant if the benchmark machine changes.
-CPU_ITER = 94_000
+#
+# Overridable via BENCH_CPU_ITER so a scenario can sweep TASK SIZE, which is
+# its own regime axis: at ~51 ms per task the runtime's per-task overhead is
+# ~2% of the work and both stacks converge on being core bound, so that single
+# size cannot distinguish their dispatch costs at all. Shrinking the task makes
+# per-task overhead the dominant term. BOTH stacks import this module, so any
+# size stays exactly as apples-to-apples as the default.
+# Reference points on this machine: 94000 = 51 ms, 3700 = ~2 ms, 920 = ~0.5 ms.
+CPU_ITER = int(os.environ.get("BENCH_CPU_ITER", "94000"))
 
 
 def io_call() -> int:

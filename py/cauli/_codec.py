@@ -189,3 +189,21 @@ def encode_str(obj: Any) -> str:
     if isinstance(out, bytes):
         return out.decode("utf-8")
     return out
+
+
+def encode_bytes(obj: Any) -> bytes:
+    """:func:`encode`, always as ``bytes`` (for byte-stream transports).
+
+    Preferred over ``encode_str`` on the cpu child's socket path, which needs
+    bytes to hand to ``sendall``. Going through ``encode_str`` there costs a
+    full transcode of every response on both backends: msgspec produces bytes
+    which would be decoded to str and immediately re-encoded, and the stdlib
+    would encode to UTF-8 twice (once for the surrogate check in ``encode``,
+    once for the socket). Each branch below does exactly one conversion.
+    """
+    out = encode(obj)
+    if isinstance(out, str):
+        # The stdlib branch already proved this string is UTF-8 encodable
+        # (the CD-1 check); this is the encode whose result actually ships.
+        return out.encode("utf-8")
+    return out

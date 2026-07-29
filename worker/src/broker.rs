@@ -113,13 +113,19 @@ end
 return 0
 "#;
 
+/// Built once, not per task. `redis::Script::new` computes the script's SHA1
+/// on construction, so building it inside `idemp_claim` re-hashed the source
+/// on every single idempotent task before the EVALSHA could even be sent.
+static IDEMP_CLAIM_SCRIPT: std::sync::LazyLock<redis::Script> =
+    std::sync::LazyLock::new(|| redis::Script::new(IDEMP_CLAIM_LUA));
+
 pub async fn idemp_claim(
     conn: &mut ConnectionManager,
     key: &str,
     task_id: &str,
     ttl_s: u64,
 ) -> Result<IdempClaim> {
-    let script = redis::Script::new(IDEMP_CLAIM_LUA);
+    let script = &*IDEMP_CLAIM_SCRIPT;
     let code: i64 = script
         .key(idemp_key(key))
         .arg(task_id)
@@ -227,12 +233,15 @@ pub async fn finish_dlq(
 }
 
 fn add_ack_del(pipe: &mut redis::Pipeline, queue: &str, stream_id: &str) {
+    // One allocation, not two: this runs on every single completion (success,
+    // duplicate, retry, and DLQ all funnel through here).
+    let qk = q_key(queue);
     pipe.cmd("XACK")
-        .arg(q_key(queue))
+        .arg(&qk)
         .arg("cauli")
         .arg(stream_id)
         .ignore();
-    pipe.cmd("XDEL").arg(q_key(queue)).arg(stream_id).ignore();
+    pipe.cmd("XDEL").arg(&qk).arg(stream_id).ignore();
 }
 
 /// §4.4 extended XPENDING: (entry_id, consumer, idle_ms, delivery_count).

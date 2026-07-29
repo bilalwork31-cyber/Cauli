@@ -330,6 +330,17 @@ run_sym() {               # run_sym <celery_frozen|cauli_fork|cauli_async>
                 --cpu-workers 6 --cpu-child-threads 15 \
                 --visibility-timeout 300 && started=0
             ;;
+        cauli_fork40)
+            # Tuned fork lane: same 6 GILs but 40 in-flight tasks per child
+            # (sends are ~300ms GIL-free HTTP wait + ~3-4ms Python, so one
+            # GIL supports ~40 threads before it saturates).
+            export DJ_CAULI_KIND=cpu DJ_SEND_POOL=40
+            start_scoped "$name" "$CAULI_WORKER_BIN" --app cauli_app_django:app \
+                --redis-url "$CAULI_URL" --python "$PY" --queues "$CAULI_QUEUES" \
+                --io-concurrency 64 --io-threads 8 --batch 16 \
+                --cpu-workers 6 --cpu-child-threads 40 \
+                --visibility-timeout 300 && started=0
+            ;;
         cauli_async)
             # The DJR real_raw cauli leg: one process, io lane, sync send
             # threads over the raw redis/SQL layer (see real_raw notes above).
@@ -370,6 +381,7 @@ log "django_real $MODE suite start (filter='${FILTER:-all}') layer=$DATA_LAYER r
 if [ "$SYM" = "1" ]; then
     run_sym celery_frozen
     run_sym cauli_fork
+    run_sym cauli_fork40
     run_sym cauli_async
 else
     run_stack celery

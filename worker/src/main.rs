@@ -176,15 +176,29 @@ async fn run_worker(
         std::process::id()
     );
     let io_concurrency = args.io_concurrency.max(1);
-    let cpu_pool = cpu::start(
-        cpu_workers,
-        args.cpu_child_threads,
-        &args.python,
-        &args.app,
-        args.no_fork_server,
-        counters.clone(),
-    )
-    .await;
+    // Only pay for cpu executors if the app actually has cpu tasks. Routing is
+    // by REGISTRY kind (dispatch.rs), so with no cpu-kind task registered the
+    // cpu path is unreachable and the fork-server parent + N children would be
+    // pure resident memory for work that can never arrive.
+    let needs_cpu = appcfg.tasks.values().any(|s| s.kind == "cpu");
+    let cpu_pool = if needs_cpu {
+        cpu::start(
+            cpu_workers,
+            args.cpu_child_threads,
+            args.cpu_prefetch,
+            &args.python,
+            &args.app,
+            args.no_fork_server,
+            counters.clone(),
+        )
+        .await
+    } else {
+        info!(
+            "no kind=\"cpu\" tasks registered: cpu pool not started \
+             (skipping the fork-server parent and {cpu_workers} children)"
+        );
+        cpu::disabled()
+    };
     let ctx = Arc::new(Ctx {
         io_sem: Arc::new(tokio::sync::Semaphore::new(io_concurrency)),
         sync_pool: pyrt::SyncPool::start(pyrt.clone(), args.io_threads, io_concurrency),

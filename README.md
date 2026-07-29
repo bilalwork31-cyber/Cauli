@@ -101,6 +101,26 @@ children fork copy-on-write, so respawning after a crash or hard timeout is chea
 `--cpu-child-threads M` to pipeline up to M requests per child on workloads that release the
 GIL (e.g. blocking network calls inside a `kind="cpu"` task); `--no-fork-server` falls back to
 one process per cpu task (also entered automatically if fork-server startup fails).
+`--cpu-prefetch` (default 4) controls how many requests are staged in each child ahead of
+what it is executing; raise it for small tasks, lower it for long ones.
+
+## Measured
+
+Drain-rate benchmarks, 6 workers on 6 shared cores, **both stacks tuned at their own optimum**
+(full method, caveats and raw numbers in `bench/RESULTS_CPU.md`):
+
+| Workload | Celery best | cauli best | ratio |
+|---|---|---|---|
+| CPU, 0.5 ms tasks | 672.9/s | 6057.9/s | 9.0x |
+| CPU, 2 ms tasks | 630.1/s | 1733.0/s | 2.75x |
+| CPU, 51 ms tasks | 67.8/s | 72.6/s | ~parity |
+| IO, async | 361.1/s | 18177.9/s | 50x, at 5x less RAM |
+
+**The 51 ms row is the honest one to read first.** Once a CPU task is big enough, both stacks
+are simply core-bound and parity is the ceiling: 6 cores of hashing is 6 cores of hashing
+whoever schedules it. cauli's advantage is per-task overhead, so it grows as tasks get smaller
+and vanishes as they get larger. Benchmarks are single-run on a contended box; treat anything
+under ~5% as noise.
 
 ## Semantics & limits
 

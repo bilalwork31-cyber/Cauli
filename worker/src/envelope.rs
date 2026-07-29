@@ -91,22 +91,27 @@ impl Envelope {
         }
     }
 
-    /// args as a `Value` directly ("null" tolerated -> `[]`). Used by callers
-    /// (the cpu child request) that build a `Value` anyway, to avoid a
-    /// pointless string round-trip (serialize to JSON text, then reparse it
-    /// right back into a `Value` — see audit nit on `exec.rs::run_cpu_task`).
-    pub fn args_value(&self) -> Value {
+    /// args as a BORROWED `Value` ("null" tolerated -> a shared empty array).
+    /// Callers that serialize (the cpu child request) go straight from the
+    /// parsed tree to the wire: no string round-trip and, unlike the previous
+    /// `args_value()`, no clone of the tree either.
+    pub fn args_ref(&self) -> &Value {
+        static EMPTY_ARRAY: std::sync::LazyLock<Value> =
+            std::sync::LazyLock::new(|| Value::Array(Vec::new()));
         match &self.args {
-            Value::Null => Value::Array(Vec::new()),
-            v => v.clone(),
+            Value::Null => &EMPTY_ARRAY,
+            v => v,
         }
     }
 
-    /// kwargs as a `Value` directly ("null" tolerated -> `{}`). See `args_value`.
-    pub fn kwargs_value(&self) -> Value {
+    /// kwargs as a BORROWED `Value` ("null" tolerated -> a shared empty
+    /// object). See `args_ref`.
+    pub fn kwargs_ref(&self) -> &Value {
+        static EMPTY_OBJECT: std::sync::LazyLock<Value> =
+            std::sync::LazyLock::new(|| Value::Object(serde_json::Map::new()));
         match &self.kwargs {
-            Value::Null => Value::Object(serde_json::Map::new()),
-            v => v.clone(),
+            Value::Null => &EMPTY_OBJECT,
+            v => v,
         }
     }
 
