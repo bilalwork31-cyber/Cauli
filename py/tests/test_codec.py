@@ -1,11 +1,16 @@
-"""cauli._codec: both backends must agree on accept/reject and roundtrip."""
+"""cauli._codec: roundtrip fidelity, and the rejections msgspec does NOT make
+on its own.
+
+msgspec is the only backend (there is no stdlib fallback), and it is more
+permissive than the protocol: left alone it encodes NaN/Infinity as null,
+accepts set and bytes, and coerces int dict keys. The tests below therefore
+mostly pin down `_validate_json_types`, which is what actually enforces the
+JSON type set.
+"""
 
 from __future__ import annotations
 
-import importlib
-import importlib.util
 import math
-import sys
 
 import pytest
 
@@ -33,28 +38,15 @@ ENVELOPE = {
 }
 
 
-def _reload_codec(monkeypatch, disable: bool):
-    if disable:
-        monkeypatch.setenv("CAULI_DISABLE_MSGSPEC", "1")
-    else:
-        monkeypatch.delenv("CAULI_DISABLE_MSGSPEC", raising=False)
+@pytest.fixture
+def codec():
+    """The codec module. Single backend: msgspec is a hard requirement, so
+    there is no parameterization and no skip — if it is missing, importing
+    cauli fails outright and that is the intended behavior."""
     import cauli._codec
 
-    return importlib.reload(cauli._codec)
-
-
-@pytest.fixture(params=["msgspec", "json"])
-def codec(request, monkeypatch):
-    """The codec module under each backend; restores the ambient one after."""
-    if request.param == "msgspec" and importlib.util.find_spec("msgspec") is None:
-        pytest.skip("msgspec not installed")
-    mod = _reload_codec(monkeypatch, disable=(request.param == "json"))
-    assert mod.backend == request.param
-    yield mod
-    # Re-import under the ORIGINAL environment so later tests (and the rest
-    # of this session's cauli modules) see the ambient backend again.
-    monkeypatch.undo()
-    importlib.reload(sys.modules["cauli._codec"])
+    assert cauli._codec.backend == "msgspec"
+    return cauli._codec
 
 
 def test_envelope_roundtrip(codec):
@@ -117,6 +109,44 @@ def test_scalars_and_bignums(codec):
     for value in (0, -1, 2**80, 1.5, "", "x", True, False, None, [], {}):
         assert codec.decode(codec.encode(value)) == value
     assert math.isclose(codec.decode(codec.encode(1e308)), 1e308)
+
+
+def test_encode_errors_covers_raw_msgspec_encode_failure(codec):
+    """`msgspec.EncodeError` does NOT subclass ValueError (its MRO is
+    EncodeError -> MsgspecError -> Exception), unlike `msgspec.DecodeError`
+    which does. A call site catching only (TypeError, ValueError) would let a
+    raw encode failure escape, so ENCODE_ERRORS must name MsgspecError."""
+    import msgspec
+
+    assert not issubclass(msgspec.EncodeError, (ValueError, TypeError))
+    assert issubclass(msgspec.EncodeError, codec.ENCODE_ERRORS)
+    assert issubclass(msgspec.DecodeError, codec.DECODE_ERRORS)
+
+
+def test_validator_catches_what_msgspec_would_wave_through(codec):
+    """msgspec is more permissive than the protocol. Without the validation
+    walk these would silently reach the wire: NaN/Infinity as `null` (a
+    corrupted value, not an error), `set` as an array, and `bytes` as base64.
+    Each must raise instead."""
+    import msgspec.json as mj
+
+    raw = mj.Encoder()
+    # Confirm the premise: bare msgspec really does accept all of these.
+    assert raw.encode({"a": float("nan")}) == b'{"a":null}'
+    assert raw.encode({"a": {1, 2}}) in (b'{"a":[1,2]}', b'{"a":[2,1]}')
+    assert raw.encode({"a": b"x"}) == b'{"a":"eA=="}'
+    # The codec must not.
+    for bad in ({"a": float("nan")}, {"a": {1, 2}}, {"a": b"x"}):
+        with pytest.raises(codec.ENCODE_ERRORS):
+            codec.encode(bad)
+
+
+def test_lone_surrogate_rejected(codec):
+    """CD-1: a result carrying an unpaired surrogate (e.g. from
+    surrogateescape filename decoding) must fail at encode, inside the
+    guarded region, rather than at some later transport boundary."""
+    with pytest.raises(codec.ENCODE_ERRORS):
+        codec.encode({"a": "\ud800"})
 
 
 def test_non_str_dict_keys_rejected_identically(codec):

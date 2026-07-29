@@ -27,6 +27,11 @@ classifiers = [
 ]
 dependencies = [
     "redis>=5",
+    # Required, not an accelerator. cauli has no stdlib json fallback: two
+    # backends meant two sets of semantics (they disagreed on lone surrogates,
+    # dict-key coercion and exception types), and a fallback lets the slow path
+    # survive unnoticed in production. See py/cauli/_codec.py.
+    "msgspec>=0.18",
 ]
 [project.urls]
 Homepage = "https://github.com/bilalwork31-cyber/Cauli"
@@ -37,12 +42,10 @@ Issues = "https://github.com/bilalwork31-cyber/Cauli/issues"
 dev = [
     "pytest>=8",
 ]
-# Optional JSON codec acceleration (cauli._codec); the wire format is
-# unchanged, and everything works without it. Disable at runtime with
-# CAULI_DISABLE_MSGSPEC=1.
-speed = [
-    "msgspec>=0.18",
-]
+# `speed` is retained as an empty alias so `pip install 'cauli[speed]'` from
+# older docs or pinned scripts keeps working; msgspec moved into the required
+# dependencies above and is no longer optional.
+speed = []
 
 [tool.setuptools]
 packages = ["cauli"]

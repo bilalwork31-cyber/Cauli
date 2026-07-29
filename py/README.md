@@ -5,8 +5,7 @@ Define tasks in Python, enqueue from any web framework, execute on the Rust work
 
 ## Install
 
-    pip install cauli               # Python >= 3.10, needs redis>=5
-    pip install 'cauli[speed]'      # optional: msgspec-accelerated JSON codec (wire format unchanged)
+    pip install cauli               # Python >= 3.10 (deps: redis>=5, msgspec)
 
 ## Define an app and tasks (myproj/tasks.py)
 

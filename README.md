@@ -42,8 +42,7 @@ forks, while CPU tasks still get true multicore parallelism.
 ## Install
 
 ```bash
-pip install cauli               # client: Python >= 3.10, needs redis>=5
-pip install 'cauli[speed]'      # optional: msgspec-accelerated JSON codec (wire format unchanged)
+pip install cauli               # client: Python >= 3.10 (deps: redis>=5, msgspec)
 ```
 
 The worker is a separate Rust binary, built from source (no crates.io/prebuilt release yet):
