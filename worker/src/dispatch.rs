@@ -57,6 +57,43 @@ async fn process(ctx: &Arc<Ctx>, queue: &str, sid: &str, raw: Option<String>) {
         return dlq_terminal(ctx, queue, sid, &raw, "unregistered", None).await;
     };
 
+    // §9.1 expiry, checked at DISPATCH — the single enforcement point, and
+    // deliberately so. It sits here rather than at enqueue (which cannot know
+    // how long the entry will actually wait), in the delayed mover (which only
+    // sees delayed entries, not backlogged ready ones) or in the fetch loop
+    // (which has not parsed the envelope yet). Dispatch is the one place every
+    // path converges: a fresh delivery, a mover hand-off, a scheduled retry
+    // and a §4.4 crash reclaim all arrive here, so "expired work never runs"
+    // holds for all of them with one check. It is also the only placement that
+    // needs nothing from the broker, which is what lets a future SQS or
+    // RabbitMQ backend inherit expiry for free.
+    //
+    // Before the idempotency claim: an expired task must not burn the
+    // idempotency key and lock out a later, still-valid task with the same one.
+    if let Some(deadline) = env.expiry_deadline_ms(ctx.queue_ttl_ms(queue)) {
+        let now = now_ms();
+        if now > deadline {
+            debug!(
+                task = %env.task, id = %env.id, deadline, now,
+                late_ms = now.saturating_sub(deadline),
+                "task expired before execution -> DLQ"
+            );
+            let rj = envelope::result_expired(deadline, now);
+            let store = env
+                .store_result
+                .then_some((env.id.as_str(), rj.as_str(), ctx.result_ttl));
+            let mut conn = ctx.redis.clone();
+            if let Err(e) =
+                broker::finish_dlq(&mut conn, queue, sid, &raw, "expired", None, store).await
+            {
+                error!(id = %env.id, "expired finish write failed: {e}");
+            }
+            ctx.counters.expired.fetch_add(1, Ordering::Relaxed);
+            ctx.counters.dlq.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+    }
+
     // §4.5 idempotency guard, claimed at execution start.
     if let Some(key) = env.idempotency_key.clone() {
         let mut conn = ctx.redis.clone();

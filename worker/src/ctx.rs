@@ -25,14 +25,28 @@ pub struct Ctx {
     pub cpu: CpuPool,
     pub result_ttl: u64,
     pub idemp_ttl: u64,
+    /// PROTOCOL §9.2 per-queue max age in MILLISECONDS, `"*"` = fallback.
+    pub queue_ttl_ms: HashMap<String, u64>,
     pub queues: Vec<String>,
     pub consumer: String,
     pub shutdown: watch::Receiver<bool>,
 }
 
+/// PROTOCOL §9.2 wildcard key: the TTL used for any queue without its own entry.
+pub const QUEUE_TTL_WILDCARD: &str = "*";
+
 impl Ctx {
     pub fn shutting_down(&self) -> bool {
         *self.shutdown.borrow()
+    }
+
+    /// Configured max age for `queue`, in ms: an exact match wins over the
+    /// `"*"` fallback, and no entry at all means unbounded.
+    pub fn queue_ttl_ms(&self, queue: &str) -> Option<u64> {
+        self.queue_ttl_ms
+            .get(queue)
+            .or_else(|| self.queue_ttl_ms.get(QUEUE_TTL_WILDCARD))
+            .copied()
     }
 }
 
@@ -127,6 +141,23 @@ pub fn parse_pyresp(s: &str, from_cpu: bool) -> Outcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// §9.2: an exact queue entry beats the `"*"` fallback; with neither, the
+    /// queue is unbounded.
+    #[test]
+    fn queue_ttl_lookup_prefers_exact_over_wildcard() {
+        let lookup = |map: &HashMap<String, u64>, q: &str| -> Option<u64> {
+            map.get(q).or_else(|| map.get(QUEUE_TTL_WILDCARD)).copied()
+        };
+        let mut map = HashMap::new();
+        assert_eq!(lookup(&map, "default"), None);
+        map.insert(QUEUE_TTL_WILDCARD.to_string(), 60_000);
+        assert_eq!(lookup(&map, "default"), Some(60_000));
+        assert_eq!(lookup(&map, "bulk"), Some(60_000));
+        map.insert("bulk".to_string(), 5_000);
+        assert_eq!(lookup(&map, "bulk"), Some(5_000));
+        assert_eq!(lookup(&map, "default"), Some(60_000));
+    }
 
     #[test]
     fn parses_success() {

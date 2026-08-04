@@ -28,7 +28,7 @@ def test_delay_xadds_exact_envelope(app, redis_client):
 
     env = json.loads(fields[b"e"])
     assert set(env.keys()) == ENVELOPE_KEYS, (
-        "envelope must have exactly the 18 spec fields"
+        "envelope must have exactly the 19 spec fields"
     )
 
     assert env["v"] == 1

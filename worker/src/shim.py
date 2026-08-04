@@ -185,12 +185,28 @@ def load_app(app_spec, extra_paths_json):
             "store_result": bool(getattr(td, "store_result", True)),
         }
 
+    # PROTOCOL §9.2 queue TTL: {queue: seconds}, key "*" is the fallback for
+    # queues with no explicit entry. Duck-read like every other app attribute
+    # so an app object predating this feature still loads.
+    queue_ttl_out = {}
+    try:
+        for qname, seconds in dict(getattr(app, "queue_ttl", None) or {}).items():
+            value = float(seconds)
+            if value > 0:
+                queue_ttl_out[str(qname)] = value
+    except (TypeError, ValueError):
+        # Malformed config must not stop the worker from starting; it just
+        # means no TTL is enforced (the client-side `expires_at` stamp still
+        # applies to anything enqueued by a client that could read it).
+        queue_ttl_out = {}
+
     return json.dumps(
         {
             "redis_url": str(getattr(app, "redis_url", "redis://localhost:6379/0")),
             "default_queue": str(getattr(app, "default_queue", "default")),
             "result_ttl": int(getattr(app, "result_ttl", 3600)),
             "idemp_ttl": int(getattr(app, "idemp_ttl", 86400)),
+            "queue_ttl": queue_ttl_out,
             "tasks": tasks_out,
         }
     )

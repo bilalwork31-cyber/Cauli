@@ -200,7 +200,13 @@ def test_delay_on_commit_defers_until_commit(monkeypatch):
             "t1",
             (41,),
             {"flag": True},
-            {"countdown": None, "queue": None, "idempotency_key": None},
+            {
+                "countdown": None,
+                "queue": None,
+                "idempotency_key": None,
+                "eta": None,
+                "expires": None,
+            },
         )
     ]
 
@@ -222,14 +228,25 @@ def test_apply_async_on_commit_forwards_options(monkeypatch):
     t1, sent = _captured_app(monkeypatch)
     with transaction.atomic():
         t1.apply_async_on_commit(
-            args=(1,), kwargs={"a": 2}, countdown=3.5, queue="q2", idempotency_key="k"
+            args=(1,),
+            kwargs={"a": 2},
+            countdown=3.5,
+            queue="q2",
+            idempotency_key="k",
+            expires=60.0,
         )
     assert sent == [
         (
             "t1",
             (1,),
             {"a": 2},
-            {"countdown": 3.5, "queue": "q2", "idempotency_key": "k"},
+            {
+                "countdown": 3.5,
+                "queue": "q2",
+                "idempotency_key": "k",
+                "eta": None,
+                "expires": 60.0,
+            },
         )
     ]
 

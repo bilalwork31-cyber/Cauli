@@ -160,6 +160,19 @@ async fn run_worker(
         return 1;
     }
 
+    // §9.2 queue TTLs, seconds -> ms. Logged so an operator can see at a
+    // glance that entries in this deployment have a bounded shelf life;
+    // silently dropping work is only acceptable when it is announced.
+    let queue_ttl_ms: std::collections::HashMap<String, u64> = appcfg
+        .queue_ttl
+        .iter()
+        .filter(|(_, secs)| secs.is_finite() && **secs > 0.0)
+        .map(|(q, secs)| (q.clone(), (*secs * 1000.0) as u64))
+        .collect();
+    if !queue_ttl_ms.is_empty() {
+        info!("queue TTLs active (§9.2, ms): {queue_ttl_ms:?}");
+    }
+
     let counters = Arc::new(stats::Counters::default());
     let cpu_workers = args.cpu_workers.unwrap_or_else(|| {
         std::thread::available_parallelism()
@@ -210,6 +223,7 @@ async fn run_worker(
         pyrt,
         result_ttl: appcfg.result_ttl,
         idemp_ttl: appcfg.idemp_ttl,
+        queue_ttl_ms,
         queues,
         consumer,
         shutdown: shutdown_rx,

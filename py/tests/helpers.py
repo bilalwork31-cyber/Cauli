@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-# The 18 envelope fields of PROTOCOL.md section 2 — exact key set, no more, no less.
+# The 19 envelope fields of PROTOCOL.md section 2 — exact key set, no more, no less.
 ENVELOPE_KEYS = {
     "v",
     "id",
@@ -32,6 +32,7 @@ ENVELOPE_KEYS = {
     "store_result",
     "enqueued_at",
     "not_before",
+    "expires_at",
 }
 
 
@@ -53,6 +54,7 @@ def assert_default_option_fields(env: dict[str, Any]) -> None:
     assert env["soft_timeout_ms"] is None
     assert env["idempotency_key"] is None
     assert env["store_result"] is True
+    assert env["expires_at"] is None
 
 
 class ExecChild:

@@ -9,6 +9,11 @@ app = Cauli(
     redis_url=os.environ.get("CAULI_REDIS_URL", "redis://127.0.0.1:6394/0"),
     default_queue="default",
     result_ttl=600,
+    # PROTOCOL section 9.3: re-route by pattern without touching task code.
+    task_routes={"*.routed_task": "routed"},
+    # PROTOCOL section 9.2: anything sitting on `shortlived` more than 1s is
+    # no longer worth running.
+    queue_ttl={"shortlived": 1.0},
 )
 
 
@@ -77,3 +82,16 @@ def slow_cpu():
 
     time.sleep(5)
     return "should not get here"
+
+
+@app.task()
+def marker(path):
+    """Writes a file. Used to prove an EXPIRED task never actually ran."""
+    with open(path, "a") as f:
+        f.write("ran")
+    return "ran"
+
+
+@app.task()
+def routed_task(x):
+    return {"routed": x}

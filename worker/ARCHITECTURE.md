@@ -8,14 +8,14 @@ against Redis Streams per PROTOCOL.md. Module map:
 | `src/main.rs` | Bootstrap: CLI, tracing, Python init, redis connect, spawns all loops, §4.7 drain, exit codes |
 | `src/cli.rs` | clap CLI per §7 + queue name validation |
 | `src/loops.rs` | fetch loop (XREADGROUP), delayed mover (§4.3), recovery (§4.4, full-backlog drain per tick), stats |
-| `src/dispatch.rs` | per-entry pipeline: parse -> idempotency (§4.5) -> route -> finish (§4.1/§4.2) |
+| `src/dispatch.rs` | per-entry pipeline: parse -> expiry (§9.1) -> idempotency (§4.5) -> route -> finish (§4.1/§4.2) |
 | `src/exec.rs` | sync-thread / async-loop / cpu-child execution, timeouts (§4.6) |
 | `src/ctx.rs` | shared context, executor response -> Outcome normalization |
 | `src/pyrt.rs` | pyo3 glue: interpreter init, shim import, sync io thread pool, async submit bridge |
 | `src/shim.py` | embedded Python shim (include_str!): app loading, run_sync, asyncio loops, soft-timeout watchdog, §4.8 lifecycle hooks |
 | `src/cpu.rs` | §5.1 cpu pool: fork-server (unix socket, multiplexed) + stdio fallback, kill+respawn, `CAULI_EXEC_CMD` test hook |
 | `src/broker.rs` | Redis key layout, group setup, mover Lua, pipelined completion writes |
-| `src/envelope.rs` | §2 envelope (unknown-field preserving), §8 result/error JSON, redelivery limit |
+| `src/envelope.rs` | §2 envelope (unknown-field preserving), §8 result/error JSON, redelivery limit, §9.1/§9.2 expiry deadline |
 | `src/backoff.rs` | §4.2 backoff math (jitter after clamp) |
 | `src/stats.rs` | counters + `stats:` line, rss_mb from /proc/self/status VmRSS |
 
@@ -131,6 +131,53 @@ against Redis Streams per PROTOCOL.md. Module map:
   -- a normal `cargo build --release` has no code path that reads this env
   var.
 
+## Expiry, queue TTL, routing, priorities
+
+- **Expiry (§9.1) is enforced in exactly one place**: `dispatch::process`, after the
+  envelope parses and the registry lookup succeeds, before the idempotency
+  claim. Every path into execution converges there — fresh XREADGROUP
+  delivery, delayed-mover hand-off, scheduled retry, §4.4 crash reclaim — so a
+  single check covers all of them. Enqueue-time and mover-time checks were both
+  rejected: the client cannot know how long an entry will wait (so it would
+  need a second check anyway, and two checks means two semantics), and the
+  mover only sees delayed entries, not the backlogged ready ones queue TTLs
+  exist for, and would have to `cjson.decode` every moved envelope inside the
+  Lua script. Placing it at dispatch also means it needs nothing from the
+  broker, which is what lets a future SQS/RabbitMQ backend inherit it for free.
+  Before the idempotency claim, so an expired task cannot burn the key and lock
+  out a later valid task carrying the same one.
+  Outcome: DLQ (`reason="expired"`) + a `"expired"` result key + XACK/XDEL, and
+  the broken-out `expired` stats counter.
+- **Queue TTL (§9.2)** arrives as `app.queue_ttl` through the same duck-typed
+  shim `load_app` config as everything else (`{queue: seconds}`, `"*"` =
+  fallback), converted to ms in `main.rs` and looked up by `Ctx::queue_ttl_ms`.
+  `Envelope::expiry_deadline_ms` takes the EARLIER of it and the envelope's own
+  `expires_at`, so neither can be used to defeat the other. It is skipped when
+  `enqueued_at == 0` (an envelope without the field would otherwise look 55
+  years overdue) and saturates on add.
+- **Routing (§9.3) is entirely client side.** The worker consumes the queues it
+  was told to and never re-routes; the envelope's `queue` field records where
+  the client decided to publish. Nothing in this binary changed for it.
+- **Priorities: not implemented, deliberately** (§9.4). The only prioritization
+  is that `XREADGROUP` returns per-stream entry arrays in the order the keys
+  were given and `fetch_loop` iterates them in that order, so earlier
+  `--queues` entries dispatch first within a batch — and cannot starve later
+  ones, since `COUNT` applies per stream. N weighted sub-queues would multiply
+  the consumer groups, PELs (and so the §4.4 drain), movers and DLQs, and would
+  replace the single `BLOCK 1000` XREADGROUP with either a busy poll or a
+  hand-written key-set scheduler, which is where starvation bugs live. It would
+  also be the wrong shape to carry forward: SQS has no priorities at all and
+  RabbitMQ has native `x-max-priority`.
+
+## Periodic scheduling
+
+Not in this binary. `cauli-beat` is a Python entry point (`py/cauli/beat.py`,
+PROTOCOL §10) and the worker is unaware of it: a beat-published envelope is an
+ordinary §2 envelope arriving on an ordinary stream. The reasoning for keeping
+it out of the worker (schedule model must be Python for a future admin view,
+`zoneinfo` for DST correctness, no throughput argument, beat and worker replica
+counts differ) is PROTOCOL §10.7.
+
 ## Admission / backpressure
 
 Global io semaphore `--io-concurrency` gates io execution. Cpu backlog is a
@@ -151,9 +198,13 @@ letting it wedge io fetching forever.
   `cauli.Retry.countdown` overrides d
 - final failure: `XADD dlq (e, reason="max_retries", error)` + result + XACK+XDEL
 - malformed / unregistered / redelivery_limit: DLQ (error field empty) + XACK+XDEL
+- expired (§9.1): `XADD dlq (e, reason="expired")` + an `"expired"` result
+  (when store_result) + XACK+XDEL; no retry, no lifecycle hooks
 
 Counters: ok counts successes and duplicates; failed counts final failures;
-retried counts scheduled retries; dlq counts every DLQ write.
+retried counts scheduled retries; dlq counts every DLQ write; expired counts
+the §9.1 subset of those (also included in dlq, broken out because "the queue
+cannot keep up" is a different alert from "tasks are failing").
 
 ## Known limitations / deviations (flagged)
 
@@ -188,8 +239,10 @@ cauli-worker --app myproj.tasks:app --queues default,emails \
 Redis URL precedence: `--redis-url` > `CAULI_REDIS_URL` > `app.redis_url` (logged with
 userinfo redacted, e.g. `redis://***@host/0` -- never logs a plaintext password).
 Stats line every `--stats-interval`s:
-`stats: fetched=N ok=N failed=N retried=N dlq=N inflight_io=N inflight_cpu=N rss_mb=N
-sync_live=N sync_abandoned=N pending_async=N`.
+`stats: fetched=N ok=N failed=N retried=N dlq=N expired=N inflight_io=N inflight_cpu=N
+rss_mb=N sync_live=N sync_abandoned=N pending_async=N`.
+Queue order in `--queues` is dispatch order within a fetch batch (§9.4); there
+are no priority levels.
 SIGTERM/SIGINT: stop fetching, drain up to `--drain-timeout`, exit 0; second
 signal exits 130. SIGKILL is safe: pending entries are re-claimed by another
 worker after `--visibility-timeout` (§4.4) -- but only once idle beyond

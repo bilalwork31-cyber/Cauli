@@ -32,7 +32,18 @@ dependencies = [
     # dict-key coercion and exception types), and a fallback lets the slow path
     # survive unnoticed in production. See py/cauli/_codec.py.
     "msgspec>=0.18",
+    # zoneinfo (stdlib) needs a system tz database; Windows ships none, and
+    # cauli.schedules refuses to guess a timezone. The client library is
+    # cross platform, so the fallback data has to be a real dependency there.
+    "tzdata; sys_platform == 'win32'",
 ]
+
+[project.scripts]
+# The scheduler is a Python entry point, not a Rust binary and not a worker
+# flag -- see PROTOCOL.md section 10.7 for the reasoning. `python -m cauli.beat`
+# is equivalent.
+cauli-beat = "cauli.beat:main"
+
 [project.urls]
 Homepage = "https://github.com/bilalwork31-cyber/Cauli"
 Repository = "https://github.com/bilalwork31-cyber/Cauli"
