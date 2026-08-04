@@ -51,6 +51,8 @@ def stack():
             BIN,
             "--app",
             "itest_app:app",
+            "--queues",
+            "default,routed,shortlived",
             "--redis-url",
             f"redis://127.0.0.1:{PORT}/0",
             "--cpu-workers",
@@ -178,6 +180,101 @@ def test_cpu_soft_timeout(stack):
     assert (
         time.time() - t0 < 8
     )  # soft-killed at ~0.3s, not the 5s sleep or 10s hard limit
+
+
+def test_eta_delays_execution_to_an_absolute_instant(stack):
+    from datetime import datetime, timedelta, timezone
+
+    r, _ = stack
+    m = _app()
+    when = datetime.now(timezone.utc) + timedelta(seconds=1.2)
+    t0 = time.time()
+    res = m.echo.apply_async(args=("eta",), eta=when)
+    assert res.get(timeout=15) == {"echo": "eta"}
+    assert time.time() - t0 >= 1.1, "ran before its eta"
+    env_score = when.timestamp() * 1000
+    raw = json.loads(r.get(f"cauli:result:{res.id}"))
+    assert raw["status"] == "success"
+    assert env_score > 0
+
+
+def test_expired_task_is_discarded_without_running(stack):
+    """PROTOCOL section 9.1: expired work is dropped at dispatch, not executed.
+
+    The marker file is the proof that the task body never ran -- a result key
+    saying "expired" would be satisfied by a task that ran and then got
+    relabelled.
+    """
+    from cauli import TaskFailedError
+
+    r, _ = stack
+    m = _app()
+    path = f"/tmp/cauli-itest-expired-{uuid.uuid4().hex}"
+    # Delayed past its own expiry: due at +1.5s, dead at +0.4s.
+    res = m.marker.apply_async(args=(path,), countdown=1.5, expires=0.4)
+
+    with pytest.raises(TaskFailedError) as ei:
+        res.get(timeout=20)
+    assert ei.value.type == "Expired"
+    assert res.expired is True
+    assert res.status() == "expired"
+    assert not os.path.exists(path), "an expired task must not execute"
+
+    entries = r.xrange("cauli:dlq:default")
+    expired = [
+        json.loads(f[b"e"])["id"] for _sid, f in entries if f[b"reason"] == b"expired"
+    ]
+    assert res.id in expired
+
+
+def test_unexpired_task_still_runs(stack):
+    m = _app()
+    path = f"/tmp/cauli-itest-live-{uuid.uuid4().hex}"
+    res = m.marker.apply_async(args=(path,), expires=60)
+    assert res.get(timeout=20) == "ran"
+    assert os.path.exists(path)
+
+
+def test_queue_ttl_expires_a_backlogged_entry(stack):
+    """PROTOCOL section 9.2: the worker enforces the queue TTL at dispatch.
+
+    The envelope here is written straight to the stream with an `enqueued_at`
+    two hours in the past and NO expires_at, so the only thing that can drop it
+    is the worker's own `queue_ttl` config for `shortlived` (1s).
+    """
+    r, _ = stack
+    m = _app()
+    path = f"/tmp/cauli-itest-qttl-{uuid.uuid4().hex}"
+    env, queue, _fire = m.app.make_envelope(
+        m.marker.name, args=[path], task=m.marker, queue="shortlived"
+    )
+    env["enqueued_at"] = int(time.time() * 1000) - 7_200_000
+    env["expires_at"] = None
+    r.xadd(f"cauli:q:{queue}", {"e": json.dumps(env)})
+
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        raw = r.get(f"cauli:result:{env['id']}")
+        if raw:
+            break
+        time.sleep(0.1)
+    assert raw, "the worker never resolved the stale entry"
+    assert json.loads(raw)["status"] == "expired"
+    assert not os.path.exists(path), "a task past its queue TTL must not execute"
+
+
+def test_app_level_routing_moves_a_task_to_another_queue(stack):
+    r, _ = stack
+    m = _app()
+    res = m.routed_task.delay(5)
+    assert res.get(timeout=20) == {"routed": 5}
+    # It really went through `routed`, not `default`: the route pattern in
+    # itest_app has no counterpart anywhere in the task's own definition.
+    assert r.exists("cauli:q:routed")
+    routed_ids = {
+        json.loads(f[b"e"])["id"] for _sid, f in r.xrange("cauli:dlq:routed") or []
+    }
+    assert res.id not in routed_ids
 
 
 def test_worker_survived_everything(stack):

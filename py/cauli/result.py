@@ -20,13 +20,15 @@ class AsyncResult:
 
     ``duplicate`` becomes ``True`` after :meth:`get` observes a result with
     status ``"duplicate"`` (idempotency guard hit); ``get`` returns ``None``
-    in that case.
+    in that case. ``expired`` becomes ``True`` when the task was discarded
+    unrun past its ``expires`` deadline; :meth:`get` raises in that case.
     """
 
     def __init__(self, task_id: str, app: "Cauli") -> None:
         self.id: str = task_id
         self.app = app
         self.duplicate: bool = False
+        self.expired: bool = False
 
     def _load(self) -> dict[str, Any] | None:
         raw = self.app._get_redis().get(f"cauli:result:{self.id}")
@@ -35,10 +37,12 @@ class AsyncResult:
         return _codec.decode(raw)
 
     def status(self) -> str:
-        """Return ``"pending" | "success" | "failure" | "duplicate"``.
+        """Return ``"pending" | "success" | "failure" | "duplicate" | "expired"``.
 
         ``"pending"`` means the result key does not exist (yet, or anymore
-        after result_ttl expiry).
+        after result_ttl expiry). ``"expired"`` means the task passed its
+        ``expires`` deadline (or its queue's TTL) before a worker picked it up,
+        so it was discarded without running (PROTOCOL.md section 9.1).
         """
         doc = self._load()
         if doc is None:
@@ -51,6 +55,10 @@ class AsyncResult:
         - success: returns the result value.
         - failure: raises :class:`TaskFailedError` (with .type/.message/.traceback).
         - duplicate: sets ``self.duplicate = True`` and returns ``None``.
+        - expired: sets ``self.expired = True`` and raises
+          :class:`TaskFailedError` with ``type == "Expired"``. It raises rather
+          than returning None because the caller asked for a result that is
+          never going to exist -- the task did not run and never will.
         - still pending when ``timeout`` (seconds) expires: raises TimeoutError.
 
         This is poll-based (default ``poll_interval`` 0.05s), not push/blocking
@@ -75,6 +83,14 @@ class AsyncResult:
                 if status == "duplicate":
                     self.duplicate = True
                     return None
+                if status == "expired":
+                    self.expired = True
+                    error = doc.get("error") or {}
+                    raise TaskFailedError(
+                        error.get("type") or "Expired",
+                        error.get("message") or "task expired before it was executed",
+                        None,
+                    )
                 raise TaskFailedError(
                     "InvalidResult", f"unrecognized result status {status!r}", None
                 )

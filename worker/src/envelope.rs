@@ -70,6 +70,14 @@ pub struct Envelope {
     pub enqueued_at: u64,
     #[serde(default)]
     pub not_before: Option<f64>,
+    /// PROTOCOL §9.1. Absolute epoch-ms deadline past which this task is no
+    /// longer worth running: the worker discards it at dispatch instead of
+    /// executing it. Null means "no deadline". Deliberately absolute (not a
+    /// duration) so it survives a retry, a delayed-zset hop and a crash
+    /// redelivery unchanged, and so it means the same thing on a broker that
+    /// has no delayed-delivery primitive of its own.
+    #[serde(default)]
+    pub expires_at: Option<u64>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
 }
@@ -109,6 +117,29 @@ impl Envelope {
     pub fn effective_async_timeout_s(&self) -> f64 {
         let soft = self.soft_timeout_ms.unwrap_or(self.timeout_ms);
         (soft.min(self.timeout_ms) as f64) / 1000.0
+    }
+
+    /// PROTOCOL §9.1/§9.2: the instant past which this entry must not run,
+    /// combining the envelope's own `expires_at` with the queue's configured
+    /// max age. The EARLIER of the two wins: a queue TTL is an operator-side
+    /// ceiling on how long anything may sit there, so a per-call `expires`
+    /// cannot be used to exceed it, and a queue TTL cannot extend a per-call
+    /// `expires` either.
+    ///
+    /// `queue_ttl_ms` is applied only when `enqueued_at` is present (a
+    /// crafted or ancient envelope with `enqueued_at == 0` would otherwise be
+    /// judged expired by ~55 years and dropped). `saturating_add` keeps a
+    /// hostile `enqueued_at` near u64::MAX from wrapping into a past deadline.
+    pub fn expiry_deadline_ms(&self, queue_ttl_ms: Option<u64>) -> Option<u64> {
+        let by_ttl = match (queue_ttl_ms, self.enqueued_at) {
+            (Some(ttl), enq) if enq > 0 => Some(enq.saturating_add(ttl)),
+            _ => None,
+        };
+        match (self.expires_at, by_ttl) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, b) => b,
+        }
     }
 }
 
@@ -164,6 +195,29 @@ pub fn result_duplicate(finished_at: u64) -> String {
     .to_string()
 }
 
+/// §9.1: a task discarded unrun past its deadline. Its own status rather than
+/// a `"failure"`, because it is not one — the task never ran, so there is no
+/// exception, no traceback and nothing to retry. The error object is carried
+/// anyway so a client that only knows `failure`/`success` still gets a usable
+/// `type`/`message` out of it.
+pub fn result_expired(deadline_ms: u64, finished_at: u64) -> String {
+    serde_json::json!({
+        "status": "expired",
+        "result": null,
+        "error": {
+            "type": "Expired",
+            "message": format!(
+                "task expired at {deadline_ms} (picked up at {finished_at}, \
+                 {}ms late) and was discarded without running",
+                finished_at.saturating_sub(deadline_ms)
+            ),
+            "traceback": "",
+        },
+        "finished_at": finished_at,
+    })
+    .to_string()
+}
+
 /// Truncate `s` to at most `max_bytes` bytes, backing off to the nearest
 /// preceding UTF-8 char boundary so multibyte input (audit H4 — executor
 /// garbage, oversize envelopes) can never panic on a byte-index slice.
@@ -211,6 +265,7 @@ mod tests {
         "store_result": false,
         "enqueued_at": 1700000000000,
         "not_before": 1700000005000.5,
+        "expires_at": 1700000060000,
         "trace_id": "unknown-field-must-survive",
         "meta": {"nested": [1, 2]}
     }"#;
@@ -289,6 +344,80 @@ mod tests {
         assert_eq!(e.effective_async_timeout_s(), 4.0);
         e.soft_timeout_ms = Some(50_000); // soft > hard: hard wins
         assert_eq!(e.effective_async_timeout_s(), 10.0);
+    }
+
+    /// §9.1/§9.2: the deadline is the EARLIER of the envelope's own
+    /// `expires_at` and `enqueued_at + queue_ttl`, in both directions.
+    #[test]
+    fn expiry_deadline_takes_the_earlier_of_expires_and_queue_ttl() {
+        let mut e: Envelope = serde_json::from_str(r#"{"id":"a","task":"t"}"#).unwrap();
+        e.enqueued_at = 1_000_000;
+
+        // Neither set: no deadline at all.
+        assert_eq!(e.expiry_deadline_ms(None), None);
+
+        // Only the envelope's own expiry.
+        e.expires_at = Some(1_060_000);
+        assert_eq!(e.expiry_deadline_ms(None), Some(1_060_000));
+
+        // Only the queue TTL.
+        e.expires_at = None;
+        assert_eq!(e.expiry_deadline_ms(Some(30_000)), Some(1_030_000));
+
+        // Both: queue TTL is the tighter one and wins (a per-call `expires`
+        // cannot be used to sit in a TTL-bounded queue longer than allowed).
+        e.expires_at = Some(1_060_000);
+        assert_eq!(e.expiry_deadline_ms(Some(30_000)), Some(1_030_000));
+
+        // Both: the envelope's own expiry is tighter and wins.
+        e.expires_at = Some(1_010_000);
+        assert_eq!(e.expiry_deadline_ms(Some(30_000)), Some(1_010_000));
+    }
+
+    /// A queue TTL needs a real `enqueued_at` to mean anything. Without this
+    /// guard an envelope missing the field (0) would be "expired" by decades
+    /// and every such entry would be silently discarded.
+    #[test]
+    fn queue_ttl_ignored_without_enqueued_at() {
+        let mut e: Envelope = serde_json::from_str(r#"{"id":"a","task":"t"}"#).unwrap();
+        assert_eq!(e.enqueued_at, 0);
+        assert_eq!(e.expiry_deadline_ms(Some(30_000)), None);
+        // ... but an explicit expires_at still applies.
+        e.expires_at = Some(7);
+        assert_eq!(e.expiry_deadline_ms(Some(30_000)), Some(7));
+    }
+
+    /// H3-style overflow guard: a hostile `enqueued_at` near u64::MAX must not
+    /// wrap the queue-TTL deadline into the past (which would expire every
+    /// task on that queue).
+    #[test]
+    fn queue_ttl_deadline_saturates_instead_of_wrapping() {
+        let mut e: Envelope = serde_json::from_str(r#"{"id":"a","task":"t"}"#).unwrap();
+        e.enqueued_at = u64::MAX;
+        assert_eq!(e.expiry_deadline_ms(Some(60_000)), Some(u64::MAX));
+    }
+
+    #[test]
+    fn expires_at_roundtrips_and_defaults_to_null() {
+        let e: Envelope = serde_json::from_str(FULL).unwrap();
+        assert_eq!(e.expires_at, Some(1_700_000_060_000));
+        let back: Value = serde_json::from_str(&serde_json::to_string(&e).unwrap()).unwrap();
+        assert_eq!(back["expires_at"], 1_700_000_060_000u64);
+
+        // Absent in an older client's envelope: null, never a bogus 0 (which
+        // would read as "expired in 1970" and discard the task).
+        let old: Envelope = serde_json::from_str(r#"{"id":"a","task":"t"}"#).unwrap();
+        assert_eq!(old.expires_at, None);
+    }
+
+    #[test]
+    fn expired_result_json_shape() {
+        let v: Value = serde_json::from_str(&result_expired(100, 350)).unwrap();
+        assert_eq!(v["status"], "expired");
+        assert_eq!(v["result"], Value::Null);
+        assert_eq!(v["error"]["type"], "Expired");
+        assert!(v["error"]["message"].as_str().unwrap().contains("250ms"));
+        assert_eq!(v["finished_at"], 350);
     }
 
     #[test]

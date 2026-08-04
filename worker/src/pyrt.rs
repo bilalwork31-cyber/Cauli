@@ -44,6 +44,10 @@ pub struct AppConfig {
     pub default_queue: String,
     pub result_ttl: u64,
     pub idemp_ttl: u64,
+    /// PROTOCOL §9.2: `{queue: seconds}` with `"*"` as the fallback key.
+    /// `default` because an app object predating queue TTLs must still load.
+    #[serde(default)]
+    pub queue_ttl: HashMap<String, f64>,
     pub tasks: HashMap<String, TaskSpec>,
 }
 

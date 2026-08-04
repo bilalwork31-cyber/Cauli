@@ -7,6 +7,11 @@ pub struct Counters {
     pub failed: AtomicU64,
     pub retried: AtomicU64,
     pub dlq: AtomicU64,
+    /// §9.1 entries discarded unrun past their expiry / queue TTL. Counted in
+    /// `dlq` too (they do get a DLQ entry); broken out because "work is being
+    /// thrown away because the queue cannot keep up" is a different operational
+    /// signal from "work is failing".
+    pub expired: AtomicU64,
     pub inflight_io: AtomicI64,
     pub inflight_cpu: AtomicI64,
     /// Every dispatched entry from spawn to final broker write; drain waits on this.
@@ -16,12 +21,13 @@ pub struct Counters {
 impl Counters {
     pub fn stats_line(&self) -> String {
         format!(
-            "stats: fetched={} ok={} failed={} retried={} dlq={} inflight_io={} inflight_cpu={} rss_mb={}",
+            "stats: fetched={} ok={} failed={} retried={} dlq={} expired={} inflight_io={} inflight_cpu={} rss_mb={}",
             self.fetched.load(Ordering::Relaxed),
             self.ok.load(Ordering::Relaxed),
             self.failed.load(Ordering::Relaxed),
             self.retried.load(Ordering::Relaxed),
             self.dlq.load(Ordering::Relaxed),
+            self.expired.load(Ordering::Relaxed),
             // Printed raw (no .max(0) clamp): a negative value here would be
             // an accounting bug, and clamping it would hide the signal.
             self.inflight_io.load(Ordering::Relaxed),

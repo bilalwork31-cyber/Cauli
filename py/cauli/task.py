@@ -11,6 +11,8 @@ import inspect
 from typing import TYPE_CHECKING, Any, Callable
 
 if TYPE_CHECKING:
+    from datetime import datetime
+
     from cauli.app import Cauli
     from cauli.result import AsyncResult
 
@@ -96,11 +98,24 @@ class TaskDef:
         countdown: float | None = None,
         queue: str | None = None,
         idempotency_key: str | None = None,
+        eta: "datetime | None" = None,
+        expires: "float | datetime | None" = None,
     ) -> "AsyncResult":
         """Enqueue with full options. Returns an AsyncResult.
 
-        ``countdown`` (seconds) delays execution via the delayed zset.
-        ``queue`` overrides both the task queue and the app default queue.
+        ``countdown`` (seconds, relative) and ``eta`` (absolute datetime) both
+        delay execution via the delayed zset and are mutually exclusive. An
+        ``eta`` MUST be timezone aware -- a naive datetime raises ValueError
+        rather than being silently reinterpreted as UTC or as local time. An
+        ``eta`` in the past is not an error; it means "due now".
+
+        ``expires`` bounds how long the task is worth running: seconds from now
+        (number) or an absolute timezone-aware datetime. A task picked up after
+        that instant is discarded instead of executed -- DLQ reason
+        ``"expired"``, result status ``"expired"`` (PROTOCOL.md section 9.1).
+
+        ``queue`` overrides the app's routing rules, the task queue and the app
+        default queue.
         """
         return self.app._enqueue(
             self,
@@ -109,6 +124,8 @@ class TaskDef:
             countdown=countdown,
             queue=queue,
             idempotency_key=idempotency_key,
+            eta=eta,
+            expires=expires,
         )
 
     def delay_on_commit(self, *args: Any, **kwargs: Any) -> None:
@@ -139,6 +156,8 @@ class TaskDef:
         queue: str | None = None,
         idempotency_key: str | None = None,
         using: str | None = None,
+        eta: "datetime | None" = None,
+        expires: "float | datetime | None" = None,
     ) -> None:
         """:meth:`apply_async`, deferred to Django's transaction commit.
 
@@ -146,6 +165,11 @@ class TaskDef:
         semantics and ``None`` return as :meth:`delay_on_commit`. ``using``
         selects the database alias whose transaction to hook (default
         database when ``None``).
+
+        Note that ``countdown`` and ``expires`` are relative to COMMIT time,
+        not to the call: the envelope is built inside the on_commit callback,
+        so a long transaction does not eat into either budget. ``eta`` is
+        absolute and so is unaffected either way.
         """
         try:
             from django.db import transaction
@@ -164,6 +188,8 @@ class TaskDef:
                 countdown=countdown,
                 queue=queue,
                 idempotency_key=idempotency_key,
+                eta=eta,
+                expires=expires,
             ),
             using=using,
         )

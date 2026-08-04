@@ -61,17 +61,21 @@ cargo build --release --bin cauli-worker
   Django/FastAPI    │  cauli-worker (one Rust process, tokio)         │
   ────────────►     │                                                │
   app.task.delay()  │  fetch / ack / retry / DLQ / delayed mover /   │
-        │           │  reclaim-on-crash / idempotency / results      │
+        │           │  reclaim-on-crash / idempotency / expiry /     │
+        │           │  results         │                             │
         ▼           │                  │                             │
    Redis Streams ◄──┼──────────────────┘                             │
    consumer groups  │        │                    │                  │
-                    │        ▼                    ▼                  │
-                    │  embedded CPython     child process pool       │
-                    │  - asyncio loop(s)    python -m cauli._exec     │
-                    │    for async tasks    (cpu tasks, N = cores,   │
-                    │  - thread pool for     hard-kill on timeout)   │
-                    │    sync I/O tasks                              │
-                    └────────────────────────────────────────────────┘
+        ▲           │        ▼                    ▼                  │
+        │           │  embedded CPython     child process pool       │
+        │           │  - asyncio loop(s)    python -m cauli._exec     │
+        │           │    for async tasks    (cpu tasks, N = cores,   │
+        │           │  - thread pool for     hard-kill on timeout)   │
+        │           │    sync I/O tasks                              │
+        │           └────────────────────────────────────────────────┘
+        │
+  cauli-beat x N  ── periodic schedules, state in Redis, leader lease
+                     (run two replicas; each slot still fires exactly once)
 ```
 
 Delivery is at least once (Redis Streams consumer groups: ack after completion, pending
@@ -121,6 +125,83 @@ GIL (e.g. blocking network calls inside a `kind="cpu"` task); `--no-fork-server`
 one process per cpu task (also entered automatically if fork-server startup fails).
 `--cpu-prefetch` (default 4) controls how many requests are staged in each child ahead of
 what it is executing; raise it for small tasks, lower it for long ones.
+
+## Scheduling
+
+### Periodic tasks (`cauli-beat`)
+
+```python
+from cauli import Cauli, crontab, interval
+
+app = Cauli(redis_url="redis://localhost:6379/0")
+
+@app.task()
+def nightly_report(): ...
+
+app.add_periodic_task("nightly", nightly_report,
+                      crontab(minute=0, hour=3, timezone="Europe/Berlin"),
+                      expires=1800)          # not worth running after 03:30
+
+app.add_periodic_task("heartbeat", "myproj.tasks.ping", interval(30))
+```
+
+```bash
+cauli-beat --app myproj.tasks:app          # or: python -m cauli.beat --app ...
+```
+
+**Run two replicas.** Celery's beat keeps last-run times in a local `shelve` file with no
+locking, so a second one double fires every cron and its own docs tell you to run only one.
+cauli keeps schedule state in Redis: replicas take a lease so one leads and failover is
+automatic, and every firing is an atomic compare-and-set on the schedule slot, so even two
+instances that both believe they lead produce exactly one task per slot. Measured with three
+replicas and the leader SIGKILLed: zero duplicate firings, failover inside the lease
+(`--lock-ttl`, default 30s). See PROTOCOL.md §10.5.
+
+Schedule entries live in Redis (`cauli:beat:schedule`), not only in Python config, so a
+Django-admin view over them is an addition rather than a rewrite. Entries declared in code are
+synced in at startup; entries created directly in Redis are scheduled too and are never
+reaped by the code sync.
+
+After downtime a due entry **fires once and then resumes its cadence** — missed slots are
+coalesced, never replayed. If a very late firing is worse than none (a 03:00 report at 09:00),
+say so per entry: `on_missed="skip", max_lateness=1800`. Crontabs use POSIX `cron(8)`
+semantics, including day-of-month OR day-of-week, in an explicit IANA timezone; DST fall-back
+fires a repeated wall time once and spring-forward does not drop it.
+
+### eta, expiry, queue TTL, routing
+
+```python
+from datetime import datetime, timedelta, timezone
+
+send.apply_async(eta=datetime(2030, 1, 1, 9, tzinfo=timezone.utc))  # absolute
+send.apply_async(countdown=30)                                       # relative
+send.apply_async(expires=60)     # discarded unrun if not picked up within 60s
+```
+
+`eta` must be timezone aware — a naive datetime raises rather than being silently read as UTC
+(Celery's `enable_utc` footgun) or as local time. An expired task is **discarded at dispatch,
+never executed**: DLQ reason `"expired"`, result status `"expired"`, and `get()` raises
+`TaskFailedError(type="Expired")`.
+
+```python
+app = Cauli(
+    redis_url=...,
+    queue_ttl={"*": 3600, "bulk": 300},          # nothing sits in bulk for over 5 min
+    task_routes={"myapp.email.*": "emails",      # re-route without editing task code
+                 "*.report_*": {"queue": "reports"}},
+)
+```
+
+Queue precedence: per-call `queue=` > `task_routes` > the task's own `queue=` > `default_queue`.
+The queue TTL is enforced by the worker as well as stamped by the client, so it applies to
+envelopes produced before it was configured.
+
+**Priorities are deliberately not supported.** Redis Streams have none, and every emulation is
+N sub-queues drained in weighted order — which multiplies the consumer groups, PELs and
+recovery paths, breaks the single blocking `XREADGROUP`, and starves low-priority work exactly
+when the system is busiest. Use queue order (`--queues high,default,bulk` dispatches earlier
+queues first within each batch, and cannot starve the later ones) or separate worker fleets,
+which is the only thing that gives real isolation anyway. Reasoning in full: PROTOCOL.md §9.4.
 
 ## Lifecycle hooks
 
@@ -231,19 +312,30 @@ Treat anything under ~5% as noise.
   deployment.
 - **The worker's working directory is on `sys.path`.** `--app` imports are resolved with CWD
   prepended (so relative app modules just work); don't run `cauli-worker` from a directory an
-  untrusted party can write to.
+  untrusted party can write to. Same for `cauli-beat`.
+- **A scheduled slot fires at most once, and once per slot.** The beat claim is atomic, so a
+  leader that dies cannot both consume a slot and fail to publish it. What a crash does cost is
+  lateness: the schedule stalls until the lease expires (bounded by `--lock-ttl`), and the
+  slots inside that window collapse into a single firing rather than being replayed. Size
+  `--lock-ttl` against how late a scheduled task may acceptably run.
+- **Beat is not supported on Redis Cluster.** Its atomic claim-and-publish script spans the
+  beat keys and the queue key, which are in different hash slots. It detects the CROSSSLOT
+  error, warns, and degrades to claim-then-publish: still no duplicates, but a crash in that
+  gap drops one firing.
 
 ## Repository layout
 
-- `PROTOCOL.md` — the wire/behavior contract (envelope JSON, Redis keys, worker semantics)
+- `PROTOCOL.md` — the wire/behavior contract (envelope JSON, Redis keys, worker semantics,
+  scheduling controls §9, periodic scheduler §10)
 - `worker/` — Rust worker binary (`cauli-worker`)
-- `py/` — Python package `cauli` (client API + cpu child executor)
+- `py/` — Python package `cauli` (client API, `cauli-beat` scheduler, cpu child executor)
 - `bench/` — Celery vs cauli benchmark harness (WSL, cgroup capped)
 
 ## Status
 
-v0.1: Redis broker only, no chains/chords, no cron/beat, no priorities. See PROTOCOL.md §9.
-Worker targets Linux; the client library is cross platform.
+v0.1: Redis broker only, no chains/chords, no rate limits. Priorities are a documented
+non-feature rather than a gap (PROTOCOL.md §9.4). Full list: PROTOCOL.md §11.
+Worker targets Linux; the client library and `cauli-beat` are cross platform.
 
 ## License
 
