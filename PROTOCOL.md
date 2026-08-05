@@ -1117,3 +1117,68 @@ pytest -q                        # needs the release worker binary built above o
 
 Building on a slow or network filesystem: set `CARGO_TARGET_DIR` to a local path before running
 cargo commands to avoid compiling through a slow mount.
+
+## 13. Distribution
+
+Two artifacts per release, published together and versioned in lockstep.
+
+| Package | Contents | Wheel tag |
+|---|---|---|
+| `cauli` | the pure-Python client, plus the `cauli-beat` entry point | `py3-none-any` |
+| `cauli-worker` | the prebuilt Rust worker binary | `cp3XX-cp3XX-manylinux_2_28_{x86_64,aarch64}` |
+
+### 13.1 Why the worker ships one wheel per CPython version
+
+`cauli-worker` embeds CPython (pyo3 `auto-initialize`), so the built binary carries
+`NEEDED: libpython3.X.so.1.0` and will not start against any other minor version. It is not a
+portable static binary, and shipping it as one would only move the failure to exec time.
+
+Wheel tags describe exactly that constraint, which is why the worker is distributed as a wheel
+rather than a tarball: `cp312-cp312-manylinux_2_28_x86_64` means "needs CPython 3.12 on glibc
+2.28 or newer", and pip refuses to install it anywhere else.
+
+Installing into the app's virtualenv also settles which interpreter the worker embeds, by
+construction rather than by configuration. pip places the binary in that venv's own `bin/`, the
+loader resolves that venv's `libpython`, and `shim.py` reads `VIRTUAL_ENV` for site-packages
+(§6). The three cannot disagree.
+
+Requirements: Linux on x86_64 or aarch64, glibc 2.28 or newer, and a CPython configured with
+`--enable-shared`. python.org builds, the Docker `python:*` images, Debian/Ubuntu/Fedora system
+packages, conda and actions/setup-python all qualify; `pyenv` does not unless rebuilt with
+`PYTHON_CONFIGURE_OPTS="--enable-shared"`. Anything outside that builds the worker from source,
+which has no such constraints.
+
+Raw binaries are also attached to each GitHub release, as
+`cauli-worker-<version>-cp3XX-cp3XX-<platform>.tar.gz`, for deployments that are not a
+virtualenv. The CPython version stays in the filename because for this binary it is not
+optional information.
+
+### 13.2 The two things a release is gated on
+
+Neither package is uploaded until both hold, on every supported CPython version:
+
+1. **The worker links libpython dynamically.** Asserted with `readelf -d` on the binary inside
+   the built wheel. pyo3 links libpython statically when the build interpreter has no shared
+   library, and a statically linked worker would carry its own interpreter, whose `sys.prefix`
+   points at a path on the build machine. On a user's box that either fails to find a stdlib
+   or, worse, starts an interpreter that cannot see their virtualenv and so cannot import
+   their tasks. It is a silent-wrong-answer failure, so it is a build-time gate.
+2. **The built wheels run the real integration suite.** They are installed into a clean
+   virtualenv with `--no-index`, and `itest/test_integration.py` runs against that installed
+   binary: real worker process, real cpu children, real Redis. A release that cannot run is
+   worse than a late one.
+
+### 13.3 Version lockstep
+
+`cauli-worker` depends on `cauli==<same version>`. The two implement one wire contract, so at
+0.x a mismatched pair is a bug rather than a convenience, and a pin turns it into a pip
+resolution error instead of a protocol bug at runtime.
+
+Four files carry the version: `worker/Cargo.toml` (which is also the worker wheel's version,
+via maturin), the `cauli==` pin in `worker/pyproject.toml`, `py/pyproject.toml`, and
+`py/cauli/__init__.py`. `scripts/check_versions.py` asserts they agree, and that they match the
+git tag when given one. It runs on every push, not only at tag time, because that failure
+otherwise surfaces at a user's `pip install`.
+
+Releasing is pushing a `vX.Y.Z` tag. `.github/workflows/release.yml` does the rest and uploads
+via PyPI trusted publishing, so no API token is stored in the repository.

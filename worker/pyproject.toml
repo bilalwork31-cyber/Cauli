@@ -1,0 +1,63 @@
+# Packaging for the PREBUILT worker binary, published to PyPI as `cauli-worker`.
+#
+# Why the worker ships as a Python wheel at all, when it is a Rust binary:
+# `cauli-worker` embeds CPython (pyo3 `auto-initialize`), so the built binary
+# carries `NEEDED: libpython3.X.so` and is bound to ONE CPython minor version.
+# It is not a portable static binary and pretending otherwise would ship
+# something that dies at exec time with a linker error.
+#
+# A wheel is the one packaging format whose tags express exactly that
+# constraint: `cp312-cp312-manylinux_2_28_x86_64` means "this binary needs
+# CPython 3.12 on that platform", and pip refuses to install it anywhere else.
+# Installing it into the user's virtualenv also settles "which interpreter does
+# the worker embed" by construction -- pip puts the binary in the venv's own
+# `bin/`, the venv's `libpython` is the one the loader resolves, and shim.py
+# reads `VIRTUAL_ENV` for site-packages. The alternative (a tarball on a
+# releases page) leaves the user to match all three by hand.
+#
+# Requires a CPython built with `--enable-shared`, which covers python.org,
+# Docker `python:*` images, Debian/Ubuntu/Fedora system packages, conda and
+# actions/setup-python. `pyenv install` does NOT do this by default; see the
+# README's install section.
+
+[build-system]
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
+
+[project]
+name = "cauli-worker"
+description = "Prebuilt cauli-worker binary: the Rust runtime that executes cauli tasks"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT OR Apache-2.0" }
+authors = [{ name = "the cauli contributors" }]
+keywords = ["task-queue", "background-jobs", "redis", "worker", "celery"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: System :: Distributed Computing",
+]
+# The worker imports the user's app through the client library, and the two
+# share one wire contract (PROTOCOL.md). Pinned rather than ranged: at 0.x the
+# protocol is still moving, so a mismatched pair is a bug, not a convenience.
+dependencies = ["cauli==0.1.0"]
+dynamic = ["version"]
+
+[project.urls]
+Homepage = "https://github.com/bilalwork31-cyber/Cauli"
+Repository = "https://github.com/bilalwork31-cyber/Cauli"
+Issues = "https://github.com/bilalwork31-cyber/Cauli/issues"
+
+[tool.maturin]
+# A Rust BINARY that embeds Python, not an extension module. maturin puts it in
+# the wheel's scripts dir, so pip installs it onto PATH inside the venv.
+bindings = "bin"
+strip = true

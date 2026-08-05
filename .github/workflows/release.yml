@@ -1,0 +1,245 @@
+name: release
+
+# Builds and publishes both halves of a cauli release:
+#
+#   cauli          pure-Python client, one py3-none-any wheel + an sdist
+#   cauli-worker   the Rust worker, one wheel per (CPython minor, arch)
+#
+# The worker needs a wheel per CPython minor version because it EMBEDS the
+# interpreter (pyo3 `auto-initialize`), so its binary carries
+# `NEEDED: libpython3.X.so` and will not start against any other version.
+# Wheel tags express that exactly, and installing into the user's virtualenv
+# makes "which interpreter does the worker embed" answer itself: pip drops the
+# binary in that venv's own bin/. See worker/pyproject.toml.
+#
+# Nothing is uploaded until a wheel has been installed into a clean venv and
+# has passed the real integration suite (`verify`). A release that cannot run
+# is worse than a late one.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Upload to PyPI (off = build and verify only)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  # Oldest glibc the worker wheels target: manylinux_2_28 is RHEL 8, Debian 10
+  # and Ubuntu 20.04 or newer.
+  MANYLINUX: "2_28"
+  PYTHONS: '["3.10", "3.11", "3.12", "3.13"]'
+
+jobs:
+  version:
+    name: versions agree
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: cauli, cauli-worker and the tag all say the same thing
+        run: |
+          python scripts/check_versions.py \
+            "${{ github.ref_type == 'tag' && github.ref_name || '' }}"
+
+  client:
+    name: cauli (sdist + wheel)
+    needs: version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install build
+      - run: python -m build --sdist --wheel --outdir dist py
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-client
+          path: dist/*
+
+  worker:
+    name: cauli-worker (${{ matrix.target }}, cp${{ matrix.python }})
+    needs: version
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64, aarch64]
+        python: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: PyO3/maturin-action@v1
+        with:
+          working-directory: worker
+          target: ${{ matrix.target }}
+          manylinux: ${{ env.MANYLINUX }}
+          args: >-
+            --release --out dist
+            --interpreter python${{ matrix.python }}
+
+      # The one property that cannot be allowed to regress silently.
+      #
+      # pyo3 links libpython statically when the build interpreter has no
+      # shared library, and some manylinux images ship a static-only CPython.
+      # A statically linked worker would carry its OWN interpreter, whose
+      # sys.prefix points at the build container's /opt/python/... path. On a
+      # user's machine that either dies looking for a stdlib or, far worse,
+      # starts an interpreter that has never heard of their virtualenv and so
+      # cannot import their tasks. Fail the build here instead of shipping it.
+      - name: assert the worker links libpython dynamically
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          wheels=(worker/dist/*.whl)
+          if [ ${#wheels[@]} -ne 1 ]; then
+            echo "expected exactly one wheel, got: ${wheels[*]:-none}" >&2
+            exit 1
+          fi
+          rm -rf _probe && mkdir _probe
+          unzip -q -o "${wheels[0]}" -d _probe
+          binary=$(ls _probe/*.data/scripts/cauli-worker)
+          echo "== dynamic section of $binary =="
+          readelf -d "$binary" | tee _probe/dyn.txt
+          if ! grep -q "libpython${{ matrix.python }}" _probe/dyn.txt; then
+            echo >&2
+            echo "FAIL: no NEEDED entry for libpython${{ matrix.python }}." >&2
+            echo "The worker embeds CPython and must link it dynamically, so" >&2
+            echo "it runs the user's interpreter rather than a copy of the" >&2
+            echo "build container's. Build against a CPython configured with" >&2
+            echo "--enable-shared." >&2
+            exit 1
+          fi
+          echo "ok: dynamically linked against libpython${{ matrix.python }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-worker-${{ matrix.target }}-cp${{ matrix.python }}
+          path: worker/dist/*.whl
+
+  verify:
+    name: verify wheel (x86_64, cp${{ matrix.python }})
+    needs: [worker, client]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install redis-server
+        run: sudo apt-get update && sudo apt-get install -y redis-server
+
+      # Two explicit downloads rather than one brace pattern: only the wheel
+      # built for THIS CPython version may be present, or pip would happily
+      # resolve a different one and the verification would prove nothing.
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-client
+          path: artifacts
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-worker-x86_64-cp${{ matrix.python }}
+          path: artifacts
+
+      # A venv built the way a user's would be, holding only what pip resolved
+      # from the artifacts we are about to publish. No editable install, no
+      # source tree on sys.path.
+      - name: install the built wheels into a clean venv
+        run: |
+          set -euo pipefail
+          ls -l artifacts
+          python -m venv .relvenv
+          .relvenv/bin/pip install --upgrade pip
+          .relvenv/bin/pip install --no-index --find-links artifacts \
+            cauli cauli-worker
+          .relvenv/bin/pip install pytest
+          test -x .relvenv/bin/cauli-worker
+          test -x .relvenv/bin/cauli-beat
+          # Asked of the INSTALLED artifacts, not the source tree: the two
+          # halves that a user ends up with must be the same release.
+          worker_v=$(.relvenv/bin/cauli-worker --version | awk '{print $2}')
+          client_v=$(.relvenv/bin/python -c "import cauli; print(cauli.__version__)")
+          echo "worker $worker_v / client $client_v"
+          test "$worker_v" = "$client_v"
+
+      # The published artifact runs the real cross-component suite: a real
+      # worker binary, real cpu child processes, real Redis.
+      - name: itest against the installed binary
+        working-directory: itest
+        env:
+          CAULI_WORKER_BIN: ${{ github.workspace }}/.relvenv/bin/cauli-worker
+          CAULI_VENV: ${{ github.workspace }}/.relvenv
+        run: ../.relvenv/bin/pytest -q test_integration.py
+
+  github-release:
+    name: attach raw binaries to the release
+    needs: verify
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-worker-*
+          path: wheels
+          merge-multiple: true
+
+      # For anyone deploying the worker outside a Python virtualenv (a distro
+      # package, a scratch container). Same binary as the wheel; the file name
+      # carries the CPython version it is bound to, because that is not
+      # optional information for this binary.
+      - name: unpack each wheel into a named tarball
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          for whl in wheels/*.whl; do
+            base=$(basename "$whl" .whl)
+            tags=${base#cauli_worker-}            # <version>-cp3XX-cp3XX-<plat>
+            rm -rf _u && mkdir _u
+            unzip -q "$whl" -d _u
+            install -m755 _u/*.data/scripts/cauli-worker release/cauli-worker
+            tar -C release -czf "release/cauli-worker-${tags}.tar.gz" cauli-worker
+            rm release/cauli-worker
+          done
+          ls -l release
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/*.tar.gz
+            wheels/*.whl
+          body: |
+            `cauli-worker` embeds CPython, so each binary is bound to one
+            CPython minor version. Pick the tarball matching your interpreter,
+            or just `pip install cauli-worker` and let pip choose.
+
+  publish:
+    name: publish to PyPI
+    needs: verify
+    if: github.ref_type == 'tag' || inputs.publish
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      # Trusted publishing (OIDC). No API token stored in the repo.
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+      - run: ls -l dist
+      - uses: pypa/gh-action-pypi-publish@release/v1

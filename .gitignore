@@ -12,6 +12,10 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .venv/
+# Scratch dirs the packaging jobs unpack wheels into (see .github/workflows).
+.relvenv/
+_probe/
+_u/
 
 # Benchmark outputs and logs
 bench/results/
