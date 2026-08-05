@@ -60,9 +60,9 @@ jobs:
           pip install -e "py[dev]"
           pip install ruff==0.15.22
       - name: ruff check
-        run: ruff check py/ worker/src/shim.py itest/
+        run: ruff check py/ worker/src/shim.py itest/ scripts/
       - name: ruff format --check
-        run: ruff format --check py/ worker/src/shim.py itest/
+        run: ruff format --check py/ worker/src/shim.py itest/ scripts/
       - name: pytest
         working-directory: py
         run: pytest -q
@@ -90,3 +90,59 @@ jobs:
           CAULI_WORKER_BIN: ${{ github.workspace }}/worker/target/release/cauli-worker
           CAULI_VENV: ${{ env.pythonLocation }}
         run: pytest -q
+
+  package:
+    name: packaging (release artifacts still build and run)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install redis-server
+        run: sudo apt-get update && sudo apt-get install -y redis-server
+
+      - name: Versions agree across cauli and cauli-worker
+        run: python scripts/check_versions.py
+
+      - name: Build the client sdist and wheel
+        run: |
+          pip install build
+          python -m build --sdist --wheel --outdir dist py
+
+      # One config only. The release workflow builds the full
+      # (CPython minor x arch) matrix; this exists so packaging breakage shows
+      # up on the PR that caused it rather than at tag time.
+      - uses: PyO3/maturin-action@v1
+        with:
+          working-directory: worker
+          target: x86_64
+          manylinux: "2_28"
+          args: --release --out ../dist --interpreter python3.12
+
+      # Same invariant the release workflow gates on: the worker embeds
+      # CPython and must link it dynamically, or it runs its own interpreter
+      # instead of the user's and cannot see their tasks.
+      - name: Worker links libpython dynamically
+        run: |
+          set -euo pipefail
+          rm -rf _probe && mkdir _probe
+          unzip -q -o dist/cauli_worker-*.whl -d _probe
+          readelf -d _probe/*.data/scripts/cauli-worker | tee _probe/dyn.txt
+          grep -q "libpython3.12" _probe/dyn.txt \
+            || { echo "FAIL: worker did not link libpython dynamically" >&2; exit 1; }
+
+      - name: Install the wheels into a clean venv and run itest
+        run: |
+          set -euo pipefail
+          python -m venv .relvenv
+          .relvenv/bin/pip install --upgrade pip
+          .relvenv/bin/pip install --no-index --find-links dist cauli cauli-worker
+          .relvenv/bin/pip install pytest
+          worker_v=$(.relvenv/bin/cauli-worker --version | awk '{print $2}')
+          client_v=$(.relvenv/bin/python -c "import cauli; print(cauli.__version__)")
+          test "$worker_v" = "$client_v"
+          cd itest
+          CAULI_WORKER_BIN="$GITHUB_WORKSPACE/.relvenv/bin/cauli-worker" \
+          CAULI_VENV="$GITHUB_WORKSPACE/.relvenv" \
+            ../.relvenv/bin/pytest -q test_integration.py

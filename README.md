@@ -42,10 +42,25 @@ forks, while CPU tasks still get true multicore parallelism.
 ## Install
 
 ```bash
-pip install cauli               # client: Python >= 3.10 (deps: redis>=5, msgspec)
+pip install cauli          # client: Python >= 3.10 (deps: redis>=5, msgspec)
+pip install cauli-worker   # the worker binary, prebuilt for your interpreter
 ```
 
-The worker is a separate Rust binary, built from source (no crates.io/prebuilt release yet):
+Install the worker into the same virtualenv as your app. That is not a
+convention, it is how the worker finds the right interpreter: `cauli-worker`
+embeds CPython, so its binary links `libpython3.X.so` and will not start
+against a different version. There is one wheel per CPython minor version and
+Linux architecture, pip picks the matching one, and the interpreter it then
+embeds is that venv's own. You get `cauli-worker` and `cauli-beat` on your PATH.
+
+Requirements for the prebuilt worker: Linux on x86_64 or aarch64, glibc 2.28 or
+newer, and a CPython configured with `--enable-shared`. That covers python.org
+builds, the Docker `python:*` images, Debian, Ubuntu and Fedora system packages,
+conda, and actions/setup-python. `pyenv` does not use it by default, so either
+reinstall with `PYTHON_CONFIGURE_OPTS="--enable-shared" pyenv install 3.12` or
+build from source.
+
+Building the worker from source, which has no such constraints:
 
 ```bash
 git clone https://github.com/bilalwork31-cyber/Cauli.git
