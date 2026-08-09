@@ -136,8 +136,11 @@ async fn finish(ctx: &Arc<Ctx>, queue: &str, sid: &str, mut env: Envelope, outco
     let now = now_ms();
     match outcome {
         Outcome::Success(v) => {
-            let rj = envelope::result_success(&v, now);
-            let store = env.store_result.then_some(rj.as_str());
+            // Built only when it is actually stored: serializing a result the
+            // caller has opted out of receiving is pure cost, and it scales
+            // with the size of whatever the task returned.
+            let rj = env.store_result.then(|| envelope::result_success(&v, now));
+            let store = rj.as_deref();
             if let Err(e) =
                 broker::finish_success(&mut conn, queue, sid, &env.id, store, ctx.result_ttl).await
             {

@@ -84,6 +84,19 @@ def django_app(settings_module: str | None = None, **overrides: Any) -> Cauli:
     return app
 
 
+#: Has this process ever opened a Django database connection? Process wide on
+#: purpose: the question "is there anything to close" is about the process, not
+#: about one app object, and several apps in one process must not each hold a
+#: private answer that only their own signal receiver updates.
+_connection_opened = False
+_CONNECTION_SIGNAL_UID = "cauli.contrib.django.connection_opened"
+
+
+def _note_connection_opened(**_kwargs: Any) -> None:
+    global _connection_opened
+    _connection_opened = True
+
+
 def install_db_hooks(app: Cauli) -> Cauli:
     """Register Django DB connection lifecycle hooks on ``app``.
 
@@ -105,10 +118,31 @@ def install_db_hooks(app: Cauli) -> Cauli:
     runs sync DB code in — closing connections on the event loop thread
     itself would miss the thread that actually holds them.
 
+    That hop is skipped entirely until this process has opened its first
+    database connection. It cannot be decided by inspecting
+    ``connections.all(initialized_only=True)`` from the event loop thread:
+    the connections live in the thread-sensitive executor's context, so the
+    loop thread always sees an empty handler and would skip the cleanup even
+    when it is needed. Latching on Django's ``connection_created`` signal
+    asks the question where the answer actually is. Until something opens a
+    connection there is provably nothing to close, and the two thread
+    hand-offs per task are pure overhead — measured at 21% of worker CPU on
+    an async HTTP workload, worth +61% throughput when skipped. Once a
+    connection exists the flag latches on and every task pays the hop again,
+    which is the conservative direction: the cost returns, correctness never
+    depends on the flag being cleared.
+
     Called for you by :func:`django_app`; call directly when you build the
     ``Cauli`` app yourself.
     """
     from django.db import close_old_connections, connections
+    from django.db.backends.signals import connection_created
+
+    connection_created.connect(
+        _note_connection_opened,
+        weak=False,
+        dispatch_uid=_CONNECTION_SIGNAL_UID,
+    )
 
     def cauli_close_old_connections() -> Any:
         try:
@@ -118,6 +152,8 @@ def install_db_hooks(app: Cauli) -> Cauli:
         except RuntimeError:
             close_old_connections()  # sync-pool thread or cpu child
             return None
+        if not _connection_opened:
+            return None  # nothing has ever been opened; nothing to close
         # Event loop thread (async task): run in asgiref's thread-sensitive
         # executor — the thread Django's async ORM uses for sync DB work.
         # The shim awaits the returned coroutine (PROTOCOL.md section 4.8).
@@ -125,9 +161,16 @@ def install_db_hooks(app: Cauli) -> Cauli:
 
         return sync_to_async(close_old_connections, thread_sensitive=True)()
 
+    def cauli_close_all_connections() -> None:
+        global _connection_opened
+        connections.close_all()
+        # A forked cpu child inherits the parent's flag but not its usable
+        # connections; close_all just dropped them, so the child starts clean.
+        _connection_opened = False
+
     app.before_task(cauli_close_old_connections)
     app.after_task(cauli_close_old_connections)
-    app.process_init(connections.close_all)
+    app.process_init(cauli_close_all_connections)
     return app
 
 

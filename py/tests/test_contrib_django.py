@@ -136,6 +136,47 @@ def test_hook_on_event_loop_returns_awaitable_closing_executor_thread_conn():
     asyncio.run(scenario())
 
 
+def test_hook_on_event_loop_skips_executor_hop_until_a_connection_exists(monkeypatch):
+    """Before anything opens a connection the async hook must do nothing.
+
+    close_old_connections has nothing to close until a connection exists, so
+    the sync_to_async round trip is two thread hand-offs of pure overhead on
+    every task. It has to come straight back once a connection does exist --
+    skipping the cleanup then would leak the connection the task opened.
+    """
+    from asgiref.sync import sync_to_async
+    from django.db import connection
+
+    from cauli.contrib import django as contrib_django
+
+    app = install_db_hooks(_app_no_redis())
+    hook = app._before_task_hooks[0]
+    monkeypatch.setattr(contrib_django, "_connection_opened", False)
+
+    async def scenario():
+        assert hook() is None, (
+            "nothing has opened a connection yet, so the hook must not pay "
+            "the thread-sensitive executor hop"
+        )
+        await sync_to_async(
+            lambda: connection.ensure_connection(), thread_sensitive=True
+        )()
+        assert contrib_django._connection_opened, (
+            "connection_created must latch the flag"
+        )
+        awaitable = hook()
+        assert awaitable is not None and hasattr(awaitable, "__await__"), (
+            "once a connection exists the hook must go back to closing it"
+        )
+        await awaitable
+        assert (
+            await sync_to_async(lambda: connection.connection, thread_sensitive=True)()
+            is None
+        )
+
+    asyncio.run(scenario())
+
+
 def _write_pkg(tmp_path, name, tasks_body=None):
     pkg = tmp_path / name
     pkg.mkdir()

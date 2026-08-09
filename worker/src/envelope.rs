@@ -165,24 +165,46 @@ impl ErrorJson {
 }
 
 /// Result key value builders, PROTOCOL §8.
+/// Borrowed result envelopes.
+///
+/// `serde_json::json!({... "result": result ...})` deep-clones `result` into a
+/// fresh `Value` tree and then serializes that tree, so a task returning a
+/// large structure paid for a full copy of it on the way out. Serializing a
+/// borrowing struct writes the same bytes straight from the original value.
+#[derive(serde::Serialize)]
+struct SuccessResult<'a> {
+    status: &'static str,
+    result: &'a Value,
+    error: (), // serializes as null
+    finished_at: u64,
+}
+
+#[derive(serde::Serialize)]
+struct FailureResult<'a> {
+    status: &'static str,
+    result: (), // serializes as null
+    error: &'a ErrorJson,
+    finished_at: u64,
+}
+
 pub fn result_success(result: &Value, finished_at: u64) -> String {
-    serde_json::json!({
-        "status": "success",
-        "result": result,
-        "error": null,
-        "finished_at": finished_at,
+    serde_json::to_string(&SuccessResult {
+        status: "success",
+        result,
+        error: (),
+        finished_at,
     })
-    .to_string()
+    .expect("result envelope is always serializable")
 }
 
 pub fn result_failure(error: &ErrorJson, finished_at: u64) -> String {
-    serde_json::json!({
-        "status": "failure",
-        "result": null,
-        "error": error,
-        "finished_at": finished_at,
+    serde_json::to_string(&FailureResult {
+        status: "failure",
+        result: (),
+        error,
+        finished_at,
     })
-    .to_string()
+    .expect("result envelope is always serializable")
 }
 
 pub fn result_duplicate(finished_at: u64) -> String {
