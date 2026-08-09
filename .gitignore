@@ -22,5 +22,6 @@ bench/results/
 bench/campaign/results/
 bench/**/results/
 bench2/results/
+bench2/_enq_app.py
 itest/worker.log
 *.log
