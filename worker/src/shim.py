@@ -280,10 +280,21 @@ def _inject_soft(tid, gen):
     # thread has since moved on to. The watchdog does not (and structurally
     # cannot cheaply) remove heap entries early, so EVERY scheduled deadline
     # reaches this check; the generation compare is what makes that safe.
+    #
+    # The injection happens INSIDE the lock, not after it. Releasing the lock
+    # between the compare and the injection reopens exactly the hole the
+    # generation counter exists to close: the pool thread reaches its disarm
+    # (bump generation, clear pending exception) in that gap, and this
+    # injection then lands on a thread that has already moved on -- so the
+    # NEXT task run on it dies of a SoftTimeLimitExceeded it never armed.
+    # Under the GIL that gap needed an eval-loop thread switch to land in and
+    # was merely improbable; on a free-threaded build the two threads run at
+    # once and nothing makes it improbable any more. Holding the lock across
+    # both makes check-and-arm atomic against bump-and-disarm.
     with _gen_lock:
         if _thread_gen.get(tid, 0) != gen:
             return
-    _set_async_exc(ctypes.c_ulong(tid), ctypes.py_object(SoftTimeLimitExceeded))
+        _set_async_exc(ctypes.c_ulong(tid), ctypes.py_object(SoftTimeLimitExceeded))
 
 
 def run_sync(name, args, kwargs, soft_timeout_ms):
