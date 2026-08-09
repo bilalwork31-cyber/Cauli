@@ -21,5 +21,6 @@ _u/
 bench/results/
 bench/campaign/results/
 bench/**/results/
+bench2/results/
 itest/worker.log
 *.log
