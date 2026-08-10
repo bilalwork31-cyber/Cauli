@@ -379,11 +379,47 @@ def _loop_main(loop):
     loop.run_forever()
 
 
+def _new_loop():
+    """Build one event loop, preferring uvloop when it is importable.
+
+    uvloop is a libuv-backed drop in replacement whose timer heap and
+    callback scheduling are several times cheaper than the stock loop's;
+    on this worker the loop machinery was measured at 60-100us of a 220us
+    per-task budget, so the loop implementation is a first order cost, not
+    a taste choice. Everything this shim does with a loop --
+    call_soon_threadsafe, create_task, run_forever, wait_for -- is in the
+    subset uvloop implements.
+
+    CAULI_LOOP=asyncio forces the stock loop (the A/B control and the
+    escape hatch); CAULI_LOOP=uvloop makes uvloop mandatory, failing
+    loudly at startup instead of silently benchmarking the wrong loop.
+    Unset means: use uvloop when available, else stock.
+    """
+    choice = os.environ.get("CAULI_LOOP", "").strip().lower()
+    if choice not in ("", "asyncio", "uvloop"):
+        raise RuntimeError(
+            "CAULI_LOOP must be 'uvloop', 'asyncio' or unset, got %r" % (choice,)
+        )
+    if choice == "asyncio":
+        return asyncio.new_event_loop(), "asyncio"
+    try:
+        import uvloop
+    except ImportError:
+        if choice == "uvloop":
+            raise RuntimeError(
+                "CAULI_LOOP=uvloop but uvloop is not importable in this "
+                "environment; install it or unset CAULI_LOOP"
+            ) from None
+        return asyncio.new_event_loop(), "asyncio"
+    return uvloop.new_event_loop(), "uvloop"
+
+
 def start_loops(n):
     n = max(1, int(n))
+    impl = None
     with _loops_lock:
         for i in range(n):
-            loop = asyncio.new_event_loop()
+            loop, impl = _new_loop()
             t = threading.Thread(
                 target=_loop_main, args=(loop,), name="cauli-aio-%d" % i, daemon=True
             )
@@ -391,6 +427,10 @@ def start_loops(n):
             _loops.append(loop)
             _pending.append([])
             _pending_locks.append(threading.Lock())
+    if impl is not None:
+        # One line, stderr: lands in the worker's log so a benchmark or an
+        # operator can see WHICH loop ran without introspecting the process.
+        sys.stderr.write("cauli: %d asyncio loop(s), impl=%s\n" % (n, impl))
     return len(_loops)
 
 

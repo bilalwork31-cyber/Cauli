@@ -113,25 +113,14 @@ pub async fn run_async_task(ctx: &Arc<Ctx>, env: &Envelope) -> Outcome {
     let _dec = DecrGuard(&ctx.counters.inflight_io); // panic-safe: MEM-3
 
     let effective_s = env.effective_async_timeout_s();
-    let (token, rx) = {
-        let rt = ctx.pyrt.clone();
-        let name = env.task.clone();
-        // Parsed values, converted to Python objects inside submit_async: no
-        // JSON text is produced here or parsed on the loop thread.
-        let a = env.args_ref().clone();
-        let k = env.kwargs_ref().clone();
-        // GIL taken briefly off the tokio worker threads
-        match tokio::task::spawn_blocking(move || rt.submit_async(&name, &a, &k, effective_s)).await
-        {
-            Ok(v) => v,
-            Err(e) => {
-                // A panic on the Python side (submit_async / pyo3 call) must
-                // not become a worker-task panic (that would itself trip
-                // MEM-3 territory); report it as a normal retryable failure.
-                return fail("WorkerShimError", format!("submit_async panicked: {e}"));
-            }
-        }
-    };
+    // Queued to the dedicated submitter thread: no GIL from here, no
+    // spawn_blocking. Args cross as parsed values and become Python objects
+    // inside the batch submit; no JSON text is produced on this path. A
+    // Python-side submit failure comes back through the oneshot as a normal
+    // retryable outcome (pyrt::submit_batch_under_gil).
+    let (token, rx) =
+        ctx.pyrt
+            .queue_submit(&env.task, env.args_ref(), env.kwargs_ref(), effective_s);
     // saturating_add: H3 — an attacker-chosen timeout_ms near u64::MAX must
     // not wrap this backstop to a near-zero duration (spurious TimeoutError).
     let backstop_ms = env.timeout_ms.saturating_add(BACKSTOP_GRACE_MS);

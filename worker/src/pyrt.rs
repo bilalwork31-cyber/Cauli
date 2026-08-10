@@ -55,6 +55,26 @@ pub struct PyRuntime {
     shim: Py<PyModule>,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Outcome>>>>,
     next_token: AtomicU64,
+    /// Async submissions are queued here and drained by ONE dedicated
+    /// submitter thread (see `init`), one GIL entry per batch. The previous
+    /// design took the GIL from a fresh `spawn_blocking` closure per task;
+    /// at high --io-concurrency that inflated tokio's blocking pool toward
+    /// its 512-thread cap, all of them convoying on the GIL against the
+    /// event-loop thread that was trying to run the tasks (measured: 527 OS
+    /// threads and a 20 ms task body inflated to 92 ms p99 at 2048 in
+    /// flight). A single submitter deletes the convoy and the pool usage;
+    /// submission order becomes FIFO, which the racing closures never were.
+    submit_tx: crossbeam_channel::Sender<SubmitJob>,
+}
+
+/// One queued async submission. Owns its data: the envelope's args/kwargs are
+/// cloned at queue time exactly as the old spawn_blocking closure cloned them.
+struct SubmitJob {
+    token: u64,
+    name: String,
+    args: Value,
+    kwargs: Value,
+    timeout_s: f64,
 }
 
 /// Normalize the shim's outcome dict (a real Python object, not JSON text)
@@ -209,14 +229,47 @@ impl PyRuntime {
         let cfg: AppConfig = serde_json::from_str(&cfg_json)
             .with_context(|| format!("shim load_app returned unparseable config: {cfg_json}"))?;
 
-        Ok((
-            Arc::new(PyRuntime {
-                shim,
-                pending,
-                next_token: AtomicU64::new(1),
-            }),
-            cfg,
-        ))
+        let (submit_tx, submit_rx) = crossbeam_channel::unbounded::<SubmitJob>();
+        let rt = Arc::new(PyRuntime {
+            shim,
+            pending,
+            next_token: AtomicU64::new(1),
+            submit_tx,
+        });
+
+        // The async submitter thread. Blocks on the channel, then drains
+        // whatever else is already queued and schedules the whole batch under
+        // ONE GIL entry. Unbounded is safe: the io admission semaphore
+        // (exec::run_async_task) caps queued jobs at --io-concurrency.
+        //
+        // Thread-state note (see the sync-pool landmine below): this thread
+        // uses a plain Python::attach per batch, NOT a pinned thread state.
+        // That is deliberate and safe HERE because nothing on this path
+        // relies on threading.local surviving between batches -- the shim's
+        // submit_async touches module globals only. The pinning requirement
+        // applies to threads that EXECUTE task bodies, which cache things
+        // like Django connections in thread locals. This thread never does.
+        let rt_submit = Arc::clone(&rt);
+        std::thread::Builder::new()
+            .name("cauli-async-submit".into())
+            .spawn(move || {
+                const DRAIN_MAX: usize = 128;
+                let mut batch: Vec<SubmitJob> = Vec::with_capacity(DRAIN_MAX);
+                while let Ok(first) = submit_rx.recv() {
+                    batch.push(first);
+                    while batch.len() < DRAIN_MAX {
+                        match submit_rx.try_recv() {
+                            Ok(job) => batch.push(job),
+                            Err(_) => break,
+                        }
+                    }
+                    rt_submit.submit_batch_under_gil(&mut batch);
+                }
+                // Channel closed: PyRuntime dropped, worker is shutting down.
+            })
+            .expect("failed to spawn cauli-async-submit thread");
+
+        Ok((rt, cfg))
     }
 
     /// Blocking sync task execution. MUST be called from a dedicated OS thread
@@ -256,12 +309,12 @@ impl PyRuntime {
         })
     }
 
-    /// Submit an async task to an embedded asyncio loop. Completion arrives
-    /// push-style on the returned oneshot (via the registered Python callback).
-    /// Briefly takes the GIL to schedule; call from `spawn_blocking`. Returns
-    /// the token alongside the receiver so the caller can `cancel(token)` if
-    /// it gives up waiting (see `cancel`, MEM-1).
-    pub fn submit_async(
+    /// Queue an async task for the submitter thread. Completion arrives
+    /// push-style on the returned oneshot (via the registered Python
+    /// callback). Takes no GIL and never blocks: call it directly from a
+    /// tokio worker thread. Returns the token alongside the receiver so the
+    /// caller can `cancel(token)` if it gives up waiting (MEM-1).
+    pub fn queue_submit(
         &self,
         name: &str,
         args: &Value,
@@ -270,30 +323,76 @@ impl PyRuntime {
     ) -> (u64, oneshot::Receiver<Outcome>) {
         let token = self.next_token.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
+        // Insert BEFORE send: once the job is on the channel the completion
+        // callback can fire on the loop thread at any moment, and it must
+        // find the slot.
         self.pending.lock().unwrap().insert(token, tx);
 
-        let submit_err: Option<String> = Python::attach(|py| {
-            let scheduled = (|| -> PyResult<()> {
-                let a = crate::pyjson::json_to_py(py, args, 0)?;
-                let k = crate::pyjson::json_to_py(py, kwargs, 0)?;
-                self.shim
-                    .bind(py)
-                    .getattr("submit_async")?
-                    .call1((token, name, a, k, timeout_s))?;
-                Ok(())
-            })();
-            scheduled.err().map(|e| pyerr_string(py, &e))
-        });
-
-        if let Some(msg) = submit_err {
-            if let Some(tx) = self.pending.lock().unwrap().remove(&token) {
-                let _ = tx.send(Outcome::Failure {
-                    err: ErrorJson::new("WorkerShimError", format!("submit_async failed: {msg}")),
-                    retryable: true,
-                });
-            }
+        let job = SubmitJob {
+            token,
+            name: name.to_string(),
+            args: args.clone(),
+            kwargs: kwargs.clone(),
+            timeout_s,
+        };
+        if self.submit_tx.send(job).is_err() {
+            // Submitter thread gone: only reachable during teardown.
+            self.fail_pending(
+                token,
+                "queue_submit failed: submitter thread has exited".to_string(),
+            );
         }
         (token, rx)
+    }
+
+    /// Schedule one drained batch on the event loops, under a single GIL
+    /// entry. Runs ONLY on the cauli-async-submit thread. `submit_async` is
+    /// resolved once per batch; the shim then batches its own loop wakeups on
+    /// top (its per-loop pending queues), so a burst of N tasks costs one
+    /// GIL entry here and one loop wakeup there instead of N of each.
+    fn submit_batch_under_gil(&self, batch: &mut Vec<SubmitJob>) {
+        let failures: Vec<(u64, String)> = Python::attach(|py| {
+            let mut failed = Vec::new();
+            let submit = match self.shim.bind(py).getattr("submit_async") {
+                Ok(f) => f,
+                Err(e) => {
+                    // Shim itself broken: fail the whole batch, same
+                    // retryable semantics as a per-task submit error.
+                    let msg = pyerr_string(py, &e);
+                    for job in batch.iter() {
+                        failed.push((job.token, msg.clone()));
+                    }
+                    return failed;
+                }
+            };
+            for job in batch.iter() {
+                let scheduled = (|| -> PyResult<()> {
+                    let a = crate::pyjson::json_to_py(py, &job.args, 0)?;
+                    let k = crate::pyjson::json_to_py(py, &job.kwargs, 0)?;
+                    submit.call1((job.token, job.name.as_str(), a, k, job.timeout_s))?;
+                    Ok(())
+                })();
+                if let Err(e) = scheduled {
+                    failed.push((job.token, pyerr_string(py, &e)));
+                }
+            }
+            failed
+        });
+        for (token, msg) in failures {
+            self.fail_pending(token, format!("submit_async failed: {msg}"));
+        }
+        batch.clear();
+    }
+
+    /// Complete a pending slot with a retryable shim failure (no-op if the
+    /// completion callback got there first).
+    fn fail_pending(&self, token: u64, msg: String) {
+        if let Some(tx) = self.pending.lock().unwrap().remove(&token) {
+            let _ = tx.send(Outcome::Failure {
+                err: ErrorJson::new("WorkerShimError", msg),
+                retryable: true,
+            });
+        }
     }
 
     /// MEM-1: remove (and drop) a pending completion slot. Called when the

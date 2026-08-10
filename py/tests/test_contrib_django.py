@@ -11,6 +11,7 @@ import asyncio
 import os
 import sys
 import tempfile
+import threading
 
 import pytest
 
@@ -23,6 +24,7 @@ from cauli.contrib.django import (  # noqa: E402
     autodiscover_tasks,
     django_app,
     install_db_hooks,
+    install_orm_executors,
 )
 
 
@@ -66,8 +68,16 @@ def test_django_app_reads_cauli_settings():
     assert app.default_queue == "dj-queue"
     assert app.result_ttl == 123
     assert app.idemp_ttl == 456
-    # DB lifecycle hooks come pre-registered (Celery-fixup parity).
-    assert len(app._before_task_hooks) == 1
+    # Lifecycle hooks come pre-registered: the sticky-executor assignment
+    # FIRST, then close_old_connections (Celery-fixup parity). The order is
+    # load-bearing -- the before-task connection health check must run on the
+    # sticky thread the task is about to use, so the executor assignment has
+    # to be in place before it.
+    names = [h.__name__ for h in app._before_task_hooks]
+    assert names == [
+        "cauli_assign_orm_executor",
+        "cauli_close_old_connections",
+    ]
     assert len(app._after_task_hooks) == 1
     assert len(app._process_init_hooks) == 1
 
@@ -175,6 +185,90 @@ def test_hook_on_event_loop_skips_executor_hop_until_a_connection_exists(monkeyp
         )
 
     asyncio.run(scenario())
+
+
+def _fresh_executor_state(monkeypatch, workers):
+    """Reset the module-singleton pool so each test installs its own size."""
+    from cauli.contrib import django as contrib_django
+
+    monkeypatch.setattr(contrib_django, "_orm_executors", [])
+    monkeypatch.setattr(contrib_django, "_orm_tokens", [])
+    monkeypatch.setattr(contrib_django, "_orm_rr", 0)
+    return install_orm_executors(_app_no_redis(), workers=workers)
+
+
+def test_sticky_executor_pins_a_task_to_one_thread_across_awaits(monkeypatch):
+    """All thread_sensitive work of one task must land on ONE executor thread.
+
+    That is the property that lets Django reuse the same cached connection
+    across every await in the task; if two calls land on two threads the task
+    is back to one-connection-per-call and CONN_MAX_AGE means nothing.
+    """
+    from asgiref.sync import sync_to_async
+
+    app = _fresh_executor_state(monkeypatch, workers=4)
+    hook = app._before_task_hooks[0]
+
+    def thread_name():
+        return threading.current_thread().name
+
+    async def one_task():
+        hook()  # what the shim does before the task body runs
+        first = await sync_to_async(thread_name, thread_sensitive=True)()
+        await asyncio.sleep(0)  # a real suspension between the two calls
+        second = await sync_to_async(thread_name, thread_sensitive=True)()
+        assert first == second, "task hopped executor threads across an await"
+        assert first.startswith("cauli-orm-"), (
+            f"thread_sensitive work ran on {first!r}, not a sticky executor"
+        )
+        return first
+
+    asyncio.run(one_task())
+
+
+def test_sticky_executors_spread_tasks_and_bound_thread_count(monkeypatch):
+    """N concurrent tasks must use more than one thread, and at most M.
+
+    More than one is the parallelism that fixed the measured 348 ms pileup on
+    asgiref's single global executor; at most M is the bound that keeps the
+    process at M cached database connections.
+    """
+    from asgiref.sync import sync_to_async
+
+    workers = 3
+    app = _fresh_executor_state(monkeypatch, workers=workers)
+    hook = app._before_task_hooks[0]
+
+    async def one_task():
+        hook()
+        return await sync_to_async(
+            lambda: threading.current_thread().name, thread_sensitive=True
+        )()
+
+    async def scenario():
+        return await asyncio.gather(*[one_task() for _ in range(workers * 4)])
+
+    names = set(asyncio.run(scenario()))
+    assert len(names) == workers, (
+        f"expected exactly {workers} sticky threads in use, saw {names}"
+    )
+
+
+def test_orm_executor_hook_is_inert_off_the_event_loop(monkeypatch):
+    """On a sync-pool thread the hook must do nothing: that thread IS the
+    task's thread, and stamping a context there would leak an executor
+    assignment into unrelated asgiref use."""
+    from asgiref.sync import SyncToAsync
+
+    app = _fresh_executor_state(monkeypatch, workers=2)
+    hook = app._before_task_hooks[0]
+    hook()  # no running loop here
+    assert SyncToAsync.thread_sensitive_context.get(None) is None
+
+
+def test_orm_executors_zero_disables(monkeypatch):
+    app = _fresh_executor_state(monkeypatch, workers=0)
+    assert app._before_task_hooks == []
 
 
 def _write_pkg(tmp_path, name, tasks_body=None):
