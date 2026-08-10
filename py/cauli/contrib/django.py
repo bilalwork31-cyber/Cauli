@@ -41,6 +41,7 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import os
+import threading
 from typing import Any, Iterable
 
 from cauli.app import Cauli
@@ -77,9 +78,17 @@ def django_app(settings_module: str | None = None, **overrides: Any) -> Cauli:
     for setting_name, kwarg in _SETTINGS_MAP:
         if hasattr(settings, setting_name):
             kwargs[kwarg] = getattr(settings, setting_name)
+    orm_executors = overrides.pop(
+        "orm_executors",
+        getattr(settings, "CAULI_ORM_EXECUTORS", DEFAULT_ORM_EXECUTORS),
+    )
     kwargs.update(overrides)
 
     app = Cauli(**kwargs)
+    # Order matters: the executor hook must run BEFORE close_old_connections
+    # in the before-task phase, so the health check runs on the sticky thread
+    # whose connection the task is about to use, not on asgiref's global one.
+    install_orm_executors(app, workers=orm_executors)
     install_db_hooks(app)
     return app
 
@@ -95,6 +104,121 @@ _CONNECTION_SIGNAL_UID = "cauli.contrib.django.connection_opened"
 def _note_connection_opened(**_kwargs: Any) -> None:
     global _connection_opened
     _connection_opened = True
+
+
+#: Default size of the sticky ORM executor pool. Eight matches the measured
+#: knee on the reference box (348 ms -> 48 ms for 64 concurrent 5 ms calls);
+#: it is a client-side thread count, deliberately independent of the worker's
+#: --io-loops. 0 disables the pool entirely.
+DEFAULT_ORM_EXECUTORS = 8
+
+_orm_executors: list[Any] = []
+_orm_tokens: list[Any] = []
+_orm_rr = 0
+_orm_lock = threading.Lock()
+
+
+def install_orm_executors(app: Cauli, workers: int = DEFAULT_ORM_EXECUTORS) -> Cauli:
+    """Give async tasks M sticky executor threads for thread-bound sync work.
+
+    Without this, every ``sync_to_async(thread_sensitive=True)`` call in the
+    process -- which is what Django's async ORM interface (``aget``,
+    ``acreate``, ...) runs its sync DB code through -- funnels into asgiref's
+    ONE global executor thread. Measured on the reference box: 64 concurrent
+    5 ms calls took 348 ms end to end (full serialisation), and ORM work from
+    coroutines churned one database connection per task with ``CONN_MAX_AGE``
+    silently ignored.
+
+    The fix uses asgiref's own extension point: ``SyncToAsync`` consults
+    ``thread_sensitive_context`` (a ContextVar) and routes to the executor
+    registered for that context in ``context_to_thread_executor``. This
+    installs M single-thread executors, and a before-task hook assigns each
+    async task one of them, round robin, by setting the ContextVar inside the
+    task's own context. Consequences, all verified by test:
+
+    - all thread-sensitive work of one task runs on ONE thread, so the same
+      database connection is reused across every await in the task;
+    - tasks distribute over M threads instead of one (348 ms -> 48 ms at
+      M=8 on the reference box);
+    - the process holds at most M cached connections, ``CONN_MAX_AGE`` is
+      honoured again, and the before/after ``close_old_connections`` hooks
+      (installed after this, so they see the ContextVar already set) run on
+      exactly the thread whose connections they are supposed to manage.
+
+    Sync-pool and cpu tasks are untouched: the hook only acts when it finds
+    itself on an event loop thread. ``workers=0`` disables the pool, restoring
+    asgiref's global-executor behaviour.
+
+    The executors are process-wide singletons (first installer wins on size):
+    the question "which thread runs thread-sensitive work" is about the
+    process, and two apps handing out executors from two private pools would
+    defeat the connection-count bound that is the point of having one.
+    """
+    if workers <= 0:
+        return app
+    try:
+        from asgiref.sync import SyncToAsync
+    except ImportError:
+        return app  # no asgiref, no async ORM path to fix
+    if not hasattr(SyncToAsync, "thread_sensitive_context") or not hasattr(
+        SyncToAsync, "context_to_thread_executor"
+    ):
+        import warnings
+
+        warnings.warn(
+            "cauli.contrib.django: this asgiref version lacks "
+            "thread_sensitive_context/context_to_thread_executor; sticky ORM "
+            "executors disabled, async ORM work will serialise on asgiref's "
+            "global executor thread",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        return app
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    with _orm_lock:
+        if not _orm_executors:
+            for i in range(int(workers)):
+                ex = ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix=f"cauli-orm-{i}"
+                )
+                # The WeakKeyDictionary key must be weakref-able and must stay
+                # alive; a plain object held in the module list satisfies both.
+                token = _StickyToken(i)
+                SyncToAsync.context_to_thread_executor[token] = ex
+                _orm_executors.append(ex)
+                _orm_tokens.append(token)
+
+    def cauli_assign_orm_executor() -> None:
+        global _orm_rr
+        try:
+            import asyncio
+
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return  # sync-pool thread or cpu child: has its own thread already
+        with _orm_lock:
+            token = _orm_tokens[_orm_rr % len(_orm_tokens)]
+            _orm_rr += 1
+        # Set INSIDE the task's context (hooks run inside the task), so the
+        # assignment is per task and vanishes with it.
+        SyncToAsync.thread_sensitive_context.set(token)
+
+    app.before_task(cauli_assign_orm_executor)
+    return app
+
+
+class _StickyToken:
+    """Weakref-able ContextVar value naming one sticky executor."""
+
+    __slots__ = ("__weakref__", "index")
+
+    def __init__(self, index: int) -> None:
+        self.index = index
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return f"<cauli sticky-executor token {self.index}>"
 
 
 def install_db_hooks(app: Cauli) -> Cauli:
