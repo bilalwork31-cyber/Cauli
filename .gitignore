@@ -27,3 +27,6 @@ bench3/results/
 bench3/_enq_app.py
 itest/worker.log
 *.log
+
+# Session working notes, never tracked
+HANDOFF.md
