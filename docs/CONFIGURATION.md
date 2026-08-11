@@ -55,14 +55,35 @@ Two other reasons to pick `kind="cpu"`:
 
 ## Worker command line
 
-`cauli-worker --app myproj.tasks:app [options]`
+`cauli-worker -A myproj.tasks:app -c 50`
+
+### The two flags that matter
+
+| Flag | Default | Effect |
+|---|---|---|
+| `-c`, `--concurrency` | unset | Total tasks in flight across all worker processes, like Celery's `-c`. Setting it derives everything below |
+| `--procs` | 1, or min(cores, 4) with `-c` | Worker processes. The binary supervises them itself: spawn, restart on death, signal fan out for graceful drain |
+
+With `-c` set, the worker derives its internals from it. Every derived value
+can still be pinned by passing its flag explicitly; an explicit flag always
+wins. The rules, each from a measured result:
+
+| Derived | Formula | Why |
+|---|---|---|
+| `--procs` | min(cores, 4, c) | 1 to 4 processes was +74% throughput at lower p99 (bench3): one GIL each |
+| `--io-concurrency` | c / procs | The gate is the real bound for `async def` tasks; a slot costs about 4 KB |
+| `--io-threads` | min(c, 512) / procs, at most the gate | The sync knee is near 1000 threads per process; past it throughput and latency fall together. Staying at 1x the gate is the latency honest default: oversubscribing buys throughput by inflating task p99 (measured 2048 slots on 4 cores: a 20 ms body reached a 92 ms p99) |
+| `--cpu-workers` | cores / procs | More cpu children than cores buys nothing |
+| `--io-loops` | always 1 | 1 loop beat 2, 3 and 4 in every sweep: extra loops contend for one GIL |
+
+Without `-c` nothing changes: one process, the standalone defaults below.
 
 ### Wiring
 
 | Flag | Default | Effect |
 |---|---|---|
-| `--app` | *required* | App location as `module:attr`. The worker's working directory is prepended to `sys.path`, so relative module paths resolve |
-| `--queues` | `app.default_queue` | Comma separated queue names to consume |
+| `-A`, `--app` | *required* | App location as `module:attr`. The worker's working directory is prepended to `sys.path`, so relative module paths resolve |
+| `-Q`, `--queues` | `app.default_queue` | Comma separated queue names to consume |
 | `--redis-url` | from app | Precedence: this flag > `CAULI_REDIS_URL` > `app.redis_url` |
 | `--python` | `python3` | Interpreter used to spawn cpu children |
 
@@ -70,8 +91,8 @@ Two other reasons to pick `kind="cpu"`:
 
 | Flag | Default | Effect |
 |---|---|---|
-| `--io-threads` | 64 | OS threads for sync `kind="io"` tasks. **This is the scaling axis for sync work** |
-| `--io-concurrency` | 256 | Admission semaphore: maximum io tasks in flight, sync and async together |
+| `--io-threads` | 64, or derived from `-c` | OS threads for sync `kind="io"` tasks. **This is the scaling axis for sync work** |
+| `--io-concurrency` | 256, or derived from `-c` | Admission semaphore: maximum io tasks in flight, sync and async together |
 | `--io-loops` | 1 | Embedded asyncio event loop threads for `async def` tasks |
 
 `--io-concurrency` is a gate, not a worker count. Raising it above
@@ -87,7 +108,7 @@ and a socket rather than a thread.
 
 | Flag | Default | Effect |
 |---|---|---|
-| `--cpu-workers` | number of cores | Child processes for `kind="cpu"` tasks |
+| `--cpu-workers` | cores / procs | Child processes for `kind="cpu"` tasks |
 | `--cpu-child-threads` | 1 | Requests pipelined per child, matched by id. Range 1 to 1024 |
 | `--cpu-prefetch` | 4 | Requests staged in a child's socket buffer beyond the one it is running. 0 disables |
 | `--no-fork-server` | off | One process per cpu task over stdio instead of the fork-server. Entered automatically if fork-server startup fails |
@@ -201,6 +222,7 @@ observes a row that got rolled back.
 | Variable | Read by | Effect |
 |---|---|---|
 | `CAULI_REDIS_URL` | client and worker | Broker URL when not passed explicitly |
+| `CAULI_LOOP` | worker | Event loop policy for the embedded asyncio loops. Unset: uvloop when importable, else stock asyncio; the startup line reports which (`impl=uvloop`). `asyncio` forces the stock loop; `uvloop` makes uvloop mandatory and fails startup without it. Force a mode when you must know which loop you measured: under a venv overlay the embedded interpreter also sees system site-packages, so uvloop can appear without being in your requirements |
 | `RUST_LOG` | worker | Overrides `--log-level` |
 | `VIRTUAL_ENV` | worker | The embedded interpreter calls `site.addsitedir` on this venv's site-packages. **Required when running the worker against a virtualenv**, because editable installs are invisible to a `PYTHONPATH` only interpreter |
 | `CAULI_EXEC_CMD` | worker, test builds only | Overrides the cpu child command. Gated behind the `test-hooks` feature |
@@ -217,6 +239,7 @@ defaults.
 | `CAULI_DEFAULT_QUEUE` | `default_queue` |
 | `CAULI_RESULT_TTL` | `result_ttl` |
 | `CAULI_IDEMP_TTL` | `idemp_ttl` |
+| `CAULI_ORM_EXECUTORS` | sticky ORM executor count for `async def` tasks, default 8. Each executor is a single thread that keeps its own DB connection, so ORM calls from async tasks reuse M connections instead of churning one per task |
 
 `django_app()` also installs the DB connection lifecycle hooks that mirror
 Celery's Django fixup: `close_old_connections` around every task, and
@@ -225,8 +248,18 @@ never survives into a forked cpu child.
 
 ## Tuning guide
 
-Start with the defaults. They are reasonable. Change one axis at a time and
-measure, because the right value depends on your task body more than on cauli.
+Start with `-c` alone. Change one axis at a time and measure, because the
+right value depends on your task body more than on cauli.
+
+**Processes first.** `--procs` is the largest axis the campaign found: on 4
+pinned cores, 1 process to 4 was +74% throughput with lower p99, because each
+process brings its own GIL *(bench3)*. `-c` turns it on automatically; a
+deployment still pinned to `--procs 1` is leaving that on the table. The
+supervisor restarts a dead process after 1 s and forwards SIGTERM to all of
+them, so systemd and docker manage one pid as before. One caveat carried over
+from single process deployments: registering any `kind="cpu"` task forks a cpu
+pool in **each** process at startup; `--cpu-workers` is divided across procs so
+the child total stays at the core count.
 
 **Sync io tasks.** `--io-threads` is the axis. Measured *(bench2)* on a two
 second task with four cores: 500 threads gave 251 tasks/s, 1000 gave 495

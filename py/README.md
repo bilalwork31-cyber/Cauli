@@ -36,7 +36,7 @@ Tasks stay directly callable for tests: `crunch(10)` runs inline, no broker need
 
 ## Run the worker (Rust binary)
 
-    cauli-worker --app myproj.tasks:app --queues default,emails --cpu-workers 4
+    cauli-worker -A myproj.tasks:app -c 50 -Q default,emails
 
 The URL falls back to env `CAULI_REDIS_URL`, then `redis://localhost:6379/0`.
 See `PROTOCOL.md` in the repo root for the full wire contract.
