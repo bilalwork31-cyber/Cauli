@@ -1,13 +1,15 @@
-# Configuration reference
+﻿# Configuration reference
 
 Every knob cauli has: the worker command line, the app object, the task
 decorator, per call options, environment variables, and the Django settings
 the contrib layer reads.
 
 Where a default was chosen by measurement rather than taste, the measurement
-is cited. Figures marked *(bench2)* come from `bench2/RESULTS.md` on a six
-core i7-9750H under WSL2 with four cores pinned to the worker; they are the
-shape of the effect, not a promise about your machine.
+is cited. Figures marked *(measured)* come from the 2026 benchmark campaigns
+on a six core i7-9750H under WSL2 with four cores pinned to the worker; they
+are the shape of the effect, not a promise about your machine. The raw
+campaign data has been retired from the tree ahead of a single reproducible
+benchmark.
 
 - [Choosing a task kind](#choosing-a-task-kind)
 - [Worker command line](#worker-command-line)
@@ -40,7 +42,7 @@ The distinction that decides it is **whether the body holds the GIL**:
   written parsing): a thread pool of any width executes these one at a time.
   Use `kind="cpu"`.
 
-Measured on identical bodies *(bench2)*: at 50 ms per task the thread pool
+Measured on identical bodies: at 50 ms per task the thread pool
 reaches 59 tasks/s on GIL releasing work and 15 tasks/s on GIL holding work,
 with the per task time inflating from 62.6 ms to 413.4 ms as concurrency rises
 from 1 to 8. That inflation is the GIL serialising the bodies, and it is why
@@ -71,7 +73,7 @@ wins. The rules, each from a measured result:
 
 | Derived | Formula | Why |
 |---|---|---|
-| `--procs` | min(cores, c / 64) | Each process is one GIL: fanning out was +74% throughput at lower p99 (bench3). Scaling by `-c` keeps a small queue worker to one quiet process on a box shared with your web app and Redis, while a large `-c` on a dedicated box uses every core. The 64 slot target is a chosen default, not yet a swept one |
+| `--procs` | min(cores, c / 64) | Each process is one GIL: fanning out was +74% throughput at lower p99 (measured). Scaling by `-c` keeps a small queue worker to one quiet process on a box shared with your web app and Redis, while a large `-c` on a dedicated box uses every core. The 64 slot target is a chosen default, not yet a swept one |
 | `--io-concurrency` | c / procs | The gate is the real bound for `async def` tasks; a slot costs about 4 KB |
 | `--io-threads` | min(c, 512) / procs, at most the gate | The sync knee is near 1000 threads per process; past it throughput and latency fall together. Staying at 1x the gate is the latency honest default: oversubscribing buys throughput by inflating task p99 (measured 2048 slots on 4 cores: a 20 ms body reached a 92 ms p99) |
 | `--cpu-workers` | min(cores, c) / procs | More cpu children than cores buys nothing, and more than `-c` would make `-c 8` on a cpu queue mean something other than 8 |
@@ -98,7 +100,7 @@ Without `-c` nothing changes: one process, the standalone defaults below.
 
 `--io-concurrency` is a gate, not a worker count. Raising it above
 `--io-threads` does not add sync parallelism, it only lets more tasks queue
-behind the same threads. Measured *(bench2)*: with `--io-threads 500`, gates of
+behind the same threads. Measured: with `--io-threads 500`, gates of
 500, 2000 and 4000 all produced the same 247 to 251 tasks/s, because a two
 second task on 500 threads is 250 tasks/s whatever the gate says.
 
@@ -257,7 +259,7 @@ right value depends on your task body more than on cauli.
 
 **Processes first.** `--procs` is the largest axis the campaign found: on 4
 pinned cores, 1 process to 4 was +74% throughput with lower p99, because each
-process brings its own GIL *(bench3)*. `-c` scales it automatically, one
+process brings its own GIL *(measured)*. `-c` scales it automatically, one
 process per ~64 slots up to the cores, so a busy dedicated box fans out and a
 small colocated worker stays out of your web app's way. The supervisor
 restarts a dead process after 1 s and forwards SIGTERM to all of them, so
@@ -265,7 +267,7 @@ systemd and docker manage one pid as before. Each process that receives cpu
 tasks starts its own cpu pool on the first one; `--cpu-workers` is divided
 across procs so the child total stays at the core count.
 
-**Sync io tasks.** `--io-threads` is the axis. Measured *(bench2)* on a two
+**Sync io tasks.** `--io-threads` is the axis. Measured *(measured)* on a two
 second task with four cores: 500 threads gave 251 tasks/s, 1000 gave 495
 tasks/s, and 2000 fell back to 351 tasks/s while the task body inflated from
 2.00 s to 3.82 s. That inflation is the signature of oversubscription, and it
@@ -273,20 +275,20 @@ is the same shape Celery's gevent pool shows at the same point. Past the knee
 you lose throughput *and* latency together.
 
 Do not simply copy the `--io-concurrency 500` from the README quickstart onto
-sync tasks. Measured cost of running wider than the optimum *(bench2)*: 9%
+sync tasks. Measured cost of running wider than the optimum *(measured)*: 9%
 on an HTTP read workload, 12% on a Django ORM workload.
 
 **Async io tasks.** `--io-concurrency` is the axis and slots are cheap, about
 4 KB each. Leave `--io-loops` at 1 unless you can show otherwise: measured
-*(bench2)*, 1 loop reached 1351 tasks/s against 1057, 957 and 969 for 2, 3 and
+*(measured)*, 1 loop reached 1351 tasks/s against 1057, 957 and 969 for 2, 3 and
 4 loops. Extra loops add threads contending for one GIL, not parallelism.
 
 **CPU tasks.** `--cpu-workers` at the core count is the right starting point.
-Sweep `--cpu-prefetch` by task size: measured *(bench2)*, 50 ms tasks were
+Sweep `--cpu-prefetch` by task size: measured *(measured)*, 50 ms tasks were
 fastest at `--cpu-prefetch 0` (60.5 against 56.0 tasks/s at the default 4),
 while sub millisecond tasks want it deep.
 
 **When none of it helps.** cauli's own dispatch measured 0.1% of worker CPU on
-the sync path and 5.8% on the async path *(bench2)*. If a workload is slow and
+the sync path and 5.8% on the async path *(measured)*. If a workload is slow and
 the flags do not move it, the cost is in the task body, the database or the
 service being called, and no worker setting will reach it.

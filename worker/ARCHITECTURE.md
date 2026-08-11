@@ -100,7 +100,7 @@ against Redis Streams per PROTOCOL.md. Module map:
   child wakeup). A staged request's hard-timeout clock does NOT start until
   the request ahead of it completes, or a queued task could be declared timed
   out having never run. Worth 4.1x at 0.5ms tasks and nothing at 51ms
-  (bench/RESULTS_CPU.md); the cost is that a child death fails everything
+  (measured); the cost is that a child death fails everything
   staged behind it as retryable WorkerLost, and staged tasks wait out the
   queue ahead of them.
   Hard timeout: SIGKILL by pid, expired requests fail "TimeoutError", the

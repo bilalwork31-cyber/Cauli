@@ -163,8 +163,8 @@ worker process per ~64 slots of `-c`, up to all cores, and supervises them
 itself: spawn, restart on death, signal fan out for graceful drain.
 Concurrency is divided across them. So `-c 50` on the box that also runs your
 Django and Redis stays one quiet process, while `-c 2000` on a dedicated 32
-core box fans out across every core, one GIL each (measured: 1 process to 4
-was +74% throughput at lower p99, bench3). `--procs N` overrides the count;
+core box fans out across every core, one GIL each (measured on 4 pinned
+cores: 1 process to 4 was +74% throughput at lower p99). `--procs N` overrides the count;
 without `-c` the worker stays a single process with its standalone defaults.
 
 Run `cauli-worker -A myproj.tasks:app -c 500 --print-plan` to see the exact
@@ -335,43 +335,11 @@ commit) and require Django only when actually called.
 
 ## Measured
 
-Numbers from `bench2/`, a campaign written to be rerun against us: worker
-pinned to 4 cores, Redis, Postgres, the mock API and the driver kept off them,
-**every arm tuned at its own optimum**, headline cells repeated and reported as
-medians. Full method, fairness controls and all 500+ raw cells:
-`bench2/RESULTS.md`.
-
-Best tuned Celery arm against best tuned cauli arm, drain rate:
-
-| Workload | Celery best | cauli best | ratio |
-|---|---|---|---|
-| CPU that releases the GIL (hashlib), 0.5 ms | 889/s | 5018/s | 5.6x |
-| same, 2 ms | 805/s | 1434/s | 1.8x |
-| same, 50 ms | 58/s | 60/s | parity |
-| Pure Python CPU (holds the GIL), 0.5 ms | 895/s | 5228/s | 5.8x |
-| same, 2 ms | 812/s | 1430/s | 1.8x |
-| same, 50 ms | 66/s | 60/s | 0.9x, Celery wins |
-| HTTP GET, 20 ms endpoint, pooled Session | 722/s at 328 MB | 963/s at 51 MB | 1.3x at 6.4x less RAM |
-| Django ORM write | 264/s at 357 MB | 608/s at 57 MB | 2.3x at 6.2x less RAM |
-
-**The 50 ms rows are the honest ones to read first.** Once a task is big
-enough, both stacks are core bound and parity is the ceiling: 4 cores of
-hashing is 4 cores of hashing whoever schedules it. cauli's advantage is per
-task overhead, so it grows as tasks get smaller and vanishes as they get
-larger. At 50 ms of pure Python, Celery prefork wins outright, and the table
-says so.
-
-The CPU rows are two workloads on purpose: a body that releases the GIL
-parallelises on threads and one that holds it does not, and the two behave
-about 4x apart under the same label. Any benchmark that just says "CPU" is
-hiding one of them.
-
-**Async is where the gap is structural** (`bench3/`, five async capable
-workers, a 20 ms task on the same 4 pinned cores): peak drain was cauli
-11,300/s, taskiq 7,100/s, SAQ 3,500/s, arq 900/s. The mechanism is in the
-data: arq spends 30.8 redis ops per task against cauli's 3.1. Celery does not
-place: its gevent pool drained 125/s through Celery's consumer on work that
-raw gevent does at 36,000/s.
+The earlier benchmark campaigns (Celery, arq, SAQ and taskiq comparisons)
+have been retired from this repository and are being replaced by one single,
+reproducible benchmark. Until that lands, this README makes no performance
+claims. The tuning defaults keep the measured facts that produced them; those
+are documented per flag in `docs/CONFIGURATION.md`.
 
 ## Semantics & limits
 
@@ -412,9 +380,6 @@ raw gevent does at 36,000/s.
 - `docs/` — configuration reference and tuning guide (`docs/CONFIGURATION.md`)
 - `worker/` — Rust worker binary (`cauli-worker`)
 - `py/` — Python package `cauli` (client API, `cauli-beat` scheduler, cpu child executor)
-- `bench2/` — cauli vs Celery campaign, method and results (`bench2/RESULTS.md`)
-- `bench3/` — five worker campaign: cauli, Celery, arq, SAQ, taskiq
-- `bench/` — the original harness (superseded by bench2)
 
 ## Status
 

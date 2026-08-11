@@ -17,14 +17,6 @@ __pycache__/
 _probe/
 _u/
 
-# Benchmark outputs and logs
-bench/results/
-bench/campaign/results/
-bench/**/results/
-bench2/results/
-bench2/_enq_app.py
-bench3/results/
-bench3/_enq_app.py
 itest/worker.log
 *.log
 
