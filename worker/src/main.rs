@@ -88,6 +88,10 @@ fn real_main() -> i32 {
         .map(|n| n.get())
         .unwrap_or(1);
     let resolved = cli::resolve(&args, cores);
+    if args.print_plan {
+        print_plan(&args, &resolved, cores);
+        return 0;
+    }
     if resolved.procs > 1 {
         info!(
             "cauli-worker supervising {} procs: app={} c={} -> per-proc io_threads={} io_concurrency={} cpu_workers={}",
@@ -214,7 +218,6 @@ async fn run_worker(
     }
 
     let counters = Arc::new(stats::Counters::default());
-    let cpu_workers = resolved.cpu_workers;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     // PROTOCOL §1: "{hostname}:{pid}" (any unique string is acceptable) --
     // no per-loop/per-thread `n` component exists in this worker (one fetch
@@ -226,33 +229,35 @@ async fn run_worker(
         std::process::id()
     );
     let io_concurrency = resolved.io_concurrency;
-    // Only pay for cpu executors if the app actually has cpu tasks. Routing is
-    // by REGISTRY kind (dispatch.rs), so with no cpu-kind task registered the
-    // cpu path is unreachable and the fork-server parent + N children would be
-    // pure resident memory for work that can never arrive.
+    // Only pay for cpu executors if the app actually has cpu tasks, and even
+    // then only once one arrives (ctx.cpu_pool). Routing is by REGISTRY kind
+    // (dispatch.rs), so with no cpu-kind task registered the cpu path is
+    // unreachable and the fork-server parent + N children would be pure
+    // resident memory for work that can never arrive.
     let needs_cpu = appcfg.tasks.values().any(|s| s.kind == "cpu");
-    let cpu_pool = if needs_cpu {
-        cpu::start(
-            cpu_workers,
-            args.cpu_child_threads,
-            args.cpu_prefetch,
-            &args.python,
-            &args.app,
-            args.no_fork_server,
-            counters.clone(),
-        )
-        .await
-    } else {
+    let cpu_cfg = needs_cpu.then(|| cpu::StartCfg {
+        workers: resolved.cpu_workers,
+        child_threads: args.cpu_child_threads,
+        prefetch: args.cpu_prefetch,
+        recycle: args.cpu_max_tasks_per_child,
+        python: args.python.clone(),
+        app_spec: args.app.clone(),
+        no_fork_server: args.no_fork_server,
+    });
+    if !needs_cpu {
+        info!("no kind=\"cpu\" tasks registered: cpu pool disabled");
+    } else if !args.eager_cpu {
         info!(
-            "no kind=\"cpu\" tasks registered: cpu pool not started \
-             (skipping the fork-server parent and {cpu_workers} children)"
+            "cpu tasks registered: pool of {} children starts on the first \
+             cpu task (--eager-cpu warms it at boot instead)",
+            resolved.cpu_workers
         );
-        cpu::disabled()
-    };
+    }
     let ctx = Arc::new(Ctx {
         io_sem: Arc::new(tokio::sync::Semaphore::new(io_concurrency)),
         sync_pool: pyrt::SyncPool::start(pyrt.clone(), resolved.io_threads, io_concurrency),
-        cpu: cpu_pool,
+        cpu: tokio::sync::OnceCell::new(),
+        cpu_cfg,
         registry: appcfg.tasks,
         redis: write_conn,
         counters,
@@ -265,8 +270,11 @@ async fn run_worker(
         shutdown: shutdown_rx,
         args,
     });
+    if ctx.args.eager_cpu && needs_cpu {
+        let _ = ctx.cpu_pool().await;
+    }
 
-    spawn_signal_task(shutdown_tx, ctx.cpu.clone());
+    spawn_signal_task(shutdown_tx, ctx.clone());
     tokio::spawn(loops::mover_loop(ctx.clone()));
     tokio::spawn(loops::recovery_loop(ctx.clone()));
     tokio::spawn(loops::stats_loop(ctx.clone()));
@@ -285,11 +293,13 @@ async fn run_worker(
         info!("drained cleanly");
     }
     info!("{}", ctx.counters.stats_line());
-    cpu::kill_children(&ctx.cpu);
+    if let Some(pool) = ctx.cpu.get() {
+        cpu::kill_children(pool);
+    }
     0
 }
 
-fn spawn_signal_task(shutdown_tx: watch::Sender<bool>, cpu_pool: cpu::CpuPool) {
+fn spawn_signal_task(shutdown_tx: watch::Sender<bool>, ctx: Arc<Ctx>) {
     tokio::spawn(async move {
         let mut term = signal(SignalKind::terminate()).expect("SIGTERM handler");
         let mut int = signal(SignalKind::interrupt()).expect("SIGINT handler");
@@ -307,9 +317,46 @@ fn spawn_signal_task(shutdown_tx: watch::Sender<bool>, cpu_pool: cpu::CpuPool) {
         // tail entirely (process::exit below never returns), so it must do
         // its own cpu pool cleanup or the fork-server socket file (and,
         // absent PDEATHSIG, its children) would be abandoned.
-        cpu::kill_children(&cpu_pool);
+        if let Some(pool) = ctx.cpu.get() {
+            cpu::kill_children(pool);
+        }
         std::process::exit(130);
     });
+}
+
+/// --print-plan: the derived execution plan, human first. Runs before any
+/// Python or Redis so it is safe anywhere, including boxes without the app.
+fn print_plan(args: &cli::Args, r: &cli::Resolved, cores: usize) {
+    let c = args
+        .concurrency
+        .map_or("unset (standalone defaults)".to_string(), |c| c.to_string());
+    println!("cauli-worker execution plan");
+    println!("  cores detected     {cores}");
+    println!("  -c (total)         {c}");
+    println!("  worker processes   {}", r.procs);
+    println!("  per process:");
+    println!(
+        "    io tasks in flight  {}  (async + sync together)",
+        r.io_concurrency
+    );
+    println!("    sync io threads     {}", r.io_threads);
+    println!("    asyncio loops       {}", args.io_loops);
+    println!(
+        "    cpu children        {}  ({}; only if the app registers kind=\"cpu\" tasks)",
+        r.cpu_workers,
+        if args.eager_cpu {
+            "started at boot: --eager-cpu"
+        } else {
+            "started on first cpu task"
+        }
+    );
+    println!(
+        "  totals: {} io tasks in flight, {} sync threads, up to {} cpu children",
+        r.io_concurrency * r.procs,
+        r.io_threads * r.procs,
+        r.cpu_workers * r.procs
+    );
+    println!("  override any value with its flag; see --help and docs/CONFIGURATION.md");
 }
 
 /// Mask `user:password@` userinfo before a redis URL reaches logs or error

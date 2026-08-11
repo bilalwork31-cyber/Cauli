@@ -153,13 +153,23 @@ plain `def` on the thread pool, `kind="cpu"` on the child process pool. One
 worker command replaces all three, at the same time, and picking wrong stops
 being possible.
 
-**`-c` also turns on multiprocessing.** With `-c` set the binary starts
-min(cores, 4) worker processes and supervises them itself: spawn, restart on
-death, signal fan out for graceful drain. Concurrency is divided across them.
-Measured (bench3, 4 pinned cores): going from 1 process to 4 was +74%
-throughput at lower p99, because each process gets its own GIL. `--procs N`
-overrides the count; without `-c` the worker stays a single process with its
-standalone defaults.
+**One warning for Celery migrants: `-c` counts tasks, not processes.** Celery
+prefork's `-c 50` forks 50 OS processes. Here `-c 50` means 50 tasks in
+flight, which is what Sidekiq, Hangfire and asynq mean by concurrency too.
+Same capacity, a fraction of the RAM. Update autoscaler math accordingly.
+
+**`-c` also turns on multiprocessing, proportionally.** The binary starts one
+worker process per ~64 slots of `-c`, up to all cores, and supervises them
+itself: spawn, restart on death, signal fan out for graceful drain.
+Concurrency is divided across them. So `-c 50` on the box that also runs your
+Django and Redis stays one quiet process, while `-c 2000` on a dedicated 32
+core box fans out across every core, one GIL each (measured: 1 process to 4
+was +74% throughput at lower p99, bench3). `--procs N` overrides the count;
+without `-c` the worker stays a single process with its standalone defaults.
+
+Run `cauli-worker -A myproj.tasks:app -c 500 --print-plan` to see the exact
+processes, threads, slots and cpu children a command will create, without
+starting anything.
 
 Every internal knob (`--io-threads`, `--io-concurrency`, `--cpu-workers`, ...)
 still exists as an explicit override and always wins over the derivation. The
@@ -167,7 +177,10 @@ full reference with the measurements behind each default is in
 `docs/CONFIGURATION.md`.
 
 Cpu tasks run in a forked child-process pool by default (one warmed, `gc.freeze()`d parent;
-children fork copy-on-write, so respawning after a crash or hard timeout is cheap). Add
+children fork copy-on-write, so respawning after a crash or hard timeout is cheap). The pool
+starts on the first cpu task rather than at boot, so registering a rarely used cpu task costs
+nothing until it runs (`--eager-cpu` warms it at boot). `--cpu-max-tasks-per-child N` recycles
+a child after N tasks, the backstop for leaky C extensions. Add
 `--cpu-child-threads M` to pipeline up to M requests per child on workloads that release the
 GIL (e.g. blocking network calls inside a `kind="cpu"` task); `--no-fork-server` falls back to
 one process per cpu task (also entered automatically if fork-server startup fails).

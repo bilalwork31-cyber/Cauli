@@ -180,12 +180,13 @@ pub async fn run_cpu_task(ctx: &Arc<Ctx>, env: &Envelope) -> Outcome {
         timeout_ms: env.timeout_ms,
         resp: tx,
     };
-    match ctx.cpu.tx.try_send(job) {
+    let cpu = ctx.cpu_pool().await;
+    match cpu.tx.try_send(job) {
         Ok(()) => {}
         Err(async_channel::TrySendError::Full(job)) => {
-            ctx.cpu.overflow.fetch_add(1, Ordering::SeqCst);
-            let r = ctx.cpu.tx.send(job).await;
-            ctx.cpu.overflow.fetch_sub(1, Ordering::SeqCst);
+            cpu.overflow.fetch_add(1, Ordering::SeqCst);
+            let r = cpu.tx.send(job).await;
+            cpu.overflow.fetch_sub(1, Ordering::SeqCst);
             if r.is_err() {
                 return fail("WorkerLost", "cpu pool closed".into());
             }

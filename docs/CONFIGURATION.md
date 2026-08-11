@@ -61,8 +61,9 @@ Two other reasons to pick `kind="cpu"`:
 
 | Flag | Default | Effect |
 |---|---|---|
-| `-c`, `--concurrency` | unset | Total tasks in flight across all worker processes, like Celery's `-c`. Setting it derives everything below |
-| `--procs` | 1, or min(cores, 4) with `-c` | Worker processes. The binary supervises them itself: spawn, restart on death, signal fan out for graceful drain |
+| `-c`, `--concurrency` | unset | Total tasks in flight across all worker processes. **Tasks, not processes**: Celery prefork's `-c 50` forks 50 processes, this `-c 50` runs 50 tasks on far less. Setting it derives everything below |
+| `--procs` | 1, or with `-c` one process per ~64 slots up to all cores | Worker processes. The binary supervises them itself: spawn, restart on death, signal fan out for graceful drain |
+| `--print-plan` | off | Print the derived plan (processes, threads, slots, cpu children) and exit. Needs no app and no Redis |
 
 With `-c` set, the worker derives its internals from it. Every derived value
 can still be pinned by passing its flag explicitly; an explicit flag always
@@ -70,10 +71,10 @@ wins. The rules, each from a measured result:
 
 | Derived | Formula | Why |
 |---|---|---|
-| `--procs` | min(cores, 4, c) | 1 to 4 processes was +74% throughput at lower p99 (bench3): one GIL each |
+| `--procs` | min(cores, c / 64) | Each process is one GIL: fanning out was +74% throughput at lower p99 (bench3). Scaling by `-c` keeps a small queue worker to one quiet process on a box shared with your web app and Redis, while a large `-c` on a dedicated box uses every core. The 64 slot target is a chosen default, not yet a swept one |
 | `--io-concurrency` | c / procs | The gate is the real bound for `async def` tasks; a slot costs about 4 KB |
 | `--io-threads` | min(c, 512) / procs, at most the gate | The sync knee is near 1000 threads per process; past it throughput and latency fall together. Staying at 1x the gate is the latency honest default: oversubscribing buys throughput by inflating task p99 (measured 2048 slots on 4 cores: a 20 ms body reached a 92 ms p99) |
-| `--cpu-workers` | cores / procs | More cpu children than cores buys nothing |
+| `--cpu-workers` | min(cores, c) / procs | More cpu children than cores buys nothing, and more than `-c` would make `-c 8` on a cpu queue mean something other than 8 |
 | `--io-loops` | always 1 | 1 loop beat 2, 3 and 4 in every sweep: extra loops contend for one GIL |
 
 Without `-c` nothing changes: one process, the standalone defaults below.
@@ -108,9 +109,11 @@ and a socket rather than a thread.
 
 | Flag | Default | Effect |
 |---|---|---|
-| `--cpu-workers` | cores / procs | Child processes for `kind="cpu"` tasks |
+| `--cpu-workers` | min(cores, c) / procs | Child processes for `kind="cpu"` tasks |
 | `--cpu-child-threads` | 1 | Requests pipelined per child, matched by id. Range 1 to 1024 |
 | `--cpu-prefetch` | 4 | Requests staged in a child's socket buffer beyond the one it is running. 0 disables |
+| `--cpu-max-tasks-per-child` | 0 (never) | Recycle a child after this many completed tasks. The backstop for leaky C extensions and slowly dirtied copy on write pages, like Celery's maxtasksperchild. Staged work drains first; no task is lost to a recycle |
+| `--eager-cpu` | off | Start the cpu pool at boot instead of on the first cpu task, buying the first task a warm start |
 | `--no-fork-server` | off | One process per cpu task over stdio instead of the fork-server. Entered automatically if fork-server startup fails |
 
 `--cpu-child-threads` above 1 only helps when the body **releases** the GIL,
@@ -123,10 +126,11 @@ dies, everything staged behind it fails as retryable `WorkerLost`, and a staged
 task waits out the tasks ahead of it. Raise it for small tasks, lower it for
 long ones.
 
-**Registering any `kind="cpu"` task forks the cpu pool at worker startup**,
-one fork-server plus `--cpu-workers` children, whether or not a cpu task ever
-arrives. An io only deployment that registers cpu tasks it never calls pays for
-those children in memory.
+**The cpu pool starts on the first cpu task, not at boot.** An io only
+deployment that registers cpu tasks it never calls pays nothing for them. The
+first cpu task after a start waits out the pool spawn (an app import, typically
+seconds); pass `--eager-cpu` when that first task's latency matters more than
+the resident children.
 
 ### Delivery and safety
 
@@ -253,13 +257,13 @@ right value depends on your task body more than on cauli.
 
 **Processes first.** `--procs` is the largest axis the campaign found: on 4
 pinned cores, 1 process to 4 was +74% throughput with lower p99, because each
-process brings its own GIL *(bench3)*. `-c` turns it on automatically; a
-deployment still pinned to `--procs 1` is leaving that on the table. The
-supervisor restarts a dead process after 1 s and forwards SIGTERM to all of
-them, so systemd and docker manage one pid as before. One caveat carried over
-from single process deployments: registering any `kind="cpu"` task forks a cpu
-pool in **each** process at startup; `--cpu-workers` is divided across procs so
-the child total stays at the core count.
+process brings its own GIL *(bench3)*. `-c` scales it automatically, one
+process per ~64 slots up to the cores, so a busy dedicated box fans out and a
+small colocated worker stays out of your web app's way. The supervisor
+restarts a dead process after 1 s and forwards SIGTERM to all of them, so
+systemd and docker manage one pid as before. Each process that receives cpu
+tasks starts its own cpu pool on the first one; `--cpu-workers` is divided
+across procs so the child total stays at the core count.
 
 **Sync io tasks.** `--io-threads` is the axis. Measured *(bench2)* on a two
 second task with four cores: 500 threads gave 251 tasks/s, 1000 gave 495

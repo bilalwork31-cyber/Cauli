@@ -18,7 +18,7 @@ pub async fn fetch_loop(ctx: Arc<Ctx>, mut fetch_conn: redis::aio::ConnectionMan
     let keys: Vec<String> = ctx.queues.iter().map(|q| broker::q_key(q)).collect();
     let ids: Vec<&str> = ctx.queues.iter().map(|_| ">").collect();
     while !ctx.shutting_down() {
-        if ctx.io_sem.available_permits() == 0 || ctx.cpu.overflow.load(Ordering::SeqCst) > 0 {
+        if ctx.io_sem.available_permits() == 0 || ctx.cpu_overflow() > 0 {
             tokio::time::sleep(Duration::from_millis(25)).await;
             continue;
         }
@@ -134,7 +134,7 @@ pub async fn recovery_loop(ctx: Arc<Ctx>) {
 /// large backlog cannot spawn an unbounded number of in-memory dispatch
 /// tasks. Returns false if shutdown began while waiting.
 async fn admission_open(ctx: &Arc<Ctx>) -> bool {
-    while ctx.io_sem.available_permits() == 0 || ctx.cpu.overflow.load(Ordering::SeqCst) > 0 {
+    while ctx.io_sem.available_permits() == 0 || ctx.cpu_overflow() > 0 {
         if ctx.shutting_down() {
             return false;
         }

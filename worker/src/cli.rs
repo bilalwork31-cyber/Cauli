@@ -26,10 +26,15 @@ pub struct Args {
     pub concurrency: Option<usize>,
 
     /// Worker processes, supervised by this binary (spawn, restart on death,
-    /// signal fan-out). Default: 1, or min(cores, 4) when -c is set. -c is
-    /// total and is divided across processes.
+    /// signal fan-out). Default: 1, or with -c one process per ~64 slots up
+    /// to all cores. -c is total and is divided across processes.
     #[arg(long)]
     pub procs: Option<usize>,
+
+    /// Print the derived execution plan (processes, threads, slots, cpu
+    /// children) and exit without starting anything
+    #[arg(long, default_value_t = false)]
+    pub print_plan: bool,
 
     /// Visibility timeout in seconds (crash recovery, PROTOCOL §4.4). Must be
     /// at least 1 (0 would make the recovery loop reclaim every
@@ -88,6 +93,18 @@ pub struct Args {
     #[arg(long, default_value_t = 4, help_heading = ADVANCED)]
     pub cpu_prefetch: usize,
 
+    /// Recycle a cpu child after it completes this many tasks (0 = never).
+    /// The backstop for leaky C extensions and slowly dirtied copy-on-write
+    /// pages, like Celery's maxtasksperchild. Staged prefetch work always
+    /// drains before the recycle fires, so no task is lost to it
+    #[arg(long, default_value_t = 0, help_heading = ADVANCED)]
+    pub cpu_max_tasks_per_child: usize,
+
+    /// Start the cpu pool at boot instead of on the first cpu task. Costs
+    /// resident children immediately; buys the first cpu task a warm start
+    #[arg(long, default_value_t = false, help_heading = ADVANCED)]
+    pub eager_cpu: bool,
+
     /// Disable the fork-server cpu child model: spawn each child directly
     /// over stdio, one request in flight per child (PROTOCOL §5.1 fallback
     /// mode). Also entered automatically if fork-server startup fails
@@ -122,9 +139,17 @@ pub struct Resolved {
     pub cpu_workers: usize,
 }
 
-/// Derivation rules (all thresholds measured, bench2/bench3; docs/CONFIGURATION.md):
-/// - procs: explicit, else min(cores, 4, c) with -c (the 1→4 process win),
-///   else 1 (standalone behavior unchanged).
+/// Auto procs target: one worker process per this many concurrency slots,
+/// never more than the cores. Small -c on a shared box (the Django + Redis +
+/// worker colocation everyone actually runs) stays a single process; a large
+/// -c on a dedicated box fans across every core, one GIL each (bench3 on 4
+/// pinned cores: 1→4 procs was +74% throughput at lower p99). The 64 is a
+/// defensible target, not yet a swept one — pin it when a wider box exists.
+const SLOTS_PER_PROC: usize = 64;
+
+/// Derivation rules (thresholds measured, bench2/bench3; docs/CONFIGURATION.md):
+/// - procs: explicit, else min(cores, c/SLOTS_PER_PROC) with -c, else 1
+///   (standalone behavior unchanged).
 /// - io_concurrency: explicit, else c/procs with -c, else 256. The gate is
 ///   the bound for async tasks (a slot costs ~4 KB).
 /// - io_threads: explicit, else min(c, 512)/procs with -c, else 64. Capped at
@@ -133,13 +158,15 @@ pub struct Resolved {
 ///   together, so the derived default stays 1x the gate up to the cap rather
 ///   than oversubscribing (oversubscription trades task p99 for throughput —
 ///   an explicit choice, not a default).
-/// - cpu_workers: explicit, else cores/procs (more than cores buys nothing).
+/// - cpu_workers: explicit, else cores/procs but never more than -c's share:
+///   more children than cores buys nothing, and more than c would make
+///   `-c 8` on a pdf-convert queue mean something other than 8.
 pub fn resolve(args: &Args, cores: usize) -> Resolved {
     let cores = cores.max(1);
     let procs = args
         .procs
         .unwrap_or_else(|| match args.concurrency {
-            Some(c) => cores.min(4).min(c.max(1)),
+            Some(c) => cores.min(c.max(1).div_ceil(SLOTS_PER_PROC)),
             None => 1,
         })
         .max(1);
@@ -163,7 +190,13 @@ pub fn resolve(args: &Args, cores: usize) -> Resolved {
     };
     let cpu_workers = args
         .cpu_workers
-        .unwrap_or_else(|| cores.div_ceil(procs))
+        .unwrap_or_else(|| {
+            let per_proc = cores.div_ceil(procs);
+            match args.concurrency {
+                Some(c) => per_proc.min(c.max(1).div_ceil(procs)),
+                None => per_proc,
+            }
+        })
         .max(1);
     Resolved {
         procs,
@@ -202,6 +235,9 @@ mod tests {
         assert_eq!(a.io_concurrency, None);
         assert_eq!(a.cpu_workers, None);
         assert_eq!(a.cpu_child_threads, 1);
+        assert_eq!(a.cpu_max_tasks_per_child, 0);
+        assert!(!a.eager_cpu);
+        assert!(!a.print_plan);
         assert!(!a.no_fork_server);
         assert_eq!(a.batch, 16);
         assert_eq!(a.visibility_timeout, 60);
@@ -287,25 +323,51 @@ mod tests {
     }
 
     #[test]
-    fn resolve_c50_divides_across_auto_procs() {
+    fn resolve_small_c_stays_one_proc() {
+        // The shared box case (Django + Redis + worker colocated): a queue
+        // worker at -c 50 must not fan out across the machine.
         let r = resolve(&parse(&["-c", "50"]), 6);
         assert_eq!(
             r,
             Resolved {
-                procs: 4,
-                io_threads: 13,
-                io_concurrency: 13,
+                procs: 1,
+                io_threads: 50,
+                io_concurrency: 50,
+                cpu_workers: 6,
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_large_c_uses_every_core() {
+        let r = resolve(&parse(&["-c", "4000"]), 6);
+        assert_eq!(r.procs, 6);
+        assert_eq!(r.io_concurrency, 667);
+        assert_eq!(r.io_threads, 86); // 512/6, not 667: sync knee guard
+        assert_eq!(r.cpu_workers, 1);
+    }
+
+    #[test]
+    fn resolve_big_box_fans_wide() {
+        let r = resolve(&parse(&["-c", "1000"]), 32);
+        assert_eq!(
+            r,
+            Resolved {
+                procs: 16, // 1000 / SLOTS_PER_PROC, under the 32 cores
+                io_threads: 32,
+                io_concurrency: 63,
                 cpu_workers: 2,
             }
         );
     }
 
     #[test]
-    fn resolve_large_c_caps_threads_at_512_total() {
-        let r = resolve(&parse(&["-c", "4000"]), 6);
-        assert_eq!(r.procs, 4);
-        assert_eq!(r.io_concurrency, 1000);
-        assert_eq!(r.io_threads, 128); // 512/4, not 1000: sync knee guard
+    fn resolve_c_caps_cpu_children() {
+        // "-c 8 on a pdf-convert queue" must mean 8, even for the cpu lane.
+        let r = resolve(&parse(&["-c", "8"]), 32);
+        assert_eq!(r.procs, 1);
+        assert_eq!(r.cpu_workers, 8);
+        assert_eq!(r.io_concurrency, 8);
     }
 
     #[test]
@@ -323,11 +385,12 @@ mod tests {
     }
 
     #[test]
-    fn resolve_tiny_c_caps_auto_procs() {
+    fn resolve_tiny_c_is_tiny_everywhere() {
         let r = resolve(&parse(&["-c", "2"]), 6);
-        assert_eq!(r.procs, 2);
-        assert_eq!(r.io_concurrency, 1);
-        assert_eq!(r.io_threads, 1);
+        assert_eq!(r.procs, 1);
+        assert_eq!(r.io_concurrency, 2);
+        assert_eq!(r.io_threads, 2);
+        assert_eq!(r.cpu_workers, 2);
     }
 
     #[test]

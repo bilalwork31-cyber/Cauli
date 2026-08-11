@@ -22,7 +22,11 @@ pub struct Ctx {
     pub io_sem: Arc<Semaphore>,
     pub sync_pool: SyncPool,
     pub pyrt: Arc<PyRuntime>,
-    pub cpu: CpuPool,
+    /// Lazily started cpu pool: empty until the first cpu task (or startup
+    /// with `--eager-cpu`). `cpu_cfg` is None when no cpu task is registered,
+    /// in which case first use gets the permanently closed `disabled()` pool.
+    pub cpu: tokio::sync::OnceCell<CpuPool>,
+    pub cpu_cfg: Option<crate::cpu::StartCfg>,
     pub result_ttl: u64,
     pub idemp_ttl: u64,
     /// PROTOCOL §9.2 per-queue max age in MILLISECONDS, `"*"` = fallback.
@@ -38,6 +42,34 @@ pub const QUEUE_TTL_WILDCARD: &str = "*";
 impl Ctx {
     pub fn shutting_down(&self) -> bool {
         *self.shutdown.borrow()
+    }
+
+    /// The cpu pool, started on first use. Concurrent callers during the
+    /// startup window all wait on the same init (OnceCell); after it, this is
+    /// a lock-free read.
+    pub async fn cpu_pool(&self) -> &CpuPool {
+        self.cpu
+            .get_or_init(|| async {
+                match &self.cpu_cfg {
+                    Some(cfg) => {
+                        tracing::info!(
+                            "first cpu task: starting cpu pool now ({} children)",
+                            cfg.workers
+                        );
+                        crate::cpu::start(cfg.clone(), self.counters.clone()).await
+                    }
+                    None => crate::cpu::disabled(),
+                }
+            })
+            .await
+    }
+
+    /// Dispatch tasks currently blocked on a full cpu backlog; 0 while the
+    /// pool has not started (nothing can be blocked on it yet).
+    pub fn cpu_overflow(&self) -> usize {
+        self.cpu
+            .get()
+            .map_or(0, |p| p.overflow.load(Ordering::SeqCst))
     }
 
     /// Configured max age for `queue`, in ms: an exact match wins over the

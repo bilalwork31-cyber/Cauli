@@ -143,18 +143,37 @@ pub fn disabled() -> CpuPool {
     }
 }
 
+/// Everything needed to start the pool. Held by Ctx so the pool can start
+/// lazily: forked on the first cpu task rather than at boot, so an io heavy
+/// deployment that registers a rarely used cpu task does not pay resident
+/// children for work that has not arrived (`--eager-cpu` restores warmup).
+#[derive(Clone)]
+pub struct StartCfg {
+    pub workers: usize,
+    pub child_threads: usize,
+    pub prefetch: usize,
+    /// Recycle a child after this many completed tasks (0 = never). The
+    /// backstop for leaky C extensions and CoW pages dirtied over hours,
+    /// same role as Celery's maxtasksperchild.
+    pub recycle: usize,
+    pub python: String,
+    pub app_spec: String,
+    pub no_fork_server: bool,
+}
+
 /// Start the cpu pool. Tries fork-server mode unless `no_fork_server`; any
 /// startup failure there (listener bind, parent spawn, no server-ready line)
 /// logs a warning and falls back to stdio mode.
-pub async fn start(
-    workers: usize,
-    child_threads: usize,
-    prefetch: usize,
-    python: &str,
-    app_spec: &str,
-    no_fork_server: bool,
-    counters: Arc<Counters>,
-) -> CpuPool {
+pub async fn start(cfg: StartCfg, counters: Arc<Counters>) -> CpuPool {
+    let StartCfg {
+        workers,
+        child_threads,
+        prefetch,
+        recycle,
+        python,
+        app_spec,
+        no_fork_server,
+    } = cfg;
     let child_threads = child_threads.max(1);
     // Backlog bound: 2 in-flight-capacities worth of pending items. Prefetched
     // requests live in the children, not this channel, so they are counted in
@@ -163,7 +182,7 @@ pub async fn start(
     let (tx, rx) = async_channel::bounded::<CpuJob>(cap);
     let overflow = Arc::new(AtomicUsize::new(0));
     let pids = Arc::new(Mutex::new(Vec::new()));
-    let (prog, argv) = child_argv(python, app_spec);
+    let (prog, argv) = child_argv(&python, &app_spec);
 
     if !no_fork_server {
         match start_fork_server(
@@ -171,6 +190,7 @@ pub async fn start(
                 workers,
                 child_threads,
                 prefetch,
+                recycle,
                 prog: prog.clone(),
                 argv: argv.clone(),
             },
@@ -197,6 +217,7 @@ pub async fn start(
             i,
             prog.clone(),
             argv.clone(),
+            recycle,
             rx.clone(),
             counters.clone(),
             pids.clone(),
@@ -355,6 +376,7 @@ pub struct PoolCfg {
     pub workers: usize,
     pub child_threads: usize,
     pub prefetch: usize,
+    pub recycle: usize,
     pub prog: String,
     pub argv: Vec<String>,
 }
@@ -369,6 +391,7 @@ async fn start_fork_server(
         workers,
         child_threads,
         prefetch,
+        recycle,
         prog,
         argv,
     } = cfg;
@@ -412,7 +435,7 @@ async fn start_fork_server(
             i,
             fork_tx.clone(),
             conn_rx.clone(),
-            prefetch,
+            ServeCfg { prefetch, recycle },
             rx.clone(),
             counters.clone(),
             pids.clone(),
@@ -625,11 +648,18 @@ async fn read_child_ready(
 /// One pool slot: keep exactly one serving child alive, requesting a
 /// replacement fork whenever the current child is gone (death, hard-timeout
 /// SIGKILL). Respawns are cheap: the parent forks its warmed, frozen image.
+/// Per-child serving knobs, fixed for the pool's lifetime.
+#[derive(Clone, Copy)]
+struct ServeCfg {
+    prefetch: usize,
+    recycle: usize,
+}
+
 async fn slot_loop(
     idx: usize,
     fork_tx: mpsc::Sender<()>,
     conn_rx: async_channel::Receiver<ChildConn>,
-    prefetch: usize,
+    cfg: ServeCfg,
     rx: async_channel::Receiver<CpuJob>,
     counters: Arc<Counters>,
     pids: Arc<Mutex<Vec<u32>>>,
@@ -650,7 +680,7 @@ async fn slot_loop(
             "cpu[{idx}]: fork child serving pid={} concurrency={}",
             conn.pid, conn.concurrency
         );
-        if !serve_child(idx, conn, prefetch, &rx, &counters, &pids).await {
+        if !serve_child(idx, conn, cfg, &rx, &counters, &pids).await {
             return; // job channel closed: worker exiting
         }
     }
@@ -721,6 +751,10 @@ enum ChildGone {
     /// A write to the child's socket failed or stalled past its budget
     /// (FS-4): the child is presumed wedged, not confirmed exited. SIGKILL it.
     Wedged,
+    /// `--cpu-max-tasks-per-child` reached with nothing in flight: SIGKILL and
+    /// fork a replacement. Only ever chosen with an empty pending map, so no
+    /// task can be lost to it.
+    Recycled,
     /// The job channel closed: worker shutdown.
     Shutdown,
 }
@@ -741,11 +775,12 @@ enum ChildGone {
 async fn serve_child(
     idx: usize,
     conn: ChildConn,
-    prefetch: usize,
+    cfg: ServeCfg,
     rx: &async_channel::Receiver<CpuJob>,
     counters: &Arc<Counters>,
     pids: &Arc<Mutex<Vec<u32>>>,
 ) -> bool {
+    let ServeCfg { prefetch, recycle } = cfg;
     let ChildConn {
         mut lines,
         mut write,
@@ -758,6 +793,10 @@ async fn serve_child(
     // reached (it reads its socket in order) and which are still queued.
     let mut order: std::collections::VecDeque<String> = std::collections::VecDeque::new();
     let queue_depth = concurrency.saturating_add(prefetch);
+    // --cpu-max-tasks-per-child accounting. The intake gate below stops
+    // ADMITTING once completed + in flight reaches the budget, so staged
+    // prefetch work always drains before the recycle fires.
+    let mut completed: usize = 0;
 
     let gone = loop {
         let next_deadline = pending.values().filter_map(|p| p.deadline).min();
@@ -783,6 +822,14 @@ async fn serve_child(
                                 // holding prefetched starts executing now, so
                                 // start that request's clock now too.
                                 arm_started(&mut pending, &order, concurrency);
+                                completed += 1;
+                                if recycle > 0 && completed >= recycle && pending.is_empty() {
+                                    info!(
+                                        "cpu[{idx}] pid={pid}: recycled after {completed} tasks \
+                                         (--cpu-max-tasks-per-child {recycle})"
+                                    );
+                                    break ChildGone::Recycled;
+                                }
                             }
                             None => warn!(
                                 "cpu[{idx}] pid={pid}: response with unknown or missing id: {}",
@@ -799,7 +846,8 @@ async fn serve_child(
                     }
                 }
             }
-            job = rx.recv(), if pending.len() < queue_depth => {
+            job = rx.recv(), if pending.len() < queue_depth
+                && (recycle == 0 || completed + pending.len() < recycle) => {
                 match job {
                     Ok(job) => {
                         let mut l = job.req_line;
@@ -892,6 +940,7 @@ async fn stdio_child_loop(
     idx: usize,
     prog: String,
     argv: Vec<String>,
+    recycle: usize,
     rx: async_channel::Receiver<CpuJob>,
     counters: Arc<Counters>,
     pids: Arc<Mutex<Vec<u32>>>,
@@ -950,6 +999,7 @@ async fn stdio_child_loop(
         info!("cpu[{idx}]: child ready pid={pid}");
 
         let mut respawn = false;
+        let mut completed: usize = 0;
         while !respawn {
             let job = match rx.recv().await {
                 Ok(j) => j,
@@ -975,6 +1025,14 @@ async fn stdio_child_loop(
             match timeout(Duration::from_millis(job.timeout_ms), lines.next_line()).await {
                 Ok(Ok(Some(resp))) => {
                     let _ = job.resp.send(CpuOutcome::Resp(resp));
+                    completed += 1;
+                    if recycle > 0 && completed >= recycle {
+                        info!(
+                            "cpu[{idx}] pid={pid}: recycled after {completed} tasks \
+                             (--cpu-max-tasks-per-child {recycle})"
+                        );
+                        respawn = true;
+                    }
                 }
                 Ok(_) => {
                     // EOF or read error: child died mid-task

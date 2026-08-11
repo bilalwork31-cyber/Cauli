@@ -177,6 +177,8 @@ fn child_argv(args: &cli::Args, r: &cli::Resolved) -> Vec<String> {
         args.cpu_child_threads.to_string(),
         "--cpu-prefetch".into(),
         args.cpu_prefetch.to_string(),
+        "--cpu-max-tasks-per-child".into(),
+        args.cpu_max_tasks_per_child.to_string(),
         "--batch".into(),
         args.batch.to_string(),
         "--visibility-timeout".into(),
@@ -202,6 +204,9 @@ fn child_argv(args: &cli::Args, r: &cli::Resolved) -> Vec<String> {
     }
     if args.no_fork_server {
         v.push("--no-fork-server".into());
+    }
+    if args.eager_cpu {
+        v.push("--eager-cpu".into());
     }
     v
 }
