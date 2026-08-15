@@ -22,3 +22,6 @@ itest/worker.log
 
 # Session working notes, never tracked
 HANDOFF.md
+
+# Transient result file campaign.py overwrites each run
+bench/campaign_result.json
