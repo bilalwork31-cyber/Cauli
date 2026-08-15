@@ -37,6 +37,9 @@ instance you already run — everything here is on its own port/role/database.
 | `chaos_driver.py` | `kill -9` mid-run, measure data loss / duplicates / recovery time |
 | `segfault_driver.py` | Segfault blast-radius: what dies, what survives, what auto-recovers |
 | `memory_report.py` | Sums PSS (not RSS — see RESULTS.md for why) across a process group |
+| `soak_driver.py` | Sustained load + periodic PSS sampling for the 24-48h soak test |
+| `raw_asyncio_enqueue.py` / `raw_asyncio_worker.py` | The no-framework ceiling every lane is bounded by |
+| `Dockerfile` / `docker-compose.yml` / `docker-init.sql` | One-command reproduction (unvalidated on this dev machine — see RESULTS.md) |
 
 ## Methodology, in one paragraph
 
