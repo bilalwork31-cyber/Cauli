@@ -230,8 +230,12 @@ v0.1. Redis only, no chains or chords, no rate limits. The worker targets
 Linux; the client library and `cauli-beat` are cross platform. Full list of
 limits in [PROTOCOL.md](PROTOCOL.md) section 11.
 
-Performance numbers are deliberately absent while the benchmark suite is being
-rebuilt as a single reproducible campaign.
+Performance numbers are deliberately absent from this README. A claim-first,
+reproducible benchmark suite lives in [bench/](bench/README.md) — start with
+[bench/CLAIMS.md](bench/CLAIMS.md) for what's actually being tested and
+[bench/RESULTS.md](bench/RESULTS.md) for the measurements, environment, and
+an explicit list of what isn't measured yet. Actively being extended, not a
+finished campaign.
 
 ## License
 
