@@ -6,9 +6,11 @@ once -- expected/acceptable under at-least-once, but must be counted, not
 hidden), and total recovery time (kill to fully drained).
 
 CLI: chaos_driver.py <lane> <N> <kill_at_fraction> <recovery_timeout_s>
-  lane: cauli_sync_chaos | celery_chaos_acks_late | celery_chaos_default
+  lane: cauli_sync_chaos | celery_chaos_acks_late | celery_chaos_default |
+        arq_chaos | dramatiq_chaos
 """
 
+import asyncio
 import subprocess
 import sys
 import time
@@ -20,20 +22,41 @@ from common import REDIS_URL
 
 EXEC_KEY = "bench:chaos:executions"
 
+# lane -> (module, attr, enqueue mechanism: delay | send | arq)
 LANES = {
-    "cauli_sync_chaos": ("tasks_cauli_sync_chaos", "chaos"),
-    "celery_chaos_acks_late": ("tasks_celery_chaos_acks_late", "chaos"),
-    "celery_chaos_default": ("tasks_celery_chaos_default", "chaos"),
+    "cauli_sync_chaos": ("tasks_cauli_sync_chaos", "chaos", "delay"),
+    "celery_chaos_acks_late": ("tasks_celery_chaos_acks_late", "chaos", "delay"),
+    "celery_chaos_default": ("tasks_celery_chaos_default", "chaos", "delay"),
+    "arq_chaos": ("tasks_arq_chaos", "chaos", "arq"),
+    "dramatiq_chaos": ("tasks_dramatiq_chaos", "chaos", "send"),
 }
 
 
-def enqueue_all(module_name, attr_name, n):
+def enqueue_all(module_name, attr_name, mechanism, n):
     import importlib
 
     mod = importlib.import_module(module_name)
-    fn = getattr(mod, attr_name)
-    for i in range(n):
-        fn.delay(f"tag-{i}")
+
+    if mechanism == "delay":
+        fn = getattr(mod, attr_name)
+        for i in range(n):
+            fn.delay(f"tag-{i}")
+    elif mechanism == "send":
+        fn = getattr(mod, attr_name)
+        for i in range(n):
+            fn.send(f"tag-{i}")
+    elif mechanism == "arq":
+        from arq.connections import create_pool
+
+        async def run():
+            pool = await create_pool(mod.redis_settings)
+            for i in range(n):
+                await pool.enqueue_job(attr_name, f"tag-{i}")
+            await pool.aclose()
+
+        asyncio.run(run())
+    else:
+        raise SystemExit(f"unknown mechanism {mechanism!r}")
 
 
 def start_worker(lane, worker_cmd, log_path):
@@ -65,13 +88,13 @@ def main():
 
     if lane not in LANES:
         raise SystemExit(f"unknown lane {lane!r}, expected one of {list(LANES)}")
-    module_name, attr_name = LANES[lane]
+    module_name, attr_name, mechanism = LANES[lane]
 
     r = redis.Redis.from_url(REDIS_URL)
     r.flushall()
 
     print(f"[enqueue] {n} tagged tasks for {lane}", file=sys.stderr)
-    enqueue_all(module_name, attr_name, n)
+    enqueue_all(module_name, attr_name, mechanism, n)
 
     print(f"[worker] starting: {' '.join(worker_cmd)}", file=sys.stderr)
     proc = start_worker(lane, worker_cmd, "/tmp/chaos_worker.log")

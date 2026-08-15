@@ -13,9 +13,11 @@ arbiter/master; individual ForkPoolWorker children are tracked separately
 via pgrep since the top-level process is expected to survive regardless.
 
 CLI: segfault_driver.py <lane> <n_holds> <observe_s> <child_pgrep_pattern> <worker_cmd...>
-  lane: cauli_async_segfault | cauli_async_segfault_fixed | celery_segfault
+  lane: cauli_async_segfault | cauli_async_segfault_fixed | celery_segfault |
+        arq_segfault | dramatiq_segfault
 """
 
+import asyncio
 import os
 import signal
 import subprocess
@@ -26,20 +28,42 @@ import redis
 
 from common import REDIS_URL
 
+# lane -> (module, enqueue mechanism: delay | send | arq)
 LANES = {
-    "cauli_async_segfault": "tasks_cauli_async_segfault",
-    "cauli_async_segfault_fixed": "tasks_cauli_async_segfault_fixed",
-    "celery_segfault": "tasks_celery_segfault",
+    "cauli_async_segfault": ("tasks_cauli_async_segfault", "delay"),
+    "cauli_async_segfault_fixed": ("tasks_cauli_async_segfault_fixed", "delay"),
+    "celery_segfault": ("tasks_celery_segfault", "delay"),
+    "arq_segfault": ("tasks_arq_segfault", "arq"),
+    "dramatiq_segfault": ("tasks_dramatiq_segfault", "send"),
 }
 
 
-def enqueue(module_name, n_holds):
+def enqueue(module_name, mechanism, n_holds):
     import importlib
 
     mod = importlib.import_module(module_name)
-    for _ in range(n_holds):
-        mod.hold.delay()
-    mod.segfault.delay()
+
+    if mechanism == "delay":
+        for _ in range(n_holds):
+            mod.hold.delay()
+        mod.segfault.delay()
+    elif mechanism == "send":
+        for _ in range(n_holds):
+            mod.hold.send()
+        mod.segfault.send()
+    elif mechanism == "arq":
+        from arq.connections import create_pool
+
+        async def run():
+            pool = await create_pool(mod.redis_settings)
+            for _ in range(n_holds):
+                await pool.enqueue_job("hold")
+            await pool.enqueue_job("segfault")
+            await pool.aclose()
+
+        asyncio.run(run())
+    else:
+        raise SystemExit(f"unknown mechanism {mechanism!r}")
 
 
 def child_pids(pattern):
@@ -56,13 +80,13 @@ def main():
 
     if lane not in LANES:
         raise SystemExit(f"unknown lane {lane!r}")
-    module_name = LANES[lane]
+    module_name, mechanism = LANES[lane]
 
     r = redis.Redis.from_url(REDIS_URL)
     r.flushall()
 
     print(f"[enqueue] {n_holds} hold tasks + 1 segfault task", file=sys.stderr)
-    enqueue(module_name, n_holds)
+    enqueue(module_name, mechanism, n_holds)
 
     print(f"[worker] starting: {' '.join(worker_cmd)}", file=sys.stderr)
     log = open("/tmp/segfault_worker.log", "w")

@@ -103,19 +103,39 @@ too, since defaults are what most deployments actually run.
 
 | Lane | Best config | Throughput | vs default |
 |---|---|---:|---|
+| arq (async) | `poll_delay=0.01, max_jobs=200` (WorkerSettings attrs — no CLI flag exists) | 248.2/s, still timed out at N=20,000/60s | **default `poll_delay=0.5s`/`max_jobs=10` gave 26.9/s — a 9.2x swing**, and even tuned this remains far below every other framework here; not fully root-caused (see note below), reported as measured rather than chased further |
 | Celery (sync) | `-c 4 -P prefork --prefetch-multiplier=1` | 850.6/s (±0.4%, 3 runs) | prefetch=4 (default) gave 676/s — tuning is a **26% swing**, not noise |
-| cauli (sync) | `--procs 12 --io-threads 80 --io-concurrency 80` | 21,713/s (±0.5%, 2 runs) | `-c` alone at `--procs 6` (one proc per core) gave 14,557/s — **oversubscribing past the core count by 2x was faster**, not slower (see "Reliability cliffs") |
+| dramatiq (sync) | `--processes 12 --threads 8` (or `6 procs / 32 threads`, statistically tied) | 12,843.6/s, clean | `6 procs / 8 threads` gave 9,490.7/s — **35% swing** from thread count alone |
 | taskiq (async) | `--workers 8 --max-async-tasks 100 --max-prefetch 100` | 9,622/s (±0.2%, 2 runs) | |
+| cauli (sync) | `--procs 12 --io-threads 80 --io-concurrency 80` | 21,713/s (±0.5%, 2 runs) | `-c` alone at `--procs 6` (one proc per core) gave 14,557/s — **oversubscribing past the core count by 2x was faster**, not slower (see "Reliability cliffs") |
 | cauli (async) | `--procs 8 --io-concurrency 96` | 30,438/s (±1.6%, 2 runs) | |
 | **raw asyncio + redis, no framework** | batch=16 (matches cauli's own `--batch 16` default), concurrency 64 | **79,792/s**, clean mid-80%-slope measurement | batch=1 (naive, one round trip per task) gave only 4,958/s — **slower than every framework above it**, proof that an unbatched "ceiling" is a strawman, not a ceiling |
 
-**Ratios**: cauli sync is **25.5x** Celery sync; cauli async is **3.2x**
-taskiq. At cauli's own default batch depth, the raw no-framework ceiling is
-79,792/s — cauli's async lane (30,438/s) captures about **38%** of that
-ceiling; the rest is real framework overhead (envelope building, JSON
-encode/decode, retry/idempotency bookkeeping, consumer-group ack) that a
-hand-rolled loop skips entirely. That 38%, not the raw ceiling number itself,
-is the honest measure of "how much does the framework cost."
+**Ratios**: cauli sync is **25.5x** Celery sync and **1.7x** Dramatiq (the
+strongest sync competitor measured); cauli async is **3.2x** taskiq and
+**123x** arq (see caveat below). At cauli's own default batch depth, the raw
+no-framework ceiling is 79,792/s — cauli's async lane (30,438/s) captures
+about **38%** of that ceiling; the rest is real framework overhead (envelope
+building, JSON encode/decode, retry/idempotency bookkeeping, consumer-group
+ack) that a hand-rolled loop skips entirely. That 38%, not the raw ceiling
+number itself, is the honest measure of "how much does the framework cost."
+
+**arq caveat, stated plainly**: arq's default `poll_delay=0.5s` is a severe,
+easy-to-miss trap — it caps throughput near `max_jobs / poll_delay`
+regardless of how fast the task itself runs, confirmed by isolating the
+same `ProcessPoolExecutor` + `asyncio.run_in_executor` pattern outside of
+arq entirely (568/s and 555/s respectively, both near the physical ceiling)
+and finding the bottleneck disappears — it is specific to arq's own
+dispatch loop, not this suite's task bodies. Tuning `poll_delay` down 50x
+recovered 9.2x of that (26.9/s → 248.2/s), but did not close the remaining
+gap to celery/dramatiq/taskiq, and the worker's own log shows a large,
+roughly-constant per-job `delayed=` value (time since enqueue, not
+execution time — jobs execute in 0.00s once picked up) suggesting a
+further bottleneck upstream of task execution that was not isolated further
+in the time available. The **123x ratio against arq should be read as "arq
+needs deeper tuning or is a poor fit for this harness's redis-list-broker
+pattern," not as a clean architectural comparison** — unlike every other
+ratio in this document, which is measured at each side's genuine optimum.
 
 Batch=32/64 pushed the ceiling higher still (up to 451,695/s naive_rate) but
 the drain completed in under 1.4s at N=200,000 — too fast for this harness's
@@ -151,23 +171,46 @@ fixing or at minimum loudly documenting upstream.
 
 ## Claim 3: true multicore for CPU-bound work
 
-Lanes built and smoke-tested for cauli (`kind="cpu"`, forked children),
-Celery prefork (native), taskiq (`--use-process-pool`, since its default
-thread pool GIL-serializes a busy loop same as any other Python threads),
-arq (`ProcessPoolExecutor` via `run_in_executor` — arq has no built-in
-cpu-pool concept, this is the standard pattern its own users reach for), and
-Dramatiq (native `--processes`). Task size sweep (0.5/2/10/50ms) defined in
-`workloads.cpu_burn` (a calibrated busy-loop, timed by `perf_counter` so
-duration is reproducible across machines rather than CPU-speed-dependent).
+Lanes: cauli (`kind="cpu"`, forked children), Celery prefork (native),
+taskiq (`--use-process-pool`, since its default thread pool GIL-serializes a
+busy loop same as any other Python threads), Dramatiq (native
+`--processes`), and arq (`ProcessPoolExecutor` via `run_in_executor` — arq
+has no built-in cpu-pool concept, this is the standard pattern its own
+users reach for). Task size sweep 0.5/2/10/50ms, `workloads.cpu_burn` (a
+calibrated busy-loop, timed by `perf_counter` so duration is reproducible
+across machines rather than CPU-speed-dependent). All five at 6
+processes/workers, matching this box's core count — CPU-bound work is
+fundamentally core-limited, not I/O-bound where the earlier oversubscription
+finding applies, so an extensive process-count sweep like Claim 2's isn't
+the right lever here.
 
-**Status: lanes built, full sweep not yet run to completion under this
-session's time budget.** Prior work on this exact question (see the
-project's own historical measurements, superseded by this suite but
-directionally consistent) found parity at large task sizes and a cauli
-advantage that grows as tasks shrink, physics dictating that trend regardless
-of implementation: per-task overhead is a shrinking fraction of total time
-as the task itself grows, so the crossover to parity is expected and not a
-regression. Full sweep is the top item in "Not yet done" below.
+| Task size | cauli | Celery | taskiq | Dramatiq | arq |
+|---:|---:|---:|---:|---:|---:|
+| 0.5ms | **2,664.8/s** | 778.4/s | 810.5/s | 1,539.5/s | ~567/s* |
+| 2ms | **1,776.6/s** | 693.2/s | 763.2/s | 1,188.7/s | ~551/s* |
+| 10ms | **516.5/s** | 413.0/s | 515.6/s (statistical tie) | 473.3/s | 335.1/s |
+| 50ms | 115.3/s | 110.8/s | 117.6/s | 117.3/s | 119.0/s — **all five within noise** |
+
+Exactly the physics-driven trend predicted before running this: per-task
+dispatch overhead is a shrinking fraction of total time as the task itself
+grows, so the gap should compress toward parity as task size grows — and it
+does, cleanly. At 50ms all five frameworks converge (110.8-119.0/s, no
+framework meaningfully ahead — the physical CPU is the bottleneck, not
+dispatch); at 0.5ms cauli's lead is largest (1.7x over the next-best,
+Dramatiq; 3.4x over Celery). This is also the one claim where cauli does
+**not** win at every size — taskiq statistically ties it at 10ms.
+
+*arq's numbers are `naive_rate` (elapsed/count), not the mid-80%-slope
+method used everywhere else in this document: `mid80_rate` came back `null`
+even on runs that completed without timing out. Cause, read directly from
+the worker's own log (see Claim 2's arq caveat): arq's completions arrive in
+one late burst rather than a steady stream — often nearly the whole run
+finishes in a single 20ms poll window — which breaks the interpolation
+method's assumption of gradual progression through the 10th-90th percentile
+of completions. Reported as the best-available honest number for a
+framework whose throughput profile doesn't fit this suite's primary
+methodology, not silently smoothed into a number the method can't actually
+back up.
 
 ## Claim 4: mixed workload survivability and honest failure modes
 
@@ -247,6 +290,63 @@ t=0.00s. Fixed by using `subprocess.Popen.poll()` (the real exit status,
 `-11` meaning "killed by signal 11") as ground truth instead of process-name
 matching.
 
+### arq and Dramatiq under the same three tests
+
+Same adversarial-mixed, kill -9, and segfault tests, run against arq and
+Dramatiq using the same task shapes. Not tuned for recovery the way Celery
+got a second, properly-configured pass (`acks_late`) — these are each
+framework's first-attempt/default reliability configuration, stated
+explicitly so the numbers aren't read as more authoritative than they are.
+
+**Adversarial mixed** (same 100 light/s + 50ms poison every 3s, 20s):
+
+| Lane | near-burst p99 | baseline p99 | ratio |
+|---|---:|---:|---:|
+| arq | 61ms | 14ms | **4.4x** |
+| Dramatiq | 91ms | 18ms | **5.1x** |
+
+Both land well below Celery's 12-14.5x and cauli-naive's 18-19x — plausibly
+because Dramatiq's `--threads 8` still shares a GIL *within* each of its 6
+processes (a poison task only stalls 1/6 of total capacity, diluting the
+effect vs. Celery's coarser per-process granularity), and arq's baseline is
+already elevated (14ms vs Celery's 4ms, cauli's 3ms) from its own dispatch
+characteristics documented in Claim 2/3. Not fully explained, reported as
+measured.
+
+**kill -9 correctness** (500 tagged tasks, killed at whatever fraction each
+framework reached by the time the earlier lanes hit theirs):
+
+| Lane | Lost (permanent) | Duplicates | Recovery time |
+|---|---:|---:|---:|
+| arq | **400/500 (80%)** | 0 | timed out at 60s |
+| Dramatiq | 85/500 (17%) | 0 | timed out at 60s |
+
+arq's loss is worse than even Celery's careless default (16%), and the lost
+tags are **not just the tail of the run** — `tag-0` and `tag-1` were among
+the lost set despite only 100/500 tasks having executed before the kill,
+which would put them first in a FIFO drain. Not investigated further in the
+time available; noted because it means the loss pattern isn't simply
+"whatever hadn't started yet," which would be the benign explanation.
+Dramatiq's 17% loss is in the same range as Celery's *default* (unconfigured)
+number — consistent with the same story: frameworks default to
+weaker-than-at-least-once delivery unless someone opts in, and Dramatiq
+wasn't given that opt-in tuning here (unexplored — see "Not yet done").
+
+**Segfault blast radius** (10 `hold` tasks + 1 segfaulting task):
+
+| Lane | Blast radius |
+|---|---|
+| arq | Entire process dies (single asyncio loop, no process isolation) — same architecture class as cauli's naive async lane. All 10 in-flight tasks lost, no auto-respawn observed. |
+| Dramatiq | Top-level process survives (`--processes 6`, same structural class as Celery prefork) |
+
+Methodology note kept honest rather than smoothed over: the auxiliary
+"child pool" pgrep tracking used `-x python3` for Dramatiq, which is too
+broad — it matched unrelated python3 processes on the box (including this
+suite's own long-running soak-test driver), so the "children that
+disappeared/appeared" reading for Dramatiq is noise, not signal. The
+**primary** result (top-level process survived, via `Popen.poll()` on the
+exact process this driver spawned) is unaffected by that and is trustworthy.
+
 ## Backlog drain (1M tasks)
 
 Preload 1,000,000 no-op tasks with no worker running, then start it: this is
@@ -289,28 +389,55 @@ discount the result, since a genuine cross-process effect and a smaller
 residual driver-contention effect are not mutually exclusive and the
 magnitude (12x, not 2x) argues for the former dominating.
 
+## Soak test (in progress)
+
+Started, still running — 48h duration, not yet complete at the time this
+section was written. cauli async (`--procs 8 --io-concurrency 96`, the same
+config measured in Claim 2), on a dedicated Redis instance (port 6396, not
+shared with any other measurement in this document) so it doesn't compete
+with or get disturbed by other work. Load: steady 2,000 tasks/s open-loop
+(not 70% of the ~30k/s peak drain rate — this suite's own producer tops out
+around 4-6k enqueues/s in a tight loop, so 2,000/s leaves comfortable
+headroom; the goal is sustained execution over many hours and hundreds of
+millions of tasks, not saturating the worker). PSS sampled every 5 minutes
+to `soak_memory.csv`. First sample at t=0: 193.2 MiB across 9 processes (1
+supervisor + 8 workers), 45,461 tasks already processed cleanly (0 failures)
+within the first ~8 seconds. Final RSS-slope result to be added once the
+run completes or is checked on — a flat line is the claim being tested, a
+climbing one is a real reference leak in the Rust↔Python FFI boundary.
+
+## docker-compose packaging
+
+`Dockerfile` and `docker-compose.yml` are written (python:3.12-slim base —
+satisfies cauli-worker's `--enable-shared` CPython requirement per the main
+README — builds cauli-worker fresh, installs pinned deps, wires
+`BENCH_REDIS_URL`/`BENCH_PG_DSN` to the compose service hostnames). **Not
+validated**: Docker Desktop's daemon is not functional on this development
+machine (CLI present, engine not running), confirmed and then explicitly
+deprioritized rather than spending further time working around a local
+environment problem unrelated to the benchmark itself. Whoever runs this
+next should treat `docker compose up --build` as untested until it's been
+run once for real.
+
 ## Not yet done
 
 Listed explicitly rather than silently absent, per the standard this suite
 holds itself to:
 
-- **Claim 3's full CPU-bound sweep** (0.5/2/10/50ms x 6 frameworks):
-  lanes built, not yet run to completion.
 - **CPU-pinned re-measurement of everything else in this document** — only
   the mixed-workload Celery anomaly has been re-tested under partial
-  isolation so far (see "CPU isolation"); throughput, memory, chaos and
-  segfault numbers above are all still shared-box measurements.
+  isolation so far (see "CPU isolation"); throughput, memory, chaos, segfault
+  and CPU-bound numbers above are all still shared-box measurements.
 - **Fully isolated driver** for the mixed-workload pinned re-test (currently
   the harness driver shares cores with the workers under test).
 - **Payload size sweep** (1KB/10KB/100KB/1MB args and results): explicitly
   cut from this pass by user decision; serialization/bandwidth cost at scale
   is a real question, just not this one's.
-- **24-48h soak test** (watching RSS slope at ~70% load): needs wall-clock
-  time this session cannot compress. To be kicked off separately and
-  checked on over following day(s), not simulated or estimated here.
-- **arq / Dramatiq** in the mixed-workload, chaos, and segfault sections:
-  covered for the no-op/CPU/Postgres throughput lanes, not yet run through
-  the reliability-focused tests. Same harness, same task shapes, just not
-  yet executed for these two.
-- **docker-compose packaging** for one-command public reproduction: last
-  item, once the harness itself is frozen.
+- **Soak test completion**: kicked off, running, not yet finished (see above).
+- **Dramatiq redelivery tuning**: only tested at default reliability config
+  (17% loss on a hard crash); unlike Celery, never given a properly-tuned
+  second pass to see if a Celery-style `acks_late` equivalent closes the gap.
+- **arq's 80%-loss root cause**: measured and reported, not root-caused —
+  the lost tags weren't just the tail of the run, which rules out the benign
+  explanation but wasn't investigated further.
+- **docker-compose validation**: written, not run (see above).

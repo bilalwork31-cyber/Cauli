@@ -16,3 +16,8 @@ async def noop(ctx):
 class WorkerSettings:
     functions = [noop]
     redis_settings = redis_settings
+    # Defaults (poll_delay=0.5s, max_jobs=10) cap throughput at roughly
+    # max_jobs/poll_delay regardless of task speed -- measured 26.9/s on a
+    # true no-op with defaults. No CLI flag for this; only settable here.
+    poll_delay = 0.01
+    max_jobs = 200

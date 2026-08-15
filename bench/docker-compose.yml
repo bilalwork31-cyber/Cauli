@@ -1,0 +1,43 @@
+services:
+  redis:
+    image: redis:7-alpine
+    command: redis-server --save "" --appendonly no
+    ports: ["6395:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: bench
+      POSTGRES_PASSWORD: bench
+      POSTGRES_DB: bench
+    ports: ["5432:5432"]
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "bench"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+    volumes:
+      - ./docker-init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+
+  bench:
+    build:
+      context: ..
+      dockerfile: bench/Dockerfile
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    environment:
+      BENCH_REDIS_URL: redis://redis:6379/0
+      BENCH_PG_DSN: postgresql://bench:bench@postgres:5432/bench
+    # docker-compose.yml's redis/postgres hostnames differ from RESULTS.md's
+    # localhost:6395/localhost:5432 (those numbers were measured directly on
+    # the host, not through this container) -- rerun campaign.py here to get
+    # numbers for YOUR hardware, don't assume RESULTS.md's numbers transfer.
+    command: ["python3", "campaign.py", "--reps", "3"]

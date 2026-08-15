@@ -26,3 +26,7 @@ async def insert(ctx):
 class WorkerSettings:
     functions = [insert]
     redis_settings = redis_settings
+    # See tasks_arq.py: default poll_delay=0.5s/max_jobs=10 caps throughput
+    # far below what the Postgres pool itself can do.
+    poll_delay = 0.01
+    max_jobs = 200

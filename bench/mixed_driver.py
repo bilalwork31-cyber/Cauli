@@ -64,6 +64,20 @@ def make_enqueue_fns(lane):
         light_fn = lambda ts: bridge.call(light.kiq, ts)
         poison_fn = lambda ts: bridge.call(poison.kiq, ts)
         return light_fn, poison_fn, bridge
+    if lane == "arq_mixed":
+        from arq.connections import create_pool
+
+        from tasks_arq_mixed import redis_settings
+
+        bridge = AsyncBridge()
+        pool = bridge.call(create_pool, redis_settings)
+        light_fn = lambda ts: bridge.call(pool.enqueue_job, "light", ts)
+        poison_fn = lambda ts: bridge.call(pool.enqueue_job, "poison", ts)
+        return light_fn, poison_fn, bridge
+    if lane == "dramatiq_mixed":
+        from tasks_dramatiq_mixed import light, poison
+
+        return (lambda ts: light.send(ts)), (lambda ts: poison.send(ts)), None
     raise SystemExit(f"unknown lane {lane!r}")
 
 

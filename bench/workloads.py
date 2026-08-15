@@ -2,6 +2,7 @@
 same work runs under every stack. See CLAIMS.md for which claim each maps to.
 """
 
+import os
 import time
 
 
@@ -18,7 +19,7 @@ def cpu_burn(ms):
     return x
 
 
-PG_DSN = "postgresql://bench:bench@127.0.0.1:5432/bench"
+PG_DSN = os.environ.get("BENCH_PG_DSN", "postgresql://bench:bench@127.0.0.1:5432/bench")
 PG_INSERT_SQL = "INSERT INTO bench_io (payload) VALUES (%s)"
 PG_PAYLOAD = "x" * 200
 PG_POOL_MAX = 100
