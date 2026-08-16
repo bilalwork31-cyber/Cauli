@@ -384,3 +384,11 @@ def test_entry_dict_roundtrip():
 def test_entry_validates_on_missed():
     with pytest.raises(ValueError, match="on_missed"):
         ScheduleEntry(name="e", task="t", schedule=interval(1), on_missed="explode")
+
+
+def test_entry_validates_max_lateness():
+    # A negative max_lateness makes lateness > max_lateness_ms always true
+    # (lateness is never negative for a due slot), so the entry would never
+    # fire again, silently.
+    with pytest.raises(ValueError, match="max_lateness"):
+        ScheduleEntry(name="e", task="t", schedule=interval(1), max_lateness=-1.0)

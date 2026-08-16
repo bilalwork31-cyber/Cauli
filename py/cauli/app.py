@@ -159,6 +159,13 @@ class Cauli:
             redis_url or os.environ.get("CAULI_REDIS_URL") or _DEFAULT_REDIS_URL
         )
         self.default_queue: str = default_queue
+        # result_ttl=0 reads like "disabled" but Redis rejects `SET key val EX
+        # 0`, so the result key would never be written and AsyncResult.get()
+        # would hang forever; validate the same way _normalize_queue_ttl does.
+        if result_ttl <= 0:
+            raise ValueError(f"result_ttl must be > 0 seconds, got {result_ttl!r}")
+        if idemp_ttl <= 0:
+            raise ValueError(f"idemp_ttl must be > 0 seconds, got {idemp_ttl!r}")
         self.result_ttl: int = result_ttl
         self.idemp_ttl: int = idemp_ttl
         # App-level routing rules (PROTOCOL.md section 9.3): pattern -> queue,

@@ -149,6 +149,7 @@ async fn e2e_main_flows() {
     );
 
     idempotency_and_timeouts(&mut c).await;
+    result_write_failure_is_not_counted_ok(&mut c).await;
 
     // graceful SIGTERM with nothing in flight -> exit 0
     w.signal(libc::SIGTERM);
@@ -319,4 +320,69 @@ async fn idempotency_and_timeouts(c: &mut redis::aio::MultiplexedConnection) {
         efield.len() <= 4096,
         "oversize envelope must be stored truncated, not in full"
     );
+}
+
+/// C9 regression: dispatch.rs's `finish()` used to fetch_add the `ok`
+/// counter unconditionally after a successful task, even when the result
+/// write itself failed. A second worker with result_ttl=0 makes Redis
+/// reject `SET ... EX 0` on every success, giving a real (not simulated)
+/// write failure to check the stats line against.
+async fn result_write_failure_is_not_counted_ok(c: &mut redis::aio::MultiplexedConnection) {
+    let log_path = fixtures_dir().join(format!("badttl-{}.log", unique_id()));
+    let mut bad = Worker::spawn_ex(
+        "badttl",
+        &[],
+        &[("FIXTURE_RESULT_TTL", "0")],
+        Some(&log_path),
+    );
+    wait_group(c, "badttl", 20).await;
+
+    let (id, e) = envelope("fx.echo", "badttl", |v| v["args"] = json!(["x"]));
+    xadd(c, "badttl", &e.to_string()).await;
+
+    // The SET is rejected, so no result key can ever appear; the stream
+    // entry still gets acked/deleted either way (finish() XACKs+XDELs
+    // regardless of the write outcome), so an emptied queue is the
+    // dispatch-is-done signal.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let len: u64 = redis::cmd("XLEN")
+            .arg("cauli:q:badttl")
+            .query_async(c)
+            .await
+            .unwrap();
+        if len == 0 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "badttl entry was never dispatched"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let raw: Option<String> = redis::cmd("GET")
+        .arg(format!("cauli:result:{id}"))
+        .query_async(c)
+        .await
+        .unwrap();
+    assert!(
+        raw.is_none(),
+        "SET ... EX 0 should have failed: no result key"
+    );
+
+    bad.signal(libc::SIGTERM);
+    assert_eq!(bad.wait_code(20), 0, "badttl worker should exit 0");
+    drop(bad);
+
+    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+    let stats = log
+        .lines()
+        .rev()
+        .find(|l| l.contains("stats: fetched="))
+        .unwrap_or_else(|| panic!("no stats line in worker log:\n{log}"));
+    assert!(
+        stats.contains("fetched=1 ok=0 failed=1"),
+        "a failed result write must not be counted as ok: {stats}"
+    );
+    let _ = std::fs::remove_file(&log_path);
 }

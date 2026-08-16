@@ -245,7 +245,7 @@ fn real_main() -> i32 {
     // floor is a strong signal of a misconfigured deployment (the invariant
     // documented in PROTOCOL.md §4.4: visibility_timeout should exceed your
     // longest task) — warn loudly at startup so operators catch it early.
-    let vt_ms = args.visibility_timeout * 1000;
+    let vt_ms = visibility_timeout_ms(args.visibility_timeout);
     for (name, spec) in &appcfg.tasks {
         if spec.timeout_ms >= vt_ms {
             warn!(
@@ -472,9 +472,23 @@ fn redact_redis_url(url: &str) -> String {
     url.to_string()
 }
 
+/// Seconds to milliseconds for the visibility timeout. Saturating, matching
+/// the overflow safe style used elsewhere for hostile or just huge input
+/// (dispatch.rs, envelope.rs, exec.rs, cpu.rs): release builds have no
+/// overflow-checks, so a plain multiply would wrap silently instead.
+fn visibility_timeout_ms(visibility_timeout_s: u64) -> u64 {
+    visibility_timeout_s.saturating_mul(1000)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn visibility_timeout_ms_saturates_instead_of_wrapping() {
+        assert_eq!(visibility_timeout_ms(60), 60_000);
+        assert_eq!(visibility_timeout_ms(u64::MAX), u64::MAX);
+    }
 
     #[test]
     fn redacts_userinfo() {

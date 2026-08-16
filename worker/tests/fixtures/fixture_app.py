@@ -159,7 +159,10 @@ class App:
     def __init__(self):
         self.redis_url = "redis://127.0.0.1:6392/0"
         self.default_queue = "default"
-        self.result_ttl = 600
+        # Overridable so a test can spawn a second worker with a deliberately
+        # invalid result_ttl (e.g. 0, which makes Redis reject `SET ... EX 0`)
+        # without disturbing the primary worker's normal result writes.
+        self.result_ttl = int(os.environ.get("FIXTURE_RESULT_TTL", "600"))
         self.idemp_ttl = 600
         self._tasks = {}
 

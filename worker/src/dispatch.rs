@@ -141,12 +141,20 @@ async fn finish(ctx: &Arc<Ctx>, queue: &str, sid: &str, mut env: Envelope, outco
             // with the size of whatever the task returned.
             let rj = env.store_result.then(|| envelope::result_success(&v, now));
             let store = rj.as_deref();
-            if let Err(e) =
-                broker::finish_success(&mut conn, queue, sid, &env.id, store, ctx.result_ttl).await
+            match broker::finish_success(&mut conn, queue, sid, &env.id, store, ctx.result_ttl)
+                .await
             {
-                error!(id = %env.id, "success finish write failed: {e}");
+                Ok(()) => {
+                    ctx.counters.ok.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    // A write failure must not count as ok: the stats line is
+                    // the operator's first signal, and folding this in would
+                    // hide a broker write failure behind a success number.
+                    error!(id = %env.id, "success finish write failed: {e}");
+                    ctx.counters.failed.fetch_add(1, Ordering::Relaxed);
+                }
             }
-            ctx.counters.ok.fetch_add(1, Ordering::Relaxed);
         }
         Outcome::ForceRetry { countdown, err } => {
             if env.retries < env.max_retries {

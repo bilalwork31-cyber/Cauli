@@ -73,6 +73,20 @@ pub struct Worker(pub Child);
 
 impl Worker {
     pub fn spawn(queues: &str, extra: &[&str]) -> Worker {
+        Self::spawn_ex(queues, extra, &[], None)
+    }
+
+    /// Like `spawn`, plus extra environment variables and, when `log_path` is
+    /// given, stdout redirected to that file instead of discarded -- that is
+    /// where tracing writes (see main.rs's `exit_now` doc comment), so a test
+    /// that needs to read the stats line back has to capture it there, not
+    /// stderr.
+    pub fn spawn_ex(
+        queues: &str,
+        extra: &[&str],
+        envs: &[(&str, &str)],
+        log_path: Option<&std::path::Path>,
+    ) -> Worker {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_cauli-worker"));
         cmd.current_dir(fixtures_dir())
             .args(["--app", "fixture_app:app", "--queues", queues])
@@ -98,12 +112,20 @@ impl Worker {
             cmd.args(["--log-level", "debug"]);
         }
         cmd.args(extra)
+            .envs(envs.iter().copied())
             .env(
                 "CAULI_EXEC_CMD",
                 format!("python3 {}", fixtures_dir().join("fake_exec.py").display()),
             )
-            .stdout(Stdio::null())
             .stderr(Stdio::inherit());
+        match log_path {
+            Some(p) => {
+                cmd.stdout(std::fs::File::create(p).expect("worker log file"));
+            }
+            None => {
+                cmd.stdout(Stdio::null());
+            }
+        }
         Worker(cmd.spawn().expect("worker spawn"))
     }
 

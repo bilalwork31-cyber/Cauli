@@ -477,6 +477,14 @@ class ScheduleEntry:
             raise ValueError(
                 f"schedule entry {name!r}: on_missed must be one of {ON_MISSED}"
             )
+        if max_lateness is not None and max_lateness < 0:
+            # lateness = now - slot is never negative for a due slot, so a
+            # negative max_lateness would make lateness > max_lateness_ms
+            # always true and the entry would never fire, silently.
+            raise ValueError(
+                f"schedule entry {name!r}: max_lateness must be >= 0 seconds, "
+                f"got {max_lateness!r}"
+            )
         self.name = name
         self.task = task
         self.schedule: Schedule = schedule_from_spec(schedule)
