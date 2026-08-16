@@ -208,6 +208,35 @@ with transaction.atomic():
     send_receipt.delay_on_commit(order.id)
 ```
 
+## FastAPI
+
+```bash
+pip install cauli 'sqlalchemy[asyncio]' 'psycopg[binary]'   # or asyncpg
+```
+
+```python
+# myproj/cauli.py
+from cauli.contrib.fastapi import fastapi_app
+
+app = fastapi_app("postgresql+psycopg://user:pass@host/db")
+```
+
+```bash
+cauli-worker -A myproj.cauli:app -c 50
+```
+
+`fastapi_app()` builds one `create_async_engine()` and one `async_sessionmaker()`
+up front, opens an `AsyncSession` before every task and closes it after through
+a `ContextVar` task code reads with `get_session()`, and disposes the engine on
+process init so a pooled connection can never survive into a forked cpu child.
+Two assumptions it does not enforce in code: the default `--io-loops 1` (an
+async pool binds to whichever loop first checks a connection out, so more than
+one loop hands the same pool to more than one thread), and no `kind="cpu"`
+tasks (`asyncio.get_running_loop()` succeeds inside a cpu task's own body, so
+"no loop" is not a safe test there; use a plain synchronous SQLAlchemy engine
+on that lane instead). Committing or rolling back stays task code's job,
+exactly like `django_app()` leaves connections and transactions separated.
+
 ## What you should know before shipping
 
 - **Delivery is at least once.** A worker crash can redeliver a task, so make
