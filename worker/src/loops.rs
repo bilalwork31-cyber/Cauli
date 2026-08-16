@@ -253,18 +253,22 @@ async fn recover_page(
 /// abandonments that triggered a replacement. `pending_async` (MEM-1) is the
 /// async runtime's pending-completion map size; a number that only grows
 /// signals a wedged event-loop thread even though `cancel` stops the
-/// Rust-side bookkeeping from leaking on its own.
+/// Rust-side bookkeeping from leaking on its own. `async_rejected` (MEM-5) is
+/// the field that actually moves during that same wedge: the shim's own per
+/// loop queue rejects submissions past its cap instead of growing forever,
+/// and this is the running count of those rejections.
 pub async fn stats_loop(ctx: Arc<Ctx>) {
     let mut tick = tokio::time::interval(Duration::from_secs(ctx.args.stats_interval.max(1)));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tick.tick().await;
         info!(
-            "{} sync_live={} sync_abandoned={} pending_async={}",
+            "{} sync_live={} sync_abandoned={} pending_async={} async_rejected={}",
             ctx.counters.stats_line(),
             ctx.sync_pool.live_threads.load(Ordering::Relaxed),
             ctx.sync_pool.abandoned.load(Ordering::Relaxed),
-            ctx.pyrt.pending_len()
+            ctx.pyrt.pending_len(),
+            ctx.pyrt.async_rejected()
         );
     }
 }

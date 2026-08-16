@@ -67,6 +67,29 @@ _pending = []
 _pending_locks = []
 _callback = None  # Rust completion callback: cb(token:int, outcome:dict)
 
+
+class AsyncQueueFull(RuntimeError):
+    """MEM-5: raised by submit_async when a loop's pending list is already at
+    _PENDING_CAP. A distinct type, not a bare RuntimeError, so pyrt.rs can
+    count these rejections by checking the exception itself rather than
+    parsing message text."""
+
+
+# MEM-5: hard cap on each loop's pending list. A blocking call inside an
+# async task (a synchronous HTTP request, time.sleep, a blocking database
+# driver) starves that loop's own callback processing forever; _drain then
+# never runs again and this list would otherwise grow without bound, keeping
+# real args and kwargs objects alive for the rest of the process lifetime.
+# MEM-1 already keeps the Rust side bookkeeping (pyrt.rs) from leaking on its
+# own backstop timer, which is exactly why that fix hides this one: the
+# pending_async stat stays flat while this list keeps growing underneath it.
+# 4096 is 2x the highest --io-concurrency this codebase has measured (2048,
+# see the convoying note in pyrt.rs), so a legitimate burst should never
+# reach it; past the cap a submission fails fast instead of piling up
+# forever.
+_PENDING_CAP = 4096
+_cap_warned = []  # per loop: already logged the cap hit warning once
+
 # Per-task lifecycle hooks (PROTOCOL §4.8), duck-read off the app object at
 # load_app time. These are references to the app's own LISTS, not copies, so
 # hooks registered after startup are still honored. Zero-arg callables; a
@@ -427,6 +450,7 @@ def start_loops(n):
             _loops.append(loop)
             _pending.append([])
             _pending_locks.append(threading.Lock())
+            _cap_warned.append(False)
     if impl is not None:
         # One line, stderr: lands in the worker's log so a benchmark or an
         # operator can see WHICH loop ran without introspecting the process.
@@ -463,6 +487,8 @@ def submit_async(token, name, args, kwargs, timeout_s):
     queue is drained per wakeup (20k tasks, trivial body, one loop thread).
     Ordering within a loop is preserved; a task submitted while a drain is in
     flight simply schedules the next drain.
+
+    Raises AsyncQueueFull if that loop's queue is already at _PENDING_CAP.
     """
     global _rr
     with _loops_lock:
@@ -474,6 +500,23 @@ def submit_async(token, name, args, kwargs, timeout_s):
         loop = _loops[idx]
 
     with _pending_locks[idx]:
+        if len(_pending[idx]) >= _PENDING_CAP:
+            if not _cap_warned[idx]:
+                _cap_warned[idx] = True
+                sys.stderr.write(
+                    "cauli: async loop %d queue hit its cap of %d pending "
+                    "submissions; rejecting new ones until it drains. Likely "
+                    "cause: a blocking call inside an async task body (a "
+                    "synchronous HTTP request, time.sleep, a blocking "
+                    "database driver) in place of its non blocking "
+                    "equivalent, which starves this loop of its own event "
+                    "loop turns.\n" % (idx, _PENDING_CAP)
+                )
+            raise AsyncQueueFull(
+                "cauli: async loop %d submission queue is full (cap=%d); "
+                "rejecting so the task can be retried instead of queued "
+                "forever" % (idx, _PENDING_CAP)
+            )
         _pending[idx].append((token, name, args, kwargs, timeout_s))
         wake = len(_pending[idx]) == 1
     if wake:

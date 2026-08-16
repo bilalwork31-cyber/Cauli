@@ -65,6 +65,12 @@ pub struct PyRuntime {
     /// flight). A single submitter deletes the convoy and the pool usage;
     /// submission order becomes FIFO, which the racing closures never were.
     submit_tx: crossbeam_channel::Sender<SubmitJob>,
+    /// MEM-5: cumulative submissions the shim rejected because a loop's own
+    /// pending list was at cap (stats: `async_rejected`). Counted here
+    /// rather than polled from Python: the GIL may only be taken on a
+    /// dedicated thread or inside spawn_blocking (see the module doc above),
+    /// and submit_batch_under_gil already holds it once per batch anyway.
+    async_rejected: AtomicU64,
 }
 
 /// One queued async submission. Owns its data: the envelope's args/kwargs are
@@ -235,6 +241,7 @@ impl PyRuntime {
             pending,
             next_token: AtomicU64::new(1),
             submit_tx,
+            async_rejected: AtomicU64::new(0),
         });
 
         // The async submitter thread. Blocks on the channel, then drains
@@ -365,6 +372,9 @@ impl PyRuntime {
                     return failed;
                 }
             };
+            // MEM-5: fetched once per batch, not cached on PyRuntime -- this
+            // closure already holds the GIL and nothing else needs it.
+            let queue_full_ty = self.shim.bind(py).getattr("AsyncQueueFull").ok();
             for job in batch.iter() {
                 let scheduled = (|| -> PyResult<()> {
                     let a = crate::pyjson::json_to_py(py, &job.args, 0)?;
@@ -373,6 +383,12 @@ impl PyRuntime {
                     Ok(())
                 })();
                 if let Err(e) = scheduled {
+                    if queue_full_ty
+                        .as_ref()
+                        .is_some_and(|ty| e.is_instance(py, ty))
+                    {
+                        self.async_rejected.fetch_add(1, Ordering::Relaxed);
+                    }
                     failed.push((job.token, pyerr_string(py, &e)));
                 }
             }
@@ -410,6 +426,14 @@ impl PyRuntime {
     /// (MEM-1) even after `cancel` stops the Rust-side bookkeeping leak.
     pub fn pending_len(&self) -> usize {
         self.pending.lock().unwrap().len()
+    }
+
+    /// Cumulative submissions rejected because a loop's own pending list was
+    /// at cap (stats: `async_rejected`, MEM-5). This is the counter that
+    /// actually moves during the exact wedge that leaves `pending_async`
+    /// flat: see submit_batch_under_gil.
+    pub fn async_rejected(&self) -> u64 {
+        self.async_rejected.load(Ordering::Relaxed)
     }
 }
 
