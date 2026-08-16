@@ -252,6 +252,27 @@ Celery's Django fixup: `close_old_connections` around every task, and
 `connections.close_all` at process init so a connection opened at import time
 never survives into a forked cpu child.
 
+**Connection count.** Those hooks manage connection staleness, not
+connection count. Each worker process opens its own pool, and each sync
+thread keeps one Django connection for its life, so the number of
+simultaneous Postgres backends is:
+
+```
+procs * io_threads                                  (sync lane)
++ procs * min(CAULI_ORM_EXECUTORS, io_concurrency)   (async lane)
++ procs * cpu_workers                                (cpu lane; each forked child connects on its own)
+```
+
+When `--io-threads` is derived from `-c` the total stays near `min(c, 512)`
+automatically (see Worker command line above). Set `--io-threads`
+explicitly and that cap no longer applies: it becomes a plain product, so
+`--procs 4 --io-threads 30` alone already totals 120. Postgres ships with
+`max_connections` at 100, about 97 usable, so totals that look modest at
+the flag level can still exhaust it. Put a connection pooler, pgbouncer in
+transaction mode, in front of Postgres once the total climbs past roughly
+a hundred. `bench/RESULTS.md` (Claim 5) has a measured exhaustion and the
+pooler recovery.
+
 ## Tuning guide
 
 Start with `-c` alone. Change one axis at a time and measure, because the

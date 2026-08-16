@@ -189,10 +189,18 @@ autodiscover_tasks(app)
 DJANGO_SETTINGS_MODULE=myproj.settings cauli-worker -A myproj.cauli:app -c 50
 ```
 
-`django_app()` reads `CAULI_*` settings, calls `django.setup()`, and manages DB
-connections around every task with Celery fixup parity. Enqueueing inside a
-transaction has an on commit variant, so a task never observes a row that got
-rolled back:
+`django_app()` reads `CAULI_*` settings, calls `django.setup()`, and closes
+stale connections around every task with Celery fixup parity. That covers
+connection lifecycle, not connection count: every process and every sync
+thread keeps its own connection, so totals scale as `procs * io_threads`
+plus a smaller async and cpu share, past Postgres's default 100 connections
+sooner than the flags suggest. Put a pooler such as pgbouncer, in
+transaction mode, in front of Postgres once you approach that; see the
+Django settings section of
+[docs/CONFIGURATION.md](docs/CONFIGURATION.md) for the full formula.
+
+Enqueueing inside a transaction has an on commit variant, so a task never
+observes a row that got rolled back:
 
 ```python
 with transaction.atomic():
