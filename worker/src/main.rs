@@ -22,8 +22,59 @@ use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::watch;
 use tracing::{error, info, warn};
 
+/// Test-only hooks for the exit-path regression (worker/tests/exit_path.rs).
+/// Gated the same way as `CAULI_EXEC_CMD` in cpu.rs: a plain `cargo build
+/// --release` carries none of this, `cargo test --features test-hooks`
+/// compiles it into the binary the e2e suite spawns as a subprocess.
+#[cfg(any(test, feature = "test-hooks"))]
+mod exit_path_test_hooks {
+    use std::sync::OnceLock;
+
+    static MARKER_PATH: OnceLock<String> = OnceLock::new();
+
+    extern "C" fn write_marker() {
+        if let Some(path) = MARKER_PATH.get() {
+            let _ = std::fs::write(path, b"atexit ran\n");
+        }
+    }
+
+    /// If `CAULI_TEST_ATEXIT_MARKER` names a file, register a real libc
+    /// atexit handler that writes it -- an observable stand-in for the
+    /// OPENSSL_cleanup handler `exit_now`'s doc comment describes, without
+    /// depending on a specific library being linked in the test build.
+    pub fn install() {
+        if let Ok(path) = std::env::var("CAULI_TEST_ATEXIT_MARKER") {
+            if MARKER_PATH.set(path).is_ok() {
+                // SAFETY: `write_marker` only reads an already-set OnceLock
+                // and calls std::fs::write; both are safe to run from libc's
+                // atexit callback context.
+                unsafe { libc::atexit(write_marker) };
+            }
+        }
+    }
+
+    /// If set, panic right now. Called right after `PyRuntime::init`
+    /// returns, so the panic lands after the interpreter's daemon asyncio
+    /// loop threads and the async-submit thread are already running -- the
+    /// exact "threads still live" condition `exit_now` exists for.
+    pub fn maybe_panic_after_pyrt_init() {
+        if std::env::var_os("CAULI_TEST_PANIC_AFTER_PYRT_INIT").is_some() {
+            panic!("test-hooks: forced main-thread panic after PyRuntime::init");
+        }
+    }
+}
+
 fn main() {
-    let code = real_main();
+    // A panic that unwinds out of real_main must not be allowed to unwind
+    // out of main itself: past that point the C runtime returns from
+    // crt0's real `main` and calls ordinary libc `exit()` -- the exact
+    // atexit/DSO-teardown race exit_now exists to prevent (see its doc
+    // comment below), and an uncaught panic here is the one path that used
+    // to bypass it. catch_unwind only guards this top-level call; it does
+    // not change how panics inside individual tasks/threads are handled
+    // (those already catch their own -- Cargo.toml is deliberately not
+    // panic = "abort").
+    let code = std::panic::catch_unwind(real_main).unwrap_or(101);
     // Explicit exit: sync pool threads and Python daemon threads must not
     // keep the process alive.
     exit_now(code);
@@ -70,6 +121,9 @@ fn exit_now(code: i32) -> ! {
 }
 
 fn real_main() -> i32 {
+    #[cfg(any(test, feature = "test-hooks"))]
+    exit_path_test_hooks::install();
+
     let args = match cli::Args::try_parse() {
         Ok(a) => a,
         Err(e) => {
@@ -153,6 +207,9 @@ fn real_main() -> i32 {
             return 1;
         }
     };
+    #[cfg(any(test, feature = "test-hooks"))]
+    exit_path_test_hooks::maybe_panic_after_pyrt_init();
+
     if appcfg.tasks.is_empty() {
         warn!("app has no registered tasks");
     }
