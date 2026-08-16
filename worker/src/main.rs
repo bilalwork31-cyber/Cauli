@@ -26,7 +26,47 @@ fn main() {
     let code = real_main();
     // Explicit exit: sync pool threads and Python daemon threads must not
     // keep the process alive.
-    std::process::exit(code);
+    exit_now(code);
+}
+
+/// Terminate the process immediately, WITHOUT running libc `atexit` handlers
+/// or shared-library destructors.
+///
+/// `std::process::exit` calls libc `exit()`, and `exit()` runs every
+/// registered atexit handler and DSO destructor on the calling thread. That
+/// teardown assumes a process which is effectively single threaded by then.
+/// This one never is, by design: the sync io pool threads, the embedded
+/// interpreter's asyncio loop threads (daemon threads the shim never joins),
+/// and any threads the task code itself started -- a psycopg or SQLAlchemy
+/// connection pool, a requests session -- are all still running or still
+/// unwinding at that moment, and none of them are joinable from here.
+///
+/// A handler that frees process-wide state then races them. The one that
+/// actually fires is `OPENSSL_cleanup`, registered via `atexit` by the libssl
+/// that a database driver's libpq links: it tears down the global OpenSSL
+/// state while those same threads are running their own per-thread OpenSSL
+/// teardown on the way out. The process then dies of "double free or
+/// corruption (fasttop)" / "malloc_consolidate(): unaligned fastbin chunk
+/// detected" AFTER every task has already completed and been acked -- a
+/// corrupt heap reported as a successful drain. Measured on the psycopg3 sync
+/// lane at --io-threads 80: ~39% of shutdowns aborted, 0% with this.
+///
+/// `_exit` is the thread-safe primitive for "stop this process now": it skips
+/// the handlers and goes straight to the kernel. Nothing here depends on them.
+/// Every resource with an owner outside this process (cpu children, the fork
+/// server socket) is released explicitly before this is reached, and Rust
+/// destructors never ran under `process::exit` either.
+///
+/// Only Rust's own buffered stdout needs draining first -- that is where
+/// tracing writes. The embedded interpreter's `sys.stdout` buffer is not
+/// flushed, but it never was: CPython only flushes it from `Py_Finalize`,
+/// which an embedded worker with live daemon threads must not call.
+fn exit_now(code: i32) -> ! {
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    // SAFETY: `_exit` is async-signal-safe and valid to call from any thread
+    // at any time; it does not return.
+    unsafe { libc::_exit(code) }
 }
 
 fn real_main() -> i32 {
@@ -314,13 +354,16 @@ fn spawn_signal_task(shutdown_tx: watch::Sender<bool>, ctx: Arc<Ctx>) {
         }
         warn!("second signal: forced exit 130");
         // FS-8: this path bypasses run_worker's normal drain-then-cleanup
-        // tail entirely (process::exit below never returns), so it must do
+        // tail entirely (exit_now below never returns), so it must do
         // its own cpu pool cleanup or the fork-server socket file (and,
         // absent PDEATHSIG, its children) would be abandoned.
         if let Some(pool) = ctx.cpu.get() {
             cpu::kill_children(pool);
         }
-        std::process::exit(130);
+        // Not `process::exit`: see exit_now. This path is strictly worse for
+        // atexit handlers than the graceful one -- it runs from a tokio task
+        // with tasks still executing on the pool threads.
+        exit_now(130);
     });
 }
 
