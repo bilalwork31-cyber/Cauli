@@ -277,6 +277,44 @@ def test_app_level_routing_moves_a_task_to_another_queue(stack):
     assert res.id not in routed_ids
 
 
+def test_dlq_stream_is_bounded(stack):
+    """C1 (DLQ) regression: cauli:dlq:{queue} must not grow without bound.
+
+    A sustained trickle of failures on a long lived worker used to grow the
+    DLQ stream forever (no MAXLEN), eventually running Redis out of memory
+    for every queue, not just the failing one. Malformed entries are the
+    cheapest way to generate many DLQ writes (no Python task execution, just
+    parse-fail -> XADD dlq + XACK + XDEL), so this floods the `shortlived`
+    queue's DLQ with far more entries than the 1000 entry cap and checks it
+    settles near the cap, not near the count pushed. `shortlived` is used
+    here (not `default` or `routed`) because no other test in this file
+    inspects its DLQ stream, so this cannot race with them regardless of
+    test execution order.
+    """
+    r, _ = stack
+    dlq_key = "cauli:dlq:shortlived"
+    q_key = "cauli:q:shortlived"
+    r.delete(dlq_key)
+
+    total = 4000
+    pipe = r.pipeline(transaction=False)
+    for i in range(total):
+        pipe.xadd(q_key, {"e": f"not-json-{i}"})
+        if i % 500 == 499:
+            pipe.execute()
+            pipe = r.pipeline(transaction=False)
+    pipe.execute()
+
+    deadline = time.time() + 30
+    while time.time() < deadline and r.xlen(q_key) > 0:
+        time.sleep(0.1)
+    assert r.xlen(q_key) == 0, "worker never drained the flood of malformed entries"
+
+    xlen = r.xlen(dlq_key)
+    assert xlen < total, f"dlq grew unbounded: {xlen} entries for {total} pushed"
+    assert 500 <= xlen <= 2000, f"dlq should settle near the 1000 entry cap, got {xlen}"
+
+
 def test_worker_survived_everything(stack):
     _, worker = stack
     assert worker.poll() is None

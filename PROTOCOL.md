@@ -30,7 +30,7 @@ All keys use prefix `cauli:`. `{queue}` is a queue name matching `[a-zA-Z0-9_.-]
 |---|---|---|
 | `cauli:q:{queue}` | Stream | Ready tasks. Each entry has exactly one field `e` whose value is the envelope JSON (UTF-8). |
 | `cauli:delayed:{queue}` | ZSET | Delayed/retrying tasks. member = envelope JSON string, score = fire_at epoch ms. |
-| `cauli:dlq:{queue}` | Stream | Dead letters. Fields: `e` = envelope JSON, `reason` = string, `error` = error JSON (see §8) or empty string. |
+| `cauli:dlq:{queue}` | Stream | Dead letters. Fields: `e` = envelope JSON, `reason` = string, `error` = error JSON (see §8) or empty string. Capped at 1000 entries (approximate XADD MAXLEN); see below. |
 | `cauli:result:{task_id}` | String | Result JSON (see §8), `SET ... EX result_ttl`. |
 | `cauli:idemp:{h}` | String | Idempotency guard. Value = task id that claimed it. `SET NX EX idemp_ttl`. |
 | `cauli:beat:*` | (several) | Periodic scheduler state. Owned by `cauli-beat`, not by the worker; full layout in §10.1. |
@@ -40,6 +40,15 @@ All keys use prefix `cauli:`. `{queue}` is a queue name matching `[a-zA-Z0-9_.-]
 fixed size and neutralizes cluster hash-tag injection (`{...}`) or other charset abuse from an
 app-controlled string; it does not need to be cryptographic since idempotency keys are chosen
 by the app author, not an adversary distinct from the app.
+
+Every `cauli:dlq:{queue}` XADD (§4, §4.2, §4.4, §9.1) carries `MAXLEN ~ 1000`, so the stream
+never grows past roughly that size regardless of how long the worker has been running. Without
+a bound, a long lived worker under a sustained trickle of failures would grow the stream forever
+until Redis runs out of memory, taking down every queue in the deployment, not just the failing
+one. The tradeoff is deliberate: past the cap, the OLDEST dead letters are dropped to make room
+for new ones, so a worker that has been failing for a long time keeps only its most recent 1000
+(approximately, `~` trims to whole internal stream nodes so it can overshoot slightly) dead
+letters per queue. Losing old dead letters beats an out of memory event that stops every queue.
 
 Consumer group: name `cauli`, created per queue stream with
 `XGROUP CREATE cauli:q:{queue} cauli 0 MKSTREAM` (ignore BUSYGROUP error).

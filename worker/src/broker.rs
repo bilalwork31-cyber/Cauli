@@ -193,6 +193,17 @@ pub async fn finish_retry(
     Ok(())
 }
 
+/// Cap on each DLQ stream (`cauli:dlq:{queue}`), enforced with approximate
+/// XADD MAXLEN below. Unbounded, a long lived worker under a sustained
+/// trickle of failures grows the stream forever until Redis runs out of
+/// memory, which takes down every queue in the deployment, not just the
+/// failing one. 1000 keeps enough recent history to see a failure trend
+/// (hours to days at realistic failure rates) while bounding the worst case,
+/// every entry near --max-envelope-bytes (default 1 MiB), to roughly 1 GB
+/// per queue instead of unbounded. Past the cap the oldest dead letters are
+/// dropped: see PROTOCOL.md section 1's key table.
+const DLQ_MAXLEN: u64 = 1000;
+
 /// DLQ write (final failure §4.2, malformed/unregistered §4, redelivery §4.4):
 /// XADD dlq + [SET result]? + XACK + XDEL, one pipeline.
 pub async fn finish_dlq(
@@ -211,6 +222,9 @@ pub async fn finish_dlq(
     let mut pipe = redis::pipe();
     pipe.cmd("XADD")
         .arg(dlq_key(queue))
+        .arg("MAXLEN")
+        .arg("~")
+        .arg(DLQ_MAXLEN)
         .arg("*")
         .arg("e")
         .arg(envelope_json)
