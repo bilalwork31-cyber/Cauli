@@ -1151,7 +1151,11 @@ lose the guard with it. It narrows the window rather than closing it. Work that 
 not run twice needs a deduplication check in a store whose durability you have chosen on purpose,
 keyed on the envelope's `beat_slot`.
 
-**Redis Cluster is not currently supported for the periodic path.** The claim script touches
+**Redis Cluster is not a supported topology at all**, and the periodic path is only one of the
+reasons. The worker builds the redis crate without its cluster protocol, so it never follows a
+MOVED redirect and ordinary operations fail against a real multi node cluster, not only the
+delayed and periodic paths. What follows is the CROSSSLOT reason specific to this path. The claim
+script touches
 both `cauli:beat:*` and `cauli:q:{queue}` (or `cauli:delayed:{queue}`), which do not share a hash
 tag and so never hash to the same slot: Cluster rejects every invocation with CROSSSLOT. The
 seed script has the same problem between `cauli:beat:due` and `cauli:beat:rev`. Both are a
@@ -1299,9 +1303,12 @@ loader resolves that venv's `libpython`, and `shim.py` reads `VIRTUAL_ENV` for s
 
 Requirements: Linux on x86_64 or aarch64, glibc 2.28 or newer, and a CPython configured with
 `--enable-shared`. python.org builds, the Docker `python:*` images, Debian/Ubuntu/Fedora system
-packages, conda and actions/setup-python all qualify; `pyenv` does not unless rebuilt with
-`PYTHON_CONFIGURE_OPTS="--enable-shared"`. Anything outside that builds the worker from source,
-which has no such constraints.
+packages and actions/setup-python all qualify; `pyenv` does not unless rebuilt with
+`PYTHON_CONFIGURE_OPTS="--enable-shared"`, and neither does conda, where the wheel installs and
+the worker then fails before `main` because the loader cannot find that environment's `libpython`.
+Anything outside that builds the worker from source, which lifts the glibc floor but not the
+platform one: the worker is Linux only either way, because it arms `PR_SET_PDEATHSIG`
+unconditionally.
 
 Raw binaries are also attached to each GitHub release, as
 `cauli-worker-<version>-cp3XX-cp3XX-<platform>.tar.gz`, for deployments that are not a
