@@ -1047,8 +1047,7 @@ app = _App()
                     .expect("sys.modules supports __contains__"),
                 "test setup invalid: cauli must not already be importable in this process"
             );
-            let code =
-                CString::new(include_str!("shim.py")).expect("shim.py contains NUL byte");
+            let code = CString::new(include_str!("shim.py")).expect("shim.py contains NUL byte");
 
             // Phase 1: PROTOCOL section 4.2's documented supported case (and
             // how the entire fixture based e2e suite in this repo runs) is

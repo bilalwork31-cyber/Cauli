@@ -601,7 +601,10 @@ mod tests {
     /// dangerous combination the new startup warning must catch.
     #[test]
     fn idemp_ttl_shorter_than_task_timeout_is_detected() {
-        assert!(300_000 < idemp_ttl_ms(86_400), "default idemp_ttl must be safe");
+        assert!(
+            300_000 < idemp_ttl_ms(86_400),
+            "default idemp_ttl must be safe"
+        );
         assert!(
             300_000 >= idemp_ttl_ms(60),
             "a 60s idemp_ttl against a 300s task timeout must be flagged"
