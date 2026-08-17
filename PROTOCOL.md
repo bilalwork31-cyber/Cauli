@@ -912,6 +912,14 @@ instant strictly greater than `slot`.
 - *Spring forward* (a wall time never occurs): `zoneinfo` resolves the nonexistent local time
   with the pre-transition offset, so a 02:30 job fires at the instant 02:30 standard time would
   have been — 03:30 by the new wall clock. It fires once; it is not dropped.
+- *Ordering*. Wall clock order is instant order only while the offset holds still, so a day whose
+  offset changes is scanned in full and answered with the EARLIEST instant after `slot`, not with
+  the first wall time that matches. Without that rule a zone whose jump is wider than the gap
+  between two scheduled hours loses a real slot: on `Antarctica/Troll` (+00 to +02) the
+  nonexistent wall 02:30 resolves to 02:30Z while the real wall 03:30 resolves to 01:30Z, so
+  answering with the first wall match would skip 01:30Z permanently. Taking the earliest instant
+  is also what keeps the ordinary one hour case firing once, where a nonexistent 02:30 and a real
+  03:30 are the same instant.
 
 ### 10.3 Reconciliation between code and Redis
 
@@ -946,6 +954,12 @@ strictly after BOTH `S` and `now`. So an entry that was due 500 times while beat
 **once** on recovery and then resumes its normal cadence. Replaying 500 firings is almost never
 what anyone wants from a scheduler, and it is the failure mode that turns a brief outage into
 an incident.
+
+Every slot that gets dropped announces itself at WARNING, because lateness alone does not tell an
+operator how much scheduled work never ran. A coalesced firing logs the count of slots it
+swallowed next to its lateness; an entry that loses its slot (disabled, definition deleted, or
+definition unreadable) logs which of those it was; and a tick that hits the cap of 500 due entries
+logs that the remainder is deferred to the next tick.
 
 Whether that single recovery firing happens at all is per entry and explicit:
 
@@ -1018,11 +1032,14 @@ clock:
 
 - "Now" is `TIME` from Redis, so every replica compares against the same clock the slots are
   stored against. A replica minutes off does not fire early or late.
-- The next slot is a **pure function of the previous slot**, not of "now" (see
-  `cauli/schedules.py`). Both replicas compute the same `S'` from the same `S`, so the CAS is a
-  real mutual exclusion rather than a race between two different proposed values. If
-  `next_after` depended on `now`, two skewed replicas would propose two different `S'` and both
-  could "win" a different write.
+- The CAS compares the slot the caller **expected**, `S`, and never the value it proposes. That
+  is what makes it a mutual exclusion: the winner's `ZADD` moves the score off `S`, so every
+  other racer's `ZSCORE` stops matching and returns 0. Agreement on `S'` is not required, and
+  does not hold in general: `advance_past` fast forwards past the present (section 10.4) and so
+  does read "now", meaning two replicas that read `TIME` seconds apart genuinely propose
+  different `S'` after an outage. Only the winner's value is written, so the schedule resumes on
+  one phase rather than two. (`next_after` on its own is a pure function of the previous slot,
+  which is worth having, but the safety argument does not rest on it.)
 
 **Leader dies mid-tick.** Advance-and-publish is one script, so a slot is either
 fired-and-advanced or neither — there is no window where a slot is consumed without a task
@@ -1049,11 +1066,38 @@ only ~10s of lease remained. In all three runs the outage appears as a SINGLE co
 not a replay of the ~4/10/20 slots that elapsed, and `cauli:beat:runs` matched the number of
 envelopes published exactly.
 
+**The guarantee is per Redis dataset.** Everything above holds for as long as the CAS write
+survives, and Redis replication is asynchronous, so a failover promotes whatever the replica had
+actually received. If the leader fires slot `S`, a worker consumes and executes that task, and
+the master then dies before the write reaches the replica, the promoted node still has `S` in
+`cauli:beat:due` and beat fires `S` a second time. That is a genuine duplicate run. It is a
+property of the store, not of the CAS, which cannot defend a write the database has forgotten.
+Sentinel gets the atomic script but no immunity from this; only a synchronously replicated store
+would be immune.
+
+`idempotent: true` does not reliably cover it. The key is `beat:{name}:{slot}`, so it is stable
+across the second firing, but the worker writes its `cauli:idemp:*` guard (section 4.5) to the
+same node inside the same window of lost writes, so a failover that loses the slot advance can
+lose the guard with it. It narrows the window rather than closing it. Work that genuinely must
+not run twice needs a deduplication check in a store whose durability you have chosen on purpose,
+keyed on the envelope's `beat_slot`.
+
 **Redis Cluster.** The claim script touches both `cauli:beat:*` and `cauli:q:{queue}`, which do
 not hash to the same slot, so Cluster rejects it with CROSSSLOT. Beat detects this once, logs a
-warning and degrades to CAS-then-publish: still no duplicate firing (the CAS is unchanged), but
-a crash in the gap between the advance and the publish now drops that single firing instead of
-being atomic. Standalone and Sentinel Redis get the atomic path.
+warning and degrades to CAS then publish. The CAS itself is unchanged, so the SLOT is still
+claimed exactly once, but the publish is a separate command now and that costs atomicity in both
+directions:
+
+- a crash in the gap between the advance and the publish drops that firing entirely;
+- a publish that lands but whose reply is lost, and which is then retried, publishes the envelope
+  twice: same task id, two stream entries, one increment of `cauli:beat:runs`.
+
+Whether the second can happen is a property of the client, not of beat. `redis.Redis` is built
+with zero command retries by default, so it raises rather than retrying. `RedisCluster` defaults
+to `cluster_error_retry_attempts=10` and does retry on connection errors, and Cluster is the only
+thing that reaches this path at all. Treat scheduled tasks as at least once when running beat
+against Cluster, and deduplicate on `beat_slot`. Standalone and Sentinel Redis get the atomic
+path and neither failure mode.
 
 ### 10.6 What a non-Redis broker would have to provide
 
