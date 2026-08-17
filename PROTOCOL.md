@@ -169,6 +169,59 @@ the value itself is otherwise valid.
 
 ## 4. Worker delivery loop
 
+### Delivery guarantee
+
+Once Redis has accepted an enqueue, cauli never loses the task silently: it either executes to a
+recorded outcome or lands in the dead letter stream with a stated reason. Execution is at least
+once. Every internal failure, a truncated completion pipeline, a worker crash, a mid script
+error, a failed idempotency check, resolves toward running the task again rather than dropping
+it, so duplicates are always possible; `idempotency_key` suppresses most of them for `idemp_ttl`
+seconds, best effort. Work terminates within bounds: `max_retries` failed executions, at most
+`max(3, max_retries + 1)` crash redeliveries per attempt, then a dead letter queue capped at
+roughly 1000 entries per queue. Beat fires each slot at most once per surviving Redis dataset.
+All of this is scoped to ONE Redis dataset: an async replication failover can forget
+unreplicated writes, which is the one place a task can vanish or a beat slot can fire twice, and
+delayed, retried and periodic tasks do not work on Cluster.
+
+**What a user must do.** Write every task to tolerate running twice, unconditionally.
+`idempotency_key` narrows the window; it does not remove that obligation. Work that truly must
+not run twice needs its own dedup check inside the task, keyed on something stable, `beat_slot`
+for scheduled work. Operationally: keep `--visibility-timeout` above the longest task timeout
+and `idemp_ttl` above the longest run plus retry horizon, both of which the worker now warns
+about, watch the dead letter queue before its cap rotates, and run standalone or Sentinel
+knowing a failover can duplicate recent work.
+
+The `idemp_ttl` half of that is now enforced rather than left to the operator: a claim is
+written for at least as long as the execution it guards, whatever `idemp_ttl` says (§4.5). The
+warning stays, because the configured value is still what governs suppression of a genuine
+resubmission after the task has finished.
+
+**Worst case executions of one task: `(max_retries + 1) x (redelivery_limit + 1)`.** The two
+counters are deliberately disjoint. `retries` counts failed executions and rides in the envelope
+(§4.2); `delivery_count` counts crash redeliveries of one attempt and lives in the stream's PEL,
+so each retry starts a new entry with a fresh count (§4.4). An attempt is dead lettered on the
+delivery AFTER `delivery_count` passes `redelivery_limit`, which is one execution more than the
+limit reads like. With the defaults (`max_retries` 3, `redelivery_limit` `max(3, 3 + 1)` = 4)
+that is 4 x 5 = 20 executions before the task is guaranteed to stop, not 4. Anything sized on
+the retry count, a downstream quota, a rate limit, an alert threshold, needs that product.
+
+**The guarantee is per Redis dataset.** Everything above holds for as long as the write itself
+survives, and Redis replication is asynchronous, so a failover promotes whatever the replica had
+actually received. An enqueue the master acknowledged and never replicated is simply gone: the
+one failure that loses a task silently, and the only one cauli cannot route to a dead letter,
+because nothing in the promoted dataset remembers the task existed. The same lost write window
+covers the rest of this section. An idempotency claim can be lost with it, so a task already
+executing is claimed Fresh a second time elsewhere. If beat fires slot `S`, a worker consumes
+and executes it, and the master then dies before that write reaches the replica, the promoted
+node still has `S` due and fires it again (§10.5); `idempotent: true` narrows that window rather
+than closing it, since the `cauli:idemp:*` guard is written to the same node inside the same
+window. It is a property of the store, not of the scripts, which cannot defend a write the
+database has forgotten. Sentinel gets the atomic scripts but no immunity; only a synchronously
+replicated store would be immune. Work that genuinely must not run twice needs a dedup check in
+a store whose durability you have chosen on purpose.
+
+### The read loop
+
 - One consumer group read loop:
   `XREADGROUP GROUP cauli {consumer} COUNT {batch} BLOCK 1000 STREAMS cauli:q:{q1} cauli:q:{q2} ... > > ...`
   Batch default 16. Only fetch when free execution slots exist (per class admission below;
@@ -317,13 +370,34 @@ needs to be for tasks that legitimately crash).
 
 At execution start, if `idempotency_key` is not null (`{h}` = the hashed key per §1):
 
-- Atomically (single Lua script): `SET cauli:idemp:{h} {task_id} NX EX idemp_ttl`; if that fails
-  because the key already exists, `GET` the existing value and compare it to `task_id`.
+- Atomically (single Lua script):
+  `SET cauli:idemp:{h} {task_id} NX EX max(idemp_ttl, (timeout_ms + grace_ms) / 1000)`
+  (rounded up; `grace_ms` = 2000, the same window §4.4 uses); if that fails because the key
+  already exists, `GET` the existing value and compare it to `task_id`.
 - If the SET succeeded (fresh claim), OR the existing value equals THIS task's own `id`
-  (**"mine again"** — see below) → execute normally.
+  (**"mine again"**, see below) → `PEXPIRE` the key back to that same TTL and execute normally.
 - If the existing value is a DIFFERENT task id → do NOT execute. If `store_result`: write
-  result JSON with status `"duplicate"` (result null). XACK + XDEL. This is dedup within
-  idemp_ttl, best effort by design (at-least-once broker).
+  result JSON with status `"duplicate"` (result null) carrying `claimant_id`, the id of the task
+  that holds the key. XACK + XDEL. This is dedup within the claim's TTL, best effort by design
+  (the broker is at least once).
+
+**The TTL is derived from the execution, not taken as configured.** `idemp_ttl` is one global
+value and `timeout_ms` is per task, so a claim written for `idemp_ttl` alone can expire while
+its own task is still running, and the next attempt then claims fresh and runs concurrently with
+the first: the duplicate the key exists to prevent. Taking the larger of the two makes the claim
+outlive the execution it guards, and the `PEXPIRE` on "mine again" extends the lease across a
+retry chain instead of leaving the window anchored at the first claim. A configured `idemp_ttl`
+longer than the execution still wins, since it is the one that governs suppression after the
+task has finished.
+
+**A claim is never released, including after the claimant is dead lettered.** The alternative,
+releasing on terminal failure, is worse: a failed attempt may have applied part of its side
+effects, so suppression is the safer default. The cost is that a resubmission with the same key
+is suppressed for the rest of the TTL even though the work never succeeded, which is why the
+duplicate result names the claimant: read `cauli:result:{claimant_id}` (§8) to find the real
+outcome, or the queue's dead letter stream if the claimant was dead lettered without a stored
+result. `claimant_id` is null only in the race where the key expired between the failed `SET`
+and the `GET` of its holder.
 
 **"Mine again"** covers two cases that both reuse the SAME task `id`: a scheduled retry
 (§4.2 re-enqueues the same id after incrementing `retries`) and a crash-redelivered claim
@@ -1135,21 +1209,11 @@ only ~10s of lease remained. In all three runs the outage appears as a SINGLE co
 not a replay of the ~4/10/20 slots that elapsed, and `cauli:beat:runs` matched the number of
 envelopes published exactly.
 
-**The guarantee is per Redis dataset.** Everything above holds for as long as the CAS write
-survives, and Redis replication is asynchronous, so a failover promotes whatever the replica had
-actually received. If the leader fires slot `S`, a worker consumes and executes that task, and
-the master then dies before the write reaches the replica, the promoted node still has `S` in
-`cauli:beat:due` and beat fires `S` a second time. That is a genuine duplicate run. It is a
-property of the store, not of the CAS, which cannot defend a write the database has forgotten.
-Sentinel gets the atomic script but no immunity from this; only a synchronously replicated store
-would be immune.
-
-`idempotent: true` does not reliably cover it. The key is `beat:{name}:{slot}`, so it is stable
-across the second firing, but the worker writes its `cauli:idemp:*` guard (section 4.5) to the
-same node inside the same window of lost writes, so a failover that loses the slot advance can
-lose the guard with it. It narrows the window rather than closing it. Work that genuinely must
-not run twice needs a deduplication check in a store whose durability you have chosen on purpose,
-keyed on the envelope's `beat_slot`.
+**The guarantee is per Redis dataset**, like every other guarantee cauli makes: the CAS cannot
+defend a write the database has forgotten, so a failover that promotes a replica which never
+received the slot advance fires `S` a second time, and `idempotent: true` narrows that window
+rather than closing it (the `cauli:idemp:*` guard is lost in the same window). Stated in full,
+with what a user has to do about it, in §4 under Delivery guarantee.
 
 **Redis Cluster is not a supported topology at all**, and the periodic path is only one of the
 reasons. The worker builds the redis crate without its cluster protocol, so it never follows a
