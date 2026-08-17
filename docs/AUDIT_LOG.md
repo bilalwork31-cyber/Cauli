@@ -7,12 +7,32 @@ chronological, newest last. Read this header first, then the tail.
 
 ## Read this first
 
-Nineteen commits. The COMBINED final state was verified independently, not just each commit at its
-own point in history: 85 Rust tests, py 222, itest 22, `cargo fmt --check` and `clippy -D warnings`
-clean. The clippy pass was forced to re check rather than replay a cache hit, so it is a real one.
-`PROTOCOL.md` was separately checked for self consistency, since three agents edited it tonight in
-different sections without seeing each other's work, and every number in it was verified against the
-actual constants in `worker/src/`. It is coherent.
+**73 commits. The tree is verified GREEN as one combined state at final HEAD.** `main` untouched at
+6256854. Nothing pushed to any remote.
+
+| check | result |
+|-------|--------|
+| `cargo build --release` | clean, version 1.0.0 |
+| `cargo test --release --features test-hooks` | **118 passed, 0 failed**, 111 unit plus 7 across 6 e2e binaries |
+| `cargo clippy --release --features test-hooks -- -D warnings` | exit 0 |
+| `cargo fmt --check` | clean |
+| `pytest py/` | **254 passed** |
+| `pytest itest/` | **26 passed** |
+| `ruff check` and `ruff format --check` | clean, 46 files |
+
+This matters because for most of the night it was not true, and the header said otherwise. An earlier
+version of this paragraph claimed the combined state was verified when that verification had covered
+commit 19 of what became 73. A readiness review caught it. The claim above is the real thing: run at
+final HEAD, on a quiescent tree with no agent mid edit and no build contending.
+
+One diagnostic worth not chasing: `cargo clippy` now prints an informational line saying
+`src/main.rs` is present in multiple build targets. That is the intended consequence of the packaging
+work adding a second bin target so a plain `cargo build` keeps producing `cauli-worker` for the
+integration suite. It is a cargo diagnostic rather than a lint, and clippy still exits 0.
+
+`PROTOCOL.md` was separately checked for self consistency, since several agents edited it in different
+sections without seeing each other's work, and every number in it was verified against the actual
+constants in `worker/src/`. It is coherent.
 
 The five findings that most justified the night:
 
@@ -3297,4 +3317,39 @@ default, plus an e2e assertion that `cpu_lost` actually MOVES when a child dies 
    and passed cleanly at default parallelism once the box was quiet. Not caused by the observability
    changes. Worth chasing: a test that deadlocks only under machine load is exactly the shape this
    audit spent the night hunting, and it will bite again in CI.
+
+
+## 2026-08-17 — Cycle 35 — BLOCKER B1 CLOSED, the tree is verified as one state
+
+The verification that had never run has now run, at final HEAD, on a quiescent tree with no agent mid
+edit and no build contending. That last condition is why it waited: for most of the session at least
+one agent held uncommitted files, and a suite run against a tree in that state measures a mixture
+rather than a state.
+
+| check | result |
+|-------|--------|
+| `cargo build --release` | clean, version 1.0.0 |
+| `cargo test --release --features test-hooks` | 118 passed, 0 failed |
+| `cargo clippy --release --features test-hooks -- -D warnings` | exit 0 |
+| `cargo fmt --check` | clean |
+| `pytest py/` | 254 passed |
+| `pytest itest/` | 26 passed |
+| `ruff check` and `ruff format --check` | clean, 46 files |
+
+Two corrections to what I reported along the way, both mine:
+
+The header claimed the combined state was verified when that run had covered commit 19 of what is now
+73. The readiness review caught it. The header now carries the real numbers and says plainly why the
+distinction matters.
+
+I also reported clippy as having one outstanding line. It exits 0. The line is a cargo informational
+diagnostic saying `src/main.rs` is present in multiple build targets, which is the intended
+consequence of the packaging work adding a second bin target so a plain `cargo build` keeps producing
+`cauli-worker` for the integration suite. Noted in commit cad6933 so nobody chases it.
+
+Fixed on the way: two pre existing `cargo fmt --check` failures at main.rs:601 and pyrt.rs:1047,
+committed state, unrelated to any of the night work. Formatting only.
+
+itest is the number that mattered most here. It is the only Python to binary surface, and it had not
+run since `arbitrary_precision` changed `serde_json::Number` behaviour crate wide. 26 passed.
 
