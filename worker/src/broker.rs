@@ -117,6 +117,10 @@ pub enum IdempClaim {
 /// §4.5 idempotency guard. Atomic via a single Lua script: `SET NX`, and on
 /// failure `GET` the existing value to distinguish "my own claim" (proceed)
 /// from "someone else's claim" (duplicate) — see `IdempClaim`.
+///
+/// The PEXPIRE in the "mine again" branch is what extends the lease across a
+/// retry or a §4.4 crash redelivery: without it the window stays anchored at
+/// the FIRST claim, so a retry chain outlives the key it claimed.
 const IDEMP_CLAIM_LUA: &str = r#"
 local ok = redis.call('SET', KEYS[1], ARGV[1], 'NX', 'EX', ARGV[2])
 if ok then
@@ -124,10 +128,24 @@ if ok then
 end
 local cur = redis.call('GET', KEYS[1])
 if cur == ARGV[1] then
+  redis.call('PEXPIRE', KEYS[1], ARGV[3])
   return 2
 end
 return 0
 "#;
+
+/// TTL a claim is actually written with, derived from the execution it
+/// guards rather than taken as configured. `idemp_ttl` is one global number
+/// and `timeout_ms` is per task, so a plain `idemp_ttl` shorter than the
+/// task's own timeout expires the key mid execution and the next attempt
+/// claims Fresh, which is exactly the duplicate concurrent run the key
+/// exists to prevent. Do not simplify this back to `idemp_ttl`.
+fn claim_ttl_s(idemp_ttl_s: u64, timeout_ms: u64) -> u64 {
+    let execution_s = timeout_ms
+        .saturating_add(crate::exec::BACKSTOP_GRACE_MS)
+        .div_ceil(1000);
+    idemp_ttl_s.max(execution_s)
+}
 
 /// Built once, not per task. `redis::Script::new` computes the script's SHA1
 /// on construction, so building it inside `idemp_claim` re-hashed the source
@@ -139,13 +157,16 @@ pub async fn idemp_claim(
     conn: &mut ConnectionManager,
     key: &str,
     task_id: &str,
-    ttl_s: u64,
+    idemp_ttl_s: u64,
+    timeout_ms: u64,
 ) -> Result<IdempClaim> {
     let script = &*IDEMP_CLAIM_SCRIPT;
+    let ttl_s = claim_ttl_s(idemp_ttl_s, timeout_ms);
     let code: i64 = script
         .key(idemp_key(key))
         .arg(task_id)
         .arg(ttl_s)
+        .arg(ttl_s.saturating_mul(1000))
         .invoke_async(conn)
         .await?;
     Ok(match code {
@@ -405,6 +426,22 @@ mod tests {
         }
     }
 
+    #[test]
+    fn claim_ttl_never_expires_before_the_execution_it_guards() {
+        let grace = crate::exec::BACKSTOP_GRACE_MS;
+        // Whichever of the two independent numbers is longer wins.
+        assert_eq!(claim_ttl_s(86_400, 300_000), 86_400);
+        assert_eq!(
+            claim_ttl_s(60, 300_000),
+            (300_000 + grace).div_ceil(1000),
+            "a 300s task under a 60s idemp_ttl must claim for its execution"
+        );
+        // Rounds up, never down: a claim one tick short of its own execution
+        // is the window this derivation exists to close.
+        assert_eq!(claim_ttl_s(0, 1_500), (1_500 + grace).div_ceil(1000));
+        assert_eq!(claim_ttl_s(u64::MAX, u64::MAX), u64::MAX);
+    }
+
     /// A throwaway redis-server this test owns, on a port dedicated to
     /// broker.rs's own tests: never :6392 (worker/tests/common), :6391
     /// (py/itest), :6390 (redis_response_timeout.rs), and never :6379.
@@ -482,9 +519,7 @@ mod tests {
                                 .args(["-p", &port.to_string(), "cluster", "info"])
                                 .output()
                                 .expect("cluster info");
-                            if String::from_utf8_lossy(&info.stdout)
-                                .contains("cluster_state:ok")
-                            {
+                            if String::from_utf8_lossy(&info.stdout).contains("cluster_state:ok") {
                                 became_ok = true;
                                 break;
                             }
@@ -590,6 +625,65 @@ mod tests {
         assert!(
             is_crossslot(&err),
             "is_crossslot must recognize the real error mover_loop will see: {err}"
+        );
+    }
+
+    /// The property the derived TTL exists for: a task whose timeout_ms is
+    /// far longer than idemp_ttl still holds its claim for the whole
+    /// execution, and a second attempt under the same id (a §4.2 retry or a
+    /// §4.4 redelivery) pushes the lease out again instead of inheriting
+    /// what the first claim had left.
+    #[tokio::test]
+    async fn claim_outlives_a_long_execution_and_refreshes_on_mine_again() {
+        let redis = ThrowawayRedis::start(6420, false);
+        let client = redis::Client::open(redis.url()).expect("client");
+        let mut conn = ConnectionManager::new(client)
+            .await
+            .expect("connection manager");
+
+        let key = "order-77";
+        let task_id = "a".repeat(32);
+        let timeout_ms: u64 = 600_000; // a ten minute task
+        let idemp_ttl_s: u64 = 60; // one minute, if the claim took it as configured
+
+        assert_eq!(
+            idemp_claim(&mut conn, key, &task_id, idemp_ttl_s, timeout_ms)
+                .await
+                .expect("fresh claim"),
+            IdempClaim::Fresh
+        );
+        let pttl: i64 = redis::cmd("PTTL")
+            .arg(idemp_key(key))
+            .query_async(&mut conn)
+            .await
+            .expect("pttl");
+        assert!(
+            pttl > timeout_ms as i64,
+            "claim expires in {pttl}ms, before the {timeout_ms}ms execution it guards"
+        );
+
+        // Burn the lease down to what a plain idemp_ttl claim would have had
+        // left mid execution, then re-enter as the same task id.
+        let _: () = redis::cmd("PEXPIRE")
+            .arg(idemp_key(key))
+            .arg(5_000)
+            .query_async(&mut conn)
+            .await
+            .expect("shorten lease");
+        assert_eq!(
+            idemp_claim(&mut conn, key, &task_id, idemp_ttl_s, timeout_ms)
+                .await
+                .expect("second claim"),
+            IdempClaim::MineAgain
+        );
+        let refreshed: i64 = redis::cmd("PTTL")
+            .arg(idemp_key(key))
+            .query_async(&mut conn)
+            .await
+            .expect("pttl after refresh");
+        assert!(
+            refreshed > timeout_ms as i64,
+            "mine again must extend its own lease, got {refreshed}ms"
         );
     }
 }

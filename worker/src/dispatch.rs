@@ -126,10 +126,12 @@ async fn process(ctx: &Arc<Ctx>, queue: &str, sid: &str, raw: Option<String>) {
         }
     }
 
-    // §4.5 idempotency guard, claimed at execution start.
+    // §4.5 idempotency guard, claimed at execution start. The envelope's own
+    // timeout_ms goes with it: the claim's real TTL is derived from the
+    // execution it guards, not from ctx.idemp_ttl alone (broker::claim_ttl_s).
     if let Some(key) = env.idempotency_key.clone() {
         let mut conn = ctx.redis.clone();
-        match broker::idemp_claim(&mut conn, &key, &env.id, ctx.idemp_ttl).await {
+        match broker::idemp_claim(&mut conn, &key, &env.id, ctx.idemp_ttl, env.timeout_ms).await {
             Ok(broker::IdempClaim::Fresh) | Ok(broker::IdempClaim::MineAgain) => {}
             Ok(broker::IdempClaim::Duplicate) => {
                 let rj = envelope::result_duplicate(now_ms());
