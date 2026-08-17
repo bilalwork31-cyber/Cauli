@@ -555,6 +555,12 @@ fn visibility_timeout_ms(visibility_timeout_s: u64) -> u64 {
     visibility_timeout_s.saturating_mul(1000)
 }
 
+/// Seconds to milliseconds for idemp_ttl, same reasoning and same
+/// saturating style as `visibility_timeout_ms` above.
+fn idemp_ttl_ms(idemp_ttl_s: u64) -> u64 {
+    idemp_ttl_s.saturating_mul(1000)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -563,6 +569,26 @@ mod tests {
     fn visibility_timeout_ms_saturates_instead_of_wrapping() {
         assert_eq!(visibility_timeout_ms(60), 60_000);
         assert_eq!(visibility_timeout_ms(u64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn idemp_ttl_ms_saturates_instead_of_wrapping() {
+        assert_eq!(idemp_ttl_ms(86_400), 86_400_000);
+        assert_eq!(idemp_ttl_ms(u64::MAX), u64::MAX);
+    }
+
+    /// F4 reproduction: idemp_ttl and a task's own timeout_ms are unrelated
+    /// numbers nothing else cross checks. The default idemp_ttl (86400s)
+    /// comfortably outlives the default task timeout (300s / 300_000ms); a
+    /// short idemp_ttl against that same default timeout is exactly the
+    /// dangerous combination the new startup warning must catch.
+    #[test]
+    fn idemp_ttl_shorter_than_task_timeout_is_detected() {
+        assert!(300_000 < idemp_ttl_ms(86_400), "default idemp_ttl must be safe");
+        assert!(
+            300_000 >= idemp_ttl_ms(60),
+            "a 60s idemp_ttl against a 300s task timeout must be flagged"
+        );
     }
 
     #[test]

@@ -88,6 +88,16 @@ pub async fn run_mover(
     Ok(n)
 }
 
+/// True if `e` is Redis Cluster's CROSSSLOT. This is a permanent property of
+/// a script's declared keys (here, `delayed_key` and `q_key` never share a
+/// hash tag), not a transient condition: the same script fails the same way
+/// on every future call, so a caller must not log or retry it like an
+/// ordinary redis error.
+pub fn is_crossslot(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<redis::RedisError>()
+        .is_some_and(|re| re.kind() == redis::ErrorKind::CrossSlot)
+}
+
 /// §4.5 idempotency guard outcome.
 #[derive(Debug, PartialEq, Eq)]
 pub enum IdempClaim {
@@ -472,7 +482,9 @@ mod tests {
                                 .args(["-p", &port.to_string(), "cluster", "info"])
                                 .output()
                                 .expect("cluster info");
-                            if String::from_utf8_lossy(&info.stdout).contains("cluster_state:ok") {
+                            if String::from_utf8_lossy(&info.stdout)
+                                .contains("cluster_state:ok")
+                            {
                                 became_ok = true;
                                 break;
                             }
@@ -551,6 +563,33 @@ mod tests {
             score,
             Some(due_at as f64),
             "entry must survive a mid script XADD failure, not vanish"
+        );
+    }
+
+    /// F2 reproduction: a genuine single node cluster-enabled redis, CRC16
+    /// verified to put cauli:q:myqueue and cauli:delayed:myqueue in
+    /// different slots (416 and 439). Asserts the error is both real
+    /// CROSSSLOT and correctly classified as non-transient, the two facts
+    /// mover_loop's loud-vs-quiet branch depends on.
+    #[tokio::test]
+    async fn mover_crossslot_is_detected_not_treated_as_transient() {
+        let redis = ThrowawayRedis::start(6410, true);
+        let client = redis::Client::open(redis.url()).expect("client");
+        let mut conn = ConnectionManager::new(client)
+            .await
+            .expect("connection manager");
+
+        let script = redis::Script::new(MOVER_LUA);
+        let err = run_mover(&mut conn, &script, "myqueue", 1_000)
+            .await
+            .expect_err("cauli:q:{queue} and cauli:delayed:{queue} never share a slot");
+        assert!(
+            err.to_string().to_uppercase().contains("CROSSSLOT"),
+            "expected CROSSSLOT, got: {err}"
+        );
+        assert!(
+            is_crossslot(&err),
+            "is_crossslot must recognize the real error mover_loop will see: {err}"
         );
     }
 }

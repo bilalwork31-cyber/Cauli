@@ -242,20 +242,34 @@ all). `.countdown` is read as a float seconds value (`None` → use the computed
 
 ### 4.3 Delayed mover
 
-Every 250ms per queue, atomically move due members (Lua script, single EVAL):
+Every 250ms per queue, move due members (Lua script, single EVAL):
 
 ```lua
 -- KEYS[1]=cauli:delayed:{queue}  KEYS[2]=cauli:q:{queue}  ARGV[1]=now_ms  ARGV[2]=limit
 local due = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, tonumber(ARGV[2]))
 for i, e in ipairs(due) do
-  redis.call('ZREM', KEYS[1], e)
   redis.call('XADD', KEYS[2], '*', 'e', e)
+  redis.call('ZREM', KEYS[1], e)
 end
 return #due
 ```
 
+Atomic against other clients, not transactional: a Lua script does not roll back on its own
+error, so if `XADD` had run after `ZREM` a failure partway through (the target key holding the
+wrong type, or an out of memory error under `maxmemory-policy noeviction`, the default) would
+remove the entry from the sorted set with no guarantee it ever reached the stream, a silent
+loss. Publishing before removing means a failure partway through can only duplicate an entry
+into the stream, never lose it.
+
 limit = 128. Both the worker AND the Python client ship this mover (worker runs it always;
 client does not run it — single source: worker only. The client merely ZADDs).
+
+**Redis Cluster is not supported for this path.** `cauli:delayed:{queue}` and `cauli:q:{queue}`
+do not share a hash tag, so they never hash to the same slot, and this EVAL is rejected with
+CROSSSLOT on every invocation, not just an occasional one. The mover loop detects CROSSSLOT
+specifically and logs loudly and by name rather than folding it into the generic "mover failed,
+retrying" warning: every delayed and every retried task on that queue is stuck in the sorted set
+and never reaches the stream until the deployment moves off Cluster.
 
 ### 4.4 Crash recovery / redelivery
 
@@ -1047,7 +1061,6 @@ score is still exactly `S`:
 local cur = redis.call('ZSCORE', KEYS[1], ARGV[1])
 if cur == false then return 0 end
 if tonumber(cur) ~= tonumber(ARGV[2]) then return 0 end
-redis.call('ZADD', KEYS[1], ARGV[3], ARGV[1])
 if ARGV[4] == 'stream' then
   redis.call('XADD', KEYS[4], '*', 'e', ARGV[5])
   redis.call('HINCRBY', KEYS[3], ARGV[1], 1)
@@ -1055,11 +1068,20 @@ elseif ARGV[4] == 'delayed' then
   redis.call('ZADD', KEYS[4], tonumber(ARGV[6]), ARGV[5])
   redis.call('HINCRBY', KEYS[3], ARGV[1], 1)
 end
+redis.call('ZADD', KEYS[1], ARGV[3], ARGV[1])
 redis.call('HSET', KEYS[2], ARGV[1], ARGV[7])
 return 1
 ```
 
 (`mode = 'none'` advances the slot without publishing: the `on_missed: "skip"` path.)
+
+The publish comes before the slot advance, deliberately. A Lua script is atomic against other
+clients but does not roll back on its own error, so every write it already made stays committed
+if a later `redis.call` in the same script fails (section 4.3 makes the identical point about
+the delayed mover). Advancing the slot first would let a failed publish, the target key holding
+the wrong type is the reproducible case, consume the slot with nothing ever sent: a silently
+lost firing with no trace anywhere. Publishing first means a failure partway through can only be
+retried and republished on a later tick, a duplicate, never a loss.
 
 Safety therefore does not depend on the lease at all. A lease can always be defeated — a
 stop-the-world GC pause, a network partition, a Redis failover — so building the exactly-once
@@ -1081,10 +1103,17 @@ clock:
   one phase rather than two. (`next_after` on its own is a pure function of the previous slot,
   which is worth having, but the safety argument does not rest on it.)
 
-**Leader dies mid-tick.** Advance-and-publish is one script, so a slot is either
-fired-and-advanced or neither — there is no window where a slot is consumed without a task
-being published. A leader that dies partway through a tick leaves its remaining entries
-un-advanced; the next leader finds them due and fires them, late but exactly once.
+**Leader dies mid tick.** Advance and publish happen inside one script invocation, so as far as
+a dying leader process is concerned a slot is either fired and advanced or its script was never
+sent at all. A leader that dies partway through a tick simply never reaches its remaining
+entries; the next leader finds them due and fires them, late but exactly once.
+
+That guarantee is about the process dying, not about what happens inside one invocation, and it
+does NOT extend to "there is no window where a slot is consumed without a task being published."
+There is one: a `redis.call` failing partway through the script itself, covered above and in
+section 4.3. The ordering fix there is what keeps that window from losing a firing; the process
+level guarantee in this paragraph is a separate, narrower claim about what a dying leader can and
+cannot leave half done.
 
 **Leader dies between ticks.** The lease expires and a standby acquires it. Because the holder
 refreshes at `lock_ttl / 3`, the residual lease at the moment of death is between
@@ -1122,22 +1151,28 @@ lose the guard with it. It narrows the window rather than closing it. Work that 
 not run twice needs a deduplication check in a store whose durability you have chosen on purpose,
 keyed on the envelope's `beat_slot`.
 
-**Redis Cluster.** The claim script touches both `cauli:beat:*` and `cauli:q:{queue}`, which do
-not hash to the same slot, so Cluster rejects it with CROSSSLOT. Beat detects this once, logs a
-warning and degrades to CAS then publish. The CAS itself is unchanged, so the SLOT is still
-claimed exactly once, but the publish is a separate command now and that costs atomicity in both
-directions:
+**Redis Cluster is not currently supported for the periodic path.** The claim script touches
+both `cauli:beat:*` and `cauli:q:{queue}` (or `cauli:delayed:{queue}`), which do not share a hash
+tag and so never hash to the same slot: Cluster rejects every invocation with CROSSSLOT. The
+seed script has the same problem between `cauli:beat:due` and `cauli:beat:rev`. Both are a
+permanent property of this key layout, not a transient condition, so the same script fails the
+same way on the next tick, and the one after that.
 
-- a crash in the gap between the advance and the publish drops that firing entirely;
-- a publish that lands but whose reply is lost, and which is then retried, publishes the envelope
-  twice: same task id, two stream entries, one increment of `cauli:beat:runs`.
+An earlier version of this document described a degraded mode here: catch the CROSSSLOT once,
+fall back to a CAS only call, then publish as a separate command. It does not work. The fallback
+call itself declares `cauli:beat:due`, `cauli:beat:state` and `cauli:beat:runs`, which do not
+share a hash tag with each other either, so it also raises CROSSSLOT, and nothing was left to
+catch it. Beat does not attempt that fallback any more. Both scripts instead raise a distinct,
+named error identifying Redis Cluster as the cause, logged loudly on every tick rather than
+folded into the generic redis error retry message a transient blip would produce. No periodic
+task is ever seeded and none ever fires, and that failure is meant to be impossible to miss in
+the logs. `cauli-worker`'s own delayed mover has the identical CROSSSLOT problem against
+`cauli:q:{queue}` and `cauli:delayed:{queue}`; see section 4.3.
 
-Whether the second can happen is a property of the client, not of beat. `redis.Redis` is built
-with zero command retries by default, so it raises rather than retrying. `RedisCluster` defaults
-to `cluster_error_retry_attempts=10` and does retry on connection errors, and Cluster is the only
-thing that reaches this path at all. Treat scheduled tasks as at least once when running beat
-against Cluster, and deduplicate on `beat_slot`. Standalone and Sentinel Redis get the atomic
-path and neither failure mode.
+Hash tagging the key layout would fix this properly, letting every one of these keys share a
+slot, but it is a breaking change to the key naming scheme with a migration story of its own, and
+is intentionally out of scope here. Standalone and Sentinel Redis are unaffected: neither
+partitions keys into slots, so CROSSSLOT never applies.
 
 ### 10.6 What a non-Redis broker would have to provide
 

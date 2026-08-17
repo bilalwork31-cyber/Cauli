@@ -10,6 +10,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import shutil
+import subprocess
 import threading
 import time
 from datetime import timedelta
@@ -28,6 +31,7 @@ from cauli.beat import (
     SCHEDULE_KEY,
     STATE_KEY,
     Beat,
+    RedisClusterUnsupported,
     RedisScheduleStore,
 )
 from cauli.schedules import ScheduleEntry
@@ -97,6 +101,23 @@ def test_first_tick_seeds_but_does_not_fire(beat_app, store, redis_client):
     assert (
         redis_client.hget(REV_KEY, "tick").decode() == beat_app._periodic["tick"].rev()
     )
+
+
+def test_seed_lua_no_longer_declares_the_dead_state_key(store, monkeypatch):
+    """_SEED_LUA never read its old KEYS[2] (STATE_KEY): dead, and it only
+    widened the CROSSSLOT exposure below for nothing. Deleted rather than
+    documented around; this asserts it stays deleted.
+    """
+    real_seed = store._seed
+    captured: dict[str, list] = {}
+
+    def spy(keys, args):
+        captured["keys"] = keys
+        return real_seed(keys=keys, args=args)
+
+    monkeypatch.setattr(store, "_seed", spy)
+    assert store.seed("tick", 1_700_000_000_000, "rev1") is True
+    assert captured["keys"] == [DUE_KEY, REV_KEY]
 
 
 def test_entry_fires_when_its_slot_arrives_and_advances(beat_app, store, redis_client):
@@ -853,3 +874,158 @@ def test_deferring_a_mass_due_backlog_is_announced(
     deferred = [m for m in warnings_from(caplog) if "came due at once" in m]
     assert len(deferred) == 1, deferred
     assert str(DUE_BATCH) in deferred[0]
+
+
+# --------------------------------------------------------- redis cluster
+
+# A port this module fully owns for its own throwaway cluster-enabled redis:
+# never :6391 (the rest of this suite, session scoped, see conftest.py),
+# never :6392/:6390 (the worker's own e2e suites), never :6379.
+CLUSTER_PORT = 6409
+
+
+@pytest.fixture(scope="module")
+def cluster_redis_url():
+    """A genuine single node `cluster-enabled yes` redis.
+
+    Not a mock: CROSSSLOT is a real cluster behaviour standalone redis never
+    exhibits, so the only faithful reproduction is a real cluster instance,
+    the same way the original bugs were found. Module scoped since claiming
+    every slot only needs to happen once; each test flushes its own keys.
+    """
+    server = shutil.which("redis-server")
+    if server is None:
+        pytest.skip("redis-server not installed")
+    subprocess.run(
+        ["redis-cli", "-p", str(CLUSTER_PORT), "shutdown", "nosave"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    time.sleep(0.2)
+    conf_dir = f"/tmp/cauli-test-cluster-{CLUSTER_PORT}"
+    # A stale nodes.conf from an earlier run already claims every slot, and
+    # CLUSTER ADDSLOTSRANGE refuses to reclaim an already assigned slot:
+    # start from a genuinely blank node every time, not just a fresh process.
+    shutil.rmtree(conf_dir, ignore_errors=True)
+    os.makedirs(conf_dir, exist_ok=True)
+    proc = subprocess.Popen(
+        [
+            server,
+            "--port",
+            str(CLUSTER_PORT),
+            "--save",
+            "",
+            "--appendonly",
+            "no",
+            "--cluster-enabled",
+            "yes",
+            "--cluster-config-file",
+            f"{conf_dir}/nodes.conf",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    url = f"redis://127.0.0.1:{CLUSTER_PORT}/0"
+    client = None
+    deadline = time.monotonic() + 10
+    while client is None and time.monotonic() < deadline:
+        try:
+            candidate = redis_lib.Redis.from_url(url, socket_connect_timeout=0.25)
+            candidate.ping()
+            client = candidate
+        except Exception:
+            time.sleep(0.05)
+    if client is None:
+        proc.terminate()
+        pytest.fail(f"could not start cluster redis on {CLUSTER_PORT}")
+    client.execute_command("CLUSTER", "ADDSLOTSRANGE", 0, 16383)
+    # cluster_state flips to "ok" on the next cluster cron tick, not
+    # synchronously with ADDSLOTSRANGE's own reply.
+    deadline = time.monotonic() + 10
+    ok = False
+    while time.monotonic() < deadline:
+        if b"cluster_state:ok" in client.execute_command("CLUSTER", "INFO"):
+            ok = True
+            break
+        time.sleep(0.05)
+    if not ok:
+        proc.terminate()
+        pytest.fail("cluster never reached cluster_state:ok")
+    yield url
+    client.close()
+    proc.terminate()
+    proc.wait(timeout=5)
+
+
+def test_seed_raises_loud_not_silent_on_cluster_crossslot(cluster_redis_url):
+    """F3 reproduction, live, against a genuine cluster-enabled redis.
+
+    Before this fix the ResponseError had no handler at this call site at
+    all, so it reached run()'s generic RedisError branch, "redis error;
+    retrying in 1s", forever: nothing is ever seeded, silently. It must now
+    be a distinct, named, unmistakable failure instead.
+    """
+    client = redis_lib.Redis.from_url(cluster_redis_url)
+    client.flushall()
+    store = RedisScheduleStore(client)
+    try:
+        with pytest.raises(RedisClusterUnsupported, match="(?i)redis cluster"):
+            store.seed("tick", 1_700_000_000_000, "rev1")
+    finally:
+        client.close()
+
+
+def test_claim_and_publish_raises_loud_not_silent_on_cluster_crossslot(
+    cluster_redis_url, beat_app
+):
+    """The sibling script's failure mode, live.
+
+    Before this fix, a CROSSSLOT here was caught once and degraded to a
+    second call believed to touch only the beat keys -- but cauli:beat:due,
+    cauli:beat:state and cauli:beat:runs do not share a hash slot either, so
+    that fallback ALSO raised CROSSSLOT, uncaught that time, reaching the
+    same generic retry loop as the seed path. It must raise the same named
+    error immediately, not degrade into a fallback that cannot work.
+    """
+    client = redis_lib.Redis.from_url(cluster_redis_url)
+    client.flushall()
+    store = RedisScheduleStore(client)
+    client.zadd(DUE_KEY, {"tick": 1_700_000_000_000})
+    env, queue, _ = beat_app.make_envelope("app.ping")
+    try:
+        with pytest.raises(RedisClusterUnsupported, match="(?i)redis cluster"):
+            store.claim_and_publish(
+                "tick", 1_700_000_000_000, 1_700_000_060_000, env, queue, None, {}
+            )
+    finally:
+        client.close()
+
+
+def test_run_reports_cluster_crossslot_loudly_and_keeps_polling(
+    cluster_redis_url, beat_app, caplog
+):
+    """The user visible behaviour end to end.
+
+    run() must not fold this into "redis error; retrying in 1s" (the generic
+    message, indistinguishable from a real transient blip), and per this
+    fix's judgement call, must not crash the process either -- it keeps
+    polling, loud, rather than refusing to run outright.
+    """
+    client = redis_lib.Redis.from_url(cluster_redis_url)
+    client.flushall()
+    beat_app.add_periodic_task("tick", "app.ping", interval(10))
+    store = FrozenStore(client, now=1_700_000_000_000)
+    beat = make_beat(beat_app, store, max_interval=0.05)
+
+    stop = StopAfter(3)
+    try:
+        with caplog.at_level(logging.ERROR, logger="cauli.beat"):
+            beat.run(stop)
+    finally:
+        client.close()
+
+    messages = [r.getMessage() for r in caplog.records]
+    loud = [m for m in messages if "redis cluster" in m.lower()]
+    generic = [m for m in messages if "retrying in 1s" in m]
+    assert loud, f"no named redis cluster failure logged: {messages}"
+    assert not generic, f"fell back to the generic blip message: {generic}"

@@ -120,12 +120,38 @@ return 1
 # slow replica could reseed a slot that a fast one had already fired, firing it
 # twice.
 _SEED_LUA = """
-local rev = redis.call('HGET', KEYS[3], ARGV[1])
+local rev = redis.call('HGET', KEYS[2], ARGV[1])
 if rev == ARGV[3] and redis.call('ZSCORE', KEYS[1], ARGV[1]) then return 0 end
 redis.call('ZADD', KEYS[1], ARGV[2], ARGV[1])
-redis.call('HSET', KEYS[3], ARGV[1], ARGV[3])
+redis.call('HSET', KEYS[2], ARGV[1], ARGV[3])
 return 1
 """
+
+class RedisClusterUnsupported(RuntimeError):
+    """A beat Lua script hit Redis Cluster's CROSSSLOT.
+
+    Deliberately not a redis.exceptions.RedisError. Every RedisError run()
+    retries below is a plausible blip: a dropped connection, a failover in
+    progress. This is not one of those. The beat keys and the target queue
+    key never share a hash tag, so the script that just failed will fail the
+    same way on the next tick, and every tick after that. Its own type keeps
+    it out of the generic handler so it can be logged as what it actually
+    is: permanent, not transient.
+    """
+
+
+def _crossslot(exc: "redis.exceptions.ResponseError") -> bool:
+    # Newer redis-py maps the server's CROSSSLOT code to a dedicated
+    # ClusterCrossSlotError whose message is a rewritten "Keys in request
+    # don't hash to the same slot", with no "CROSSSLOT" substring left in
+    # str(exc) at all -- checked by type first for that case, older redis-py
+    # (no such class; the raw "CROSSSLOT ..." server message survives) by
+    # substring after.
+    cross_slot_type = getattr(redis.exceptions, "ClusterCrossSlotError", ())
+    if isinstance(exc, cross_slot_type):
+        return True
+    return "CROSSSLOT" in str(exc).upper()
+
 
 _REFRESH_LUA = """
 if redis.call('GET', KEYS[1]) == ARGV[1] then
@@ -233,10 +259,6 @@ class RedisScheduleStore(ScheduleStore):
         self._seed = client.register_script(_SEED_LUA)
         self._refresh = client.register_script(_REFRESH_LUA)
         self._release = client.register_script(_RELEASE_LUA)
-        # Flipped to False the first time the atomic claim+publish trips over
-        # a Redis Cluster CROSSSLOT error (the beat keys and cauli:q:{queue}
-        # do not share a hash slot). See `claim_and_publish`.
-        self._atomic_publish = True
 
     # -- clock ------------------------------------------------------------
     def now_ms(self) -> int:
@@ -286,11 +308,19 @@ class RedisScheduleStore(ScheduleStore):
 
     # -- slots ------------------------------------------------------------
     def seed(self, name: str, slot_ms: int, rev: str) -> bool:
-        return bool(
-            self._seed(
-                keys=[DUE_KEY, STATE_KEY, REV_KEY], args=[name, int(slot_ms), rev]
+        try:
+            return bool(
+                self._seed(keys=[DUE_KEY, REV_KEY], args=[name, int(slot_ms), rev])
             )
-        )
+        except redis.exceptions.ResponseError as exc:
+            if not _crossslot(exc):
+                raise
+            raise RedisClusterUnsupported(
+                f"beat cannot seed schedule entries on redis cluster: {DUE_KEY} "
+                f"and {REV_KEY} do not share a hash slot, so this script always "
+                "fails with CROSSSLOT; no periodic task can ever be seeded on "
+                "this deployment"
+            ) from exc
 
     def slots_and_revs(self) -> tuple[dict[str, int], dict[str, str]]:
         """Current next-fire slots and schedule fingerprints, in one round trip.
@@ -341,58 +371,30 @@ class RedisScheduleStore(ScheduleStore):
             )
 
         state_json = _codec.encode(state)
-        if mode != "none" and self._atomic_publish:
-            try:
-                return bool(
-                    self._claim(
-                        keys=[DUE_KEY, STATE_KEY, RUNS_KEY, target],
-                        args=[
-                            name,
-                            int(expected_slot),
-                            int(next_slot),
-                            mode,
-                            payload,
-                            int(fire_at or 0),
-                            state_json,
-                        ],
-                    )
+        try:
+            return bool(
+                self._claim(
+                    keys=[DUE_KEY, STATE_KEY, RUNS_KEY, target],
+                    args=[
+                        name,
+                        int(expected_slot),
+                        int(next_slot),
+                        mode,
+                        payload,
+                        int(fire_at or 0),
+                        state_json,
+                    ],
                 )
-            except redis.exceptions.ResponseError as exc:
-                if "CROSSSLOT" not in str(exc).upper():
-                    raise
-                # Redis Cluster: the beat keys and the queue key live in
-                # different slots, so no script can touch both. Degrade
-                # explicitly rather than silently: the CAS still guarantees no
-                # DUPLICATE firing, but a crash in the gap between the advance
-                # and the publish now loses that one firing.
-                log.warning(
-                    "beat: redis cluster CROSSSLOT on the atomic claim+publish; "
-                    "falling back to claim-then-publish (a crash in the gap now "
-                    "drops a single firing instead of being atomic)"
-                )
-                self._atomic_publish = False
-
-        won = bool(
-            self._claim(
-                keys=[DUE_KEY, STATE_KEY, RUNS_KEY, DUE_KEY],
-                args=[
-                    name,
-                    int(expected_slot),
-                    int(next_slot),
-                    "none",
-                    "",
-                    0,
-                    state_json,
-                ],
             )
-        )
-        if won and envelope is not None:
-            if fire_at is not None:
-                self.client.zadd(target, {payload: fire_at})
-            else:
-                self.client.xadd(target, {"e": payload})
-            self.client.hincrby(RUNS_KEY, name, 1)
-        return won
+        except redis.exceptions.ResponseError as exc:
+            if not _crossslot(exc):
+                raise
+            raise RedisClusterUnsupported(
+                f"beat cannot claim and publish on redis cluster: cauli:beat:* "
+                f"and {target} do not share a hash slot, so this script always "
+                "fails with CROSSSLOT; no periodic task can ever fire on this "
+                "deployment"
+            ) from exc
 
     def state(self, name: str) -> dict[str, Any] | None:
         raw = self.client.hget(STATE_KEY, name)
@@ -741,6 +743,16 @@ class Beat:
                         self.sync_code_entries()
                         self._reconciled = True
                     sleep_s = self.tick()
+                except RedisClusterUnsupported as exc:
+                    # Same lease reasoning as the generic handler below (force
+                    # a refresh, do not step down), but never logged as
+                    # "retrying in 1s": stepping down would just hand the
+                    # exact same permanent CROSSSLOT to the next leader, and
+                    # a message that reads like a blip would send an operator
+                    # chasing a network problem that does not exist.
+                    log.error("beat: %s", exc)
+                    self._next_refresh = 0.0
+                    sleep_s = 1.0
                 except redis.exceptions.RedisError as exc:
                     # Do NOT step down here. A transient error says nothing
                     # about whether the lease is still ours, and `acquire_lock`

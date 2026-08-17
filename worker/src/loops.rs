@@ -10,7 +10,7 @@ use redis::AsyncCommands;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 /// §4 fetch loop. Gate: fetch only when io slots are free and no cpu dispatch
 /// is blocked on a full backlog (bounded starvation, see ARCHITECTURE.md).
@@ -72,7 +72,22 @@ pub async fn mover_loop(ctx: Arc<Ctx>) {
         tick.tick().await;
         for q in &ctx.queues {
             if let Err(e) = broker::run_mover(&mut conn, &script, q, now_ms()).await {
-                warn!(queue = %q, "delayed mover failed: {e}");
+                if broker::is_crossslot(&e) {
+                    // Not a blip: cauli:q:{queue} and cauli:delayed:{queue}
+                    // never share a hash slot, so this EVAL fails with
+                    // CROSSSLOT on every future tick too, not just this one.
+                    // Name the real cause instead of letting it read like an
+                    // ordinary retryable error.
+                    error!(
+                        queue = %q,
+                        "redis cluster is not supported for the delayed path: {e}; \
+                         cauli:q:{{queue}} and cauli:delayed:{{queue}} do not share a hash \
+                         slot, so this queue's delayed and retried tasks can never reach \
+                         the stream on this deployment (PROTOCOL.md section 4.3)"
+                    );
+                } else {
+                    warn!(queue = %q, "delayed mover failed: {e}");
+                }
             }
         }
     }
