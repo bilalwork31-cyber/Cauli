@@ -151,6 +151,28 @@ def test_retry_response_without_countdown(child):
     assert resp["error"]["type"] == "Retry"
 
 
+def test_retry_response_with_non_numeric_countdown_falls_back(child):
+    # A Retry.countdown that float() cannot convert must not let that
+    # ValueError replace the user's actual Retry in the response: this
+    # mirrors worker/src/shim.py's _finish_exc, which already guards this
+    # exact conversion and degrades to the computed backoff (countdown=None)
+    # instead of losing the real exception.
+    resp = child.request(
+        {
+            "id": "t4",
+            "task": "retryme",
+            "args": ["nope"],
+            "kwargs": {},
+            "soft_timeout_ms": None,
+        }
+    )
+    assert resp["id"] == "t4"
+    assert resp["ok"] is False
+    assert resp["retry"] is True
+    assert resp["countdown"] is None
+    assert resp["error"]["type"] == "Retry"
+
+
 def test_retry_recognized_by_duck_type_not_isinstance(child):
     # M6 regression: a "Retry" class that does NOT subclass cauli.exceptions.Retry
     # must still be recognized (name + .countdown duck typing), matching

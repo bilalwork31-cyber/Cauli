@@ -242,12 +242,16 @@ def _execute(
         except BaseException as exc:  # the child must never crash on task errors
             if _is_retry(exc):
                 cd = getattr(exc, "countdown", None)
-                countdown = None if cd is None else float(cd)
+                if cd is not None:
+                    try:
+                        cd = float(cd)
+                    except Exception:
+                        cd = None
                 return {
                     "id": request_id,
                     "ok": False,
                     "retry": True,
-                    "countdown": countdown,
+                    "countdown": cd,
                     "error": _error_json(exc),
                 }
             return {"id": request_id, "ok": False, "error": _error_json(exc)}
