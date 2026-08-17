@@ -127,6 +127,7 @@ redis.call('HSET', KEYS[2], ARGV[1], ARGV[3])
 return 1
 """
 
+
 class RedisClusterUnsupported(RuntimeError):
     """A beat Lua script hit Redis Cluster's CROSSSLOT.
 

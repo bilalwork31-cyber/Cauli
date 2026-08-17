@@ -458,7 +458,9 @@ def test_crash_redelivery_resolves_mine_again_not_duplicate(stack):
         res = AsyncResult(task_id, m.app)
         out = res.get(timeout=25)
         assert out == {"slow_idemp_done": True}, "reclaimed task must genuinely execute"
-        assert res.status() == "success", "crash redelivery must not resolve as duplicate"
+        assert res.status() == "success", (
+            "crash redelivery must not resolve as duplicate"
+        )
 
         deadline = time.time() + 5
         while time.time() < deadline and _pending_count(r, queue) != 0:
@@ -517,7 +519,11 @@ def test_redelivery_limit_dead_letters_with_result(stack):
     entry_id = delivered[0][1][0][0]
     for i in range(3):
         r.xclaim(
-            q_key, "cauli", f"sim-redelivery-{i}", min_idle_time=0, message_ids=[entry_id]
+            q_key,
+            "cauli",
+            f"sim-redelivery-{i}",
+            min_idle_time=0,
+            message_ids=[entry_id],
         )
     pel = r.xpending_range(q_key, "cauli", min=entry_id, max=entry_id, count=1)
     assert pel[0]["times_delivered"] == 4, "setup must land exactly one over the limit"
