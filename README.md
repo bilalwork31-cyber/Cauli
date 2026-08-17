@@ -233,16 +233,20 @@ pip install cauli 'sqlalchemy[asyncio]' 'psycopg[binary]'   # or asyncpg
 
 ```python
 # myproj/cauli.py
-from cauli.contrib.fastapi import fastapi_app
+from cauli.contrib.sqlalchemy import sqlalchemy_app
 
-app = fastapi_app("postgresql+psycopg://user:pass@host/db")
+app = sqlalchemy_app("postgresql+psycopg://user:pass@host/db")
 ```
 
 ```bash
 cauli-worker -A myproj.cauli:app -c 50
 ```
 
-`fastapi_app()` builds one `create_async_engine()` and one `async_sessionmaker()`
+The module imports no web framework, so it serves FastAPI, Starlette, Litestar or
+a bare asyncio app identically. `cauli.contrib.fastapi` remains as an alias, so
+existing imports keep working.
+
+`sqlalchemy_app()` builds one `create_async_engine()` and one `async_sessionmaker()`
 up front, opens an `AsyncSession` before every task and closes it after through
 a `ContextVar` task code reads with `get_session()`, and disposes the engine on
 process init so a pooled connection can never survive into a forked cpu child.
