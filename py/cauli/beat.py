@@ -452,6 +452,16 @@ class Beat:
         self.fired = 0
         self.skipped = 0
         self.lost_races = 0
+        # Runs here, once per process, rather than from add_periodic_task: a
+        # task name may resolve to an @app.task decorated later in the same
+        # module, so a name still missing is only a real typo once the whole
+        # app module has finished importing, which construction time
+        # guarantees. Logged instead of left to raise: one typo must not stop
+        # every other entry in the schedule from being reconciled and fired.
+        try:
+            self.app.check_periodic_tasks()
+        except ValueError as exc:
+            log.error("beat: %s", exc)
 
     # -- leadership -------------------------------------------------------
     @property

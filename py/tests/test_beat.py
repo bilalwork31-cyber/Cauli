@@ -187,6 +187,36 @@ def test_impossible_crontab_is_reported_not_raised(beat_app, store):
     assert beat.fired == 0
 
 
+def test_unregistered_periodic_task_is_named_at_error_on_beat_startup(
+    beat_app, store, caplog
+):
+    """check_periodic_tasks() is wired into Beat.__init__, not into
+    add_periodic_task itself, since a name may resolve to an @app.task
+    decorated later in the same module. Beat startup is after the whole app
+    module has imported, so a name still missing there is a real typo: name
+    it loudly and keep going, the same as every other unusable entry."""
+
+    @beat_app.task(name="app.ping")
+    def ping():
+        return None
+
+    beat_app.add_periodic_task("good", "app.ping", interval(60))
+    beat_app.add_periodic_task("typo_job", "app.pign", interval(60))  # never registered
+
+    with caplog.at_level(logging.ERROR, logger="cauli.beat"):
+        beat = make_beat(beat_app, store)  # must not raise
+
+    errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+    assert len(errors) == 1, errors
+    assert "typo_job" in errors[0] and "app.pign" in errors[0]
+
+    beat.sync_code_entries()
+    beat.tick()
+    store.clock += 60_000
+    beat.tick()
+    assert store.state("good")["status"] == "fired", "the good entry must still fire"
+
+
 # -------------------------------------------------------- missed slots
 
 
