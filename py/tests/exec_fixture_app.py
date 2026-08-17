@@ -68,6 +68,15 @@ def pidinfo():
     return {"pid": os.getpid(), "tid": threading.get_ident()}
 
 
+@app.task(name="selfsignal", kind="cpu")
+def selfsignal(sig):
+    # Kills THIS child with a real signal (e.g. SIGSEGV), standing in for a
+    # segfault or an OOM kill so the fork-server parent's reaper has a
+    # WIFSIGNALED exit status to log.
+    os.kill(os.getpid(), sig)
+    return "unreachable"
+
+
 @app.task(name="freeze_count", kind="cpu")
 def freeze_count():
     # In a fork-server child this must be > 0: the parent froze its warmed

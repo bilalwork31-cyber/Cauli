@@ -363,14 +363,34 @@ def _rss_kb() -> tuple[int | None, int | None]:
 
 
 def _reap_children(signum: int, frame: Any) -> None:
-    """SIGCHLD handler in the fork-server parent: reap every exited child."""
+    """SIGCHLD handler in the fork-server parent: reap every exited child.
+
+    Logs WIFSIGNALED and the signal number for an abnormal exit. cpu.rs
+    learns of a child's death from EOF on that child's own socket
+    connection, which cannot carry a reason: the process is already gone by
+    the time EOF is observed, so it cannot self report why. Only this
+    parent's waitpid() status, once reaped, can tell a segfault, an OOM
+    kill, or any other unprompted signal death apart from a plain nonzero
+    exit. A normal exit (status 0) stays silent, same as before.
+    """
     while True:
         try:
-            pid, _status = os.waitpid(-1, os.WNOHANG)
+            pid, status = os.waitpid(-1, os.WNOHANG)
         except ChildProcessError:
             return
         if pid == 0:
             return
+        if os.WIFSIGNALED(status):
+            sig = os.WTERMSIG(status)
+            try:
+                name = signal.Signals(sig).name
+            except ValueError:
+                name = "?"
+            _log(f"cauli._exec: child pid={pid} killed by signal {sig} ({name})")
+        elif os.WIFEXITED(status) and os.WEXITSTATUS(status) != 0:
+            _log(
+                f"cauli._exec: child pid={pid} exited with code {os.WEXITSTATUS(status)}"
+            )
 
 
 def _fork_server_main(app_spec: str, sock_path: str, child_threads: int) -> int:
