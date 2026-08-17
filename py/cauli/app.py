@@ -24,6 +24,12 @@ from cauli.schedules import ScheduleEntry
 from cauli.task import TaskDef
 
 _DEFAULT_REDIS_URL = "redis://localhost:6379/0"
+# Matches the Rust worker's --redis-timeout default (worker/src/cli.rs). Passed
+# explicitly to redis.Redis.from_url below: redis-py's own default for this
+# depends on the installed version (pyproject pins only "redis>=5", no upper
+# bound), so leaving it unset would make this client's hang behavior an
+# accident of whatever version happens to be installed rather than a decision.
+_DEFAULT_SOCKET_TIMEOUT = 5
 _QUEUE_NAME_RE = re.compile(r"[a-zA-Z0-9_.-]+\Z")
 
 #: Wildcard key in :attr:`Cauli.queue_ttl` meaning "every queue without an
@@ -237,7 +243,9 @@ class Cauli:
         if self._redis is None:
             with self._redis_lock:
                 if self._redis is None:
-                    self._redis = redis.Redis.from_url(self.redis_url)
+                    self._redis = redis.Redis.from_url(
+                        self.redis_url, socket_timeout=_DEFAULT_SOCKET_TIMEOUT
+                    )
         return self._redis
 
     def before_task(self, fn: Callable[[], Any]) -> Callable[[], Any]:

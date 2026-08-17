@@ -196,3 +196,21 @@ def test_get_redis_is_thread_safe(redis_url):
     assert all(client is seen[0] for client in seen), (
         "all threads must observe the same client"
     )
+
+
+def test_get_redis_sets_explicit_socket_timeout(redis_url):
+    # Regression: _get_redis used to call redis.Redis.from_url with no
+    # socket_timeout, so whether a stuck redis (paused, swapping, a
+    # partition dropping packets) ever raised instead of hanging forever
+    # depended entirely on whichever redis-py version happened to be
+    # installed. Assert the client now carries an explicit value, matching
+    # the Rust worker's --redis-timeout default, regardless of that
+    # version's own default.
+    from cauli.app import _DEFAULT_SOCKET_TIMEOUT
+
+    app = Cauli(redis_url=redis_url)
+    client = app._get_redis()
+    assert (
+        client.connection_pool.connection_kwargs.get("socket_timeout")
+        == _DEFAULT_SOCKET_TIMEOUT
+    )

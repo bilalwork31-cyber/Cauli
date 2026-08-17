@@ -52,6 +52,9 @@ codegen-units = 1
 
 [dev-dependencies]
 libc = "0.2"
-redis = { version = "0.32", features = ["tokio-comp"] }
+# connection-manager: worker/tests/redis_response_timeout.rs exercises
+# ConnectionManager/ConnectionManagerConfig directly, the same types
+# main.rs builds its two redis connections with.
+redis = { version = "0.32", features = ["tokio-comp", "connection-manager"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

@@ -14,7 +14,7 @@ mod supervisor;
 
 use clap::Parser;
 use ctx::Ctx;
-use redis::aio::ConnectionManager;
+use redis::aio::{ConnectionManager, ConnectionManagerConfig};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -158,6 +158,12 @@ fn real_main() -> i32 {
         );
         return 1;
     }
+    if args.redis_timeout == 0 {
+        error!(
+            "--redis-timeout must be >= 1 (0 would time out every redis round trip immediately)"
+        );
+        return 1;
+    }
     // FS-10: an absurd value (e.g. a typo'd extra digit) would eagerly
     // allocate a `2 * cpu_workers * cpu_child_threads`-sized channel and ask
     // Python to start that many threads per child; reject early with a clear
@@ -284,18 +290,31 @@ async fn run_worker(
             return 1;
         }
     };
-    let mut write_conn = match ConnectionManager::new(client.clone()).await {
-        Ok(c) => c,
-        Err(e) => {
-            error!(
-                "cannot connect to redis at {}: {e}",
-                redact_redis_url(&redis_url)
-            );
-            return 1;
-        }
-    };
+    // Config level timeout, not tokio::time::timeout wrapped around each
+    // call: a caller side timeout only abandons the caller's own wait, the
+    // ConnectionManager itself never observes an Err, so its internal
+    // reconnect_if_io_error! never fires and the same wedged socket gets
+    // reused by every later call. Setting response_timeout here makes the
+    // manager itself see a timeout as a genuine Err (it converts to
+    // ErrorKind::IoError), which activates that already existing reconnect
+    // path instead of leaving it dormant. Do not "simplify" this back to a
+    // per call tokio::timeout; it silently breaks reconnection.
+    let conn_cfg = ConnectionManagerConfig::new()
+        .set_response_timeout(Duration::from_secs(args.redis_timeout))
+        .set_connection_timeout(Duration::from_secs(args.redis_timeout));
+    let mut write_conn =
+        match ConnectionManager::new_with_config(client.clone(), conn_cfg.clone()).await {
+            Ok(c) => c,
+            Err(e) => {
+                error!(
+                    "cannot connect to redis at {}: {e}",
+                    redact_redis_url(&redis_url)
+                );
+                return 1;
+            }
+        };
     // Dedicated connection for blocking XREADGROUP so BLOCK never stalls writes.
-    let fetch_conn = match ConnectionManager::new(client).await {
+    let fetch_conn = match ConnectionManager::new_with_config(client, conn_cfg).await {
         Ok(c) => c,
         Err(e) => {
             error!("cannot open fetch connection: {e}");

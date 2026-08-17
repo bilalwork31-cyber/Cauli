@@ -142,11 +142,34 @@ the resident children.
 | `--visibility-timeout` | 60 | Seconds before a dead worker's in flight tasks are reclaimed by another. Must be at least 1 |
 | `--max-envelope-bytes` | 1048576 | Oversize entries go to the DLQ as `malformed` before being parsed |
 | `--drain-timeout` | 30 | Seconds to finish in flight tasks on graceful shutdown |
+| `--redis-timeout` | 5 | Response and connection timeout, in seconds, for every redis round trip |
 
 **`--visibility-timeout` must exceed your longest task's `timeout`** (PROTOCOL
 section 4.4). The worker warns at startup when a registered task violates it.
 Undersized, genuine crash recovery is slower than it needs to be, and a long
 running task risks being reclaimed and run twice.
+
+**`--redis-timeout` bounds fetch, the idempotency claim, the delayed mover,
+crash recovery, and result writes**, all of which otherwise wait on redis with
+no client side deadline at all. Without it, a redis that accepts the TCP
+connection but never answers (paused, swapping, or a network partition
+dropping packets rather than refusing them) hangs the affected call forever;
+`BLOCK` on `XREADGROUP` is a server side wait, not a client side one, and does
+not help. There is no single correct default: it depends on this deployment's
+redis tail latency. Below roughly 1 second, ordinary fork, fsync and network
+jitter risk a false trip, including the delayed mover's Lua script, which can
+touch up to 128 items in one round trip. Past roughly half of
+`--visibility-timeout`, a slow but genuinely alive redis is not caught
+meaningfully sooner than doing nothing. A trip is never a new failure mode:
+every affected call site already has a tested fallback for a redis error
+(a failed result write leaves the entry unacked for `XCLAIM` to redeliver, the
+idempotency claim fails open and executes anyway), so this only reaches an
+existing safe outcome sooner, at the cost of one log line and at most one
+`--visibility-timeout` of added latency on that task. Never data loss.
+
+The Python client built by `Cauli._get_redis()` (`py/cauli/app.py`) passes the
+same 5 second default as `socket_timeout` explicitly, for the same reason:
+redis-py's own default depends on the installed version.
 
 ### Observability
 

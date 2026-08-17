@@ -125,6 +125,34 @@ pub struct Args {
     /// Python executable used to spawn cpu children
     #[arg(long, default_value = "python3", help_heading = ADVANCED)]
     pub python: String,
+
+    /// Response and connection timeout, in seconds, for every redis round
+    /// trip: fetch (XREADGROUP), the idempotency claim before a task body
+    /// runs, the delayed mover, crash recovery, and task result writes.
+    /// Unset in the underlying client, a redis that accepts the TCP
+    /// connection but never answers (paused, swapping, or a network
+    /// partition dropping packets rather than refusing them) hangs these
+    /// calls forever. BLOCK on XREADGROUP is a server side wait, not a
+    /// client side deadline, and does not substitute for this.
+    ///
+    /// This is new configuration surface, deliberately: the right value
+    /// depends on this deployment's redis tail latency, which cannot be
+    /// known in advance, so one hardcoded number would be wrong for either
+    /// a shared noisy redis or a dedicated local one. Below roughly 1
+    /// second, ordinary fork, fsync and network jitter risk a false trip
+    /// (the delayed mover's Lua script alone can touch up to 128 items in
+    /// one round trip). Past roughly half of visibility_timeout, a slow but
+    /// genuinely alive redis is not caught meaningfully sooner than doing
+    /// nothing.
+    ///
+    /// A trip is never a new failure mode: every affected call site already
+    /// has a tested fallback for a redis error (finish() leaves the entry
+    /// unacked for XCLAIM to redeliver; idemp_claim fails open and executes
+    /// anyway), so this only reaches an existing safe outcome sooner, at the
+    /// cost of one log line and at most one visibility timeout of added
+    /// latency on that task. Never data loss.
+    #[arg(long, default_value_t = 5, help_heading = ADVANCED)]
+    pub redis_timeout: u64,
 }
 
 /// Concrete per-process execution settings after applying the -c/--procs
@@ -246,6 +274,7 @@ mod tests {
         assert_eq!(a.python, "python3");
         assert_eq!(a.stats_interval, 10);
         assert_eq!(a.log_level, "info");
+        assert_eq!(a.redis_timeout, 5);
     }
 
     #[test]
@@ -278,6 +307,8 @@ mod tests {
             "1",
             "--log-level",
             "debug",
+            "--redis-timeout",
+            "7",
         ])
         .unwrap();
         assert_eq!(a.queues, vec!["default", "emails", "bulk-2"]);
@@ -292,6 +323,7 @@ mod tests {
         assert_eq!(a.python, "python3.12");
         assert_eq!(a.stats_interval, 1);
         assert_eq!(a.log_level, "debug");
+        assert_eq!(a.redis_timeout, 7);
     }
 
     #[test]
