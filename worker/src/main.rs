@@ -477,11 +477,21 @@ fn print_plan(args: &cli::Args, r: &cli::Resolved, cores: usize) {
     );
     println!(
         "  totals: {} io tasks in flight, {} sync threads, up to {} cpu children",
-        r.io_concurrency * r.procs,
-        r.io_threads * r.procs,
-        r.cpu_workers * r.procs
+        plan_total(r.io_concurrency, r.procs),
+        plan_total(r.io_threads, r.procs),
+        plan_total(r.cpu_workers, r.procs)
     );
     println!("  override any value with its flag; see --help and docs/CONFIGURATION.md");
+}
+
+/// Per process value times process count, for the --print-plan totals line.
+/// Saturating, matching the overflow safe style used elsewhere for hostile or
+/// just huge input (dispatch.rs, envelope.rs, exec.rs, cpu.rs, and
+/// visibility_timeout_ms below): release builds have no overflow-checks, so a
+/// plain multiply would wrap silently instead, e.g. a 19 digit -c wrapping
+/// the printed total down to single digits.
+fn plan_total(per_process: usize, procs: usize) -> usize {
+    per_process.saturating_mul(procs)
 }
 
 /// Mask `user:password@` userinfo, and `password=`/`username=` query
@@ -553,6 +563,12 @@ mod tests {
     fn visibility_timeout_ms_saturates_instead_of_wrapping() {
         assert_eq!(visibility_timeout_ms(60), 60_000);
         assert_eq!(visibility_timeout_ms(u64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn plan_total_saturates_instead_of_wrapping() {
+        assert_eq!(plan_total(84, 6), 504);
+        assert_eq!(plan_total(usize::MAX, 2), usize::MAX);
     }
 
     #[test]
