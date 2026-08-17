@@ -37,11 +37,86 @@ fn d_timeout() -> u64 {
     300_000
 }
 
+/// Ceiling accepted for `timeout_ms` at parse (the default above is already
+/// well under it). The recovery loop's `required_idle_ms = max(visibility
+/// timeout, timeout_ms + grace)` (worker/src/loops.rs) means a `timeout_ms`
+/// near u64::MAX makes a stuck entry effectively unreclaimable rather than
+/// merely slow to reclaim, so an extreme value is clamped here instead of
+/// left to saturating arithmetic further down the pipeline.
+const MAX_TIMEOUT_MS: u64 = 86_400_000; // 24h
+
+/// Core of the `deserialize_flexible_*` family below: a JSON integer is
+/// accepted as is; a JSON float is accepted only when it is an exact whole
+/// number in u64 range, since PROTOCOL.md invites any compliant JSON codec
+/// and several emit large integers in exponent form (`1.7e12`). A fractional
+/// value (`1.5`) is malformed, not rounded: silently truncating it would
+/// change what the caller asked for, which is why this cannot be simplified
+/// into a plain `as u64` cast.
+fn value_to_u64(v: &Value) -> Result<u64, String> {
+    let n = match v {
+        Value::Number(n) => n,
+        other => return Err(format!("invalid type: {other}, expected a number")),
+    };
+    if let Some(u) = n.as_u64() {
+        return Ok(u);
+    }
+    match n.as_f64() {
+        Some(f) if f.is_finite() && f.fract() == 0.0 && f >= 0.0 && f < u64::MAX as f64 => {
+            Ok(f as u64)
+        }
+        _ => Err(format!("number {n} is not a valid whole number in range")),
+    }
+}
+
+fn deserialize_flexible_u64<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    value_to_u64(&Value::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+}
+
+fn deserialize_flexible_u32<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let n = value_to_u64(&Value::deserialize(deserializer)?).map_err(serde::de::Error::custom)?;
+    u32::try_from(n).map_err(|_| serde::de::Error::custom(format!("{n} out of range for u32")))
+}
+
+fn deserialize_flexible_opt_u64<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match Option::<Value>::deserialize(deserializer)? {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => value_to_u64(&v).map(Some).map_err(serde::de::Error::custom),
+    }
+}
+
+/// `timeout_ms` gets its own wrapper on top of `deserialize_flexible_u64`: an
+/// extremely large value is clamped to `MAX_TIMEOUT_MS` here rather than
+/// rejected, since it plausibly means the caller wants an effectively
+/// unbounded timeout. Zero is also nonsense (PROTOCOL §4.6: a zero timeout
+/// elapses before any attempt can possibly finish) but is deliberately NOT
+/// rejected here. dispatch.rs checks it after a full, successful parse
+/// instead, the same way it already checks `v` against `PROTOCOL_VERSION`,
+/// so an otherwise valid id is still recoverable and a caller blocked in
+/// `AsyncResult.get()` gets a real "Malformed" answer rather than hanging.
+/// Failing the parse itself, as args/kwargs and the other flexible numeric
+/// fields do, would take that id down with it, same as any other
+/// unparseable envelope.
+fn deserialize_timeout_ms<'de, D>(deserializer: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(deserialize_flexible_u64(deserializer)?.min(MAX_TIMEOUT_MS))
+}
+
 /// Task envelope, PROTOCOL §2. Unknown fields are preserved across
 /// deserialize -> mutate -> serialize (retry re-enqueue) via the flattened map.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Envelope {
-    #[serde(default = "d_v")]
+    #[serde(default = "d_v", deserialize_with = "deserialize_flexible_u32")]
     pub v: u32,
     pub id: String,
     pub task: String,
@@ -53,27 +128,36 @@ pub struct Envelope {
     pub queue: String,
     #[serde(default = "d_kind")]
     pub kind: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_flexible_u32")]
     pub retries: u32,
-    #[serde(default = "d_max_retries")]
+    #[serde(
+        default = "d_max_retries",
+        deserialize_with = "deserialize_flexible_u32"
+    )]
     pub max_retries: u32,
-    #[serde(default = "d_backoff_base")]
+    #[serde(
+        default = "d_backoff_base",
+        deserialize_with = "deserialize_flexible_u64"
+    )]
     pub backoff_base_ms: u64,
     #[serde(default = "d_backoff_factor")]
     pub backoff_factor: f64,
-    #[serde(default = "d_backoff_max")]
+    #[serde(
+        default = "d_backoff_max",
+        deserialize_with = "deserialize_flexible_u64"
+    )]
     pub backoff_max_ms: u64,
     #[serde(default = "d_true")]
     pub jitter: bool,
-    #[serde(default = "d_timeout")]
+    #[serde(default = "d_timeout", deserialize_with = "deserialize_timeout_ms")]
     pub timeout_ms: u64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_flexible_opt_u64")]
     pub soft_timeout_ms: Option<u64>,
     #[serde(default)]
     pub idempotency_key: Option<String>,
     #[serde(default = "d_true")]
     pub store_result: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_flexible_u64")]
     pub enqueued_at: u64,
     #[serde(default)]
     pub not_before: Option<f64>,
@@ -83,7 +167,7 @@ pub struct Envelope {
     /// duration) so it survives a retry, a delayed-zset hop and a crash
     /// redelivery unchanged, and so it means the same thing on a broker that
     /// has no delayed-delivery primitive of its own.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_flexible_opt_u64")]
     pub expires_at: Option<u64>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
@@ -498,5 +582,141 @@ mod tests {
 
         let short = "hello";
         assert_eq!(safe_truncate(short, 512), "hello");
+    }
+
+    // Bug: a wrongly typed args/kwargs must be rejected before execution,
+    // never reach fn(*args, **kwargs). The shape gate itself lives in
+    // dispatch.rs (args_kwargs_shape_ok), not here: see that module's
+    // tests for the array/object/null cases. Deserialize still accepts
+    // any JSON type for these two fields, unchanged.
+
+    /// Regression coverage requested alongside the fix above: a legitimate
+    /// envelope with args/kwargs absent, and one with them present but
+    /// empty, must both still normalize to an empty array/object.
+    #[test]
+    fn args_kwargs_absent_or_empty_still_normalize_correctly() {
+        let absent: Envelope = serde_json::from_str(r#"{"id":"a","task":"t"}"#).unwrap();
+        assert_eq!(absent.args_ref(), &Value::Array(vec![]));
+        assert_eq!(absent.kwargs_ref(), &Value::Object(serde_json::Map::new()));
+
+        let empty: Envelope =
+            serde_json::from_str(r#"{"id":"a","task":"t","args":[],"kwargs":{}}"#).unwrap();
+        assert_eq!(empty.args_ref(), &Value::Array(vec![]));
+        assert_eq!(empty.kwargs_ref(), &Value::Object(serde_json::Map::new()));
+    }
+
+    // Bug: timeout_ms 0 guarantees a hard timeout on every attempt.
+    // Rejected in dispatch.rs (after a successful parse, like the `v`
+    // version check), not here: see this file's doc comment on
+    // deserialize_timeout_ms for why.
+
+    #[test]
+    fn timeout_ms_zero_parses_here_unclamped() {
+        let e: Envelope = serde_json::from_str(r#"{"id":"a","task":"t","timeout_ms":0}"#).unwrap();
+        assert_eq!(e.timeout_ms, 0);
+    }
+
+    /// A value near u64::MAX must not make the recovery loop's
+    /// required_idle_ms effectively infinite (worker/src/loops.rs); it is
+    /// clamped rather than rejected, since it plausibly means "never time
+    /// out" rather than a malformed request. The clamp value (86_400_000 =
+    /// 24h) is hardcoded rather than referencing the implementation's own
+    /// constant, so a change to that constant fails this test instead of
+    /// trivially passing it.
+    #[test]
+    fn timeout_ms_huge_value_clamped_not_rejected() {
+        let e: Envelope =
+            serde_json::from_str(r#"{"id":"a","task":"t","timeout_ms":18446744073709551615}"#)
+                .unwrap();
+        assert_eq!(e.timeout_ms, 86_400_000);
+
+        let e: Envelope =
+            serde_json::from_str(r#"{"id":"a","task":"t","timeout_ms":999999999999}"#).unwrap();
+        assert_eq!(e.timeout_ms, 86_400_000);
+
+        // Just at and just under the ceiling: passed through unclamped.
+        let e: Envelope =
+            serde_json::from_str(r#"{"id":"a","task":"t","timeout_ms":86400000}"#).unwrap();
+        assert_eq!(e.timeout_ms, 86_400_000);
+        let e: Envelope =
+            serde_json::from_str(r#"{"id":"a","task":"t","timeout_ms":86399999}"#).unwrap();
+        assert_eq!(e.timeout_ms, 86_399_999);
+    }
+
+    // Bug: integers in exponent or float form rejected outright.
+
+    #[test]
+    fn integral_float_accepted_for_integer_fields() {
+        let e: Envelope = serde_json::from_str(
+            r#"{"id":"a","task":"t","timeout_ms":300000.0,"enqueued_at":1.7e12,
+                "retries":2.0,"max_retries":5.0,"backoff_base_ms":250.0,"backoff_max_ms":30000.0}"#,
+        )
+        .unwrap();
+        assert_eq!(e.timeout_ms, 300_000);
+        assert_eq!(e.enqueued_at, 1_700_000_000_000);
+        assert_eq!(e.retries, 2);
+        assert_eq!(e.max_retries, 5);
+        assert_eq!(e.backoff_base_ms, 250);
+        assert_eq!(e.backoff_max_ms, 30_000);
+    }
+
+    #[test]
+    fn integral_float_accepted_for_optional_integer_fields() {
+        let e: Envelope = serde_json::from_str(
+            r#"{"id":"a","task":"t","soft_timeout_ms":6000.0,"expires_at":1.7e12}"#,
+        )
+        .unwrap();
+        assert_eq!(e.soft_timeout_ms, Some(6_000));
+        assert_eq!(e.expires_at, Some(1_700_000_000_000));
+
+        let e: Envelope = serde_json::from_str(
+            r#"{"id":"a","task":"t","soft_timeout_ms":null,"expires_at":null}"#,
+        )
+        .unwrap();
+        assert_eq!(e.soft_timeout_ms, None);
+        assert_eq!(e.expires_at, None);
+    }
+
+    /// The whole risk of the fix above: a fractional value must still be
+    /// rejected, not rounded; NaN, infinity and out of range floats must be
+    /// rejected too, not saturated into a plausible looking integer.
+    #[test]
+    fn fractional_and_non_finite_and_out_of_range_floats_rejected() {
+        // fractional: must not be silently rounded
+        assert!(
+            serde_json::from_str::<Envelope>(r#"{"id":"a","task":"t","timeout_ms":1.5}"#).is_err()
+        );
+        assert!(
+            serde_json::from_str::<Envelope>(r#"{"id":"a","task":"t","enqueued_at":1.1}"#).is_err()
+        );
+
+        // negative: out of range for an unsigned field, integer or float form
+        assert!(
+            serde_json::from_str::<Envelope>(r#"{"id":"a","task":"t","timeout_ms":-5}"#).is_err()
+        );
+        assert!(
+            serde_json::from_str::<Envelope>(r#"{"id":"a","task":"t","enqueued_at":-5.0}"#)
+                .is_err()
+        );
+
+        // infinity: a plain JSON number token can overflow f64 to infinity
+        // with no "Infinity" keyword involved, so this must reach and fail
+        // the finiteness check rather than being merely unreachable.
+        assert!(
+            serde_json::from_str::<Envelope>(r#"{"id":"a","task":"t","enqueued_at":1e400}"#)
+                .is_err()
+        );
+
+        // huge but finite float: out of u64 range
+        assert!(
+            serde_json::from_str::<Envelope>(r#"{"id":"a","task":"t","enqueued_at":1e30}"#)
+                .is_err()
+        );
+
+        // out of range for u32 specifically (v is u32)
+        assert!(
+            serde_json::from_str::<Envelope>(r#"{"id":"a","task":"t","v":4294967296.0}"#).is_err()
+        );
+        assert!(serde_json::from_str::<Envelope>(r#"{"id":"a","task":"t","v":1.0}"#).is_ok());
     }
 }
