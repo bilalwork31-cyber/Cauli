@@ -1,8 +1,8 @@
-"""FastAPI / SQLAlchemy integration e2e: real cauli-worker + real Postgres.
+"""Async SQLAlchemy integration e2e: real cauli-worker + real Postgres.
 
-Proves, end to end, the three claims cauli.contrib.fastapi's module
+Proves, end to end, the three claims cauli.contrib.sqlalchemy's module
 docstring makes about session and connection lifecycle, the ones its own
-test docstring (py/tests/test_contrib_fastapi.py) admits were only ever
+test docstring (py/tests/test_contrib_sqlalchemy.py) admits were only ever
 checked by a manual run against pg_stat_activity, not a committed test:
   1. concurrent tasks each get their own AsyncSession/connection, never one
      shared between two tasks in flight at once;
@@ -15,7 +15,7 @@ checked by a manual run against pg_stat_activity, not a committed test:
      a burst finishes, and every task in the burst still completes even
      though the burst is twice the pool's ceiling.
 
-Infrastructure: throwaway redis on port 6411 (639x/64xx families are in use
+Infrastructure: throwaway redis on port 6419 (639x/64xx families are in use
 by concurrent audit work) and the audit's own already-running Postgres,
 role and database both "bench", on the default port (CAULI_ITEST_PG_* env
 vars override host/port/db/user/password). That Postgres is shared with
@@ -43,7 +43,7 @@ import redis as redis_lib
 pytest.importorskip("sqlalchemy")
 psycopg = pytest.importorskip("psycopg")
 
-REDIS_PORT = 6411
+REDIS_PORT = 6419
 REDIS_URL = f"redis://127.0.0.1:{REDIS_PORT}/0"
 HOME = os.path.expanduser("~")
 BIN = os.environ.get("CAULI_WORKER_BIN", f"{HOME}/rupy-target/release/cauli-worker")
@@ -63,7 +63,7 @@ PG_DSN = f"postgresql://{PG_USER}:{PG_PASSWORD}@{PG_HOST}:{PG_PORT}/{PG_DB}"
 # runs), without needing an absolute count anywhere except the one baseline
 # assertion, which subtracts what was already there before the worker
 # started.
-APPNAME = f"cauli-itest-fastapi-{uuid.uuid4().hex[:8]}"
+APPNAME = f"cauli-itest-sqlalchemy-{uuid.uuid4().hex[:8]}"
 
 pytestmark = pytest.mark.skipif(
     not os.path.exists(BIN), reason=f"cauli-worker binary not found at {BIN}"
@@ -103,8 +103,8 @@ def _worker_env():
 
 
 def _spawn_worker():
-    # --procs 1: one process, one engine, one pool -- the connection-count
-    # arithmetic in the fastapi.py module docstring stays procs * ceiling
+    # --procs 1: one process, one engine, one pool -- the connection count
+    # arithmetic in the sqlalchemy.py module docstring stays procs * ceiling
     # with procs pinned at 1, so the ceiling itself is what's under test.
     # --io-loops 1: the module's own hazard, pins the pool to one loop.
     # --io-concurrency 32 is well above the 15 connection pool ceiling on
@@ -114,9 +114,9 @@ def _spawn_worker():
         [
             BIN,
             "--app",
-            "fastapi_site:app",
+            "sqlalchemy_site:app",
             "--queues",
-            "fastapi",
+            "sqlalchemy",
             "--redis-url",
             REDIS_URL,
             "--procs",
@@ -138,7 +138,7 @@ def _spawn_worker():
         ],
         cwd=HERE,
         env=_worker_env(),
-        stdout=open(f"{HERE}/worker_fastapi.log", "wb"),
+        stdout=open(f"{HERE}/worker_sqlalchemy.log", "wb"),
         stderr=subprocess.STDOUT,
     )
 
@@ -187,14 +187,14 @@ def stack():
             time.sleep(0.1)
     r.flushall()
 
-    # Client-side env BEFORE importing fastapi_site: the test process is the
+    # Client side env BEFORE importing sqlalchemy_site: the test process is the
     # "web app" here, it only enqueues (delay() talks to redis, never to
     # Postgres), but it still needs CAULI_REDIS_URL set for that.
     os.environ["CAULI_REDIS_URL"] = REDIS_URL
-    import fastapi_site  # noqa: F401  (registers session_probe against app)
+    import sqlalchemy_site  # noqa: F401  (registers session_probe against app)
 
     worker = _spawn_worker()
-    _wait_group(r, "fastapi")
+    _wait_group(r, "sqlalchemy")
     yield r, worker, baseline_total
     worker.send_signal(signal.SIGTERM)
     try:
@@ -207,16 +207,16 @@ def stack():
 
 
 def _probe():
-    import fastapi_site
+    import sqlalchemy_site
 
-    return fastapi_site.session_probe
+    return sqlalchemy_site.session_probe
 
 
 def test_concurrent_tasks_get_distinct_sessions(stack):
     """Five tasks in flight at once, each holding its connection for half a
     second, must show five distinct Postgres backends: proof, at the real
     worker and real Postgres level, of the ContextVar isolation
-    py/tests/test_contrib_fastapi.py already proves at the hook level."""
+    py/tests/test_contrib_sqlalchemy.py already proves at the hook level."""
     probe = _probe()
     n = 5
     started = time.monotonic()
@@ -239,7 +239,7 @@ def test_connections_stay_bounded_and_are_returned_under_concurrency(stack):
     tasks is twice the 15-connection ceiling they imply, so if a session
     ever leaked instead of returning to the pool, the connections behind it
     would never free up, later probes' session.execute() would block on an
-    exhausted pool and then raise (max_retries=0 in fastapi_site.py turns
+    exhausted pool and then raise (max_retries=0 in sqlalchemy_site.py turns
     that into a failed .get() instead of a retry quietly hiding it), and
     the backend count would keep climbing instead of settling back down.
     That is what makes every assertion below able to fail for real, not

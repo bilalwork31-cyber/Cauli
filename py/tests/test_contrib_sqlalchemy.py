@@ -1,4 +1,4 @@
-"""cauli.contrib.fastapi unit tests (no broker, no worker, no real Postgres).
+"""cauli.contrib.sqlalchemy unit tests (no broker, no worker, no real Postgres).
 
 Every hook below runs against a real SQLAlchemy ``AsyncEngine`` pointed at
 ``127.0.0.1:1``, a reserved port nothing listens on: engine/sessionmaker/
@@ -27,11 +27,11 @@ psycopg = pytest.importorskip("psycopg")
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine  # noqa: E402
 
 from cauli import Cauli  # noqa: E402
-from cauli.contrib import fastapi as contrib_fastapi  # noqa: E402
-from cauli.contrib.fastapi import (  # noqa: E402
-    fastapi_app,
+from cauli.contrib import sqlalchemy as contrib_sqlalchemy  # noqa: E402
+from cauli.contrib.sqlalchemy import (  # noqa: E402
     get_session,
     install_sqlalchemy_session,
+    sqlalchemy_app,
 )
 
 # Port 1 is a reserved port nothing listens on: connecting to it fails fast,
@@ -59,9 +59,9 @@ def _reset_session_var():
     leak this whole module exists to prevent, so the test suite for it must
     not be able to hide one.
     """
-    token = contrib_fastapi._session_var.set(None)
+    token = contrib_sqlalchemy._session_var.set(None)
     yield
-    contrib_fastapi._session_var.reset(token)
+    contrib_sqlalchemy._session_var.reset(token)
 
 
 def _app_no_redis() -> Cauli:
@@ -72,8 +72,10 @@ def _engine():
     return create_async_engine(_FAKE_DATABASE_URL)
 
 
-def test_fastapi_app_builds_engine_and_wires_hooks():
-    app = fastapi_app(_FAKE_DATABASE_URL, redis_url=_FAKE_REDIS_URL, default_queue="q")
+def test_sqlalchemy_app_builds_engine_and_wires_hooks():
+    app = sqlalchemy_app(
+        _FAKE_DATABASE_URL, redis_url=_FAKE_REDIS_URL, default_queue="q"
+    )
     assert app.redis_url == _FAKE_REDIS_URL
     assert app.default_queue == "q"
     assert [h.__name__ for h in app._before_task_hooks] == [
@@ -233,7 +235,7 @@ def test_process_init_dispose_hook_runs_without_error_on_real_engine():
     hook: an empty hook body still runs without error, but it would leave
     the backend counted below.
     """
-    marker = f"cauli-fastapi-dispose-itest-{uuid.uuid4().hex}"
+    marker = f"cauli-sqlalchemy-dispose-itest-{uuid.uuid4().hex}"
     async_dsn = _BENCH_PG_DSN.replace("postgresql://", "postgresql+psycopg://", 1)
     engine = create_async_engine(
         async_dsn,
@@ -277,3 +279,46 @@ def test_process_init_dispose_hook_runs_without_error_on_real_engine():
         assert n == 0, "dispose() left the real backend connection open"
     finally:
         asyncio.run(engine.dispose())  # belt and suspenders: never leak a real backend
+
+
+# The module was called cauli.contrib.fastapi until the 1.0 API freeze. That
+# name survives as a reexport alias, and these two tests are the only thing
+# standing between it and a future edit that quietly duplicates the
+# implementation there instead of reexporting it.
+
+
+def test_old_fastapi_import_path_still_works():
+    """Code written against the pre rename name keeps importing and keeps
+    working. Identity is what is asserted, not mere importability: an alias
+    that copied the implementation would import exactly as cleanly and then
+    own a second ContextVar and a second engine.
+    """
+    from cauli.contrib import fastapi as contrib_fastapi
+    from cauli.contrib.fastapi import (
+        fastapi_app,
+        get_session as aliased_get_session,
+        install_sqlalchemy_session as aliased_install,
+    )
+
+    assert fastapi_app is sqlalchemy_app
+    assert aliased_get_session is get_session
+    assert aliased_install is install_sqlalchemy_session
+    assert contrib_fastapi.sqlalchemy_app is sqlalchemy_app
+
+
+def test_alias_and_new_module_share_one_session():
+    """The behavioural half of the alias contract: a session opened by hooks
+    wired through the old import path is the very session the new module's
+    get_session hands back, one ContextVar behind both names."""
+    from cauli.contrib.fastapi import fastapi_app
+
+    app = fastapi_app(_FAKE_DATABASE_URL, redis_url=_FAKE_REDIS_URL)
+    before, after = app._before_task_hooks[0], app._after_task_hooks[0]
+
+    async def scenario():
+        before()
+        session = get_session()
+        assert isinstance(session, AsyncSession)
+        await after()
+
+    asyncio.run(scenario())
