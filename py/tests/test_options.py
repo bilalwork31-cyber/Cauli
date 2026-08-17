@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import json
+import logging
 import threading
+
+import pytest
 
 from cauli import Cauli
 
@@ -131,6 +134,33 @@ def test_redis_url_resolution(monkeypatch):
     )
 
 
+def test_default_redis_url_logs_a_warning(monkeypatch, caplog):
+    # An unconfigured Cauli() silently resolving to localhost is exactly how
+    # tasks vanish into an unrelated redis already on 6379 (a common box
+    # state) with no error anywhere. The default itself is unchanged; only
+    # its visibility is fixed. warning (not info) so it is seen even with no
+    # logging configured at all, via logging's own last resort handler.
+    monkeypatch.delenv("CAULI_REDIS_URL", raising=False)
+    with caplog.at_level(logging.WARNING, logger="cauli.app"):
+        app = Cauli()
+    assert app.redis_url == "redis://localhost:6379/0"
+    assert "redis://localhost:6379/0" in caplog.text
+    assert "defaulting" in caplog.text
+
+
+def test_explicit_redis_url_does_not_log_the_default_notice(caplog):
+    with caplog.at_level(logging.WARNING, logger="cauli.app"):
+        Cauli(redis_url="redis://explicit:1234/0")
+    assert "defaulting" not in caplog.text
+
+
+def test_env_redis_url_does_not_log_the_default_notice(monkeypatch, caplog):
+    monkeypatch.setenv("CAULI_REDIS_URL", "redis://envhost:6399/2")
+    with caplog.at_level(logging.WARNING, logger="cauli.app"):
+        Cauli()
+    assert "defaulting" not in caplog.text
+
+
 def test_repr_redacts_credentials():
     # M4 regression: a redis URL with embedded credentials must never appear
     # in plaintext in repr() (logs/tracebacks commonly include repr output).
@@ -214,3 +244,46 @@ def test_get_redis_sets_explicit_socket_timeout(redis_url):
         client.connection_pool.connection_kwargs.get("socket_timeout")
         == _DEFAULT_SOCKET_TIMEOUT
     )
+
+
+def test_check_periodic_tasks_accepts_a_registered_task(redis_url):
+    app = Cauli(redis_url=redis_url)
+
+    @app.task(name="jobs.ping")
+    def ping():
+        return None
+
+    app.add_periodic_task("ping_every_minute", "jobs.ping", schedule=60)
+    app.check_periodic_tasks()  # must not raise
+
+
+def test_check_periodic_tasks_rejects_an_unregistered_task_name(redis_url):
+    app = Cauli(redis_url=redis_url)
+    app.add_periodic_task("typo_job", "jobs.pign", schedule=60)  # never registered
+
+    with pytest.raises(ValueError, match="typo_job"):
+        app.check_periodic_tasks()
+
+
+def test_check_periodic_tasks_allows_the_task_registered_after_the_entry(redis_url):
+    # The ordering problem: add_periodic_task may legitimately be declared
+    # before the task it names is decorated later in the same module. The
+    # check only runs when explicitly asked (schedule start), by which point
+    # every legitimate ordering inside one module has already settled.
+    app = Cauli(redis_url=redis_url)
+    app.add_periodic_task("late_job", "jobs.late", schedule=60)
+
+    @app.task(name="jobs.late")
+    def late():
+        return None
+
+    app.check_periodic_tasks()  # must not raise
+
+
+def test_add_periodic_task_itself_does_not_validate_the_task_name(redis_url):
+    # Declaration time cannot reject a typo without also rejecting the
+    # legitimate "task registered later" ordering above, so it must accept
+    # any string here; check_periodic_tasks is where validation belongs.
+    app = Cauli(redis_url=redis_url)
+    app.add_periodic_task("never_registered", "jobs.does_not_exist", schedule=60)
+    assert "never_registered" in app._periodic

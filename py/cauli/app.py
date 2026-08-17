@@ -8,6 +8,7 @@ The attribute names ``_tasks``, ``redis_url``, ``default_queue``,
 from __future__ import annotations
 
 import fnmatch
+import logging
 import os
 import re
 import threading
@@ -22,6 +23,8 @@ from cauli import _codec
 from cauli.result import AsyncResult
 from cauli.schedules import ScheduleEntry
 from cauli.task import TaskDef
+
+log = logging.getLogger("cauli.app")
 
 _DEFAULT_REDIS_URL = "redis://localhost:6379/0"
 # Matches the Rust worker's --redis-timeout default (worker/src/cli.rs). Passed
@@ -195,9 +198,18 @@ class Cauli:
         queue_ttl: Any = None,
     ) -> None:
         # Resolution order: explicit arg > env CAULI_REDIS_URL > default.
-        self.redis_url: str = (
-            redis_url or os.environ.get("CAULI_REDIS_URL") or _DEFAULT_REDIS_URL
-        )
+        env_redis_url = os.environ.get("CAULI_REDIS_URL")
+        self.redis_url: str = redis_url or env_redis_url or _DEFAULT_REDIS_URL
+        if not redis_url and not env_redis_url:
+            # Otherwise this is silent: a box with an unrelated redis already
+            # on 6379 (common) makes tasks vanish into the wrong instance with
+            # no error anywhere. warning (not info) so it is visible even with
+            # no logging configuration at all, via logging's own last resort
+            # handler.
+            log.warning(
+                "no redis_url given and CAULI_REDIS_URL is not set, defaulting to %s",
+                _DEFAULT_REDIS_URL,
+            )
         self.default_queue: str = default_queue
         # result_ttl=0 reads like "disabled" but Redis rejects `SET key val EX
         # 0`, so the result key would never be written and AsyncResult.get()
@@ -382,6 +394,26 @@ class Cauli:
         )
         self._periodic[name] = entry
         return entry
+
+    def check_periodic_tasks(self) -> None:
+        """Raise if a declared periodic entry names a task this app has not registered.
+
+        Not called from :meth:`add_periodic_task`: a periodic entry may
+        legitimately name a task by string before that task's own
+        ``@app.task`` runs later in the same module, so checking at
+        declaration time would reject valid code. This is meant to be called
+        once the whole app module has finished importing (every decorator has
+        therefore run) and right before the schedule actually starts running,
+        which is the earliest point a name that is still missing is a real
+        typo rather than an ordering artifact.
+        """
+        for entry in self._periodic.values():
+            if entry.task not in self._tasks:
+                raise ValueError(
+                    f"periodic task {entry.name!r} names task {entry.task!r}, "
+                    "which is not registered on this app (typo, or its "
+                    "@app.task has not been imported yet)"
+                )
 
     def _route(self, task_name: str, args: Any, kwargs: dict[str, Any]) -> str | None:
         """First matching app-level route's queue, or None (PROTOCOL.md 9.3).
