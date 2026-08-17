@@ -133,8 +133,13 @@ async fn process(ctx: &Arc<Ctx>, queue: &str, sid: &str, raw: Option<String>) {
         let mut conn = ctx.redis.clone();
         match broker::idemp_claim(&mut conn, &key, &env.id, ctx.idemp_ttl, env.timeout_ms).await {
             Ok(broker::IdempClaim::Fresh) | Ok(broker::IdempClaim::MineAgain) => {}
-            Ok(broker::IdempClaim::Duplicate) => {
-                let rj = envelope::result_duplicate(now_ms());
+            Ok(broker::IdempClaim::Duplicate { claimant }) => {
+                // The claim is deliberately never released, not even after
+                // the claimant is dead lettered (partial side effects make
+                // suppression the safer default), so the claimant's id is
+                // the suppressed caller's only route to the real outcome.
+                debug!(id = %env.id, claimant = %claimant, "idempotency key held -> duplicate");
+                let rj = envelope::result_duplicate(now_ms(), &claimant);
                 let store = env.store_result.then_some(rj.as_str());
                 // Gated the same way, and for the same reason, as the
                 // success branch in `finish` below: a write failure must

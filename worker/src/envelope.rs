@@ -298,11 +298,18 @@ pub fn result_failure(error: &ErrorJson, finished_at: u64) -> String {
     .expect("result envelope is always serializable")
 }
 
-pub fn result_duplicate(finished_at: u64) -> String {
+/// §4.5 suppression. `claimant_id` names the task that holds the key, and it
+/// is the only thread a suppressed caller has: a claim is never released, so
+/// a resubmission after the claimant was dead lettered is suppressed too, and
+/// without the id there is no way to discover that the work never succeeded.
+/// Null only in the race where the key expired between the failed claim and
+/// the read of its holder.
+pub fn result_duplicate(finished_at: u64, claimant_id: &str) -> String {
     serde_json::json!({
         "status": "duplicate",
         "result": null,
         "error": null,
+        "claimant_id": (!claimant_id.is_empty()).then_some(claimant_id),
         "finished_at": finished_at,
     })
     .to_string()
@@ -562,11 +569,28 @@ mod tests {
         assert_eq!(v["error"]["type"], "ValueError");
         assert_eq!(v["error"]["message"], "boom");
 
-        let d = result_duplicate(9);
+        let d = result_duplicate(9, "0123456789abcdef0123456789abcdef");
         let v: Value = serde_json::from_str(&d).unwrap();
         assert_eq!(v["status"], "duplicate");
         assert_eq!(v["result"], Value::Null);
         assert_eq!(v["error"], Value::Null);
+    }
+
+    /// A suppressed caller gets nothing back but this result, so the id of
+    /// the task that holds the key has to travel in it: the claim is never
+    /// released, and after the claimant is dead lettered the only way to
+    /// find out the work never succeeded is `cauli:result:{claimant_id}`.
+    #[test]
+    fn duplicate_result_carries_the_claimant_id() {
+        let claimant = "0123456789abcdef0123456789abcdef";
+        let v: Value = serde_json::from_str(&result_duplicate(9, claimant)).unwrap();
+        assert_eq!(v["claimant_id"], claimant);
+        assert_eq!(v["finished_at"], 9);
+
+        // Unknown holder (the key expired mid claim) reports null rather
+        // than an empty string a caller would have to special case.
+        let v: Value = serde_json::from_str(&result_duplicate(9, "")).unwrap();
+        assert_eq!(v["claimant_id"], Value::Null);
     }
 
     /// H4 regression: a naive `&s[..512]` panics when byte 512 lands inside a

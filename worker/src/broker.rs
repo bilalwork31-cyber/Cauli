@@ -111,7 +111,10 @@ pub enum IdempClaim {
     /// could never be used together).
     MineAgain,
     /// The key is held by a DIFFERENT task id: a genuine duplicate.
-    Duplicate,
+    /// `claimant` is that id, carried back so a suppressed caller can look up
+    /// the claimant's own outcome. Empty only in the race where the key
+    /// expired between the failed SET and the GET of its holder.
+    Duplicate { claimant: String },
 }
 
 /// §4.5 idempotency guard. Atomic via a single Lua script: `SET NX`, and on
@@ -121,17 +124,22 @@ pub enum IdempClaim {
 /// The PEXPIRE in the "mine again" branch is what extends the lease across a
 /// retry or a §4.4 crash redelivery: without it the window stays anchored at
 /// the FIRST claim, so a retry chain outlives the key it claimed.
+///
+/// Returns `{code, holder}`: the holder's task id travels back with the
+/// duplicate verdict, since nothing else ever tells a suppressed caller which
+/// execution took the key. Empty in the branches that have no other holder to
+/// name, so the reply is always a two element array.
 const IDEMP_CLAIM_LUA: &str = r#"
 local ok = redis.call('SET', KEYS[1], ARGV[1], 'NX', 'EX', ARGV[2])
 if ok then
-  return 1
+  return {1, ''}
 end
 local cur = redis.call('GET', KEYS[1])
 if cur == ARGV[1] then
   redis.call('PEXPIRE', KEYS[1], ARGV[3])
-  return 2
+  return {2, ''}
 end
-return 0
+return {0, cur or ''}
 "#;
 
 /// TTL a claim is actually written with, derived from the execution it
@@ -162,7 +170,7 @@ pub async fn idemp_claim(
 ) -> Result<IdempClaim> {
     let script = &*IDEMP_CLAIM_SCRIPT;
     let ttl_s = claim_ttl_s(idemp_ttl_s, timeout_ms);
-    let code: i64 = script
+    let (code, holder): (i64, String) = script
         .key(idemp_key(key))
         .arg(task_id)
         .arg(ttl_s)
@@ -172,7 +180,7 @@ pub async fn idemp_claim(
     Ok(match code {
         1 => IdempClaim::Fresh,
         2 => IdempClaim::MineAgain,
-        _ => IdempClaim::Duplicate,
+        _ => IdempClaim::Duplicate { claimant: holder },
     })
 }
 
@@ -684,6 +692,38 @@ mod tests {
         assert!(
             refreshed > timeout_ms as i64,
             "mine again must extend its own lease, got {refreshed}ms"
+        );
+    }
+
+    /// A suppressed caller has to be able to find the execution that took the
+    /// key. Nothing ever releases a claim, so once the claimant has been dead
+    /// lettered every resubmission is suppressed too, and the id in the
+    /// verdict is the only route back to what actually happened.
+    #[tokio::test]
+    async fn duplicate_verdict_names_the_claimant() {
+        let redis = ThrowawayRedis::start(6421, false);
+        let client = redis::Client::open(redis.url()).expect("client");
+        let mut conn = ConnectionManager::new(client)
+            .await
+            .expect("connection manager");
+
+        let key = "order-88";
+        let claimant = "a".repeat(32);
+        let latecomer = "b".repeat(32);
+
+        assert_eq!(
+            idemp_claim(&mut conn, key, &claimant, 60, 1_000)
+                .await
+                .expect("fresh claim"),
+            IdempClaim::Fresh
+        );
+        assert_eq!(
+            idemp_claim(&mut conn, key, &latecomer, 60, 1_000)
+                .await
+                .expect("duplicate claim"),
+            IdempClaim::Duplicate {
+                claimant: claimant.clone()
+            }
         );
     }
 }
