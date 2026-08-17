@@ -216,7 +216,12 @@ def test_unknown_task_is_reported(child):
     )
     assert resp["id"] == "x1"
     assert resp["ok"] is False
-    assert resp["error"]["type"] == "UnknownTask"
+    # Matches the worker's own pre dispatch registry check (PROTOCOL.md
+    # section 8, worker/src/dispatch.rs): same error.type string, and
+    # non retryable so a caller matching the documented sentinel actually
+    # sees this path instead of it being retried under "max_retries".
+    assert resp["error"]["type"] == "UnregisteredTask"
+    assert resp["retryable"] is False
 
 
 def test_eof_exits_zero(child):

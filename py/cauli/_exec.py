@@ -196,11 +196,18 @@ def _execute(
 
     task = getattr(app, "_tasks", {}).get(task_name)
     if task is None:
+        # Same error.type string as the worker's own pre dispatch registry
+        # check (worker/src/dispatch.rs, PROTOCOL.md section 8), and
+        # "retryable": False so this fails on this one attempt instead of
+        # burning the full backoff schedule on something that can never
+        # succeed: worker/src/ctx.rs's parse_pyresp honors an explicit
+        # "retryable" field over its own default.
         return {
             "id": request_id,
             "ok": False,
+            "retryable": False,
             "error": {
-                "type": "UnknownTask",
+                "type": "UnregisteredTask",
                 "message": f"task {task_name!r} is not registered in this app",
                 "traceback": "",
             },
