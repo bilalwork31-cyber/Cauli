@@ -354,7 +354,7 @@ def _run_sync_inner(name, args, kwargs, soft_timeout_ms):
             "ok": False,
             "retryable": False,
             "error": {
-                "type": "Unregistered",
+                "type": "UnregisteredTask",
                 "message": "unknown task %s" % (name,),
                 "traceback": "",
             },
@@ -531,7 +531,7 @@ async def _arun(token, name, args, kwargs, timeout_s):
                 "ok": False,
                 "retryable": False,
                 "error": {
-                    "type": "Unregistered",
+                    "type": "UnregisteredTask",
                     "message": "unknown task %s" % (name,),
                     "traceback": "",
                 },

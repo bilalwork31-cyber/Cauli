@@ -149,6 +149,29 @@ fn outcome_from_py(obj: &Bound<'_, PyAny>) -> Outcome {
     Outcome::Failure { err, retryable }
 }
 
+/// `json_to_py`'s only failure mode is the argument tree nesting deeper than
+/// `pyjson::MAX_DEPTH`: a structural property of the payload itself, not a
+/// transient shim or environment problem, so retrying parses the identical
+/// too deep tree again and fails identically every time. Classified the
+/// same as the opposite direction's depth failure (`py_to_json`, handled in
+/// `outcome_from_py` above) rather than left to fall into the generic
+/// `WorkerShimError` catch all below: that type name reads as "the shim
+/// itself misbehaved", which sends the next reader looking in the wrong
+/// place, and worse, is retryable, which would burn the full backoff
+/// schedule on a payload that can never succeed.
+fn depth_failure_outcome(py: Python<'_>, e: &PyErr) -> Outcome {
+    Outcome::Failure {
+        err: ErrorJson::new(
+            "SerializationError",
+            format!(
+                "task arguments are not JSON serializable: {}",
+                pyerr_string(py, e)
+            ),
+        ),
+        retryable: false,
+    }
+}
+
 /// Matches the caps already enforced Python side (shim.py's `_MAX_TB`,
 /// _exec.py's `_TRACEBACK_CAP`, both 8192): `pyerr_string` below feeds
 /// `ErrorJson`, which is written into Redis result keys and DLQ entries
@@ -312,8 +335,14 @@ impl PyRuntime {
     ) -> Outcome {
         Python::attach(|py| {
             let call = (|| -> PyResult<Outcome> {
-                let a = crate::pyjson::json_to_py(py, args, 0)?;
-                let k = crate::pyjson::json_to_py(py, kwargs, 0)?;
+                let a = match crate::pyjson::json_to_py(py, args, 0) {
+                    Ok(v) => v,
+                    Err(e) => return Ok(depth_failure_outcome(py, &e)),
+                };
+                let k = match crate::pyjson::json_to_py(py, kwargs, 0) {
+                    Ok(v) => v,
+                    Err(e) => return Ok(depth_failure_outcome(py, &e)),
+                };
                 let out =
                     self.shim
                         .bind(py)
@@ -373,8 +402,12 @@ impl PyRuntime {
     /// top (its per-loop pending queues), so a burst of N tasks costs one
     /// GIL entry here and one loop wakeup there instead of N of each.
     fn submit_batch_under_gil(&self, batch: &mut Vec<SubmitJob>) {
-        let failures: Vec<(u64, String)> = Python::attach(|py| {
-            let mut failed = Vec::new();
+        // Depth failures are collected separately from generic shim failures:
+        // they complete with a typed Outcome that is not retryable, directly,
+        // rather than through `fail_pending`'s WorkerShimError/retryable bucket.
+        let (failures, depth_failures) = Python::attach(|py| {
+            let mut failed: Vec<(u64, String)> = Vec::new();
+            let mut depth_failed: Vec<(u64, Outcome)> = Vec::new();
             let submit = match self.shim.bind(py).getattr("submit_async") {
                 Ok(f) => f,
                 Err(e) => {
@@ -384,20 +417,28 @@ impl PyRuntime {
                     for job in batch.iter() {
                         failed.push((job.token, msg.clone()));
                     }
-                    return failed;
+                    return (failed, depth_failed);
                 }
             };
             // MEM-5: fetched once per batch, not cached on PyRuntime -- this
             // closure already holds the GIL and nothing else needs it.
             let queue_full_ty = self.shim.bind(py).getattr("AsyncQueueFull").ok();
             for job in batch.iter() {
-                let scheduled = (|| -> PyResult<()> {
-                    let a = crate::pyjson::json_to_py(py, &job.args, 0)?;
-                    let k = crate::pyjson::json_to_py(py, &job.kwargs, 0)?;
-                    submit.call1((job.token, job.name.as_str(), a, k, job.timeout_s))?;
-                    Ok(())
-                })();
-                if let Err(e) = scheduled {
+                let a = match crate::pyjson::json_to_py(py, &job.args, 0) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        depth_failed.push((job.token, depth_failure_outcome(py, &e)));
+                        continue;
+                    }
+                };
+                let k = match crate::pyjson::json_to_py(py, &job.kwargs, 0) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        depth_failed.push((job.token, depth_failure_outcome(py, &e)));
+                        continue;
+                    }
+                };
+                if let Err(e) = submit.call1((job.token, job.name.as_str(), a, k, job.timeout_s)) {
                     if queue_full_ty
                         .as_ref()
                         .is_some_and(|ty| e.is_instance(py, ty))
@@ -407,23 +448,35 @@ impl PyRuntime {
                     failed.push((job.token, pyerr_string(py, &e)));
                 }
             }
-            failed
+            (failed, depth_failed)
         });
         for (token, msg) in failures {
             self.fail_pending(token, format!("submit_async failed: {msg}"));
         }
+        for (token, outcome) in depth_failures {
+            self.complete_pending(token, outcome);
+        }
         batch.clear();
+    }
+
+    /// Complete a pending slot with the given outcome. Does nothing if the
+    /// completion callback got there first.
+    fn complete_pending(&self, token: u64, outcome: Outcome) {
+        if let Some(tx) = self.pending.lock().unwrap().remove(&token) {
+            let _ = tx.send(outcome);
+        }
     }
 
     /// Complete a pending slot with a retryable shim failure (no-op if the
     /// completion callback got there first).
     fn fail_pending(&self, token: u64, msg: String) {
-        if let Some(tx) = self.pending.lock().unwrap().remove(&token) {
-            let _ = tx.send(Outcome::Failure {
+        self.complete_pending(
+            token,
+            Outcome::Failure {
                 err: ErrorJson::new("WorkerShimError", msg),
                 retryable: true,
-            });
-        }
+            },
+        );
     }
 
     /// MEM-1: remove (and drop) a pending completion slot. Called when the
@@ -825,5 +878,135 @@ app = _App()
         // not an overcount left over from the panic.
         pool.report_hard_timeout();
         assert_eq!(pool.live_threads.load(Ordering::Relaxed), 1);
+    }
+
+    /// A payload nested deeper than `pyjson::MAX_DEPTH` can never succeed:
+    /// retrying it parses the identical too deep tree again. Before the fix,
+    /// `run_sync_blocking` bucketed this into "WorkerShimError" with
+    /// `retryable: true`, burning the whole backoff schedule on a payload
+    /// `--max-envelope-bytes` is far too coarse to catch.
+    #[test]
+    fn run_sync_blocking_depth_failure_is_not_retryable() {
+        #[allow(deprecated)]
+        pyo3::prepare_freethreaded_python();
+        let app_spec = Python::attach(|py| {
+            install_fake_app_module(py, "cauli_test_depth_sync_app", MINIMAL_VALID_APP_SRC)
+        });
+        let (rt, _cfg) = PyRuntime::init(&app_spec, 1).expect("valid app must init cleanly");
+
+        // Deeper than MAX_DEPTH: the failure happens while converting `args`,
+        // before the (unregistered) task name is ever looked up.
+        let mut deep = serde_json::json!(0);
+        for _ in 0..(crate::pyjson::MAX_DEPTH + 2) {
+            deep = serde_json::json!([deep]);
+        }
+        match rt.run_sync_blocking("does.not.matter", &deep, &serde_json::json!({}), None) {
+            Outcome::Failure { err, retryable } => {
+                assert!(
+                    !retryable,
+                    "a nesting depth failure can never succeed on retry"
+                );
+                assert_eq!(err.type_, "SerializationError");
+            }
+            Outcome::Success(_) => panic!("expected a depth failure, got Success"),
+            Outcome::ForceRetry { .. } => panic!("expected a depth failure, got ForceRetry"),
+        }
+    }
+
+    /// Same as `run_sync_blocking_depth_failure_is_not_retryable` above, for
+    /// the async submit lane (`queue_submit` -> `submit_batch_under_gil`).
+    /// Before the fix this was also "WorkerShimError"/retryable true.
+    #[tokio::test]
+    async fn queue_submit_depth_failure_is_not_retryable() {
+        #[allow(deprecated)]
+        pyo3::prepare_freethreaded_python();
+        let app_spec = Python::attach(|py| {
+            install_fake_app_module(py, "cauli_test_depth_async_app", MINIMAL_VALID_APP_SRC)
+        });
+        let (rt, _cfg) = PyRuntime::init(&app_spec, 1).expect("valid app must init cleanly");
+
+        let mut deep = serde_json::json!(0);
+        for _ in 0..(crate::pyjson::MAX_DEPTH + 2) {
+            deep = serde_json::json!([deep]);
+        }
+        let (_token, rx) = rt.queue_submit("does.not.matter", &deep, &serde_json::json!({}), 5.0);
+        match rx.await.expect("submitter thread must respond") {
+            Outcome::Failure { err, retryable } => {
+                assert!(
+                    !retryable,
+                    "a nesting depth failure can never succeed on retry"
+                );
+                assert_eq!(err.type_, "SerializationError");
+            }
+            Outcome::Success(_) => panic!("expected a depth failure, got Success"),
+            Outcome::ForceRetry { .. } => panic!("expected a depth failure, got ForceRetry"),
+        }
+    }
+
+    /// shim.py's own `_registry` miss (sync lane, `_run_sync_inner`) must use
+    /// the canonical "UnregisteredTask" string, the one PROTOCOL section 8
+    /// documents and dispatch.rs's own registry gate uses, not the stale
+    /// "Unregistered". In a real worker process dispatch.rs's registry
+    /// check (built from this same `load_app()` snapshot) never lets an
+    /// unregistered name reach here, but calling `run_sync_blocking`
+    /// directly, as this test does, bypasses that gate the same way a
+    /// future caller might.
+    #[test]
+    fn shim_sync_unregistered_task_error_type_is_canonical() {
+        #[allow(deprecated)]
+        pyo3::prepare_freethreaded_python();
+        let app_spec = Python::attach(|py| {
+            install_fake_app_module(
+                py,
+                "cauli_test_unregistered_sync_app",
+                MINIMAL_VALID_APP_SRC,
+            )
+        });
+        let (rt, _cfg) = PyRuntime::init(&app_spec, 1).expect("valid app must init cleanly");
+
+        match rt.run_sync_blocking(
+            "no.such.task",
+            &serde_json::json!([]),
+            &serde_json::json!({}),
+            None,
+        ) {
+            Outcome::Failure { err, retryable } => {
+                assert_eq!(err.type_, "UnregisteredTask");
+                assert!(!retryable);
+            }
+            Outcome::Success(_) => panic!("expected a failure, got Success"),
+            Outcome::ForceRetry { .. } => panic!("expected a failure, got ForceRetry"),
+        }
+    }
+
+    /// Same as `shim_sync_unregistered_task_error_type_is_canonical` above,
+    /// for the async lane (`_arun`).
+    #[tokio::test]
+    async fn shim_async_unregistered_task_error_type_is_canonical() {
+        #[allow(deprecated)]
+        pyo3::prepare_freethreaded_python();
+        let app_spec = Python::attach(|py| {
+            install_fake_app_module(
+                py,
+                "cauli_test_unregistered_async_app",
+                MINIMAL_VALID_APP_SRC,
+            )
+        });
+        let (rt, _cfg) = PyRuntime::init(&app_spec, 1).expect("valid app must init cleanly");
+
+        let (_token, rx) = rt.queue_submit(
+            "no.such.task",
+            &serde_json::json!([]),
+            &serde_json::json!({}),
+            5.0,
+        );
+        match rx.await.expect("submitter thread must respond") {
+            Outcome::Failure { err, retryable } => {
+                assert_eq!(err.type_, "UnregisteredTask");
+                assert!(!retryable);
+            }
+            Outcome::Success(_) => panic!("expected a failure, got Success"),
+            Outcome::ForceRetry { .. } => panic!("expected a failure, got ForceRetry"),
+        }
     }
 }
