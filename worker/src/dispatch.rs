@@ -49,6 +49,13 @@ async fn process(ctx: &Arc<Ctx>, queue: &str, sid: &str, raw: Option<String>) {
         return dlq_terminal(ctx, queue, sid, preview, "malformed", None).await;
     }
     let env = match serde_json::from_str::<Envelope>(&raw) {
+        Ok(e) if e.v > envelope::PROTOCOL_VERSION => {
+            warn!(
+                v = e.v, supported = envelope::PROTOCOL_VERSION, id = %e.id,
+                "envelope protocol version unsupported -> DLQ"
+            );
+            return dlq_terminal(ctx, queue, sid, &raw, "malformed", None).await;
+        }
         Ok(e) if !e.id.is_empty() && !e.task.is_empty() && valid_task_id(&e.id) => e,
         _ => return dlq_terminal(ctx, queue, sid, &raw, "malformed", None).await,
     };
@@ -233,8 +240,44 @@ async fn final_failure(
     ctx.counters.dlq.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Terminal DLQ for malformed / unregistered / redelivery_limit entries
-/// (no retry, no result key; error field empty string when None).
+/// Best effort task id recovery for a terminal DLQ write: bounded to the
+/// same preview cap as the oversize path (`safe_truncate`, 4096 bytes), so a
+/// hostile huge `raw_e` can never turn this into the parse that §M2 exists
+/// to avoid. A small envelope that is only oversize relative to a low
+/// --max-envelope-bytes, or one already fully read (unregistered,
+/// redelivery_limit), still parses inside that cap and its id comes back.
+fn recover_id(raw_e: &str) -> Option<String> {
+    let preview = envelope::safe_truncate(raw_e, 4096);
+    match serde_json::from_str::<Envelope>(preview) {
+        Ok(e) if valid_task_id(&e.id) => Some(e.id),
+        _ => None,
+    }
+}
+
+/// Synthetic error for a task that never ran: no Python exception exists,
+/// so a type distinguishable from a real one (mirrors `result_expired`'s
+/// "Expired") lets a caller's `except TaskFailedError` tell them apart.
+fn dlq_error(reason: &str) -> ErrorJson {
+    let type_ = match reason {
+        "malformed" => "Malformed",
+        "unregistered" => "UnregisteredTask",
+        "redelivery_limit" => "RedeliveryLimitExceeded",
+        _ => "DeadLettered",
+    };
+    ErrorJson::new(
+        type_,
+        format!("task was dead lettered before it ran (reason {reason})"),
+    )
+}
+
+/// Terminal DLQ for malformed / unregistered / redelivery_limit entries: no
+/// retry. When a task id can be recovered from `raw_e` (see `recover_id`), a
+/// failure result is written too, so a caller blocked in
+/// `AsyncResult.get()` with no timeout gets an answer instead of waiting on
+/// a `cauli:result:{id}` key that would otherwise never exist. Where no id
+/// can be recovered there is nothing to key a result on, so none is
+/// written, same as before. Error field in the DLQ stream entry is still
+/// the empty string when `err` is None.
 pub async fn dlq_terminal(
     ctx: &Arc<Ctx>,
     queue: &str,
@@ -244,7 +287,18 @@ pub async fn dlq_terminal(
     err: Option<&ErrorJson>,
 ) {
     let mut conn = ctx.redis.clone();
-    if let Err(e) = broker::finish_dlq(&mut conn, queue, sid, raw_e, reason, err, None).await {
+    let recovered_id = recover_id(raw_e);
+    let synthesized = err.is_none().then(|| dlq_error(reason));
+    let result_error = err.or(synthesized.as_ref());
+    let result_json = match (&recovered_id, result_error) {
+        (Some(_), Some(e)) => Some(envelope::result_failure(e, now_ms())),
+        _ => None,
+    };
+    let store = match (&recovered_id, &result_json) {
+        (Some(id), Some(rj)) => Some((id.as_str(), rj.as_str(), ctx.result_ttl)),
+        _ => None,
+    };
+    if let Err(e) = broker::finish_dlq(&mut conn, queue, sid, raw_e, reason, err, store).await {
         error!(reason, "terminal dlq write failed: {e}");
     }
     ctx.counters.dlq.fetch_add(1, Ordering::Relaxed);
@@ -270,5 +324,39 @@ mod tests {
         assert!(!valid_task_id(&"g".repeat(32))); // right length, non-hex letter
                                                   // right length, one invalid char (hash-tag injection attempt)
         assert!(!valid_task_id(&format!("{{{}", "a".repeat(31))));
+    }
+
+    #[test]
+    fn recover_id_from_a_fully_parseable_envelope() {
+        let raw = r#"{"id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","task":"t"}"#;
+        assert_eq!(
+            recover_id(raw),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
+        );
+    }
+
+    #[test]
+    fn recover_id_none_when_the_id_is_past_the_preview_cap() {
+        // A hostile oversize payload never gets its id back: the preview
+        // cap (4096 bytes) lands inside the padding, well before the id
+        // field or the closing brace, so this can never become the
+        // unbounded parse §M2 exists to avoid.
+        let raw = format!(
+            r#"{{"pad":"{}","id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","task":"t"}}"#,
+            "x".repeat(5000)
+        );
+        assert_eq!(recover_id(&raw), None);
+    }
+
+    #[test]
+    fn recover_id_none_for_an_id_that_fails_the_charset_gate() {
+        let raw = r#"{"id":"not-32-hex","task":"t"}"#;
+        assert_eq!(recover_id(raw), None);
+    }
+
+    #[test]
+    fn recover_id_none_for_unparseable_input() {
+        assert_eq!(recover_id(""), None);
+        assert_eq!(recover_id("not json"), None);
     }
 }

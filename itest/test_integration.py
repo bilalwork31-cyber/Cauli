@@ -126,6 +126,33 @@ def test_final_failure_dlq_and_error(stack):
     assert res.id in ids
 
 
+def test_unregistered_task_result_resolves_instead_of_hanging(stack):
+    """Dead letter root cause fix: dlq_terminal used to always write
+    result=None, so AsyncResult.get() blocked forever on a result key that
+    would never appear. An unregistered task name is the cheapest way to
+    reach a terminal DLQ with a recoverable id: the envelope parses fine,
+    only the registry lookup fails.
+    """
+    from cauli import TaskFailedError
+    from cauli.result import AsyncResult
+
+    r, _ = stack
+    m = _app()
+    env, queue, _fire = m.app.make_envelope(
+        "itest_app.does_not_exist", args=[], task=None, queue="default"
+    )
+    r.xadd(f"cauli:q:{queue}", {"e": json.dumps(env)})
+
+    res = AsyncResult(env["id"], m.app)
+    with pytest.raises(TaskFailedError) as ei:
+        res.get(timeout=10)
+    assert ei.value.type == "UnregisteredTask"
+
+    entries = r.xrange("cauli:dlq:default")
+    ids = [json.loads(fields[b"e"])["id"] for _, fields in entries]
+    assert env["id"] in ids
+
+
 def test_idempotency_dedup(stack):
     m = _app()
     path = f"/tmp/cauli-itest-idemp-{uuid.uuid4().hex}"

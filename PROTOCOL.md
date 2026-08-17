@@ -84,6 +84,10 @@ Unknown fields must be preserved on re-enqueue (retries) if practical, otherwise
 }
 ```
 
+- `v`: protocol version, currently always `1`. The worker accepts a `v` at or below its own
+  supported version and rejects anything higher, since no forward compatibility is defined for
+  a version this build predates -> DLQ reason `"malformed"` (§8) rather than guessing at an
+  unknown shape.
 - `kind`: `"io"` or `"cpu"`. Worker-side registry wins if it disagrees (registry is authoritative).
 - `retries`: attempts completed so far. 0 on first enqueue. The worker increments it when
   scheduling a retry.
@@ -150,8 +154,10 @@ coerce non-`str` dict keys — none of which this protocol defines.
   indefinitely: bound in-worker cpu backlog to twice the cpu pool's in-flight capacity,
   i.e. `2 * cpu_workers * cpu_child_threads` pending items).
 - Parse envelope from field `e`. Malformed JSON: XACK + XADD to DLQ with reason
-  `"malformed"` (best effort raw payload in `e`), continue.
-- Unknown task name (not in registry): DLQ with reason `"unregistered"`, XACK. No retry.
+  `"malformed"` (best effort raw payload in `e`), continue. A result key is written too when the
+  id can be recovered from the entry (§8).
+- Unknown task name (not in registry): DLQ with reason `"unregistered"`, XACK. No retry. A
+  result key is written too (§8): the id is always recoverable here, since the envelope parsed.
 - Expired (past `expires_at` or the queue's TTL): DLQ with reason `"expired"`, XACK. No retry,
   no execution. Checked BEFORE the §4.5 idempotency claim — see §9.1.
 - Route by registry kind (fallback envelope kind): io/async, io/sync, cpu.
@@ -252,7 +258,8 @@ Every `visibility_timeout / 2` (visibility_timeout default 60s, CLI flag), per q
    if any registered task's `timeout_ms >= visibility_timeout * 1000`.
 3. Otherwise (idle >= required_idle_ms): if `delivery_count > redelivery_limit` (default
    `max(3, max_retries+1)`, computed per envelope after claim; use 3 if envelope unreadable):
-   claim it (`XCLAIM ... JUSTID` acceptable), DLQ with reason `"redelivery_limit"`, XACK+XDEL.
+   claim it (`XCLAIM ... JUSTID` acceptable), DLQ with reason `"redelivery_limit"`, XACK+XDEL. A
+   result key is written too when the id is recoverable (§8).
 4. Else `XCLAIM cauli:q:{queue} cauli {consumer} {visibility_timeout_ms} {id}` and execute it
    normally (same code path as a fresh delivery; do not increment `retries` for a claim).
 
@@ -598,9 +605,11 @@ cauli-worker --app myproj.tasks:app [--queues default,emails] [--redis-url URL]
   attacker-controlled modules — a standard Python-tooling caveat, not specific to cauli.
 - `--redis-url` precedence: CLI > env `CAULI_REDIS_URL` > `app.redis_url`.
 - `--queues` default: `app.default_queue`.
-- `--batch` and `--visibility-timeout` must be >= 1 (exit 1 at startup otherwise): `--batch 0`
-  would mean "unlimited" to Redis's `XREADGROUP COUNT`, and `--visibility-timeout 0` would make
-  the recovery loop (§4.4) reclaim every currently-executing task on nearly every tick.
+- `--batch`, `--visibility-timeout` and `--max-envelope-bytes` must be >= 1 (exit 1 at startup
+  otherwise): `--batch 0` would mean "unlimited" to Redis's `XREADGROUP COUNT`,
+  `--visibility-timeout 0` would make the recovery loop (§4.4) reclaim every currently-executing
+  task on nearly every tick, and `--max-envelope-bytes 0` would dead letter every single message
+  as oversize.
 - `--max-envelope-bytes` (default 1 MiB): see §2.
 - `--cpu-child-threads` (default 1): per-child request concurrency, `--no-fork-server`:
   force the stdio child mode — both per §5.1.
@@ -657,6 +666,15 @@ fabricated error in front of the caller. The error object is populated anyway (`
 `"Expired"`, message naming the deadline and how late the pickup was) so a client that only
 knows success/failure still gets something usable, and `AsyncResult.get()` raises
 `TaskFailedError(type="Expired")` rather than returning a silent `None`.
+
+A terminal dead letter that never executed at all (malformed envelope, unregistered task, or
+redelivery limit exceeded; §4/§4.4) also writes a `"failure"` result reusing this same shape,
+whenever the task id could be recovered from the entry (present and matching the §2 charset
+gate). `error.type` names why: `"Malformed"`, `"UnregisteredTask"` or
+`"RedeliveryLimitExceeded"`. Without this, `AsyncResult.get()` called with no timeout would
+block forever on a result key that would never be written. Where the id cannot be recovered
+(the envelope is not valid JSON, or its `id` fails the charset gate) there is nothing to key a
+result on, so none is written and the caller's own timeout, or lack of one, governs as before.
 
 `traceback` may be truncated to 8KB. Task return values must be JSON serializable; a non
 serializable success value is a failure with type `"SerializationError"` (no retry — treat as

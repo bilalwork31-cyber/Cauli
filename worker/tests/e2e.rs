@@ -290,6 +290,12 @@ async fn idempotency_and_timeouts(c: &mut redis::aio::MultiplexedConnection) {
     xadd(c, "default", &e.to_string()).await;
     let (reason, _, _) = wait_dlq(c, "default", &id, 10).await;
     assert_eq!(reason, "unregistered");
+    // root cause fix: a terminal DLQ with a recoverable id must still
+    // resolve AsyncResult.get() instead of leaving it blocked forever on a
+    // result key that would otherwise never be written.
+    let r = wait_result(c, &id, 10).await;
+    assert_eq!(r["status"], "failure");
+    assert_eq!(r["error"]["type"], "UnregisteredTask");
 
     // malformed payload -> DLQ with raw payload preserved
     let raw = "{this is not json";
@@ -305,6 +311,27 @@ async fn idempotency_and_timeouts(c: &mut redis::aio::MultiplexedConnection) {
     xadd(c, "default", &bad_id_env.to_string()).await;
     let (reason, _, _) = wait_dlq(c, "default", "not-a-valid-32-char-lowercase-hex-id", 10).await;
     assert_eq!(reason, "malformed");
+    // scope boundary: an id that fails the M1 charset gate must never be
+    // used as a result key either, even for this new write -- that is the
+    // same collision the gate exists to prevent, so "no id recoverable"
+    // stays exactly as it was.
+    let none: Option<String> = redis::cmd("GET")
+        .arg("cauli:result:not-a-valid-32-char-lowercase-hex-id")
+        .query_async(c)
+        .await
+        .unwrap();
+    assert!(none.is_none());
+
+    // protocol version this worker does not understand -> DLQ malformed,
+    // same as any other worker side gate failure; unlike the bad id case,
+    // the id itself is fine here, so a result is still written.
+    let (id, mut v99_env) = envelope("fx.echo", "default", |_| {});
+    v99_env["v"] = json!(99);
+    xadd(c, "default", &v99_env.to_string()).await;
+    let (reason, _, _) = wait_dlq(c, "default", &id, 10).await;
+    assert_eq!(reason, "malformed");
+    let r = wait_result(c, &id, 10).await;
+    assert_eq!(r["status"], "failure");
 
     // M2 regression: an envelope larger than --max-envelope-bytes (default 1
     // MiB) -> DLQ malformed before it is ever parsed, with only a truncated

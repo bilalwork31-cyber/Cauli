@@ -204,10 +204,11 @@ async fn mem1_async_backstop_fires_cleanly(c: &mut redis::aio::MultiplexedConnec
     drop(w);
 }
 
-/// M8 regression: `--batch 0` and `--visibility-timeout 0` must be rejected
-/// at startup (exit 1) rather than accepted -- 0 would mean "unlimited"
-/// XREADGROUP fetch, or a recovery loop that reclaims every in-flight task on
-/// nearly every tick.
+/// M8 regression: `--batch 0`, `--visibility-timeout 0` and
+/// `--max-envelope-bytes 0` must be rejected at startup (exit 1) rather than
+/// accepted. 0 would mean "unlimited" XREADGROUP fetch, a recovery loop
+/// that reclaims every task in flight on nearly every tick, or (0 bytes)
+/// every single message dead lettered as oversize.
 fn m8_cli_floors_reject_zero() {
     let mut bad_batch = Worker::spawn("m8q", &["--batch", "0"]);
     assert_eq!(bad_batch.wait_code(15), 1, "--batch 0 must be rejected");
@@ -220,6 +221,14 @@ fn m8_cli_floors_reject_zero() {
         "--visibility-timeout 0 must be rejected"
     );
     drop(bad_vt);
+
+    let mut bad_meb = Worker::spawn("m8q", &["--max-envelope-bytes", "0"]);
+    assert_eq!(
+        bad_meb.wait_code(15),
+        1,
+        "--max-envelope-bytes 0 must be rejected"
+    );
+    drop(bad_meb);
 }
 
 /// H1 regression: a task sleeping well past the visibility_timeout floor,

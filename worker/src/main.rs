@@ -152,6 +152,12 @@ fn real_main() -> i32 {
         error!("--visibility-timeout must be >= 1 (0 reclaims every in-flight task on nearly every tick)");
         return 1;
     }
+    if args.max_envelope_bytes == 0 {
+        error!(
+            "--max-envelope-bytes must be >= 1 (0 dead letters every single message as oversize)"
+        );
+        return 1;
+    }
     // FS-10: an absurd value (e.g. a typo'd extra digit) would eagerly
     // allocate a `2 * cpu_workers * cpu_child_threads`-sized channel and ask
     // Python to start that many threads per child; reject early with a clear
@@ -460,8 +466,8 @@ fn print_plan(args: &cli::Args, r: &cli::Resolved, cores: usize) {
 }
 
 /// Mask `user:password@` userinfo, and `password=`/`username=` query
-/// parameters, before a redis URL reaches logs or error messages (audit M4
-/// — both are shapes redis-py accepts as real credentials, so either would
+/// parameters, before a redis URL reaches logs or error messages (audit M4:
+/// both are shapes redis-py accepts as real credentials, so either would
 /// otherwise land in plaintext logs).
 fn redact_redis_url(url: &str) -> String {
     let Some(scheme_end) = url.find("://") else {

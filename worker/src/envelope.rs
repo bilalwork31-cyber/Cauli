@@ -5,6 +5,13 @@ use std::collections::BTreeMap;
 fn d_v() -> u32 {
     1
 }
+
+/// Highest envelope protocol version this worker understands (PROTOCOL.md
+/// section 2). The protocol does not define forward compatibility for a
+/// higher `v`, so the conservative reading applies: accept the current
+/// version, reject anything newer rather than guess at a shape this build
+/// has never seen.
+pub const PROTOCOL_VERSION: u32 = 1;
 fn d_queue() -> String {
     "default".to_string()
 }
