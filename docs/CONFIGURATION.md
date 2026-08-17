@@ -287,7 +287,7 @@ observes a row that got rolled back.
 |---|---|---|
 | `CAULI_REDIS_URL` | client and worker | Broker URL when not passed explicitly |
 | `CAULI_LOOP` | worker | Event loop policy for the embedded asyncio loops. Unset: uvloop when importable, else stock asyncio; the startup line reports which (`impl=uvloop`). `asyncio` forces the stock loop; `uvloop` makes uvloop mandatory and fails startup without it. Force a mode when you must know which loop you measured: under a venv overlay the embedded interpreter also sees system site-packages, so uvloop can appear without being in your requirements |
-| `RUST_LOG` | worker | Overrides `--log-level` |
+| `RUST_LOG` | worker | Overrides `--log-level`. A bare level such as `RUST_LOG=debug` works everywhere. A per target directive has to name the right target, and that differs between builds: the wheel ships `cauli_worker_bin`, while a local `cargo build` produces `cauli_worker`. So use `RUST_LOG=cauli_worker_bin=debug` against an installed worker and `RUST_LOG=cauli_worker=debug` against one you built yourself. Both binaries are the same `src/main.rs`; the two names exist so that `cargo build` keeps producing `cauli-worker` for the integration suite while the wheel ships its console script wrapper under that name |
 | `VIRTUAL_ENV` | worker | The embedded interpreter calls `site.addsitedir` on this venv's site-packages. **Required when running the worker against a virtualenv**, because editable installs are invisible to a `PYTHONPATH` only interpreter |
 | `CAULI_EXEC_CMD` | worker, test builds only | Overrides the cpu child command. Gated behind the `test-hooks` feature |
 
