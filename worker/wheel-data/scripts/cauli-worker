@@ -1,0 +1,145 @@
+#!python
+"""Console entry point for cauli-worker: fix the environment, then hand over.
+
+The worker binary embeds CPython, so it carries `NEEDED: libpython3.X.so.1.0`,
+and with no build.rs and no cargo link args it carries no RUNPATH. The dynamic
+loader can therefore resolve libpython only through the ldconfig cache or
+LD_LIBRARY_PATH. Where neither applies (a minimal container, a uv managed
+interpreter, conda, most pyenv builds) the binary dies inside the loader,
+before main, so even `cauli-worker --version` fails with "error while loading
+shared libraries". This script points the loader at the running interpreter's
+own library directory first.
+
+It also exports VIRTUAL_ENV when unset, because worker/src/shim.py resolves the
+user's app package through it. A systemd unit or a Dockerfile CMD that names an
+absolute path never activates the venv, and without VIRTUAL_ENV the app import
+fails with a bare ModuleNotFoundError that says nothing about the real cause.
+
+Both edits are additive. An LD_LIBRARY_PATH the caller set keeps its entries and
+their precedence, and an activated venv keeps its own VIRTUAL_ENV, so an
+environment that already works is left as it is.
+
+os.execv, never a subprocess. The worker puts PR_SET_PDEATHSIG on its cpu
+children and its supervisor respawns itself, so an extra process between the
+caller and the worker would change the process tree and break signal delivery.
+After the exec this process IS the worker: arguments, the three standard
+streams and the exit code are its own.
+
+Installed by pip from the wheel's data directory; the raw binary sits beside it
+as `cauli-worker-bin` and can still be run directly by anyone who has already
+sorted the loader out.
+"""
+
+import os
+import shutil
+import sys
+import sysconfig
+
+BINARY = "cauli-worker-bin"
+
+
+def _candidate_dirs():
+    """Directories that may hold the real binary, best guess first.
+
+    argv[0] before sys.executable: pip rewrites this script's shebang to the
+    venv interpreter, so the two normally agree, but a copied or symlinked
+    script should still find the binary it was installed next to.
+    """
+    argv0 = sys.argv[0] or ""
+    dirs = []
+    if argv0:
+        dirs.append(os.path.dirname(os.path.realpath(argv0)))
+        dirs.append(os.path.dirname(os.path.abspath(argv0)))
+    dirs.append(os.path.dirname(os.path.abspath(sys.executable)))
+    dirs.append(sysconfig.get_path("scripts"))
+    out = []
+    for d in dirs:
+        if d and d not in out:
+            out.append(d)
+    return out
+
+
+def _find_binary():
+    for d in _candidate_dirs():
+        path = os.path.join(d, BINARY)
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
+    return shutil.which(BINARY)
+
+
+def _libpython_dir():
+    """The directory holding this interpreter's libpython, or None.
+
+    None means there is nothing worth adding: a CPython built without
+    --enable-shared has no shared library to point at, and a directory that
+    does not actually contain the file would only add a dead entry to the
+    loader's search path.
+    """
+    if not sysconfig.get_config_var("Py_ENABLE_SHARED"):
+        return None
+    names = [
+        sysconfig.get_config_var("INSTSONAME"),
+        sysconfig.get_config_var("LDLIBRARY"),
+    ]
+    dirs = [
+        sysconfig.get_config_var("LIBDIR"),
+        sysconfig.get_config_var("LIBPL"),
+        os.path.join(sys.base_prefix, "lib"),
+    ]
+    for d in dirs:
+        for name in names:
+            if d and name and os.path.isfile(os.path.join(d, name)):
+                return d
+    return None
+
+
+def _in_venv():
+    if sys.prefix != getattr(sys, "base_prefix", sys.prefix):
+        return True
+    return os.path.isfile(os.path.join(sys.prefix, "pyvenv.cfg"))
+
+
+def _prepare(env):
+    """Repair only what is missing, and only by appending."""
+    libdir = _libpython_dir()
+    if libdir is not None:
+        # Appended rather than prepended: every entry the caller set keeps its
+        # precedence, so a search path that already resolves libpython never
+        # reaches ours. Where nothing was set, this directory holds the
+        # libpython belonging to this exact interpreter, which is the one the
+        # binary was built against.
+        parts = [p for p in env.get("LD_LIBRARY_PATH", "").split(os.pathsep) if p]
+        if libdir not in parts:
+            parts.append(libdir)
+        env["LD_LIBRARY_PATH"] = os.pathsep.join(parts)
+    if not env.get("VIRTUAL_ENV") and _in_venv():
+        env["VIRTUAL_ENV"] = sys.prefix
+
+
+def main():
+    binary = _find_binary()
+    if binary is None:
+        sys.stderr.write(
+            "cauli-worker: cannot find {} in {} or on PATH.\n"
+            "The worker binary ships in the cauli-worker wheel; reinstall it "
+            "with: pip install cauli-worker\n".format(
+                BINARY, os.pathsep.join(_candidate_dirs())
+            )
+        )
+        return 127
+    # os.environ writes reach the real process environment through putenv, and
+    # that is what execv passes to the new image.
+    _prepare(os.environ)
+    try:
+        # argv[0] is passed through unchanged so clap's usage text names the
+        # command the user actually typed. The worker locates itself for
+        # --procs respawns with current_exe(), never with argv[0].
+        os.execv(binary, [sys.argv[0] or binary, *sys.argv[1:]])
+    except OSError as exc:
+        sys.stderr.write("cauli-worker: cannot execute {}: {}\n".format(binary, exc))
+        return 126
+    return 0  # unreachable: a successful execv never returns
+
+
+if __name__ == "__main__":
+    sys.exit(main())
