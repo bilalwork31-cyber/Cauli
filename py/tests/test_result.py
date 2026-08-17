@@ -89,6 +89,19 @@ def test_pending_timeout_raises_timeouterror(app):
     assert time.monotonic() - t0 >= 0.25
 
 
+def test_pending_timeout_message_does_not_claim_the_task_is_pending(app):
+    # A task that ran and succeeded reads exactly the same (no result key)
+    # once result_ttl has elapsed, so the message must not assert "pending"
+    # as if that were a known fact; it must name the task id and state
+    # plainly that no result key is present.
+    ar = _ar(app)
+    with pytest.raises(TimeoutError) as excinfo:
+        ar.get(timeout=0.3)
+    message = str(excinfo.value)
+    assert "pending" not in message
+    assert ar.id in message
+
+
 def test_get_polls_until_late_result_arrives(app, redis_client):
     ar = _ar(app)
 
@@ -110,3 +123,49 @@ def test_get_polls_until_late_result_arrives(app, redis_client):
     assert time.monotonic() - t0 >= 0.3, (
         "get() must actually have waited for the result"
     )
+
+
+def test_status_and_get_raise_named_error_for_undecodable_bytes(app, redis_client):
+    ar = _ar(app)
+    redis_client.set(f"cauli:result:{ar.id}", b"not json at all {{{")
+
+    with pytest.raises(TaskFailedError) as excinfo:
+        ar.status()
+    assert excinfo.value.type == "InvalidResult"
+    assert ar.id in str(excinfo.value)
+
+    with pytest.raises(TaskFailedError) as excinfo:
+        ar.get(timeout=1)
+    assert excinfo.value.type == "InvalidResult"
+    assert ar.id in str(excinfo.value)
+
+
+def test_status_and_get_raise_named_error_for_a_json_array_document(app, redis_client):
+    ar = _ar(app)
+    redis_client.set(f"cauli:result:{ar.id}", json.dumps([1, 2, 3]))
+
+    with pytest.raises(TaskFailedError) as excinfo:
+        ar.status()
+    assert excinfo.value.type == "InvalidResult"
+    assert ar.id in str(excinfo.value)
+
+    with pytest.raises(TaskFailedError) as excinfo:
+        ar.get(timeout=1)
+    assert excinfo.value.type == "InvalidResult"
+
+
+def test_status_matches_get_for_a_dict_missing_the_status_field(app, redis_client):
+    ar = _ar(app)
+    _write_result(redis_client, ar.id, {"result": 1, "error": None, "finished_at": 1})
+
+    # Existing good behaviour to match: get() already classifies this as
+    # InvalidResult via its own fallthrough for an unrecognized status.
+    with pytest.raises(TaskFailedError) as excinfo:
+        ar.get(timeout=1)
+    assert excinfo.value.type == "InvalidResult"
+
+    # The inconsistency this test guards against: status() used to silently
+    # return "pending" for this exact document instead of matching get().
+    with pytest.raises(TaskFailedError) as excinfo:
+        ar.status()
+    assert excinfo.value.type == "InvalidResult"
