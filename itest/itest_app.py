@@ -92,6 +92,15 @@ def slow_idemp(path, seconds):
     return {"slow_idemp_done": True}
 
 
+@app.task(max_retries=0, timeout=0.5)
+def redelivery_doomed(x):
+    """Never actually runs in the redelivery limit test: that test advances
+    this task's own delivery_count past its limit before any worker reads
+    it, so the recovery loop dead letters it on sight.
+    """
+    return x
+
+
 @app.task(kind="cpu", soft_timeout=0.3, timeout=10, max_retries=0)
 def slow_cpu():
     import time

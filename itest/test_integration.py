@@ -478,6 +478,66 @@ def test_crash_redelivery_resolves_mine_again_not_duplicate(stack):
     os.remove(path)
 
 
+def test_redelivery_limit_dead_letters_with_result(stack):
+    """PROTOCOL section 4.4: redelivery_limit = max(3, max_retries + 1)
+    bounds how many times the recovery loop will XCLAIM the same crash
+    victim before giving up on it. `redelivery_limit_rules` in envelope.rs
+    already covers the formula; the coverage audit found the actual path,
+    repeated XCLAIM redelivery reaching that limit and then dead lettering,
+    had no end to end test anywhere.
+
+    The three prior redeliveries are simulated with the same redis primitive
+    the worker's own recovery loop uses to reclaim (XCLAIM increments
+    delivery_count identically regardless of caller), so the real worker
+    below is the one making the last, decisive call: dead letter with reason
+    redelivery_limit (not max_retries, the other dead letter reason), and
+    write a result so a waiting client gets an error instead of hanging on
+    it forever.
+    """
+    from cauli import TaskFailedError
+    from cauli.result import AsyncResult
+
+    r, _ = stack
+    m = _app()
+    queue = f"redelivery-{uuid.uuid4().hex}"
+    q_key = f"cauli:q:{queue}"
+
+    env, _q, _fire = m.app.make_envelope(
+        m.redelivery_doomed.name, args=[1], task=m.redelivery_doomed, queue=queue
+    )
+    task_id = env["id"]
+
+    r.xgroup_create(q_key, "cauli", id="0", mkstream=True)
+    r.xadd(q_key, {"e": json.dumps(env)})
+
+    # One real delivery, then three claims: times_delivered becomes 4, past
+    # this task's own limit of max(3, 0 + 1) = 3, before any worker process
+    # exists to look at it.
+    delivered = r.xreadgroup("cauli", "sim-initial", {q_key: ">"}, count=1)
+    entry_id = delivered[0][1][0][0]
+    for i in range(3):
+        r.xclaim(
+            q_key, "cauli", f"sim-redelivery-{i}", min_idle_time=0, message_ids=[entry_id]
+        )
+    pel = r.xpending_range(q_key, "cauli", min=entry_id, max=entry_id, count=1)
+    assert pel[0]["times_delivered"] == 4, "setup must land exactly one over the limit"
+
+    w = _spawn_worker(queue, "--visibility-timeout", "1", log_name="redelivery")
+    try:
+        res = AsyncResult(task_id, m.app)
+        with pytest.raises(TaskFailedError) as ei:
+            res.get(timeout=20)
+        assert ei.value.type == "RedeliveryLimitExceeded"
+
+        dlq_entries = r.xrange(f"cauli:dlq:{queue}")
+        reasons = {json.loads(f[b"e"])["id"]: f[b"reason"] for _sid, f in dlq_entries}
+        assert task_id in reasons, "doomed entry never reached the dead letter queue"
+        assert reasons[task_id] == b"redelivery_limit"
+        assert reasons[task_id] != b"max_retries"
+    finally:
+        _stop_worker(w)
+
+
 def test_worker_survived_everything(stack):
     _, worker = stack
     assert worker.poll() is None
