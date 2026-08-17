@@ -3427,3 +3427,59 @@ short still carries a usable answer, and it runs under `setsid` so it survives i
 It also validates its analysis script against the COMPLETED 2400 second run before trusting it on new
 data, which is the right order: check the instrument against a known result first.
 
+
+## 2026-08-17 — Cycle 38 — the deadlocking test, root caused — commit f164b46
+
+An agent reported the unit test binary hanging three times in
+`pyrt::tests::shim_async_unregistered_task_error_type_is_canonical`, always under parallel test
+threads while another agent's `cargo test` shared the box, and attributed it to machine load. That
+attribution was plausible but "it only deadlocks when the box is busy" describes every production
+incident, and CI is a busy box, so it was chased properly.
+
+### Reproduced, then root caused with backtraces rather than inference
+
+Provoked deliberately: the unit binary at `--test-threads=6`, pinned to two cores with `taskset`, and
+six `yes > /dev/null` competing for CPU. Two hangs plus one wrong error, `WorkerShimError` where
+`UnregisteredTask` was expected, in four stressed runs. It never hung unstressed.
+
+A gdb backtrace of all 22 threads settled what it was NOT: **nobody held the GIL.** Every
+`cauli-async-submit` thread was parked on an empty crossbeam channel, every uvloop thread idle in
+`uv_run`, and the hung test thread parked in tokio `block_on` at pyrt.rs:997 on a oneshot that never
+resolved. A lost completion, not a lock cycle.
+
+Root cause: `PyModule::from_code` calls `PyImport_ExecCodeModuleEx`, which returns the module ALREADY
+in `sys.modules` and re runs the source in that module's own dict. Verified directly through ctypes:
+same module object, globals reset. Every `PyRuntime::init` uses the fixed name `cauli_worker_shim`,
+so every runtime in one process shares one shim module and therefore all of shim.py's dispatch state.
+A second init empties `_loops` and `_pending` and repoints the single `_callback` at the newest
+runtime, so an older runtime's completion arrives at a pending map that no longer holds its token and
+is silently dropped.
+
+### Test problem, not product problem, and the reasoning matters
+
+`main.rs:220` is the only `PyRuntime::init` in the product, called once per process before any
+dispatch thread exists, and cpu work runs in separate child processes. Two real worker threads cannot
+produce this interleaving. The test module builds seven runtimes concurrently, which the product never
+does. Supporting evidence that the design is deliberate rather than accidental: `loops.rs:487`
+imports `cauli_worker_shim` by name, so one shim per process is intended.
+
+Fix: a `SHIM_STATE_LOCK` static mutex, poison tolerant, taken by the eight tests that mutate shared
+interpreter state. Two async tests moved from `#[tokio::test]` with `.await` to `blocking_recv`,
+because clippy's `await_holding_lock` fires on a std guard crossing an await and is right to.
+
+Verified at 260 runs with zero hangs and zero failures: 100 stressed on two cores at six threads, 60
+at default parallelism under load, 40 at sixteen threads on one core, and 60 stressed again after
+rebuild. A deadlock fix confirmed by one passing run would not be confirmed at all.
+
+### Follow up commissioned: make the invariant enforced rather than conventional
+
+The investigation is itself the argument for a guard. "One `PyRuntime` per process" currently holds
+because there happens to be one call site, and violating it corrupts the first runtime SILENTLY by
+emptying its dispatch state and dropping its completions. A future refactor adding a second init would
+reintroduce exactly this hang, presenting as an intermittent lost task rather than as an obvious
+mistake.
+
+A hard guard in `PyRuntime::init` is being added so a second call fails immediately and names the
+real consequence, converting a silent corruption into a loud error. That is the through line of this
+entire audit.
+
