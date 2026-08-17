@@ -69,3 +69,57 @@ pytest at `/home/blackdevil/rupy-venv/bin/pytest`.
 3. Deal with any uncommitted partial work from the in flight agents above, using the decision
    documents rather than trying to reconstruct intent from the diff.
 4. Then the 1.0 blockers in `docs/decisions/release-readiness.md`.
+
+---
+
+## UPDATE, later the same session
+
+Two of the four in flight items LANDED before shutdown. Corrected state:
+
+| item | state now |
+|------|-----------|
+| Delivery guarantee | **DONE**: `ab3eab9` claim TTL derived from execution, `ee9af3b` claimant id in duplicate results, `a58b98c` retry delay clamped at 30 days, `27c4c98` PROTOCOL section 4. 113 Rust tests, clippy clean. |
+| Packaging | **DONE**, but committed inside `8ce73f3`, see below. cp314 everywhere, the loader wrapper, an unmaskable CI leg, version 1.0.0 in all four gated places. |
+| Observability | still in flight, partial edits may remain in `worker/src/{stats,exec,pyrt}.rs` |
+| SoftTimeLimitExceeded rebind and the `float(cd)` guard | still in flight, partial edits may remain in `worker/src/shim.py`, `py/cauli/_exec.py`, `py/tests/test_exec.py` |
+
+### The claim TTL fix, concretely
+
+With `idemp_ttl` 60s and a 300s task, the guard key previously expired 240 seconds BEFORE the task
+could finish, so the next redelivery claimed Fresh and ran concurrently. That was exactly the
+duplicate execution the key exists to prevent. It now claims 302s, and every retry or redelivery
+pushes it back to 302s, so a four attempt chain holds the key continuously.
+
+### The packaging fix reproduced the real blocker
+
+On a uv managed CPython 3.13 under `env -i`: the raw binary died with
+`error while loading shared libraries: libpython3.13.so.1.0`, exit 127. Through the new console
+script wrapper: `cauli-worker 1.0.0`, exit 0. The wrapper was tested with 17 assertions against two
+interpreters, 34 of 34, including that it uses `execv` so the pid is unchanged, which matters because
+this project relies on PDEATHSIG and a supervisor.
+
+It also found and fixed a latent break that would have failed the release job outright:
+`pip install --no-index --find-links dist cauli cauli-worker` cannot resolve cauli's own `redis` and
+`msgspec` dependencies. Both workflows now name the two wheels by path.
+
+### One regression the packaging fix introduces, needs a decision
+
+The shipped binary's log target is now `cauli_worker_bin` rather than `cauli_worker`, because the raw
+binary was renamed so that a plain `cargo build` keeps producing `cauli-worker` for itest, bench and
+the docs. `RUST_LOG=debug` is unaffected, but **`RUST_LOG=cauli_worker=debug` now matches nothing in
+a wheel build.** Nothing documents a per target directive today, so nobody is provably broken, but it
+should be either aliased or documented before the tag.
+
+### Correcting the record on 8ce73f3
+
+The packaging agent reported that "another agent" swept its working tree into a documentation commit.
+That was me, not another agent. I staged `docs/AUDIT_LOG.md` and `docs/decisions/` while that agent
+had eight files sitting in the shared index, and I did not run `git diff --cached --name-only` before
+committing, which is the exact check that had caught every earlier collision. The content is byte
+identical to what was tested and the wrapper kept mode 100755, so nothing is lost, but the
+attribution in that commit message is wrong and the packaging work deserves its own.
+
+### Also fixed
+
+`ruff format --check` was failing at HEAD on `py/cauli/beat.py` and `itest/test_integration.py`,
+pre existing and unrelated to tonight's work. Fixed in `b3d5fad`; 48 files now pass.
