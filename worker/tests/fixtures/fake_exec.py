@@ -56,6 +56,12 @@ def handle(task, args, kwargs):
                 f.write("died")
             os._exit(9)  # simulates a crashing child mid-task
         return "revived"
+    if task == "fx.cpu_die_always":
+        os._exit(9)  # simulates a child that never survives a single task
+    if task == "fx.cpu_selfsignal":
+        sig = int(args[0]) if args else signal.SIGSEGV
+        os.kill(os.getpid(), sig)  # simulates a segfault or an OOM kill
+        return "unreachable"
     if task == "fx.cpu_fail":
         raise ValueError("cpu boom")
     if task == "fx.cpu_ghost":

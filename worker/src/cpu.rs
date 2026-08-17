@@ -39,6 +39,7 @@ use crate::stats::Counters;
 use anyhow::Context;
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::ExitStatusExt;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -664,6 +665,12 @@ async fn slot_loop(
     counters: Arc<Counters>,
     pids: Arc<Mutex<Vec<u32>>>,
 ) {
+    // Mirrors parent_control_loop's Refused backoff (FS-3): a child that
+    // forks successfully and then dies immediately, over and over, must
+    // not be forked again at full OS speed with no delay. Reset on a
+    // planned recycle, which can legitimately be this frequent if the
+    // operator configured it that way.
+    let mut backoff = Duration::from_millis(100);
     loop {
         if fork_tx.send(()).await.is_err() {
             return; // control loop gone: worker exiting
@@ -680,8 +687,13 @@ async fn slot_loop(
             "cpu[{idx}]: fork child serving pid={} concurrency={}",
             conn.pid, conn.concurrency
         );
-        if !serve_child(idx, conn, cfg, &rx, &counters, &pids).await {
-            return; // job channel closed: worker exiting
+        match serve_child(idx, conn, cfg, &rx, &counters, &pids).await {
+            ServeExit::Shutdown => return, // job channel closed: worker exiting
+            ServeExit::Recycled => backoff = Duration::from_millis(100),
+            ServeExit::Died => {
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(2));
+            }
         }
     }
 }
@@ -770,15 +782,18 @@ struct IdOnly<'a> {
 }
 
 enum ChildGone {
-    /// EOF observed on read: the child process has already exited and been
-    /// reaped by the fork-server parent's SIGCHLD handler (FS-7) -- its pid
-    /// may already be reused by an unrelated process, so it must NOT be
-    /// SIGKILLed again.
+    /// EOF observed on read, or a write that completed with an error (or
+    /// returned 0 for a non empty buffer): either way the kernel is telling
+    /// us the child process has already gone, one way reaped by the
+    /// fork-server parent's SIGCHLD handler (FS-7) and the other simply
+    /// refusing to receive: its pid may already be reused by an unrelated
+    /// process, so it must NOT be SIGKILLed again.
     Exited,
     /// A request exceeded its hard timeout: SIGKILL the child.
     HardTimeout,
-    /// A write to the child's socket failed or stalled past its budget
-    /// (FS-4): the child is presumed wedged, not confirmed exited. SIGKILL it.
+    /// A write to the child's socket stalled past its budget (FS-4) with
+    /// nothing already in flight to excuse it: the child is presumed
+    /// wedged, not confirmed exited. SIGKILL it.
     Wedged,
     /// `--cpu-max-tasks-per-child` reached with nothing in flight: SIGKILL and
     /// fork a replacement. Only ever chosen with an empty pending map, so no
@@ -788,11 +803,26 @@ enum ChildGone {
     Shutdown,
 }
 
+/// What `slot_loop` should do once `serve_child` returns: told apart from a
+/// plain bool so a child that dies (or is killed) gets backed off before the
+/// next fork request, while a `--cpu-max-tasks-per-child` recycle, which is
+/// planned and can legitimately be just as frequent as the operator
+/// configured it to be, does not.
+enum ServeExit {
+    /// The job channel closed: worker shutdown, stop looping.
+    Shutdown,
+    /// Recycled: fork a replacement immediately, no backoff.
+    Recycled,
+    /// Gone for an unplanned reason (death, hard timeout, wedged): fork a
+    /// replacement, but back off first.
+    Died,
+}
+
 /// Serve one child connection, keeping up to `concurrency` requests EXECUTING
 /// and up to `prefetch` more pre-staged in the child's socket buffer (pending
-/// map keyed by request id, FIFO order tracked separately). Returns false when
-/// the worker is shutting down (job channel closed), true when the slot should
-/// fork a replacement child.
+/// map keyed by request id, FIFO order tracked separately). Returns what the
+/// slot should do next (`ServeExit`): stop (worker shutting down), or fork a
+/// replacement child, immediately or after a backoff.
 ///
 /// Prefetch is what keeps a child busy back to back. Without it, a child that
 /// finishes a task writes its response and then sits idle for a full round
@@ -808,7 +838,7 @@ async fn serve_child(
     rx: &async_channel::Receiver<CpuJob>,
     counters: &Arc<Counters>,
     pids: &Arc<Mutex<Vec<u32>>>,
-) -> bool {
+) -> ServeExit {
     let ServeCfg { prefetch, recycle } = cfg;
     let ChildConn {
         mut lines,
@@ -974,19 +1004,27 @@ async fn serve_child(
                             arm_started(&mut pending, &order, concurrency);
                         }
                     }
+                    // A write that completes with an error (EPIPE,
+                    // ECONNRESET, ...), or a stream write() returning 0 for
+                    // a non empty buffer, is the kernel telling us the same
+                    // "already gone" thing a read EOF does: the child is not
+                    // there to receive this, so its pid may just as well
+                    // already be reused by an unrelated process (see
+                    // `ChildGone::Exited`'s doc comment). This is not a
+                    // write that merely stalled while the child might still
+                    // be alive (the arms below), so it does not repeat the
+                    // kill: it takes the `Exited` path, not `Wedged`.
                     Ok(_zero) => {
-                        // A stream write() returning 0 for a non empty
-                        // buffer means the socket will never accept more.
                         let pw = pending_write.take().expect("just matched Some");
                         warn!("cpu[{idx}] pid={pid}: write returned 0 bytes, treating as closed");
                         let _ = pw.resp.send(CpuOutcome::Lost);
-                        break ChildGone::Wedged;
+                        break ChildGone::Exited;
                     }
                     Err(e) => {
                         let pw = pending_write.take().expect("just matched Some");
                         warn!("cpu[{idx}] pid={pid}: write failed: {e}");
                         let _ = pw.resp.send(CpuOutcome::Lost);
-                        break ChildGone::Wedged;
+                        break ChildGone::Exited;
                     }
                 }
             }
@@ -1034,7 +1072,11 @@ async fn serve_child(
         counters.inflight_cpu.fetch_sub(1, Ordering::Relaxed);
     }
     track_pid(pids, pid, false);
-    !matches!(gone, ChildGone::Shutdown)
+    match gone {
+        ChildGone::Shutdown => ServeExit::Shutdown,
+        ChildGone::Recycled => ServeExit::Recycled,
+        ChildGone::Exited | ChildGone::HardTimeout | ChildGone::Wedged => ServeExit::Died,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1050,6 +1092,10 @@ async fn stdio_child_loop(
     counters: Arc<Counters>,
     pids: Arc<Mutex<Vec<u32>>>,
 ) {
+    // Mirrors parent_control_loop's Refused backoff (FS-3) and slot_loop's
+    // fork-server equivalent: a child that dies instantly and repeatedly
+    // must not respawn at full OS speed. Reset on a planned recycle.
+    let mut backoff = Duration::from_millis(100);
     loop {
         let mut cmd = Command::new(&prog);
         cmd.args(&argv)
@@ -1104,6 +1150,10 @@ async fn stdio_child_loop(
         info!("cpu[{idx}]: child ready pid={pid}");
 
         let mut respawn = false;
+        // Set on every respawn EXCEPT a planned recycle, so the backoff
+        // below only ever applies to a child dying or being killed, never
+        // to `--cpu-max-tasks-per-child`, which can be legitimately frequent.
+        let mut died_unplanned = false;
         let mut completed: usize = 0;
         while !respawn {
             let job = match rx.recv().await {
@@ -1124,6 +1174,7 @@ async fn stdio_child_loop(
                 warn!("cpu[{idx}] pid={pid}: write failed: {e}");
                 let _ = job.resp.send(CpuOutcome::Lost);
                 counters.inflight_cpu.fetch_sub(1, Ordering::Relaxed);
+                died_unplanned = true;
                 break; // exits while: child gets killed + respawned below
             }
 
@@ -1140,10 +1191,23 @@ async fn stdio_child_loop(
                     }
                 }
                 Ok(_) => {
-                    // EOF or read error: child died mid-task
-                    warn!("cpu[{idx}] pid={pid}: child died mid-task (WorkerLost)");
+                    // EOF or read error: child died mid-task. A best effort,
+                    // non blocking peek at its exit status (WIFSIGNALED and
+                    // the signal number) so an operator can tell a segfault,
+                    // an OOM kill, and any other unprompted death apart,
+                    // since by the time this fires the child cannot self
+                    // report why it is gone.
+                    let cause = match child.try_wait() {
+                        Ok(Some(status)) => match status.signal() {
+                            Some(sig) => format!(" (signal {sig})"),
+                            None => format!(" (exit code {:?})", status.code()),
+                        },
+                        _ => String::new(),
+                    };
+                    warn!("cpu[{idx}] pid={pid}: child died mid-task{cause} (WorkerLost)");
                     let _ = job.resp.send(CpuOutcome::Lost);
                     respawn = true;
+                    died_unplanned = true;
                 }
                 Err(_) => {
                     warn!(
@@ -1152,6 +1216,7 @@ async fn stdio_child_loop(
                     );
                     let _ = job.resp.send(CpuOutcome::Timeout);
                     respawn = true;
+                    died_unplanned = true;
                 }
             }
             counters.inflight_cpu.fetch_sub(1, Ordering::Relaxed);
@@ -1160,5 +1225,100 @@ async fn stdio_child_loop(
         let _ = child.start_kill();
         let _ = child.wait().await;
         track_pid(&pids, pid, false);
+
+        if died_unplanned {
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(Duration::from_secs(2));
+        } else {
+            backoff = Duration::from_millis(100);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Item 2 (audit): a write error (EPIPE/ECONNRESET, e.g. from a child
+    /// that already died) must resolve to `ChildGone::Exited`, same as a
+    /// read EOF, not `Wedged`: the pid may already have been reused by an
+    /// unrelated process. Hands `serve_child` a REAL, unrelated process's
+    /// pid as the "child" pid. Uses TWO independent socketpairs, not one:
+    /// with item 1's fix, reads and writes are polled concurrently by the
+    /// same select! loop, so closing one shared connection makes read EOF
+    /// and the write error race each other for which arm fires first,
+    /// which would make this test flaky, since read EOF already resolved
+    /// to `Exited` before this fix and would mask a regression here half
+    /// the time. Keeping the read side's peer alive and silent removes that
+    /// race: `lines.next_line()` can never resolve, so only the write side
+    /// (whose peer IS dropped) decides the outcome. If the fix regresses
+    /// and kills the pid again on a write error, this innocent bystander
+    /// process dies.
+    #[tokio::test]
+    async fn write_error_does_not_rekill_a_possibly_reused_pid() {
+        let mut bystander = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .expect("spawn bystander");
+        let bystander_pid = bystander.id();
+
+        let (write_worker, write_peer) = tokio::net::UnixStream::pair().unwrap();
+        let (read_worker, _read_peer) = tokio::net::UnixStream::pair().unwrap();
+        drop(write_peer); // the write side's peer is gone from the start
+                          // _read_peer stays alive (and silent) for the whole test: nothing
+                          // ever arrives, so the read arm can never fire.
+
+        let (_unused_read_half, write) = write_worker.into_split();
+        let (read, _unused_write_half) = read_worker.into_split();
+        let conn = ChildConn {
+            lines: BufReader::new(read).lines(),
+            write,
+            pid: bystander_pid,
+            concurrency: 1,
+        };
+
+        let (tx, rx) = async_channel::bounded::<CpuJob>(1);
+        let (resp_tx, resp_rx) = oneshot::channel();
+        tx.try_send(CpuJob {
+            id: "t1".into(),
+            req_line: "x".repeat(1_000_000),
+            timeout_ms: 5_000,
+            resp: resp_tx,
+        })
+        .unwrap();
+        drop(tx);
+
+        let counters = Arc::new(Counters::default());
+        let pids = Arc::new(Mutex::new(Vec::new()));
+        serve_child(
+            0,
+            conn,
+            ServeCfg {
+                prefetch: 0,
+                recycle: 0,
+            },
+            &rx,
+            &counters,
+            &pids,
+        )
+        .await;
+
+        let outcome = resp_rx.await.expect("resp channel closed");
+        assert!(
+            matches!(outcome, CpuOutcome::Lost),
+            "a dead child's write error must still resolve the request as Lost"
+        );
+
+        // The regression this guards: a naive fix kills again on any write
+        // failure, which would SIGKILL this bystander if the kernel had
+        // already reused its pid for it (exactly what happens once the
+        // fork-server parent reaps the real child via SIGCHLD).
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            bystander.try_wait().expect("try_wait").is_none(),
+            "a write error must not kill the pid again: it may already be reused"
+        );
+        let _ = bystander.kill();
+        let _ = bystander.wait();
     }
 }

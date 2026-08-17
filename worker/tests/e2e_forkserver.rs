@@ -20,6 +20,9 @@ async fn e2e_fork_server() {
     cpu_unknown_id_log_does_not_leak_payload(&mut c).await;
     busy_child_write_backpressure_is_not_wedged(&mut c).await;
     genuinely_wedged_child_is_still_killed_despite_prefetch_stall(&mut c).await;
+    instant_repeated_child_death_is_backed_off(&mut c).await;
+    instant_repeated_child_death_is_backed_off_stdio(&mut c).await;
+    selfsignal_death_is_logged_with_signal_number_stdio(&mut c).await;
 
     stop_redis();
 }
@@ -335,4 +338,132 @@ async fn genuinely_wedged_child_is_still_killed_despite_prefetch_stall(
     w.signal(libc::SIGTERM);
     assert_eq!(w.wait_code(20), 0);
     drop(w);
+}
+
+/// Item 3 (audit): a child that forks successfully and then dies instantly,
+/// repeatedly, must be backed off before the next fork request (mirrors
+/// `parent_control_loop`'s `Refused` backoff), not forked again at full OS
+/// speed with no delay. fx.cpu_die_always os._exit(9)s unconditionally on
+/// receipt, so every one of these SIX SEPARATE tasks (`max_retries` 0: one
+/// attempt each, no task level retry involved) kills its own dedicated
+/// child on `--cpu-workers 1`'s one slot. Deliberately six independent
+/// tasks rather than retries of one: a retried task's next attempt is only
+/// picked up by the 250ms delayed mover poll (§4.3), which would dominate
+/// this timing and hide cpu.rs's own backoff entirely. Before the fix this
+/// ran at full OS speed (measured 14.4 fork/crash cycles per second, 2 to
+/// 5ms gaps); the escalating 100ms to 2s backoff makes even a handful of
+/// cycles take well over the 300ms threshold below.
+async fn instant_repeated_child_death_is_backed_off(c: &mut redis::aio::MultiplexedConnection) {
+    // --cpu-prefetch 0: with the default prefetch, several of the six tasks
+    // below can be admitted into the same soon to die child's socket
+    // buffer before it ever reads the first one, so its single death
+    // resolves multiple of them at once and only one backoff interval is
+    // observed. Disabling prefetch forces one task per child, one death
+    // per task, so the timing assertion actually reflects consecutive
+    // backoff intervals rather than getting lucky on request batching.
+    let mut w = Worker::spawn("backoffq", &["--cpu-workers", "1", "--cpu-prefetch", "0"]);
+    wait_group(c, "backoffq", 20).await;
+
+    let t0 = std::time::Instant::now();
+    let mut ids = Vec::new();
+    for _ in 0..6 {
+        let (id, e) = envelope("fx.cpu_die_always", "backoffq", |v| {
+            v["kind"] = json!("cpu");
+            v["max_retries"] = json!(0);
+        });
+        xadd(c, "backoffq", &e.to_string()).await;
+        ids.push(id);
+    }
+    for id in &ids {
+        wait_dlq(c, "backoffq", id, 30).await;
+    }
+    let elapsed = t0.elapsed();
+    assert!(
+        elapsed > std::time::Duration::from_millis(300),
+        "six tasks that each instantly crash their own child must be backed \
+         off between fork attempts, not forked again at full OS speed: took \
+         only {elapsed:?}"
+    );
+
+    w.signal(libc::SIGTERM);
+    assert_eq!(w.wait_code(20), 0);
+    drop(w);
+}
+
+/// Same regression, stdio mode (`--no-fork-server`): `stdio_child_loop`
+/// used to go straight back to spawning a replacement with no delay either.
+async fn instant_repeated_child_death_is_backed_off_stdio(
+    c: &mut redis::aio::MultiplexedConnection,
+) {
+    let mut w = Worker::spawn("backoffqstdio", &["--no-fork-server", "--cpu-workers", "1"]);
+    wait_group(c, "backoffqstdio", 20).await;
+
+    let t0 = std::time::Instant::now();
+    let mut ids = Vec::new();
+    for _ in 0..6 {
+        let (id, e) = envelope("fx.cpu_die_always", "backoffqstdio", |v| {
+            v["kind"] = json!("cpu");
+            v["max_retries"] = json!(0);
+        });
+        xadd(c, "backoffqstdio", &e.to_string()).await;
+        ids.push(id);
+    }
+    for id in &ids {
+        wait_dlq(c, "backoffqstdio", id, 30).await;
+    }
+    let elapsed = t0.elapsed();
+    assert!(
+        elapsed > std::time::Duration::from_millis(300),
+        "stdio mode: six tasks that each instantly crash their own child \
+         must be backed off between spawn attempts too: took only {elapsed:?}"
+    );
+
+    w.signal(libc::SIGTERM);
+    assert_eq!(w.wait_code(20), 0);
+    drop(w);
+}
+
+/// Item 4 (audit), stdio mode counterpart to the fork server parent's
+/// reaper fix (`cauli._exec._reap_children`, covered at the Python level by
+/// `py/tests/test_fork_server.py`): in stdio mode there is no separate
+/// parent process, `stdio_child_loop` reaps its own child directly, and it
+/// had the exact same gap, discarding the exit status entirely so a
+/// segfault, an OOM kill and any other unprompted death all logged
+/// identically. fx.cpu_selfsignal kills itself with SIGSEGV (signal 11),
+/// standing in for a real crash; `child.try_wait()`'s WIFSIGNALED peek now
+/// appends the signal number to the existing "child died mid-task" line.
+async fn selfsignal_death_is_logged_with_signal_number_stdio(
+    c: &mut redis::aio::MultiplexedConnection,
+) {
+    let log_path = fixtures_dir().join(format!("selfsignal-{}.log", unique_id()));
+    let mut w = Worker::spawn_ex(
+        "selfsignalq",
+        &["--no-fork-server", "--cpu-workers", "1"],
+        &[],
+        Some(&log_path),
+    );
+    wait_group(c, "selfsignalq", 20).await;
+
+    let (id, e) = envelope("fx.cpu_selfsignal", "selfsignalq", |v| {
+        v["kind"] = json!("cpu");
+        v["max_retries"] = json!(0);
+    });
+    xadd(c, "selfsignalq", &e.to_string()).await;
+    wait_dlq(c, "selfsignalq", &id, 20).await;
+
+    w.signal(libc::SIGTERM);
+    assert_eq!(w.wait_code(20), 0);
+    drop(w);
+
+    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+    let line = log
+        .lines()
+        .rev()
+        .find(|l| l.contains("child died mid-task"))
+        .unwrap_or_else(|| panic!("no 'child died mid-task' log line found:\n{log}"));
+    assert!(
+        line.contains("(signal 11)"),
+        "a SIGSEGV death must be logged with its signal number: {line}"
+    );
+    let _ = std::fs::remove_file(&log_path);
 }

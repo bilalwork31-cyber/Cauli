@@ -155,6 +155,14 @@ def cpu_die_once(counter_file):  # fake_exec: os._exit(9) once, then "revived"
     return "revived"
 
 
+def cpu_die_always():  # fake_exec: os._exit(9) unconditionally, every attempt
+    return "unreachable"
+
+
+def cpu_selfsignal(sig=None):  # fake_exec: os.kill(self, sig), default SIGSEGV
+    return "unreachable"
+
+
 def cpu_ghost():  # fake_exec: also sends one unsolicited line with no match
     return {"echo": "ghost-real"}
 
@@ -191,4 +199,6 @@ app.add(TaskDef("fx.cpu_slow", cpu_slow, kind="cpu"))
 app.add(TaskDef("fx.cpu_slow_pid", cpu_slow_pid, kind="cpu"))
 app.add(TaskDef("fx.cpu_soft_slow", cpu_soft_slow, kind="cpu"))
 app.add(TaskDef("fx.cpu_die_once", cpu_die_once, kind="cpu"))
+app.add(TaskDef("fx.cpu_die_always", cpu_die_always, kind="cpu"))
+app.add(TaskDef("fx.cpu_selfsignal", cpu_selfsignal, kind="cpu"))
 app.add(TaskDef("fx.cpu_ghost", cpu_ghost, kind="cpu"))
