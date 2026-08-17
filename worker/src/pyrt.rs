@@ -698,6 +698,44 @@ impl SyncPool {
 mod tests {
     use super::*;
 
+    /// Serializes every test below that builds a `PyRuntime`, or that
+    /// otherwise mutates state the embedded interpreter shares process wide.
+    ///
+    /// shim.py keeps all of its dispatch state (`_loops`, `_pending`,
+    /// `_registry`, `_callback`) in module globals, and `PyModule::from_code`
+    /// publishes that module in `sys.modules` under one fixed name
+    /// (`cauli_worker_shim`, which loops.rs then imports back by that name).
+    /// A second `PyRuntime::init` in one process therefore does not get a
+    /// second shim: `PyImport_ExecCodeModuleEx` finds the module already in
+    /// `sys.modules` and runs the source again in ITS dict, which empties
+    /// `_loops` and `_pending` and points the one `_callback` at the newest
+    /// runtime. An older runtime's async completion then lands in the newest
+    /// runtime's pending map, where its token does not exist, and is
+    /// dropped, so the older test's `queue_submit` receiver never resolves
+    /// and that test thread parks forever. Land the same reset a moment
+    /// earlier, while an older runtime is mid submit, and `submit_async`
+    /// finds `_loops` empty and raises instead, so the task comes back as a
+    /// retryable WorkerShimError. Both shapes were reproduced by running
+    /// this binary at default parallelism pinned to two busy cores.
+    ///
+    /// main.rs builds exactly one runtime per process, at startup, before
+    /// any dispatch thread exists, so nothing outside this module can create
+    /// that overlap. Keep the lock: without it the tests still pass at
+    /// `--test-threads=1` and on an idle box, which is exactly what makes
+    /// the hang look like someone else's problem.
+    static SHIM_STATE_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Poison tolerant on purpose: a test that panics while holding the lock
+    /// must not turn every other test here into a lock poisoning failure
+    /// that buries the one real failure.
+    fn shim_state_guard() -> std::sync::MutexGuard<'static, ()> {
+        let guard = SHIM_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Mandated entry point; pyo3 0.26 aliases it to Python::initialize.
+        #[allow(deprecated)]
+        pyo3::prepare_freethreaded_python();
+        guard
+    }
+
     /// Registers a synthetic module in `sys.modules` under `module_name` so
     /// shim.py's `importlib.import_module` finds it without touching the
     /// filesystem, and returns the "module:app" spec `PyRuntime::init`
@@ -724,8 +762,7 @@ mod tests {
     /// Rust's `u64` and fail to parse (see the docstring on AppConfig).
     #[test]
     fn unparseable_config_error_does_not_leak_redis_password() {
-        #[allow(deprecated)]
-        pyo3::prepare_freethreaded_python();
+        let _shim_state = shim_state_guard();
         let app_spec = Python::attach(|py| {
             install_fake_app_module(
                 py,
@@ -799,8 +836,7 @@ app = _App()
     /// hits its ceiling, instead of growing without bound.
     #[test]
     fn report_hard_timeout_stops_spawning_at_the_thread_ceiling() {
-        #[allow(deprecated)]
-        pyo3::prepare_freethreaded_python();
+        let _shim_state = shim_state_guard();
         let app_spec = Python::attach(|py| {
             install_fake_app_module(py, "cauli_test_ceiling_app", MINIMAL_VALID_APP_SRC)
         });
@@ -832,8 +868,7 @@ app = _App()
     /// observable silently stops telling the truth the moment it matters.
     #[test]
     fn sync_pool_thread_panic_does_not_overcount_live_threads() {
-        #[allow(deprecated)]
-        pyo3::prepare_freethreaded_python();
+        let _shim_state = shim_state_guard();
         let app_spec = Python::attach(|py| {
             install_fake_app_module(py, "cauli_test_panic_app", MINIMAL_VALID_APP_SRC)
         });
@@ -881,8 +916,7 @@ app = _App()
     /// `--max-envelope-bytes` is far too coarse to catch.
     #[test]
     fn run_sync_blocking_depth_failure_is_not_retryable() {
-        #[allow(deprecated)]
-        pyo3::prepare_freethreaded_python();
+        let _shim_state = shim_state_guard();
         let app_spec = Python::attach(|py| {
             install_fake_app_module(py, "cauli_test_depth_sync_app", MINIMAL_VALID_APP_SRC)
         });
@@ -910,10 +944,9 @@ app = _App()
     /// Same as `run_sync_blocking_depth_failure_is_not_retryable` above, for
     /// the async submit lane (`queue_submit` -> `submit_batch_under_gil`).
     /// Before the fix this was also "WorkerShimError"/retryable true.
-    #[tokio::test]
-    async fn queue_submit_depth_failure_is_not_retryable() {
-        #[allow(deprecated)]
-        pyo3::prepare_freethreaded_python();
+    #[test]
+    fn queue_submit_depth_failure_is_not_retryable() {
+        let _shim_state = shim_state_guard();
         let app_spec = Python::attach(|py| {
             install_fake_app_module(py, "cauli_test_depth_async_app", MINIMAL_VALID_APP_SRC)
         });
@@ -924,7 +957,10 @@ app = _App()
             deep = serde_json::json!([deep]);
         }
         let (_token, rx) = rt.queue_submit("does.not.matter", &deep, &serde_json::json!({}), 5.0);
-        match rx.await.expect("submitter thread must respond") {
+        // blocking_recv rather than #[tokio::test] and `.await`: the guard
+        // above has to span both the submit and the completion, and a std
+        // MutexGuard has no business crossing an await point.
+        match rx.blocking_recv().expect("submitter thread must respond") {
             Outcome::Failure { err, retryable } => {
                 assert!(
                     !retryable,
@@ -947,8 +983,7 @@ app = _App()
     /// future caller might.
     #[test]
     fn shim_sync_unregistered_task_error_type_is_canonical() {
-        #[allow(deprecated)]
-        pyo3::prepare_freethreaded_python();
+        let _shim_state = shim_state_guard();
         let app_spec = Python::attach(|py| {
             install_fake_app_module(
                 py,
@@ -975,10 +1010,9 @@ app = _App()
 
     /// Same as `shim_sync_unregistered_task_error_type_is_canonical` above,
     /// for the async lane (`_arun`).
-    #[tokio::test]
-    async fn shim_async_unregistered_task_error_type_is_canonical() {
-        #[allow(deprecated)]
-        pyo3::prepare_freethreaded_python();
+    #[test]
+    fn shim_async_unregistered_task_error_type_is_canonical() {
+        let _shim_state = shim_state_guard();
         let app_spec = Python::attach(|py| {
             install_fake_app_module(
                 py,
@@ -994,7 +1028,10 @@ app = _App()
             &serde_json::json!({}),
             5.0,
         );
-        match rx.await.expect("submitter thread must respond") {
+        // blocking_recv rather than #[tokio::test] and `.await`: the guard
+        // above has to span both the submit and the completion, and a std
+        // MutexGuard has no business crossing an await point.
+        match rx.blocking_recv().expect("submitter thread must respond") {
             Outcome::Failure { err, retryable } => {
                 assert_eq!(err.type_, "UnregisteredTask");
                 assert!(!retryable);
@@ -1033,8 +1070,7 @@ app = _App()
     /// executing in parallel could.
     #[test]
     fn load_app_rebinds_soft_time_limit_exceeded_once_cauli_becomes_importable() {
-        #[allow(deprecated)]
-        pyo3::prepare_freethreaded_python();
+        let _shim_state = shim_state_guard();
         Python::attach(|py| {
             let sys_modules = py
                 .import("sys")
