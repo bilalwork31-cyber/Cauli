@@ -276,13 +276,12 @@ async fn recover_page(
 /// replacements, capped at a fixed multiple of --io-threads), sync_abandoned
 /// is the cumulative count of hard timeout abandonments reported (each
 /// spawns a replacement thread unless the pool is already at that cap).
-/// `pending_async` (MEM-1) is the async runtime's pending completion map
-/// size; a number that only grows
-/// signals a wedged event-loop thread even though `cancel` stops the
-/// Rust-side bookkeeping from leaking on its own. `async_rejected` (MEM-5) is
-/// the field that actually moves during that same wedge: the shim's own per
-/// loop queue rejects submissions past its cap instead of growing forever,
-/// and this is the running count of those rejections. `cpu_backlog` is the
+/// `async_rejected` (MEM-5) is the field that moves during an event loop
+/// wedge: the shim's own per loop queue rejects submissions past its cap
+/// instead of growing forever, and this is the running count of those
+/// rejections. It replaced `pending_async` (the pending completion map size),
+/// whose own note here already conceded that this was the number that
+/// actually moved while it stayed flat. `cpu_backlog` is the
 /// live depth behind the fetch loop's admission gate (see its comment): a
 /// nonzero reading means fetching is currently paused for every lane, not
 /// just cpu, which `Counters::note_cpu_backlog` also logs on the
@@ -298,13 +297,12 @@ pub async fn stats_loop(ctx: Arc<Ctx>) {
         tick.tick().await;
         let oldest = oldest_unacked_ms(&ctx, &mut conn).await;
         info!(
-            "{} oldest_ms={} cpu_rss_mb={} sync_live={} sync_abandoned={} pending_async={} async_rejected={} cpu_backlog={}",
+            "{} oldest_ms={} cpu_rss_mb={} sync_live={} sync_abandoned={} async_rejected={} cpu_backlog={}",
             ctx.counters.stats_line(),
             oldest,
             ctx.cpu_rss_mb(),
             ctx.sync_pool.live_threads.load(Ordering::Relaxed),
             ctx.sync_pool.abandoned.load(Ordering::Relaxed),
-            ctx.pyrt.pending_len(),
             ctx.pyrt.async_rejected(),
             ctx.cpu_overflow()
         );

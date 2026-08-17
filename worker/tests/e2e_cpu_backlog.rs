@@ -117,6 +117,12 @@ async fn e2e_cpu_backlog_observability() {
         stats_line.contains("stats: fetched="),
         "expected a full stats line, got: {stats_line}"
     );
+    // Removed key: its own source note named async_rejected as the field that
+    // actually moves during the wedge it was supposed to expose.
+    assert!(
+        !stats_line.contains("pending_async"),
+        "pending_async must be gone from the stats line: {stats_line}"
+    );
 
     let full_line = wait_log_contains(&log_path, "cpu backlog full", 6).await;
     assert!(

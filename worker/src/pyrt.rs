@@ -489,17 +489,11 @@ impl PyRuntime {
         self.pending.lock().unwrap().remove(&token);
     }
 
-    /// Current size of the pending-completion map (stats: `pending_async`).
-    /// A number that only grows over time signals a wedged event-loop thread
-    /// (MEM-1) even after `cancel` stops the Rust-side bookkeeping leak.
-    pub fn pending_len(&self) -> usize {
-        self.pending.lock().unwrap().len()
-    }
-
     /// Cumulative submissions rejected because a loop's own pending list was
     /// at cap (stats: `async_rejected`, MEM-5). This is the counter that
-    /// actually moves during the exact wedge that leaves `pending_async`
-    /// flat: see submit_batch_under_gil.
+    /// actually moves during an event loop wedge, which is why it replaced
+    /// the pending completion map size on the stats line: see
+    /// submit_batch_under_gil.
     pub fn async_rejected(&self) -> u64 {
         self.async_rejected.load(Ordering::Relaxed)
     }
