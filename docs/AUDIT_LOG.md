@@ -3483,3 +3483,87 @@ A hard guard in `PyRuntime::init` is being added so a second call fails immediat
 real consequence, converting a silent corruption into a loud error. That is the through line of this
 entire audit.
 
+
+## 2026-08-17 — Cycle 38 — the two unrecoverable states, and the init guard
+
+Commits `d75c430` and `8b873cf`. These close the single change `docs/decisions/process-model.md`
+said should not ship as built.
+
+### A wedged asyncio loop now exits so a supervisor can restart it
+
+`shim.py` gained `heartbeat()`: Rust stamps every loop through `call_soon_threadsafe` every 5s and
+gets back, per loop, lag, outstanding and completed. One stamp outstanding at a time, so a loop that
+recovers does not face a pile of queued callbacks.
+
+The verdict requires TWO signals: the stamp unanswered for three intervals, 15s, AND either work
+outstanding at a loop that completed nothing over that window, or `async_rejected` rising. A late
+stamp alone is exactly what a GIL convoy looks like, so a single check would restart the worker on an
+ordinary load spike.
+
+**The agent corrected its own first approach, and the correction is the interesting part.** It
+initially corroborated on the shim's pending queue depth. A live e2e run showed that queue EMPTY
+during a genuine wedge, because one drain converts a whole batch into Tasks before the first of them
+blocks the thread. It now counts submitted minus completed, which catches both shapes. That is a real
+defect found in its own design by running it rather than reasoning about it.
+
+The exit goes through `exit_now`, so `_exit` rather than `process::exit`, because every loop thread is
+still live at that moment. That is tonight's very first finding being applied correctly by a later
+agent without being told.
+
+Measured wedge to exit latency: 15 to 20 seconds. Exit code 87. `loop_lag_ms` is now in the stats
+line, which also answers the cross lane GIL convoy blind spot the process model document identified
+as the incident this audit was most likely to miss. One instrument, two problems, as designed.
+
+On the 15 second window, which the agent flagged as its own judgement call: keep it. A synchronous
+HTTP request with a ten second timeout inside an `async def` is a real pattern, badly written but
+real, and restarting the worker every time one runs would be worse than the brownout it prevents.
+The safety does not come from the window length anyway, it comes from the second signal.
+
+### NOGROUP self heals rather than exiting
+
+`broker::is_nogroup` matches the error CODE rather than message text, and `fetch_loop` gets a
+dedicated arm that recreates the groups and resumes.
+
+The reasoning for choosing self heal over failing loudly is sound and worth keeping: the loss has
+already happened and no exit code undoes it, the stream is where new work keeps arriving, and a
+worker that dies here turns a recoverable broker event into an outage anywhere a supervisor is not
+running. Honesty is bought with the log line instead, at error level, naming the pending entries list
+and the delayed set as gone. It opens with `redis has no consumer group`, which cannot be mistaken
+for a connection blip, which is exactly what it looked like before.
+
+PROTOCOL section 4 now states the persistence requirement that the at least once guarantee always
+silently assumed, including `maxmemory-policy` and the ElastiCache default.
+
+### The PyRuntime guard: an invariant made enforced rather than conventional
+
+A `static RUNTIME_BUILT: AtomicBool` with a single `swap(true, SeqCst)` as the first statement of
+`PyRuntime::init`. Taken and never given back, including on the failure paths below it, since those
+have already run shim.py's module body and started its loop threads by the time they report.
+
+The error text names the CONSEQUENCE rather than the rule, which is the whole point of it:
+
+> PyRuntime::init was called twice in this process. The embedded shim is one Python module shared
+> process wide, so a second runtime empties the first one's asyncio loop list and submission queues
+> and takes over its completion callback: every task the first runtime still has in flight is then
+> dropped silently, with no error raised anywhere. Build exactly one PyRuntime per process.
+
+Scoping around the tests is better than I asked for: the guard is ARMED under `cfg(test)` rather than
+compiled out. The test helper clears it once per test and only while already holding
+`SHIM_STATE_LOCK`, so the clear can happen only at a strictly sequential handoff. Inside any single
+test body the guard is live, and a new test proves a second `init` there fails exactly as the product
+path would, asserting the message names the dropped completions rather than only the rule. A guard
+the tests bypass entirely would have been worth much less.
+
+Verified across 180 runs under the provoking load: 100 at `--test-threads=6` pinned to two cores with
+six competing `yes` loops, 50 at default parallelism under load, 30 at sixteen threads on one core.
+Zero hangs.
+
+### Noted, not chased
+
+Both agents saw `broker::tests::mover_crossslot_is_detected_not_treated_as_transient` fail
+intermittently with "cluster never reached cluster_state:ok", in each case while the other agent's
+CPU starvation load or a competing redis node was running. It passes in isolation and in the final
+full run. It has a load sensitive timeout on a real cluster startup, which will be flaky in CI on a
+busy runner. Worth a longer timeout or a retry, and recorded here rather than fixed because neither
+agent owned it.
+
