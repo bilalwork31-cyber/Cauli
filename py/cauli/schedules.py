@@ -115,14 +115,26 @@ class Schedule:
         it jumps directly (a jump can only ever *skip* slots, never duplicate
         one, so the bound is safe).
         """
+        return self.advance_past_with_missed(slot_ms, now_ms)[0]
+
+    def advance_past_with_missed(
+        self, slot_ms: int, now_ms: int
+    ) -> tuple[int, int | None]:
+        """:meth:`advance_past`, plus how many slots the fast forward swallowed.
+
+        The count is the occurrences strictly after ``slot_ms`` and no later
+        than ``now_ms``: scheduled work that will never run, which beat has to
+        announce rather than drop quietly. It is ``None`` when the step bound
+        was reached, because the true number is then unknown.
+        """
         nxt = self.next_after(slot_ms)
-        steps = 0
+        missed = 0
         while nxt <= now_ms:
-            if steps >= _MAX_ADVANCE_STEPS:
-                return self.next_after(now_ms)
+            if missed >= _MAX_ADVANCE_STEPS:
+                return self.next_after(now_ms), None
             nxt = self.next_after(nxt)
-            steps += 1
-        return nxt
+            missed += 1
+        return nxt, missed
 
     def rev(self) -> str:
         """Stable 16-hex-char fingerprint of this schedule's definition.
@@ -160,15 +172,17 @@ class IntervalSchedule(Schedule):
     def next_after(self, slot_ms: int) -> int:
         return int(slot_ms) + self.every_ms
 
-    def advance_past(self, slot_ms: int, now_ms: int) -> int:
+    def advance_past_with_missed(
+        self, slot_ms: int, now_ms: int
+    ) -> tuple[int, int | None]:
         # Closed form: no loop, so an interval schedule recovers from arbitrary
         # downtime in O(1) (a 1-second interval down for a day would otherwise
         # step 86_400 times).
         slot_ms = int(slot_ms)
         if now_ms < slot_ms:
-            return slot_ms + self.every_ms
+            return slot_ms + self.every_ms, 0
         steps = (now_ms - slot_ms) // self.every_ms + 1
-        return slot_ms + steps * self.every_ms
+        return slot_ms + steps * self.every_ms, steps - 1
 
     def to_spec(self) -> dict[str, Any]:
         return {"type": "interval", "every_ms": self.every_ms}
@@ -337,6 +351,13 @@ class CrontabSchedule(Schedule):
         naive = datetime(d.year, d.month, d.day, hour, minute, tzinfo=self.tz)
         return int(naive.timestamp() * 1000)
 
+    def _offset_changes_during(self, d: _date) -> bool:
+        """True when this zone changes UTC offset somewhere inside day d."""
+        after = d + timedelta(days=1)
+        start = datetime(d.year, d.month, d.day, tzinfo=self.tz)
+        end = datetime(after.year, after.month, after.day, tzinfo=self.tz)
+        return start.utcoffset() != end.utcoffset()
+
     def next_after(self, slot_ms: int) -> int:
         slot_ms = int(slot_ms)
         local = datetime.fromtimestamp(slot_ms / 1000.0, tz=timezone.utc).astimezone(
@@ -349,12 +370,29 @@ class CrontabSchedule(Schedule):
         from_hm = (local.hour, local.minute)
         for offset in range(_MAX_SCAN_DAYS):
             if self._date_matches(day):
+                # Wall order equals instant order only while the offset holds
+                # still. On a transition day it does not, because a nonexistent
+                # wall time resolves through the offset in force BEFORE the
+                # jump: with a two hour spring forward (Antarctica/Troll, +00 to
+                # +02) wall 02:30 lands at 02:30Z while the real wall 03:30
+                # lands at 01:30Z. Returning the first wall match would answer
+                # 02:30Z and lose 01:30Z permanently, so a shifting day is
+                # scanned in full and answered with the EARLIEST instant past
+                # the argument. Taking the minimum is also what collapses the
+                # ordinary one hour case, where the phantom 02:30 and the real
+                # 03:30 are the same instant and so must fire once, not twice.
+                shifting = self._offset_changes_during(day)
+                best: int | None = None
                 for hm in self._hm:
-                    if offset == 0 and hm < from_hm:
+                    if offset == 0 and not shifting and hm < from_hm:
                         continue
                     ms = self._instant_ms(day, hm[0], hm[1])
-                    if ms > slot_ms:
-                        return ms
+                    if ms > slot_ms and (best is None or ms < best):
+                        best = ms
+                        if not shifting:
+                            break
+                if best is not None:
+                    return best
             day = day + timedelta(days=1)
         raise ValueError(
             f"crontab {self!r} has no occurrence within {_MAX_SCAN_DAYS} days "

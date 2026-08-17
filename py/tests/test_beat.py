@@ -9,6 +9,7 @@ in test_beat_ha.py.
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import time
 from datetime import timedelta
@@ -17,7 +18,9 @@ import pytest
 import redis as redis_lib
 
 from cauli import Cauli, crontab, interval
+from cauli import beat as beat_module
 from cauli.beat import (
+    DUE_BATCH,
     DUE_KEY,
     LOCK_KEY,
     REV_KEY,
@@ -607,3 +610,193 @@ def test_keys_are_namespaced_under_cauli_beat(redis_client, beat_app, store):
 
     keys = {k.decode() for k in redis_client.keys("cauli:beat:*")}
     assert keys == {SCHEDULE_KEY, DUE_KEY, REV_KEY, STATE_KEY, RUNS_KEY, LOCK_KEY}
+
+
+# --------------------------------------------------- reconciliation and the lease
+
+
+class StopAfter(threading.Event):
+    """Lets ``run()`` make exactly ``passes`` trips round the loop, then stops it."""
+
+    def __init__(self, passes: int) -> None:
+        super().__init__()
+        self.left = passes
+
+    def wait(self, timeout: float | None = None) -> bool:
+        self.left -= 1
+        if self.left <= 0:
+            self.set()
+        return True
+
+
+def test_a_standby_does_not_reconcile_before_it_holds_the_lease(
+    beat_app, store, redis_client, redis_url
+):
+    """Starting a replica must never unschedule the leader's entries.
+
+    PROTOCOL.md section 10.3: reconciliation runs only while holding the lease.
+    `run()` used to reconcile once before the loop, so during a rolling deploy a
+    replica running the OLD code deleted every entry the new code had added, and
+    the leader never restored them because it had already reconciled.
+    """
+    beat_app.add_periodic_task("kept", "app.a", interval(60))
+    beat_app.add_periodic_task("added-by-the-new-version", "app.b", interval(60))
+    leader = Beat(beat_app, store=store, use_lock=True, instance_id="leader")
+    leader.sync_code_entries()
+    assert leader._hold_leadership(0.0)
+    leader.tick()
+    assert set(store.load()) == {"kept", "added-by-the-new-version"}
+
+    old_app = Cauli(redis_url=redis_url)
+    old_app.add_periodic_task("kept", "app.a", interval(60))
+    standby = Beat(
+        old_app,
+        store=FrozenStore(redis_client, store.clock),
+        use_lock=True,
+        instance_id="standby",
+    )
+    standby.run(StopAfter(2))
+
+    assert not standby.is_leader
+    assert redis_client.get(LOCK_KEY) == b"leader"
+    assert set(store.load()) == {"kept", "added-by-the-new-version"}
+    assert redis_client.zscore(DUE_KEY, "added-by-the-new-version") is not None
+
+
+def test_once_does_not_reconcile_while_another_instance_holds_the_lease(
+    beat_app, store, redis_client, redis_url, monkeypatch
+):
+    beat_app.add_periodic_task("kept", "app.a", interval(60))
+    beat_app.add_periodic_task("added-by-the-new-version", "app.b", interval(60))
+    beat = make_beat(beat_app, store)
+    beat.sync_code_entries()
+    beat.tick()
+    RedisScheduleStore(redis_client).acquire_lock("someone-else", 60_000)
+
+    old_app = Cauli(redis_url=redis_url)
+    old_app.add_periodic_task("kept", "app.a", interval(60))
+    monkeypatch.setattr(beat_module, "load_app", lambda spec: old_app)
+
+    assert beat_module.main(["--app", "x:app", "--redis-url", redis_url, "--once"]) == 0
+
+    assert set(store.load()) == {"kept", "added-by-the-new-version"}
+    assert redis_client.get(LOCK_KEY) == b"someone-else"
+
+
+def test_once_reconciles_and_ticks_when_it_can_take_the_lease(
+    beat_app, redis_client, redis_url, monkeypatch
+):
+    """The system cron deployment: --once is the only scheduler, so it must
+    reconcile, fire, and hand the lease straight back."""
+    stale = ScheduleEntry(name="stale", task="app.gone", schedule=interval(60))
+    RedisScheduleStore(redis_client).upsert(stale)
+
+    app = Cauli(redis_url=redis_url)
+    app.add_periodic_task("live", "app.a", interval(60))
+    monkeypatch.setattr(beat_module, "load_app", lambda spec: app)
+
+    assert beat_module.main(["--app", "x:app", "--redis-url", redis_url, "--once"]) == 0
+
+    store = RedisScheduleStore(redis_client)
+    assert set(store.load()) == {"live"}
+    assert redis_client.zscore(DUE_KEY, "live") is not None
+    assert redis_client.get(LOCK_KEY) is None
+
+
+# ------------------------------------------------- announcing dropped work
+
+
+def warnings_from(caplog):
+    return [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+def test_a_coalesced_firing_reports_how_many_slots_it_swallowed(
+    beat_app, store, redis_client, caplog
+):
+    """PROTOCOL.md section 10.4 coalesces a backlog into one firing. The count
+    of slots that will never run is the number an operator needs, and lateness
+    alone does not give it."""
+    beat_app.add_periodic_task("nightly", "app.report", interval(60))
+    beat = make_beat(beat_app, store)
+    beat.sync_code_entries()
+    beat.tick()
+
+    store.clock += 6 * 3600 * 1000  # six hours down, 60s cadence
+    with caplog.at_level(logging.INFO, logger="cauli.beat"):
+        beat.tick()
+
+    assert beat.fired == 1
+    fired = [m for m in warnings_from(caplog) if "fired 'nightly'" in m]
+    assert len(fired) == 1, warnings_from(caplog)
+    assert "359 missed slots" in fired[0]
+
+
+def test_a_firing_that_is_on_time_stays_at_info_without_a_count(
+    beat_app, store, redis_client, caplog
+):
+    beat_app.add_periodic_task("p", "app.a", interval(60))
+    beat = make_beat(beat_app, store)
+    beat.sync_code_entries()
+    beat.tick()
+
+    store.clock += 60_000
+    with caplog.at_level(logging.INFO, logger="cauli.beat"):
+        beat.tick()
+
+    assert beat.fired == 1
+    assert not [m for m in warnings_from(caplog) if "fired" in m]
+    assert not [m for m in warnings_from(caplog) if "missed slots" in m]
+
+
+def test_dropping_the_slot_of_a_vanished_definition_is_announced(
+    beat_app, store, redis_client, caplog
+):
+    beat_app.add_periodic_task("a", "app.a", interval(60))
+    beat = make_beat(beat_app, store)
+    beat.sync_code_entries()
+    beat.tick()
+    redis_client.hdel(SCHEDULE_KEY, "a")
+
+    with caplog.at_level(logging.INFO, logger="cauli.beat"):
+        beat.tick()
+
+    assert redis_client.zscore(DUE_KEY, "a") is None
+    assert [m for m in warnings_from(caplog) if "'a'" in m and "no schedule" in m]
+
+
+def test_dropping_the_slot_of_a_disabled_entry_is_announced(
+    beat_app, store, redis_client, caplog
+):
+    beat_app.add_periodic_task("a", "app.a", interval(60))
+    beat = make_beat(beat_app, store)
+    beat.sync_code_entries()
+    beat.tick()
+
+    entry = store.load()["a"]
+    entry.enabled = False
+    store.upsert(entry)
+    with caplog.at_level(logging.INFO, logger="cauli.beat"):
+        beat.tick()
+        beat.tick()  # steady state: the warning must not repeat every tick
+
+    assert redis_client.zscore(DUE_KEY, "a") is None
+    disabled = [m for m in warnings_from(caplog) if "'a'" in m and "disabled" in m]
+    assert len(disabled) == 1, disabled
+
+
+def test_deferring_a_mass_due_backlog_is_announced(
+    beat_app, store, redis_client, caplog
+):
+    for i in range(DUE_BATCH + 20):
+        beat_app.add_periodic_task(f"e{i:04d}", "app.a", interval(60))
+    beat = make_beat(beat_app, store)
+    beat.sync_code_entries()
+    beat.tick()
+
+    store.clock += 60_000
+    with caplog.at_level(logging.INFO, logger="cauli.beat"):
+        beat.tick()
+
+    deferred = [m for m in warnings_from(caplog) if "came due at once" in m]
+    assert len(deferred) == 1, deferred
+    assert str(DUE_BATCH) in deferred[0]

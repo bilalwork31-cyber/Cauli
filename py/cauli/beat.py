@@ -523,6 +523,11 @@ class Beat:
         for name, entry in entries.items():
             if not entry.enabled:
                 if name in slots:
+                    log.warning(
+                        "beat: entry %r is disabled; dropping its next fire slot. "
+                        "It will not run again until it is enabled",
+                        name,
+                    )
                     self.store.drop_slot(name)
                 continue
             rev = entry.rev()
@@ -544,12 +549,29 @@ class Beat:
         # A slot with no surviving definition would otherwise sit due forever.
         for name in slots:
             if name not in entries:
+                log.warning(
+                    "beat: dropping the next fire slot for %r: it has no schedule "
+                    "definition any more (deleted, or unreadable and logged above)",
+                    name,
+                )
                 self.store.drop_slot(name)
 
-        for name, slot in self.store.due(now):
+        due = self.store.due(now)
+        if len(due) >= DUE_BATCH:
+            log.warning(
+                "beat: %d entries came due at once, which is the per tick cap; "
+                "the rest are deferred to the next tick and will fire late",
+                len(due),
+            )
+        for name, slot in due:
             entry = entries.get(name)
             if entry is None or not entry.enabled:
-                # Definition deleted or disabled between the seed and now.
+                log.warning(
+                    "beat: dropping due slot %s for %r: its definition was deleted "
+                    "or disabled during this tick, so that slot will not fire",
+                    slot,
+                    name,
+                )
                 self.store.drop_slot(name)
                 continue
             self._fire(entry, slot, now)
@@ -558,7 +580,7 @@ class Beat:
 
     def _fire(self, entry: ScheduleEntry, slot: int, now: int) -> None:
         try:
-            next_slot = entry.schedule.advance_past(slot, now)
+            next_slot, missed = entry.schedule.advance_past_with_missed(slot, now)
         except ValueError as exc:
             log.error("beat: cannot advance entry %r: %s", entry.name, exc)
             return
@@ -632,8 +654,18 @@ class Beat:
             )
             return
         self.fired += 1
-        log.info(
-            "beat: fired %r (task %s -> queue %s, id %s, slot %s, %dms late, next %s)",
+        # A coalesced firing silently consumes every slot it slept through
+        # (PROTOCOL.md section 10.4), so say how many rather than leaving an
+        # operator to divide lateness by the cadence.
+        if missed is None:
+            coalesced = ", coalescing more missed slots than the fast forward bound"
+        elif missed:
+            coalesced = f", coalescing {missed} missed slots that will not fire"
+        else:
+            coalesced = ""
+        log.log(
+            logging.WARNING if coalesced else logging.INFO,
+            "beat: fired %r (task %s -> queue %s, id %s, slot %s, %dms late, next %s)%s",
             entry.name,
             entry.task,
             queue,
@@ -641,6 +673,7 @@ class Beat:
             slot,
             lateness,
             next_slot,
+            coalesced,
         )
 
     def _sleep_for(self, now: int, started: float) -> float:
@@ -668,7 +701,6 @@ class Beat:
     def run(self, stop: threading.Event | None = None) -> None:
         """Loop until ``stop`` is set (or forever). Releases the lease on exit."""
         stop = stop or threading.Event()
-        self.sync_code_entries()
         log.info(
             "cauli-beat started: instance=%s entries=%d lock_ttl=%.1fs max_interval=%.1fs",
             self.instance_id,
@@ -802,13 +834,16 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     if args.once:
-        beat.sync_code_entries()
         if beat._hold_leadership(0.0):
+            beat.sync_code_entries()
             beat.tick()
             if beat.use_lock:
                 beat.store.release_lock(beat.instance_id)
         else:
-            log.info("beat: another instance holds the lease; --once did nothing")
+            log.info(
+                "beat: another instance holds the lease and is already "
+                "reconciling and scheduling; --once did nothing"
+            )
         return 0
 
     stop = threading.Event()
