@@ -36,9 +36,13 @@ Install the worker into the same virtualenv as your app. `cauli-worker` embeds
 CPython, so its wheel is built per CPython minor version and links that venv's
 own interpreter. Requires Linux, glibc 2.28 or newer, and a CPython built with
 `--enable-shared` (python.org builds, the `python:*` Docker images, Debian,
-Ubuntu, Fedora, conda and actions/setup-python all qualify).
+Ubuntu, Fedora and actions/setup-python all qualify). Conda does not: the
+wheel installs, then the worker fails before `main` because the loader cannot
+find that environment's `libpython`.
 
-Building from source has no such constraint:
+Building from source lifts the glibc floor, not the platform one. The worker
+is Linux only either way: it arms `PR_SET_PDEATHSIG` unconditionally, so no
+child can outlive the process that spawned it.
 
 ```bash
 git clone https://github.com/bilalwork31-cyber/Cauli.git
@@ -77,6 +81,11 @@ r.get(timeout=10)
 ```bash
 cauli-worker -A myproj.tasks:app -c 50
 ```
+
+**Pass a `timeout` to `get()`.** It polls for a result key, so a task that
+never writes one leaves an untimed `get()` waiting forever: `store_result=False`
+skips the write, and so does an envelope too malformed to recover a task id
+from. Everything with a recoverable id resolves, dead letters included.
 
 Tasks stay directly callable in tests: `crunch([1, 2])` runs inline, no broker
 needed.
@@ -157,9 +166,15 @@ cauli-beat --app myproj.tasks:app
 and on standalone or Sentinel Redis every firing is an atomic compare and
 set on the slot, so two instances that both believe they lead still
 produce exactly one task per slot. Celery's beat keeps state in a local
-file with no locking and its own docs tell you to run only one. This does
-not hold on Redis Cluster; see "What you should know before shipping"
-below.
+file with no locking and its own docs tell you to run only one. Redis
+Cluster is not a supported topology; see "What you should know before
+shipping" below.
+
+That guarantee is per Redis dataset. Replication is asynchronous, so a
+failover that loses the last acknowledged writes can fire the current slot a
+second time; history is never replayed either way. `idempotent=True` does not
+protect against it, because the guard key sits in the same window of lost
+writes. PROTOCOL.md section 10.5 has the detail.
 
 After downtime a due entry fires once and resumes its cadence; missed slots are
 coalesced, never replayed. Per call scheduling is the usual set:
@@ -254,15 +269,38 @@ equivalent, so enqueueing inside a transaction can hand a task a row that
 is not committed yet unless you enqueue it yourself once the transaction
 exits.
 
+`.delay()` and `.apply_async()` are synchronous redis calls, so calling one
+from an `async def` handler blocks the event loop until redis answers, up to
+the client's 5 second socket timeout when redis degrades. There is no async
+enqueue API yet; hand the call to a thread, Starlette's
+`await run_in_threadpool(send_email.delay, addr)` for instance, when a slow
+redis must not stall the loop.
+
 ## What you should know before shipping
 
-- **Redis Cluster is not supported for delayed or periodic tasks.**
-  `countdown`, `eta`, retries, and `cauli-beat` all rely on Lua scripts
-  whose keys never share a hash slot, so Cluster rejects every call with
-  CROSSSLOT: delayed and retried tasks sit in the sorted set forever, and
-  no periodic task ever fires. The worker logs the failure loudly, but
-  nothing is delivered. Standalone and Sentinel Redis are unaffected; see
+- **Redis Cluster is not supported.** The worker builds the redis crate
+  without its cluster protocol, so it never follows a MOVED redirect and
+  ordinary operations fail against a real multi node cluster, not only the
+  delayed and periodic paths. Those fail for a second reason as well:
+  `countdown`, `eta`, retries and `cauli-beat` rely on Lua scripts whose
+  keys never share a hash slot, so Cluster rejects every call with
+  CROSSSLOT. Standalone and Sentinel are the supported topologies; see
   PROTOCOL.md sections 4.3 and 10.5.
+- **Redis must be persistent and must never come back empty.** The stream,
+  its consumer group, the pending entries list and the delayed sorted set
+  are the only copy of accepted work. A Redis that restarts empty, which is
+  the ElastiCache default and also what an OOM kill or a restore from
+  backup looks like, loses every delayed, retried and unacknowledged task.
+  Workers survive that but do not recover from it: the consumer group is
+  created at worker startup only, so they warn on each fetch and consume
+  nothing until they are restarted. Run with AOF, or accept losing whatever
+  the last snapshot missed.
+- **Upgrade workers before producers.** A worker that does not recognise a
+  task name dead letters it terminally and writes an `UnregisteredTask`
+  failure result, so the caller stops waiting and the task is gone rather
+  than left for an upgraded worker to pick up. In a rolling deploy every
+  worker must be running the new code before anything enqueues a new task
+  name.
 - **Delivery is at least once.** A worker crash can redeliver a task, so make
   tasks safe to repeat or pass an `idempotency_key`.
 - **`--visibility-timeout` must exceed your longest task timeout.** The worker
