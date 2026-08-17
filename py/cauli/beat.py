@@ -769,7 +769,8 @@ def build_parser() -> argparse.ArgumentParser:
         prog="cauli-beat",
         description="cauli periodic scheduler (PROTOCOL.md section 10). "
         "Safe to run as several replicas: schedule state lives in Redis and "
-        "each slot fires exactly once.",
+        "each slot fires exactly once per Redis dataset (section 10.5 covers "
+        "what a failover can still replay).",
     )
     p.add_argument("--app", required=True, help="app location as module:attr")
     p.add_argument(
