@@ -93,11 +93,14 @@ pub struct Args {
     #[arg(long, default_value_t = 4, help_heading = ADVANCED)]
     pub cpu_prefetch: usize,
 
-    /// Recycle a cpu child after it completes this many tasks (0 = never).
-    /// The backstop for leaky C extensions and slowly dirtied copy-on-write
-    /// pages, like Celery's maxtasksperchild. Staged prefetch work always
-    /// drains before the recycle fires, so no task is lost to it
-    #[arg(long, default_value_t = 0, help_heading = ADVANCED)]
+    /// Recycle a cpu child after it completes this many tasks. THE DEFAULT
+    /// IS 1000: children are recycled unless you say otherwise. Pass 0 to opt
+    /// out and let a child live for the whole worker lifetime. This is the
+    /// backstop for leaky C extensions and slowly dirtied copy on write
+    /// pages, like Celery's maxtasksperchild, and nothing else in the worker
+    /// bounds cpu child memory. Staged prefetch work always drains before the
+    /// recycle fires, so no task is lost to it
+    #[arg(long, default_value_t = 1000, help_heading = ADVANCED)]
     pub cpu_max_tasks_per_child: usize,
 
     /// Start the cpu pool at boot instead of on the first cpu task. Costs
@@ -263,7 +266,7 @@ mod tests {
         assert_eq!(a.io_concurrency, None);
         assert_eq!(a.cpu_workers, None);
         assert_eq!(a.cpu_child_threads, 1);
-        assert_eq!(a.cpu_max_tasks_per_child, 0);
+        assert_eq!(a.cpu_max_tasks_per_child, 1000);
         assert!(!a.eager_cpu);
         assert!(!a.print_plan);
         assert!(!a.no_fork_server);
@@ -275,6 +278,21 @@ mod tests {
         assert_eq!(a.stats_interval, 10);
         assert_eq!(a.log_level, "info");
         assert_eq!(a.redis_timeout, 5);
+    }
+
+    /// Behaviour change: cpu children recycle by default now. 0 has to stay
+    /// accepted, because it is the documented way to opt back out.
+    #[test]
+    fn cpu_recycle_defaults_to_1000_with_zero_as_the_opt_out() {
+        assert_eq!(parse(&[]).cpu_max_tasks_per_child, 1_000);
+        assert_eq!(
+            parse(&["--cpu-max-tasks-per-child", "0"]).cpu_max_tasks_per_child,
+            0
+        );
+        assert_eq!(
+            parse(&["--cpu-max-tasks-per-child", "7"]).cpu_max_tasks_per_child,
+            7
+        );
     }
 
     #[test]
