@@ -31,7 +31,14 @@ pyo3 = { version = "0.26", features = ["auto-initialize"] }
 rand = "0.9"
 redis = { version = "0.32", features = ["tokio-comp", "connection-manager"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# arbitrary_precision (audit CRITICAL): without it, serde_json's default
+# Number silently falls back to f64 for any integer literal outside i64/u64
+# range, at parse time, before any cauli code runs. With it, the parser keeps
+# the exact source digits instead, so json_to_py can hand Python back the
+# exact int the caller sent (see pyjson.rs). Changes how serde_json::Number
+# is represented crate wide; every inspection site was reviewed for fallout,
+# see the commit message.
+serde_json = { version = "1", features = ["arbitrary_precision"] }
 # Trimmed from "full" (audit dependency review) to the features actually used:
 # rt-multi-thread/macros (runtime + tokio::spawn + #[tokio::test]), sync
 # (oneshot/watch/Semaphore), time (timeout/interval/sleep), io-util
@@ -56,5 +63,5 @@ libc = "0.2"
 # ConnectionManager/ConnectionManagerConfig directly, the same types
 # main.rs builds its two redis connections with.
 redis = { version = "0.32", features = ["tokio-comp", "connection-manager"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["arbitrary_precision"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

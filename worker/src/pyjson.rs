@@ -34,9 +34,14 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
 use serde_json::{Map, Value};
 
-/// Maximum nesting depth accepted in either direction. Comfortably deeper than
-/// any real task payload, far shallower than the Rust stack. A self
-/// referential Python container hits this instead of recursing forever.
+/// Maximum nesting depth accepted in either direction: comfortably deeper
+/// than any real task payload, far shallower than the Rust stack. On the
+/// only path that ever feeds `json_to_py` a `Value`, namely text parsed from
+/// redis, serde_json's own deserializer already bounds nesting one step
+/// earlier and always cleanly, so this check is not what rejects on that
+/// path today. It remains defence in depth for any caller that reaches
+/// `json_to_py` or `py_to_json` without a parser in front of it, such as the
+/// self referential Python container caught below.
 pub const MAX_DEPTH: usize = 128;
 
 /// Why a Python value could not be represented as JSON. Carries a message
@@ -67,10 +72,23 @@ pub fn json_to_py<'py>(py: Python<'py>, v: &Value, depth: usize) -> PyResult<Bou
             } else if let Some(u) = n.as_u64() {
                 u.into_pyobject(py)?.into_any()
             } else {
-                // serde_json only produces finite f64 here (it rejects
-                // NaN/Infinity at parse time), so this cannot make a
-                // non-JSON float.
-                n.as_f64().unwrap_or(0.0).into_pyobject(py)?.into_any()
+                let text = n.to_string();
+                if text.contains('.') || text.contains('e') || text.contains('E') {
+                    // Genuinely written with a decimal point or exponent, so
+                    // this is a float on the wire, not an integer literal.
+                    // serde_json only produces finite f64 here (it rejects
+                    // NaN/Infinity at parse time), so this cannot make a
+                    // non-JSON float.
+                    n.as_f64().unwrap_or(0.0).into_pyobject(py)?.into_any()
+                } else {
+                    // A plain integer literal outside i64/u64 range, e.g.
+                    // uuid.uuid4().int. With the arbitrary_precision feature
+                    // (Cargo.toml), serde_json kept the exact source digits
+                    // instead of collapsing them into an approximate f64, so
+                    // build the equivalent Python int straight from that
+                    // text: Python ints are unbounded, so this is exact.
+                    py.get_type::<PyInt>().call1((text,))?
+                }
             }
         }
         Value::String(s) => PyString::new(py, s).into_any(),
@@ -296,5 +314,110 @@ mod tests {
             let v = py_to_json(&obj, 0).map_err(|e| e.0).unwrap();
             assert_eq!(v, json!([1, "a", null]));
         });
+    }
+
+    /// Audit finding, CRITICAL: `args`/`kwargs` are a bare `Value` with no
+    /// bound on integer size, and serde_json's default `Number` silently
+    /// falls back to f64 for any integer literal outside i64/u64 range, at
+    /// parse time, before this function ever runs. A realistic value this
+    /// size is simply `uuid.uuid4().int`. It must reach Python as the exact
+    /// int the caller sent, never a corrupted float.
+    #[test]
+    fn huge_integer_survives_as_exact_python_int_not_float() {
+        Python::initialize();
+        Python::attach(|py| {
+            let raw = "338958331192819208857724424333372550912"; // uuid4().int shaped
+            let v: Value = serde_json::from_str(raw).unwrap();
+            let obj = json_to_py(py, &v, 0).expect("convert");
+            assert!(
+                obj.is_instance_of::<PyInt>(),
+                "a JSON integer outside i64/u64 range must still become a Python int, not a float"
+            );
+            assert_eq!(
+                obj.str().unwrap().extract::<String>().unwrap(),
+                raw,
+                "value must round trip exactly, not lose precision to f64"
+            );
+        });
+    }
+
+    /// End to end version of the reproduction above: the exact value from
+    /// the audit, arriving as a real envelope's kwargs, must reach the task
+    /// as an int with the exact value the caller sent.
+    #[test]
+    fn envelope_kwargs_huge_integer_reaches_python_as_exact_int() {
+        Python::initialize();
+        Python::attach(|py| {
+            let raw = r#"{"id":"a","task":"t","kwargs":{"uid": 338958331192819208857724424333372550912}}"#;
+            let env: crate::envelope::Envelope = serde_json::from_str(raw).unwrap();
+            let obj = json_to_py(py, env.kwargs_ref(), 0).expect("convert");
+            let uid = obj.get_item("uid").unwrap();
+            assert!(uid.is_instance_of::<PyInt>(), "must be an int, not a float");
+            assert_eq!(
+                uid.str().unwrap().extract::<String>().unwrap(),
+                "338958331192819208857724424333372550912"
+            );
+        });
+    }
+
+    /// Boundary sweep around i64::MAX and u64::MAX, in both directions, plus
+    /// the regression a careless fix causes: a normal small integer must
+    /// stay an int, and a genuine large float must stay a float.
+    #[test]
+    fn integer_boundaries_are_exact_and_typed_correctly() {
+        Python::initialize();
+        Python::attach(|py| {
+            let int_cases = [
+                "9223372036854775807",              // 2^63 - 1 (i64::MAX)
+                "9223372036854775808",              // 2^63
+                "18446744073709551615",             // u64::MAX
+                "18446744073709551616",             // u64::MAX + 1 (2^64): first corrupted value
+                "1267650600228229401496703205376",  // 2^100
+                "-1267650600228229401496703205376", // large negative, below i64::MIN
+                "5",                                // normal small integer: must not regress
+                "-5",
+            ];
+            for raw in int_cases {
+                let v: Value = serde_json::from_str(raw).unwrap();
+                let obj = json_to_py(py, &v, 0).expect("convert");
+                assert!(obj.is_instance_of::<PyInt>(), "{raw}: must be a Python int");
+                assert_eq!(
+                    obj.str().unwrap().extract::<String>().unwrap(),
+                    raw,
+                    "{raw}: must round trip exactly"
+                );
+            }
+
+            // A genuine float that happens to be large must stay a float,
+            // never get swept into the large integer literal path above.
+            let v: Value = serde_json::from_str("1.7976931348623157e308").unwrap();
+            let obj = json_to_py(py, &v, 0).expect("convert");
+            assert!(
+                obj.is_instance_of::<PyFloat>(),
+                "a real float literal must stay a float"
+            );
+        });
+    }
+
+    /// The corrected `MAX_DEPTH` doc comment rests on this: on the only path
+    /// that ever feeds `json_to_py` a `Value` (text parsed from redis),
+    /// serde_json's own deserializer bounds nesting at this same threshold
+    /// before `json_to_py` runs at all. Confirms that holds regardless of
+    /// the `arbitrary_precision` feature.
+    #[test]
+    fn serde_json_parser_bounds_nesting_at_max_depth_independent_of_the_check_here() {
+        let nested = |depth: usize| {
+            let mut s = String::with_capacity(depth * 2 + 1);
+            for _ in 0..depth {
+                s.push('[');
+            }
+            s.push('1');
+            for _ in 0..depth {
+                s.push(']');
+            }
+            s
+        };
+        assert!(serde_json::from_str::<Value>(&nested(MAX_DEPTH - 1)).is_ok());
+        assert!(serde_json::from_str::<Value>(&nested(MAX_DEPTH)).is_err());
     }
 }
