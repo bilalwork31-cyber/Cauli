@@ -258,6 +258,18 @@ def crunch(data): ...
 The worker's registry is authoritative for `kind`: if an envelope disagrees
 with the registered task, the registry wins.
 
+Raising `cauli.Retry(countdown=...)` inside a task forces a retry with that
+delay instead of the computed backoff, still bounded by `max_retries`. The
+worker recognises it by class name plus a `countdown` attribute rather than by
+class identity, so an exception class of your own named `Retry` that carries a
+`countdown` is read the same way. Identity matching is not available here: the
+worker's interpreter is not required to have cauli installed at all, and the cpu
+lane decides in Rust from a type name read off a pipe. The collision costs
+little, since cauli retries every exception by default anyway; the only
+difference is that your `countdown` replaces the computed backoff, and the task
+still retries `max_retries` times and still dead letters with your own type and
+traceback.
+
 ## Per call options
 
 ```python
