@@ -120,6 +120,18 @@ def unser():
     return {1, 2, 3}  # a set is not JSON serializable
 
 
+class SerializationError(Exception):
+    """An app's own class whose name collides with cauli's reserved type name.
+
+    Not far fetched in a Celery migration: kombu ships one.
+    """
+
+
+@app.task(name="user_serialization_error", kind="cpu")
+def user_serialization_error():
+    raise SerializationError("raised by the app, not by cauli")
+
+
 @app.task(name="noisy", kind="cpu")
 def noisy():
     print("this print must NOT corrupt the pipe protocol")

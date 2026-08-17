@@ -199,6 +199,7 @@ def test_non_serializable_result_is_serialization_error(child):
     assert resp["id"] == "u1"
     assert resp["ok"] is False
     assert resp["error"]["type"] == "SerializationError"
+    assert resp["retryable"] is False
 
     resp = child.request(
         {
@@ -210,6 +211,26 @@ def test_non_serializable_result_is_serialization_error(child):
         }
     )
     assert resp == {"id": "u2", "ok": True, "result": 2}
+
+
+def test_user_exception_named_serialization_error_still_retries(child):
+    """The cpu lane stamps `retryable` instead of letting the worker's name
+    based default decide. An app class named SerializationError retries on the
+    io lanes (shim.py `_finish_exc` always stamps True), so it must retry here
+    too: same task, same exception, same outcome whichever lane ran it.
+    """
+    resp = child.request(
+        {
+            "id": "s1",
+            "task": "user_serialization_error",
+            "args": [],
+            "kwargs": {},
+            "soft_timeout_ms": None,
+        }
+    )
+    assert resp["ok"] is False
+    assert resp["error"]["type"] == "SerializationError"
+    assert resp["retryable"] is True
 
 
 def test_async_task_runs_via_asyncio(child):

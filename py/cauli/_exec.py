@@ -254,7 +254,16 @@ def _execute(
                     "countdown": cd,
                     "error": _error_json(exc),
                 }
-            return {"id": request_id, "ok": False, "error": _error_json(exc)}
+            # Stamped, exactly as shim.py's `_finish_exc` stamps the io lanes:
+            # left absent, ctx.rs falls back to a name based default that makes
+            # a user exception class named "SerializationError" terminal here
+            # and retryable on io, for the same task and the same exception.
+            return {
+                "id": request_id,
+                "ok": False,
+                "retryable": True,
+                "error": _error_json(exc),
+            }
         return {"id": request_id, "ok": True, "result": result}
     finally:
         run_hooks(getattr(app, "_after_task_hooks", ()), "after_task")
@@ -280,7 +289,12 @@ def _handle_request_line(
         return _execute(app, request, watchdog=watchdog)
     except BaseException as exc:  # e.g. a soft timeout landing at the task boundary
         request_id = request.get("id") if isinstance(request, dict) else None
-        return {"id": request_id, "ok": False, "error": _error_json(exc)}
+        return {
+            "id": request_id,
+            "ok": False,
+            "retryable": True,
+            "error": _error_json(exc),
+        }
 
 
 def _serialize_response_bytes(payload: dict[str, Any]) -> bytes:
@@ -301,8 +315,10 @@ def _serialize_response_bytes(payload: dict[str, Any]) -> bytes:
             "message": f"task result is not JSON serializable: {exc}",
             "traceback": _format_traceback(exc),
         }
+        # Stamped rather than left to the reader's name based default, which
+        # is only a fallback for older children (PROTOCOL.md section 8).
         return _codec.encode_bytes(
-            {"id": payload.get("id"), "ok": False, "error": error}
+            {"id": payload.get("id"), "ok": False, "retryable": False, "error": error}
         )
 
 
@@ -558,7 +574,7 @@ def _safe_handle_and_respond(
             rid = req.get("id") if isinstance(req, dict) else None
         except Exception:
             rid = None
-        resp = {"id": rid, "ok": False, "error": _error_json(exc)}
+        resp = {"id": rid, "ok": False, "retryable": True, "error": _error_json(exc)}
     try:
         writer.write_response(resp)
     except BaseException:
