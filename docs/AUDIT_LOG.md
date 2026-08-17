@@ -3397,3 +3397,33 @@ was claimed. itest correctly not run and the reason given: the worker e2e cpu la
 `worker/tests/fixtures/fake_exec.py` through `CAULI_EXEC_CMD` and never `cauli._exec`, and the one
 e2e SerializationError case is an io task.
 
+
+## 2026-08-17 — Cycle 37 — no new dimension, blocker B4 restarted
+
+Nothing new was audited. Both running agents still hold `main.rs`, `shim.py`, `broker.rs`, `loops.rs`
+and `pyrt.rs`, which is every file the three remaining decision documents need, so error taxonomy,
+clock architecture and the cluster startup refusal all stay queued rather than being forced onto a
+contended tree. Six git collisions tonight is enough evidence that the queue is cheaper than the
+recovery.
+
+The cycle went instead to blocker B4, the failure path soak, which is the last outstanding piece of
+evidence and needs wall clock time rather than files. It was killed at 215 samples by the unplanned
+shutdown, so it is running again at the full 4 hours with the same harness, the same task mix and
+the same constant rate, so all three runs stay comparable.
+
+What it has to settle, restated because the two candidates are easy to conflate: the failure path
+costs about 11x the happy path in post warmup RSS growth, 1.466 MB per hour against 0.132, and
+decelerates hard before holding near 0.37 without reaching the true flat the happy path reached.
+Either that is a longer warmup that had not finished, in which case the late window rate keeps falling
+toward zero, or it is a small genuine residue in the retry and dead letter bookkeeping, in which case
+it holds or climbs. Four hours separates those; forty minutes did not.
+
+The most suspicious explanation is already ruled out: the cpu child recycle path was provably clean
+across 649 forks with a bit for bit identical 25688 KB spawn RSS every single time.
+
+Two durability lessons from the killed run are now built into the harness: the sample file and a
+rolling summary are written OUTSIDE any scratch directory and updated every 10 minutes, so a run cut
+short still carries a usable answer, and it runs under `setsid` so it survives its parent shell.
+It also validates its analysis script against the COMPLETED 2400 second run before trusting it on new
+data, which is the right order: check the instrument against a known result first.
+
