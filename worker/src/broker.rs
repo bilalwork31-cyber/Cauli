@@ -98,6 +98,16 @@ pub fn is_crossslot(e: &anyhow::Error) -> bool {
         .is_some_and(|re| re.kind() == redis::ErrorKind::CrossSlot)
 }
 
+/// True if `e` is Redis's NOGROUP: the consumer group named in the command
+/// does not exist, because the group or the whole stream key is gone. Matched
+/// on the error CODE, not on message text and not by widening the caller's
+/// generic error arm: a NOGROUP means the broker dataset was reset under a
+/// live connection, and it is the one XREADGROUP failure that never clears by
+/// waiting (see `loops::recreate_groups`).
+pub fn is_nogroup(e: &redis::RedisError) -> bool {
+    e.code() == Some("NOGROUP")
+}
+
 /// §4.5 idempotency guard outcome.
 #[derive(Debug, PartialEq, Eq)]
 pub enum IdempClaim {
@@ -634,6 +644,71 @@ mod tests {
             is_crossslot(&err),
             "is_crossslot must recognize the real error mover_loop will see: {err}"
         );
+    }
+
+    /// The two facts `loops::fetch_loop` splits its error arm on: a broker
+    /// that lost the consumer group answers XREADGROUP with a NOGROUP that
+    /// `is_nogroup` recognizes, and `ensure_groups` makes the very same call
+    /// succeed again afterwards. Driven against a real redis rather than a
+    /// synthetic error, since the point is that the code survives the round
+    /// trip through the client.
+    #[tokio::test]
+    async fn nogroup_is_detected_and_ensure_groups_clears_it() {
+        let redis = ThrowawayRedis::start(6422, false);
+        let client = redis::Client::open(redis.url()).expect("client");
+        let mut conn = ConnectionManager::new(client)
+            .await
+            .expect("connection manager");
+
+        let queues = vec!["reset".to_string()];
+        let read = |conn: &mut ConnectionManager| {
+            let key = q_key(&queues[0]);
+            let mut conn = conn.clone();
+            async move {
+                redis::cmd("XREADGROUP")
+                    .arg("GROUP")
+                    .arg("cauli")
+                    .arg("c1")
+                    .arg("COUNT")
+                    .arg(1)
+                    .arg("STREAMS")
+                    .arg(key)
+                    .arg(">")
+                    .query_async::<Option<redis::streams::StreamReadReply>>(&mut conn)
+                    .await
+            }
+        };
+
+        let err = read(&mut conn)
+            .await
+            .expect_err("no group exists on a fresh dataset");
+        assert!(
+            is_nogroup(&err),
+            "is_nogroup must recognize the real error fetch_loop will see: {err} \
+             (code {:?})",
+            err.code()
+        );
+        // Another failure of the very same call must NOT take that branch:
+        // to the generic handler every one of them is "XREADGROUP failed".
+        let _: () = redis::cmd("SET")
+            .arg(q_key(&queues[0]))
+            .arg("not a stream")
+            .query_async(&mut conn)
+            .await
+            .expect("set");
+        let other = read(&mut conn).await.expect_err("wrong type");
+        assert!(
+            !is_nogroup(&other),
+            "only NOGROUP takes that branch: {other}"
+        );
+        let _: () = redis::cmd("DEL")
+            .arg(q_key(&queues[0]))
+            .query_async(&mut conn)
+            .await
+            .expect("del");
+
+        ensure_groups(&mut conn, &queues).await.expect("recreate");
+        read(&mut conn).await.expect("group exists again");
     }
 
     /// The property the derived TTL exists for: a task whose timeout_ms is

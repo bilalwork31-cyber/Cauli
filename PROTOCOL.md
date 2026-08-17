@@ -205,6 +205,22 @@ limit reads like. With the defaults (`max_retries` 3, `redelivery_limit` `max(3,
 that is 4 x 5 = 20 executions before the task is guaranteed to stop, not 4. Anything sized on
 the retry count, a downstream quota, a rate limit, an alert threshold, needs that product.
 
+**The guarantee requires a Redis that keeps its data.** At least once is a claim about the
+stream and its pending entries list, so it lasts exactly as long as they do. Redis must therefore
+be configured to persist (RDB, AOF, or both) and to be restored from that persistence on restart.
+This is not the default everywhere: ElastiCache ships with persistence off, and a redis that comes
+back empty after a restart, an OOM kill or a restore from an empty backup has lost every unacked
+entry, every delayed and retried task in `cauli:delayed:*`, and every idempotency claim. Nothing
+redelivers that work, because nothing remembers it. Two related settings matter as much: do not
+point `maxmemory-policy` at an eviction policy that can evict cauli's own keys (`noeviction` is
+the safe choice for a broker, since evicting a stream key silently deletes queued work), and treat
+`FLUSHALL` on a broker as data loss.
+
+Workers survive the event rather than hanging on it. A missing consumer group is detected
+specifically (NOGROUP, not a generic broker error), logged at error level naming the reset and
+what it destroyed, and the groups are recreated so consumption resumes; see §7 for the exact line.
+Recovery is of the queue, not of the work that was in flight when the dataset went.
+
 **The guarantee is per Redis dataset.** Everything above holds for as long as the write itself
 survives, and Redis replication is asynchronous, so a failover promotes whatever the replica had
 actually received. An enqueue the master acknowledged and never replicated is simply gone: the
@@ -747,7 +763,7 @@ cauli-worker --app myproj.tasks:app [--queues default,emails] [--redis-url URL]
   - counters (`fetched`, `ok`, `failed`, `retried`, `dlq`, `expired`, `cpu_lost`,
     `sync_abandoned`, `async_rejected`) are cumulative over the worker's lifetime;
   - gauges (`inflight_io`, `inflight_cpu`, `rss_mb`, `cpu_rss_mb`, `oldest_ms`, `sync_live`,
-    `cpu_backlog`) are instantaneous at the tick;
+    `cpu_backlog`, `loop_lag_ms`) are instantaneous at the tick;
   - the latency keys (`sync_p50` through `cpu_p99`) are scoped to the interval that just ended
     and reset at every tick, so they are the only keys that can legitimately fall;
   - the key set is frozen for the life of a major version. A minor release may ADD a key;
@@ -759,11 +775,11 @@ cauli-worker --app myproj.tasks:app [--queues default,emails] [--redis-url URL]
   stats: fetched=N ok=N failed=N retried=N dlq=N expired=N cpu_lost=N inflight_io=N
          inflight_cpu=N rss_mb=N sync_p50=N sync_p99=N async_p50=N async_p99=N cpu_p50=N
          cpu_p99=N oldest_ms=N cpu_rss_mb=N sync_live=N sync_abandoned=N async_rejected=N
-         cpu_backlog=N
+         cpu_backlog=N loop_lag_ms=N
   ```
 
   That is one physical line, wrapped here only to fit. The extra line logged once at shutdown
-  carries the first sixteen keys only, up to and including `cpu_p99`; the remaining six are
+  carries the first sixteen keys only, up to and including `cpu_p99`; the remaining seven are
   produced by the periodic loop and are absent there.
 
   - `expired` (§9.1) counts entries discarded unrun past their deadline. They are counted in
@@ -799,7 +815,37 @@ cauli-worker --app myproj.tasks:app [--queues default,emails] [--redis-url URL]
     entry's lane before parsing it. The transition is logged too: a warning the moment
     `cpu_backlog` first goes above zero, and a matching one with the total paused duration when
     it returns to zero.
-- Exit codes: 0 graceful, 1 fatal config/startup error, 130 forced.
+  - `loop_lag_ms` is the largest lag measured across the embedded asyncio loops: every few
+    seconds the worker stamps each loop through `call_soon_threadsafe`, and this is how long the
+    slowest one took to run that trivial callback, or how long it has been failing to. Near zero
+    is healthy. It rises whenever the loops are not getting scheduled, which covers both the
+    wedge below and the cross lane case nothing else here can see: a CPU heavy task
+    misclassified onto the sync pool starves the loops of the GIL, async p99 climbs, and every
+    other field stays flat.
+- Exit codes: 0 graceful, 1 fatal config/startup error, 87 self exit on a confirmed event loop
+  wedge, 130 forced.
+- **Event loop wedge, exit 87.** A blocking call inside an `async def` (a synchronous HTTP
+  request, `time.sleep`, a blocking database driver) starves the loop thread it runs on of every
+  callback, including asyncio's own `wait_for` deadline, permanently: CPython gives no safe way
+  to kill that thread. At the default `--io-loops 1` that ends all async throughput while the
+  worker keeps fetching and fails every async task at its full timeout. The worker therefore
+  stops itself instead. A loop is called wedged only when its stamp has been unanswered for
+  three stamp intervals, fifteen seconds, AND a second signal agrees the lane has stopped
+  producing (work outstanding at a loop that completed nothing over that same window, or
+  `async_rejected` rising). Both are required so that ordinary GIL starvation under load cannot
+  trigger an exit. Measured latency from wedge to exit is fifteen to twenty seconds, since the
+  wedge can begin just after a stamp was answered. The process then logs `wedged async event
+  loop confirmed` with the loop index and its lag, and exits 87 for a supervisor to restart it;
+  in flight tasks are redelivered under §4.4, exactly as for any other process death. Run the worker under something that restarts it: systemd, Kubernetes, or
+  cauli's own `--procs` supervisor, which restarts a child in about a second.
+- **Emptied broker.** A redis whose dataset was reset under a live connection answers XREADGROUP
+  with NOGROUP forever. The worker matches that code specifically and logs an error beginning
+  `redis has no consumer group`, naming what the reset destroyed: the pending entries list, so
+  nothing in flight is redelivered, and the delayed set, so pending retries, countdowns and beat
+  slots are gone. It then recreates the groups and resumes consuming, which is why that line
+  appears once per reset rather than once per read. The line, not a restart, is the alert; the
+  worker itself needs no operator action. §4 covers the persistence that stops the event
+  happening at all.
 
 ### 7.1 Scheduler CLI (`cauli-beat`, Python entry point)
 

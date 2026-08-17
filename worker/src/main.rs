@@ -112,6 +112,11 @@ fn main() {
 /// tracing writes. The embedded interpreter's `sys.stdout` buffer is not
 /// flushed, but it never was: CPython only flushes it from `Py_Finalize`,
 /// which an embedded worker with live daemon threads must not call.
+///
+/// Callers: this `main`, the forced exit on a second signal (130), and
+/// `loops::wedge_loop` on a confirmed event loop wedge
+/// (`loops::WEDGE_EXIT_CODE`), which is the one that runs with the whole
+/// process still executing tasks.
 fn exit_now(code: i32) -> ! {
     use std::io::Write;
     let _ = std::io::stdout().flush();
@@ -417,6 +422,7 @@ async fn run_worker(
     tokio::spawn(loops::mover_loop(ctx.clone()));
     tokio::spawn(loops::recovery_loop(ctx.clone()));
     tokio::spawn(loops::stats_loop(ctx.clone()));
+    tokio::spawn(loops::wedge_loop(ctx.clone()));
 
     loops::fetch_loop(ctx.clone(), fetch_conn).await; // returns on shutdown
 
