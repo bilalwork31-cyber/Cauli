@@ -20,7 +20,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::ffi::CString;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
 
@@ -190,11 +190,43 @@ fn pyerr_string(py: Python<'_>, e: &PyErr) -> String {
     crate::envelope::safe_truncate(&s, MAX_PYERR_CHARS).to_string()
 }
 
+/// One `PyRuntime` per process, enforced rather than left to the fact that
+/// main.rs happens to have the only call site.
+///
+/// shim.py keeps every piece of its dispatch state (`_loops`, `_pending`,
+/// `_registry`, `_callback`) in module globals, and the shim is published in
+/// `sys.modules` under one fixed name, `cauli_worker_shim`, which loops.rs
+/// imports back by that name. `PyModule::from_code` therefore cannot produce
+/// a second, independent shim: `PyImport_ExecCodeModuleEx` finds the module
+/// already registered and runs the source again in ITS dict. A second `init`
+/// would empty the first runtime's loop list and submission queues and take
+/// over the single completion callback, after which the first runtime's
+/// completions arrive at a pending map that no longer holds their tokens and
+/// are dropped. Every task it still had in flight would then hang to its
+/// backstop timeout with nothing logged anywhere, which is the failure this
+/// guard exists to convert into an immediate startup error.
+static RUNTIME_BUILT: AtomicBool = AtomicBool::new(false);
+
 impl PyRuntime {
     /// Initialize the interpreter, import the shim, load the app, register the
     /// completion callback and start the asyncio loop threads.
     /// Returns the runtime and the parsed app config.
     pub fn init(app_spec: &str, io_loops: usize) -> Result<(Arc<PyRuntime>, AppConfig)> {
+        // Taken before anything else and never given back, including on the
+        // failure paths below: those have already run shim.py's module body and
+        // started its loop threads by the time they report, and main.rs exits
+        // on an init error anyway.
+        if RUNTIME_BUILT.swap(true, Ordering::SeqCst) {
+            return Err(anyhow!(
+                "PyRuntime::init was called twice in this process. The embedded shim \
+                 is one Python module shared process wide, so a second runtime empties \
+                 the first one's asyncio loop list and submission queues and takes over \
+                 its completion callback: every task the first runtime still has in \
+                 flight is then dropped silently, with no error raised anywhere. Build \
+                 exactly one PyRuntime per process."
+            ));
+        }
+
         // Mandated entry point; pyo3 0.26 aliases it to Python::initialize.
         #[allow(deprecated)]
         pyo3::prepare_freethreaded_python();
@@ -730,6 +762,13 @@ mod tests {
     /// that buries the one real failure.
     fn shim_state_guard() -> std::sync::MutexGuard<'static, ()> {
         let guard = SHIM_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // The one runtime per process guard stays ARMED for tests rather than
+        // being compiled out of them: it is cleared here, once, and only with
+        // the lock above already held, so a second `PyRuntime::init` inside any
+        // single test body still fails exactly the way the product path would.
+        // Clearing it is sound only because the lock makes the handoff between
+        // tests strictly sequential, which is the same reason the lock exists.
+        RUNTIME_BUILT.store(false, Ordering::SeqCst);
         // Mandated entry point; pyo3 0.26 aliases it to Python::initialize.
         #[allow(deprecated)]
         pyo3::prepare_freethreaded_python();
@@ -831,6 +870,34 @@ class _App:
 
 app = _App()
 "#;
+
+    /// RUNTIME_BUILT is enforcement, not documentation: a second `init` in one
+    /// process must fail immediately rather than quietly empty the first
+    /// runtime's dispatch state. This also pins down how the guard is scoped
+    /// for tests. `shim_state_guard` clears it once per test and only under
+    /// the serialization lock, so the guard is still armed inside every test
+    /// body, which is exactly what the second call here proves.
+    #[test]
+    fn a_second_pyruntime_in_one_process_fails_loudly() {
+        let _shim_state = shim_state_guard();
+        let app_spec = Python::attach(|py| {
+            install_fake_app_module(py, "cauli_test_double_init_app", MINIMAL_VALID_APP_SRC)
+        });
+        let (_rt, _cfg) = PyRuntime::init(&app_spec, 1).expect("valid app must init cleanly");
+
+        let err = match PyRuntime::init(&app_spec, 1) {
+            Ok(_) => panic!("a second PyRuntime in one process must not be allowed"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(
+            err.contains("called twice in this process"),
+            "the second init failed, but for the wrong reason: {err}"
+        );
+        assert!(
+            err.contains("dropped silently"),
+            "the error must name the consequence, not just the rule: {err}"
+        );
+    }
 
     /// H2 follow up: `report_hard_timeout` must stop spawning once the pool
     /// hits its ceiling, instead of growing without bound.
