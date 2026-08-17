@@ -197,7 +197,8 @@ letting it wedge io fetching forever.
   + XACK + XDEL, d per §4.2 (jitter = uniform(0.5d, d) after the max clamp);
   `cauli.Retry.countdown` overrides d
 - final failure: `XADD dlq (e, reason="max_retries", error)` + result + XACK+XDEL
-- malformed / unregistered / redelivery_limit: DLQ (error field empty) + XACK+XDEL
+- malformed / unregistered / redelivery_limit: DLQ (error field empty) + result
+  (when the id is recoverable) + XACK+XDEL
 - expired (§9.1): `XADD dlq (e, reason="expired")` + an `"expired"` result
   (when store_result) + XACK+XDEL; no retry, no lifecycle hooks
 
@@ -217,9 +218,12 @@ cannot keep up" is a different alert from "tasks are failing").
    does return, it just resumes serving as extra headroom. A job still
    sitting in the queue when its own dispatcher already gave up is skipped
    rather than run late.
-2. **No result key** is written for `malformed` / `unregistered` /
-   `redelivery_limit` DLQ entries: §4 / §4.4 specify only the DLQ write, so a
-   client `get()` on such a task waits until timeout. Spec followed literally.
+2. **No result key** is written for a `malformed` / `unregistered` /
+   `redelivery_limit` DLQ entry when the task id itself cannot be recovered
+   from the envelope (invalid JSON, or an id failing the §2 charset gate):
+   there is nothing to key a result on. Otherwise a `"failure"` result is
+   written alongside the DLQ entry (§4 / §4.4 / §8), so a client `get()`
+   gets an answer instead of waiting on a key that would never exist.
 3. **Non-JSON `-m cauli._exec` responses** are treated as retryable
    WorkerShimError failures rather than crashing the pool.
 4. Usage errors print via clap but exit 1 (spec: 1 = fatal config error;

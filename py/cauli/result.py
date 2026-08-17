@@ -104,10 +104,14 @@ class AsyncResult:
 
         This is poll-based (default ``poll_interval`` 0.05s), not push/blocking
         redis-side. Without ``timeout``, ``get()`` can block forever by design:
-        a malformed/unregistered/redelivery-limit-exhausted task, or one
-        enqueued with ``store_result=False``, never gets a result key at all
-        (see PROTOCOL.md §4/§4.4 and ARCHITECTURE.md limitation #3). Passing an
-        explicit ``timeout`` is recommended for anything but throwaway scripts.
+        a task enqueued with ``store_result=False`` never gets a result key at
+        all, and neither does one dead lettered as malformed, unregistered, or
+        over its redelivery limit, but only when the task id itself could not
+        be recovered from the envelope (rare). In the usual case those three
+        get a result key too (a synthesized failure), so ``get()`` raises
+        instead of hanging (see PROTOCOL.md §4/§4.4/§8 and ARCHITECTURE.md
+        limitation #2). Passing an explicit ``timeout`` is recommended for
+        anything but throwaway scripts.
         """
         deadline = None if timeout is None else time.monotonic() + timeout
         while True:
