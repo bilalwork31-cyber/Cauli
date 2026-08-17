@@ -42,12 +42,38 @@ What :func:`fastapi_app` gives you on top of a plain ``Cauli()``:
   protocol, so something has to carry the session from the hook to the task
   body, and a ``ContextVar`` plus one accessor is the minimum that does it.
 
+Connection count is a different question from lifecycle, and this module
+does not manage it either. One process builds one engine, and that engine's
+pool is bounded by SQLAlchemy's own ``pool_size`` (default 5) and
+``max_overflow`` (default 10), 15 connections total, a ceiling nothing here
+knows about. cauli's own concurrency knob for the async lane is
+``--io-concurrency`` (default 256, see ``docs/CONFIGURATION.md``), and
+nothing wires the two together: cauli will admit up to 256 tasks at once,
+each opening a session in the before task hook, while the pool underneath
+can only serve 15 of them at a time. The rest queue for a pool slot up to
+SQLAlchemy's ``pool_timeout`` (default 30 seconds) and then raise, the
+failure a reviewer reproduced under exactly this mismatch: ``QueuePool limit
+of size 2 overflow 3 reached, connection timed out``. Since this module
+pins ``--io-loops`` to 1 (see the hazards below), every session in a process
+funnels through that one pool, so sizing it is arithmetic: either raise
+``pool_size`` plus ``max_overflow`` to match ``--io-concurrency`` so an
+admitted task never waits on a connection, or lower ``--io-concurrency`` to
+the pool's ceiling so the semaphore, not a pool timeout, is what applies
+backpressure. ``procs`` multiplies whichever ceiling you land on, the same
+as ``cauli.contrib.django``'s formula, so watch Postgres's
+``max_connections`` (100 by default) once ``procs`` times that ceiling
+climbs past roughly a hundred, and put a pooler, pgbouncer in transaction
+mode, in front once it does.
+
 This module never commits or rolls back for you. Managing the transaction,
 ``await session.commit()``, or letting an exception propagate to roll back,
 is task code's job, the same division ``cauli.contrib.django`` keeps between
-managing connections (its job) and managing transactions (yours).
+managing connections (its job) and managing transactions (yours). Skip both
+and the session's ``close()`` at the end of the task silently discards the
+transaction: an uncommitted write simply vanishes, zero rows persisted, with
+no error raised anywhere, so the failure mode is safe but easy to miss.
 
-Two hazards this module deliberately leaves for you to respect, neither
+Four hazards this module deliberately leaves for you to respect, none
 detectable at import time:
 
 - **One io loop, or the pool is not really pooled.** An async connection
@@ -76,6 +102,40 @@ detectable at import time:
   before task hook, at the one call site documented above, and a loop check
   inside the accessor would be fooled by exactly the case this paragraph
   describes.
+- **A soft timeout cancels the client, not the query.** cauli's soft
+  timeout cancels the task's own await; nothing about that cancellation
+  reaches Postgres, because asyncio cancellation over psycopg sends no
+  server side cancel request. Reproduced three times against a real server:
+  ``select pg_sleep(5)`` under a 0.4 second soft timeout returns control to
+  the task immediately, ``close()`` returns with no error, and the client
+  side pool recovers correctly, verified even with a single slot pool.
+  ``pg_stat_activity`` tells the other half of the story: the backend is
+  still shown running that same query more than a second after ``close()``
+  returned, and it goes on burning a real backend and holding whatever
+  locks the query held for its full natural duration, all of it invisible
+  to cauli. Nothing in this module can reach across the socket and stop the
+  server once the client has stopped waiting for it; if a query must
+  actually stop server side, set Postgres's own ``statement_timeout``
+  (role, session, or a connect option), the one setting that runs where the
+  query actually runs.
+- **A background task that outlives the task body can resurrect a closed
+  session.** The after task hook closes the session unconditionally, but
+  nothing stops task code from leaking a reference past that point, for
+  example handing the session to an ``asyncio.create_task(...)`` the task
+  body never awaits. Reproduced: open the session in the before hook,
+  capture it, spawn such a task, let the after hook run and close the
+  session, and the orphaned child goes on to run a query successfully about
+  0.2 seconds later. This is not a bug in ``close()``: SQLAlchemy's
+  ``AsyncSession`` reopens itself transparently on next use, deliberate
+  behaviour for request scoped sessions that this module relies on nowhere
+  but also cannot turn off. The consequence is that a leaked reference does
+  new database work this module has no way to see, on a connection nothing
+  will ever return to the pool, because the after hook, the only thing that
+  would have closed it, has already run. This module cannot stop task code
+  from holding a reference past the task body, so the contract is explicit
+  instead: a background task that outlives the task body it was spawned
+  from is not supported and will leak a connection. Await it, or whatever
+  it needs to keep the session alive for, before the task body returns.
 """
 
 from __future__ import annotations
