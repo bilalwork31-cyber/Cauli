@@ -113,13 +113,15 @@ async fn process(ctx: &Arc<Ctx>, queue: &str, sid: &str, raw: Option<String>) {
                 .store_result
                 .then_some((env.id.as_str(), rj.as_str(), ctx.result_ttl));
             let mut conn = ctx.redis.clone();
-            if let Err(e) =
-                broker::finish_dlq(&mut conn, queue, sid, &raw, "expired", None, store).await
-            {
-                error!(id = %env.id, "expired finish write failed: {e}");
+            match broker::finish_dlq(&mut conn, queue, sid, &raw, "expired", None, store).await {
+                Ok(()) => {
+                    ctx.counters.expired.fetch_add(1, Ordering::Relaxed);
+                    ctx.counters.dlq.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    error!(id = %env.id, "expired finish write failed: {e}");
+                }
             }
-            ctx.counters.expired.fetch_add(1, Ordering::Relaxed);
-            ctx.counters.dlq.fetch_add(1, Ordering::Relaxed);
             return;
         }
     }
@@ -191,9 +193,12 @@ async fn finish(ctx: &Arc<Ctx>, queue: &str, sid: &str, mut env: Envelope, outco
                     ctx.counters.ok.fetch_add(1, Ordering::Relaxed);
                 }
                 Err(e) => {
-                    // A write failure must not count as ok: the stats line is
-                    // the operator's first signal, and folding this in would
-                    // hide a broker write failure behind a success number.
+                    // A write failure must not count as ok, or as any of
+                    // its counterparts in the duplicate, final failure,
+                    // terminal dlq and expiry branches: the stats line is
+                    // the operator's first signal, and folding this in
+                    // would hide a broker write failure behind a healthy
+                    // number.
                     error!(id = %env.id, "success finish write failed: {e}");
                     ctx.counters.failed.fetch_add(1, Ordering::Relaxed);
                 }

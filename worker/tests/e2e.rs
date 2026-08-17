@@ -449,15 +449,16 @@ async fn result_write_failure_is_not_counted_ok(c: &mut redis::aio::MultiplexedC
     let _ = std::fs::remove_file(&log_path);
 }
 
-/// Audit regression (item D): the duplicate, final failure and terminal DLQ
-/// completion branches used to fetch_add `ok` / `failed` / `dlq`
-/// unconditionally, even when the write recording that outcome failed. This
-/// is the same truthfulness bug `result_write_failure_is_not_counted_ok`
-/// above covers for the plain success branch. Same mechanism
-/// (FIXTURE_RESULT_TTL=0 -> every `SET ... EX 0` is rejected), three more
-/// branches, one worker: a duplicate resolution, a final failure that was
-/// never retryable (SerializationError), and a terminal DLQ for a task that
-/// was never registered.
+/// Audit regression (item D): the duplicate, final failure, terminal DLQ and
+/// expiry completion branches used to fetch_add `ok` / `failed` / `dlq` /
+/// `expired` unconditionally, even when the write recording that outcome
+/// failed. This is the same truthfulness bug
+/// `result_write_failure_is_not_counted_ok` above covers for the plain
+/// success branch. Same mechanism (FIXTURE_RESULT_TTL=0 -> every
+/// `SET ... EX 0` is rejected), four more branches, one worker: a duplicate
+/// resolution, a final failure that was never retryable
+/// (SerializationError), a terminal DLQ for a task that was never
+/// registered, and a task that had already expired before dispatch.
 async fn write_failure_is_not_counted_for_duplicate_final_and_terminal(
     c: &mut redis::aio::MultiplexedConnection,
 ) {
@@ -523,6 +524,15 @@ async fn write_failure_is_not_counted_for_duplicate_final_and_terminal(
     xadd(c, "badttl2", &e4.to_string()).await;
     wait_drained(c, "badttl2").await;
 
+    // D: a task already expired before dispatch (PROTOCOL §9.1), dead
+    // lettered without ever executing. Must not count `expired`/`dlq` when
+    // the write fails.
+    let (_id5, e5) = envelope("fx.echo", "badttl2", |v| {
+        v["expires_at"] = json!(now_ms().saturating_sub(60_000))
+    });
+    xadd(c, "badttl2", &e5.to_string()).await;
+    wait_drained(c, "badttl2").await;
+
     bad.signal(libc::SIGTERM);
     assert_eq!(bad.wait_code(20), 0, "badttl2 worker should exit 0");
     drop(bad);
@@ -533,14 +543,15 @@ async fn write_failure_is_not_counted_for_duplicate_final_and_terminal(
         .rev()
         .find(|l| l.contains("stats: fetched="))
         .unwrap_or_else(|| panic!("no stats line in worker log:\n{log}"));
-    // fetched=4 (e1..e4); ok=0 (e1 -> failed via the success gate, e2's
+    // fetched=5 (e1..e5); ok=0 (e1 -> failed via the success gate, e2's
     // duplicate write also fails); failed=1 (e1 only: final_failure's own
-    // write failed for e3, so it must not count either); dlq=0 (both e3's
-    // final_failure and e4's dlq_terminal had their DLQ write fail).
+    // write failed for e3, so it must not count either); dlq=0 (e3's
+    // final_failure, e4's dlq_terminal and e5's expiry write all fail);
+    // expired=0 (e5's own write failed, so it must not count either).
     assert!(
-        stats.contains("fetched=4 ok=0 failed=1 retried=0 dlq=0"),
-        "a failed write on the duplicate, final failure or terminal dlq \
-         path must not be counted as ok, failed or dlq: {stats}"
+        stats.contains("fetched=5 ok=0 failed=1 retried=0 dlq=0 expired=0"),
+        "a failed write on the duplicate, final failure, terminal dlq or \
+         expiry path must not be counted as ok, failed, dlq or expired: {stats}"
     );
     let _ = std::fs::remove_file(&log_path);
 }
