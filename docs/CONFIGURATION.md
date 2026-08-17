@@ -69,17 +69,25 @@ Two other reasons to pick `kind="cpu"`:
 
 With `-c` set, the worker derives its internals from it. Every derived value
 can still be pinned by passing its flag explicitly; an explicit flag always
-wins. The rules, each from a measured result:
+wins. Every division below is ceiling division, `⌈a / b⌉`: it rounds up, so
+`-c 65` gives 2 processes and `-c 200` gives 4, not the 1 and 3 a floor
+reading predicts. The rules, each from a measured result:
 
 | Derived | Formula | Why |
 |---|---|---|
-| `--procs` | min(cores, c / 64) | Each process is one GIL: fanning out was +74% throughput at lower p99 (measured). Scaling by `-c` keeps a small queue worker to one quiet process on a box shared with your web app and Redis, while a large `-c` on a dedicated box uses every core. The 64 slot target is a chosen default, not yet a swept one |
-| `--io-concurrency` | c / procs | The gate is the real bound for `async def` tasks; a slot costs about 4 KB |
-| `--io-threads` | min(c, 512) / procs, at most the gate | The sync knee is near 1000 threads per process; past it throughput and latency fall together. Staying at 1x the gate is the latency honest default: oversubscribing buys throughput by inflating task p99 (measured 2048 slots on 4 cores: a 20 ms body reached a 92 ms p99) |
-| `--cpu-workers` | min(cores, c) / procs | More cpu children than cores buys nothing, and more than `-c` would make `-c 8` on a cpu queue mean something other than 8 |
+| `--procs` | min(cores, ⌈c / 64⌉) | Each process is one GIL: fanning out was +74% throughput at lower p99 (measured). Scaling by `-c` keeps a small queue worker to one quiet process on a box shared with your web app and Redis, while a large `-c` on a dedicated box uses every core. The 64 slot target is a chosen default, not yet a swept one |
+| `--io-concurrency` | ⌈c / procs⌉ | The gate is the real bound for `async def` tasks; a slot costs about 4 KB |
+| `--io-threads` | ⌈min(c, 512) / procs⌉, at most the gate in this derivation | The sync knee is near 1000 threads per process; past it throughput and latency fall together. Staying at 1x the gate is the latency honest default: oversubscribing buys throughput by inflating task p99 (measured 2048 slots on 4 cores: a 20 ms body reached a 92 ms p99). The gate gets no special enforcement of its own: an explicit `--io-threads` is not capped by it, so `-c 50 --io-threads 999` really does give 999 threads against a gate of 50 |
+| `--cpu-workers` | ⌈min(cores, c) / procs⌉ | More cpu children than cores buys nothing, and more than `-c` would make `-c 8` on a cpu queue mean something other than 8 |
 | `--io-loops` | always 1 | 1 loop beat 2, 3 and 4 in every sweep: extra loops contend for one GIL |
 
-Without `-c` nothing changes: one process, the standalone defaults below.
+Without `-c`, one process and the standalone defaults below apply, unless
+`--procs` is passed alone: it still divides `cpu_workers` across the
+processes you asked for, but `--io-threads` and `--io-concurrency` stay at
+their flat per process defaults, 64 and 256. `--procs 4` alone therefore
+means 4x those defaults fleet wide, 256 threads and 1024 io slots, not 64
+and 256 split four ways. Pass `-c`, which divides both, to scale them down
+instead.
 
 ### Wiring
 
@@ -111,7 +119,7 @@ and a socket rather than a thread.
 
 | Flag | Default | Effect |
 |---|---|---|
-| `--cpu-workers` | min(cores, c) / procs | Child processes for `kind="cpu"` tasks |
+| `--cpu-workers` | ⌈min(cores, c) / procs⌉ | Child processes for `kind="cpu"` tasks |
 | `--cpu-child-threads` | 1 | Requests pipelined per child, matched by id. Range 1 to 1024 |
 | `--cpu-prefetch` | 4 | Requests staged in a child's socket buffer beyond the one it is running. 0 disables |
 | `--cpu-max-tasks-per-child` | 0 (never) | Recycle a child after this many completed tasks. The backstop for leaky C extensions and slowly dirtied copy on write pages, like Celery's maxtasksperchild. Staged work drains first; no task is lost to a recycle |
@@ -287,9 +295,11 @@ procs * io_threads                                  (sync lane)
 ```
 
 When `--io-threads` is derived from `-c` the total stays near `min(c, 512)`
-automatically (see Worker command line above). Set `--io-threads`
-explicitly and that cap no longer applies: it becomes a plain product, so
-`--procs 4 --io-threads 30` alone already totals 120. Postgres ships with
+automatically (see Worker command line above). Without `-c`, or with
+`--io-threads` set explicitly, that cap does not apply and the sync lane is
+a plain product: `--procs 4` alone leaves `io_threads` at its standalone
+default of 64 per process, for 4 * 64 = 256 connections, and
+`--procs 4 --io-threads 30` explicitly is 4 * 30 = 120. Postgres ships with
 `max_connections` at 100, about 97 usable, so totals that look modest at
 the flag level can still exhaust it. Put a connection pooler, pgbouncer in
 transaction mode, in front of Postgres once the total climbs past roughly
