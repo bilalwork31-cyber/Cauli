@@ -3353,3 +3353,47 @@ committed state, unrelated to any of the night work. Formatting only.
 itest is the number that mattered most here. It is the only Python to binary surface, and it had not
 run since `arbitrary_precision` changed `serde_json::Number` behaviour crate wide. 26 passed.
 
+
+### Retry name matching, remaining items — commits f7adc3b and 98dcb60
+
+The last two items from `docs/decisions/retry-name-matching.md`, after `67f9c14` and `2ca6d93`.
+
+**The SerializationError lane divergence, reproduced and fixed.** A user exception class named
+`SerializationError`, which kombu ships and a Celery migration could plausibly carry, was retried on
+the io lanes and terminal on the cpu lane. Same task, same exception, different outcome depending
+which lane happened to run it.
+
+| mint site | before | after |
+|-----------|--------|-------|
+| cpu, `_exec._execute` | `retryable` absent, so the name default made it TERMINAL | `retryable: True`, RETRIES |
+| io, `shim._finish_exc` | `retryable: True`, RETRIES | unchanged |
+| cauli's OWN unserializable result | absent, TERMINAL by name | `retryable: False`, TERMINAL explicitly |
+
+Two judgement calls, both the right way round.
+
+It went FURTHER than the decision document, which named only the serialization mint site. Stamping
+just that one would have left the divergence intact for user classes, which was the actual complaint,
+so it stamped all four `_exec.py` failure paths, mirroring what `shim.py` already does. It said so and
+justified it rather than quietly widening scope.
+
+It went LESS far in the other direction and did not narrow the name default in `ctx.rs`, even though
+that file was in its list. Reason: `pyrt.rs:148` mirrors `ctx.rs:210` field for field by design, and
+PROTOCOL.md:863 specifies the name default as the WIRE CONTRACT. Removing it from ctx.rs alone, while
+pyrt.rs was held by another agent, would have created precisely the divergence it was asked not to
+create. Left in place, it is now only a compatibility fallback for older children, since a current
+cauli child stamps every failure response explicitly. That is the restraint I wanted and did not get
+automatically.
+
+No wire shape change: `PyResp.retryable` was already optional and already came from this same file.
+
+**`Retry` plus `countdown` documented as a reserved exception shape.** It was specified only in
+PROTOCOL, and users do not read protocol specifications. Now in CONFIGURATION.md at footnote length,
+stating what happens if you define your own class by that name, and why identity matching is not
+available: the worker's interpreter is not required to have cauli installed at all, and the cpu lane
+decides in Rust from a type name read off a pipe.
+
+Verified: py 255, up one for the new regression test, ruff clean. No Rust file touched, so no Rust run
+was claimed. itest correctly not run and the reason given: the worker e2e cpu lane runs
+`worker/tests/fixtures/fake_exec.py` through `CAULI_EXEC_CMD` and never `cauli._exec`, and the one
+e2e SerializationError case is an io task.
+
