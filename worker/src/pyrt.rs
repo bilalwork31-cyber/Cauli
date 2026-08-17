@@ -149,6 +149,13 @@ fn outcome_from_py(obj: &Bound<'_, PyAny>) -> Outcome {
     Outcome::Failure { err, retryable }
 }
 
+/// Matches the caps already enforced Python side (shim.py's `_MAX_TB`,
+/// _exec.py's `_TRACEBACK_CAP`, both 8192): `pyerr_string` below feeds
+/// `ErrorJson`, which is written into Redis result keys and DLQ entries
+/// verbatim, so an unbounded exception message or traceback would land
+/// there whole.
+const MAX_PYERR_CHARS: usize = 8192;
+
 fn pyerr_string(py: Python<'_>, e: &PyErr) -> String {
     let mut s = e.to_string();
     if let Some(tb) = e.traceback(py) {
@@ -157,7 +164,7 @@ fn pyerr_string(py: Python<'_>, e: &PyErr) -> String {
             s.push_str(&t);
         }
     }
-    s
+    crate::envelope::safe_truncate(&s, MAX_PYERR_CHARS).to_string()
 }
 
 impl PyRuntime {
@@ -232,8 +239,16 @@ impl PyRuntime {
             Ok((m.unbind(), cfg))
         })?;
 
-        let cfg: AppConfig = serde_json::from_str(&cfg_json)
-            .with_context(|| format!("shim load_app returned unparseable config: {cfg_json}"))?;
+        // Do not interpolate cfg_json here: shim.py's load_app serializes
+        // redis_url (with its password) and the full task registry into this
+        // same string, and main.rs logs the full context chain on startup
+        // failure ({e:#}). The wrapped serde_json error is appended to that
+        // chain automatically and already names the parse failure (its type
+        // and position) without echoing unrelated fields, so this stays
+        // useful for debugging without the raw JSON.
+        let cfg: AppConfig = serde_json::from_str(&cfg_json).with_context(|| {
+            format!("shim load_app returned unparseable config for app {app_spec:?}")
+        })?;
 
         let (submit_tx, submit_rx) = crossbeam_channel::unbounded::<SubmitJob>();
         let rt = Arc::new(PyRuntime {
@@ -572,5 +587,93 @@ impl SyncPool {
     pub fn report_hard_timeout(&self) {
         self.abandoned.fetch_add(1, Ordering::Relaxed);
         self.spawn_worker();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Registers a synthetic module in `sys.modules` under `module_name` so
+    /// shim.py's `importlib.import_module` finds it without touching the
+    /// filesystem, and returns the "module:app" spec `PyRuntime::init`
+    /// expects. `module_name` must be unique per test: `sys.modules` is
+    /// process global and tests run concurrently.
+    fn install_fake_app_module(py: Python<'_>, module_name: &str, src: &str) -> String {
+        let code = CString::new(src).expect("test app source has no NUL bytes");
+        let filename = CString::new(format!("{module_name}.py")).unwrap();
+        let modname = CString::new(module_name).unwrap();
+        let m = PyModule::from_code(py, code.as_c_str(), filename.as_c_str(), modname.as_c_str())
+            .expect("failed to build synthetic test app module");
+        py.import("sys")
+            .expect("sys is always importable")
+            .getattr("modules")
+            .expect("sys.modules always exists")
+            .set_item(module_name, m)
+            .expect("sys.modules supports __setitem__");
+        format!("{module_name}:app")
+    }
+
+    /// Startup regression: a config parse failure must never echo the raw
+    /// shim JSON, which carries `redis_url` (password and all) verbatim.
+    /// `result_ttl = -1` is one of several unvalidated fields that reach
+    /// Rust's `u64` and fail to parse (see the docstring on AppConfig).
+    #[test]
+    fn unparseable_config_error_does_not_leak_redis_password() {
+        #[allow(deprecated)]
+        pyo3::prepare_freethreaded_python();
+        let app_spec = Python::attach(|py| {
+            install_fake_app_module(
+                py,
+                "cauli_test_secret_leak_app",
+                r#"
+class _App:
+    redis_url = "redis://appuser:s3cr3tpw@example.com:6379/0"
+    default_queue = "default"
+    result_ttl = -1
+    idemp_ttl = 86400
+    queue_ttl = {}
+    _tasks = {}
+
+app = _App()
+"#,
+            )
+        });
+        let err = match PyRuntime::init(&app_spec, 1) {
+            Ok(_) => panic!("expected init to fail: result_ttl=-1 cannot parse as u64"),
+            Err(e) => e,
+        };
+        // main.rs prints startup errors with {e:#}, which walks the whole
+        // anyhow context chain (see the with_context call above) -- this is
+        // the exact text an operator would see in the log.
+        let logged = format!("{err:#}");
+        assert!(
+            !logged.contains("s3cr3tpw"),
+            "redis password leaked into startup error: {logged}"
+        );
+        assert!(
+            !logged.contains("appuser"),
+            "redis credentials leaked into startup error: {logged}"
+        );
+    }
+
+    /// `pyerr_string` feeds `ErrorJson` (run_sync_blocking, fail_pending),
+    /// which is written into Redis result keys and DLQ entries verbatim: an
+    /// exception with a huge message or traceback must not carry all of it
+    /// along, the same way shim.py's `_MAX_TB` and _exec.py's
+    /// `_TRACEBACK_CAP` already bound the Python-side equivalents.
+    #[test]
+    fn pyerr_string_is_capped_to_a_bounded_size() {
+        #[allow(deprecated)]
+        pyo3::prepare_freethreaded_python();
+        let len = Python::attach(|py| {
+            let huge = "x".repeat(50_000);
+            let err = pyo3::exceptions::PyValueError::new_err(huge);
+            pyerr_string(py, &err).len()
+        });
+        assert!(
+            len <= MAX_PYERR_CHARS,
+            "pyerr_string produced {len} bytes, expected at most {MAX_PYERR_CHARS}"
+        );
     }
 }
