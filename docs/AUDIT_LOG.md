@@ -3257,3 +3257,44 @@ Verified: Rust 114 passing, py 254, itest 26. The e2e binary count matched basel
 extra tests beyond baseline plus its own trace to other agents' commits visible in the log during the
 session rather than to anything it touched, which it checked rather than assumed.
 
+
+### The observability field set — commits 4987f04, 2d6bdc7, 97100b4, 5e76742, dbe40d5, a428da7
+
+All six items from `docs/decisions/observability.md` landed, each committed separately. Tree builds
+and passes: 111 unit tests plus 7 e2e binaries, clippy clean with `-D warnings`.
+
+The live stats line, captured from a real run with all three lanes loaded:
+
+    stats: fetched=84 ok=82 failed=0 retried=0 dlq=0 expired=0 cpu_lost=0 inflight_io=0
+    inflight_cpu=2 rss_mb=27 sync_p50=13 sync_p99=512 async_p50=24 async_p99=512 cpu_p50=704
+    cpu_p99=1024 oldest_ms=1665 cpu_rss_mb=22 sync_live=8 sync_abandoned=0 async_rejected=0
+    cpu_backlog=0
+
+The numbers were checked against the load driven rather than merely observed: 40 sync bodies at 10ms
+plus a 400ms pair gives p50 13 and p99 512, and 20 async at 20ms plus a 300ms pair gives 24 and 512.
+`oldest_ms` read 1665 with work in flight and 0 once drained. `cpu_rss_mb=22` is the fork server
+child that `rss_mb=27` never counted, which is the 331.8 MB blind spot from cycle 19 now closed. The
+following tick showed `sync_p50=0 sync_p99=0`, confirming the interval scoping works rather than
+accumulating a lifetime aggregate.
+
+Tests added: 8 latency tests asserting bucket boundaries and hand computed interpolation directly
+rather than merely that a field appears, 1 stream id age test, 3 for the new gauges, 1 for the recycle
+default, plus an e2e assertion that `cpu_lost` actually MOVES when a child dies mid task, and one that
+`pending_async` is genuinely gone from a real emitted line rather than just from the source.
+
+### Three things it flagged, all real
+
+1. `cargo fmt --check` fails on `worker/src/main.rs:601` and `worker/src/pyrt.rs:1047`, both
+   pre existing committed state, verified with `git diff HEAD` on those paths. It deliberately
+   reverted an unrelated rustfmt hunk its own formatter introduced in pyrt.rs so its commit carried
+   only its change, which is the right instinct.
+2. `worker/src/shim.py:85` still carries a comment referring to `pending_async`, now a dangling
+   reference to a field that no longer exists. Left alone because another agent was actively
+   committing in that file.
+3. **The unit test binary deadlocked three times under parallel test threads**, always in
+   `pyrt::tests::shim_async_unregistered_task_error_type_is_canonical`, and always while another
+   agent's `cargo test` ran concurrently on the same box. It passes in 0.42s with `--test-threads=1`
+   and passed cleanly at default parallelism once the box was quiet. Not caused by the observability
+   changes. Worth chasing: a test that deadlocks only under machine load is exactly the shape this
+   audit spent the night hunting, and it will bite again in CI.
+
