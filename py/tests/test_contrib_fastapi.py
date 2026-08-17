@@ -15,10 +15,14 @@ before and during the run) is a manual verification built on
 from __future__ import annotations
 
 import asyncio
+import os
+import time
+import uuid
 
 import pytest
 
 sqlalchemy = pytest.importorskip("sqlalchemy")
+psycopg = pytest.importorskip("psycopg")
 
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine  # noqa: E402
 
@@ -35,6 +39,14 @@ from cauli.contrib.fastapi import (  # noqa: E402
 # without ever touching a real database or a real redis.
 _FAKE_REDIS_URL = "redis://127.0.0.1:1/0"
 _FAKE_DATABASE_URL = "postgresql+psycopg://u:p@127.0.0.1:1/db"
+
+# The audit's throwaway Postgres, role and database both "bench", the same
+# instance bench/sqla_models.py points at. Only the one dispose test below
+# that needs a real, populated pool uses this; it skips itself when nothing
+# answers rather than failing the file in an environment without Postgres.
+_BENCH_PG_DSN = os.environ.get(
+    "BENCH_PG_DSN", "postgresql://bench:bench@127.0.0.1:5432/bench"
+)
 
 
 @pytest.fixture(autouse=True)
@@ -209,5 +221,59 @@ def test_process_init_disposes_engine(monkeypatch):
 
 
 def test_process_init_dispose_hook_runs_without_error_on_real_engine():
-    app = install_sqlalchemy_session(_app_no_redis(), _engine())
-    app._process_init_hooks[0]()  # must not hang and must not raise
+    """Unlike test_process_init_disposes_engine above, which replaces
+    dispose() itself with a fake and so never touches the pool, this test
+    checks a real connection out of a real pool and back in before the hook
+    runs, a populated pool being the fork safety scenario the hook exists
+    for (module docstring's process init bullet and the install_sqlalchemy_
+    session process init paragraph); a hook that only ever ran against an
+    empty, never used pool never exercised that path. The assertion reads
+    Postgres's own pg_stat_activity rather than "no exception raised", so it
+    cannot pass by accident if the dispose call were ever dropped from the
+    hook: an empty hook body still runs without error, but it would leave
+    the backend counted below.
+    """
+    marker = f"cauli-fastapi-dispose-itest-{uuid.uuid4().hex}"
+    async_dsn = _BENCH_PG_DSN.replace("postgresql://", "postgresql+psycopg://", 1)
+    engine = create_async_engine(
+        async_dsn,
+        pool_size=1,
+        max_overflow=0,
+        connect_args={"application_name": marker},
+    )
+
+    def backends_for_marker() -> int:
+        with psycopg.connect(_BENCH_PG_DSN, autocommit=True) as conn:
+            row = conn.execute(
+                "select count(*) from pg_stat_activity where application_name = %s",
+                (marker,),
+            ).fetchone()
+            return row[0]
+
+    async def checkout_and_release() -> None:
+        async with engine.connect() as conn:
+            await conn.execute(sqlalchemy.text("select 1"))
+
+    try:
+        asyncio.run(checkout_and_release())
+        checked_in = backends_for_marker()
+    except Exception as exc:
+        pytest.skip(f"bench Postgres not reachable at {_BENCH_PG_DSN}: {exc}")
+
+    try:
+        assert checked_in == 1, (
+            "checkout/release did not leave a real pooled backend for "
+            "dispose to close; the test would be vacuous"
+        )
+
+        app = install_sqlalchemy_session(_app_no_redis(), engine)
+        app._process_init_hooks[0]()  # must not hang and must not raise
+
+        deadline = time.monotonic() + 5
+        n = backends_for_marker()
+        while n and time.monotonic() < deadline:
+            time.sleep(0.1)
+            n = backends_for_marker()
+        assert n == 0, "dispose() left the real backend connection open"
+    finally:
+        asyncio.run(engine.dispose())  # belt and suspenders: never leak a real backend
