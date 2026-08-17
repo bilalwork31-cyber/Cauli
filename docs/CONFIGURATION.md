@@ -197,6 +197,22 @@ redis-py's own default depends on the installed version.
 | `--stats-interval` | 10 | Seconds between stats log lines |
 | `--log-level` | `info` | `trace`, `debug`, `info`, `warn` or `error`. `RUST_LOG` overrides |
 
+**What to alert on.** Two fields in the stats line (PROTOCOL section 7) mean
+something is already broken, not that a threshold is near:
+
+- **`async_rejected` above zero.** The shim's per loop submission queue
+  rejects only once it is at its cap, and it only reaches that cap when an
+  event loop thread has wedged. That process's async lane does not recover on
+  its own; restarting the process is the only fix.
+- **`sync_abandoned` climbing.** Each abandonment is one sync io task that
+  overran its hard timeout and kept running anyway. The thread is never
+  reclaimed, and neither is anything it holds, a database connection
+  included, so a rising counter is capacity lost for good.
+
+Set `--cpu-max-tasks-per-child` to a nonzero value in production. It is the
+only bound on a cpu child's memory, and `rss_mb` cannot see that growth (see
+CPU execution above).
+
 ## App object
 
 ```python
