@@ -87,6 +87,65 @@ def _app():
     return itest_app
 
 
+def _spawn_worker(queues, *extra_args, log_name):
+    """Start an extra cauli-worker process against the shared stack's redis.
+
+    For tests that need to control a worker's crash or restart timing
+    directly, beyond the one long lived worker `stack` already runs.
+    """
+    env = dict(os.environ)
+    env["VIRTUAL_ENV"] = VENV
+    env["PATH"] = f"{VENV}/bin:" + env.get("PATH", "")
+    env["CAULI_REDIS_URL"] = f"redis://127.0.0.1:{PORT}/0"
+    return subprocess.Popen(
+        [
+            BIN,
+            "--app",
+            "itest_app:app",
+            "--queues",
+            queues,
+            "--redis-url",
+            f"redis://127.0.0.1:{PORT}/0",
+            "--cpu-workers",
+            "2",
+            "--io-concurrency",
+            "64",
+            *extra_args,
+            "--python",
+            f"{VENV}/bin/python",
+            "--log-level",
+            "info",
+        ],
+        cwd=HERE,
+        env=env,
+        stdout=open(f"{HERE}/worker_{log_name}.log", "wb"),
+        stderr=subprocess.STDOUT,
+    )
+
+
+def _stop_worker(proc, timeout=15):
+    proc.send_signal(signal.SIGTERM)
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=5)
+
+
+def _pending_count(r, queue):
+    summary = r.xpending(f"cauli:q:{queue}", "cauli")
+    return summary["pending"] if summary else 0
+
+
+def _wait_until_pending(r, queue, at_least, deadline_s):
+    deadline = time.time() + deadline_s
+    while time.time() < deadline:
+        if _pending_count(r, queue) >= at_least:
+            return
+        time.sleep(0.05)
+    raise AssertionError(f"{queue} never reached {at_least} pending entries")
+
+
 def test_sync_io_roundtrip(stack):
     m = _app()
     res = m.echo.delay("hello")
@@ -340,6 +399,83 @@ def test_dlq_stream_is_bounded(stack):
     xlen = r.xlen(dlq_key)
     assert xlen < total, f"dlq grew unbounded: {xlen} entries for {total} pushed"
     assert 500 <= xlen <= 2000, f"dlq should settle near the 1000 entry cap, got {xlen}"
+
+
+def test_crash_redelivery_resolves_mine_again_not_duplicate(stack):
+    """PROTOCOL section 4.5 "mine again": a worker that dies mid task leaves
+    its claim standing in cauli:idemp:{h}. `test_idempotency_key_allows_retry`
+    above already covers the scheduled retry half of that fix; this covers
+    the other half, crash redelivery, which the coverage audit found had no
+    test anywhere despite being the half that matters most: it is what stops
+    a task being stuck forever after a worker dies mid execution.
+
+    A worker claims the task and is killed before it can finish, so the
+    entry stays in the pending entries list; a second worker's recovery loop
+    reclaims it with XCLAIM once idle exceeds the visibility timeout. The
+    guard must resolve that reclaim as MineAgain so it genuinely re-executes,
+    not Duplicate, which would strand the task forever.
+    """
+    from cauli.result import AsyncResult
+
+    r, _ = stack
+    m = _app()
+    queue = f"crashidemp-{uuid.uuid4().hex}"
+    path = f"/tmp/cauli-itest-crashidemp-{uuid.uuid4().hex}"
+    key = f"itest-crash-{uuid.uuid4().hex}"
+
+    env, _q, _fire = m.app.make_envelope(
+        m.slow_idemp.name,
+        args=[path, 1.5],
+        task=m.slow_idemp,
+        queue=queue,
+        idempotency_key=key,
+    )
+    task_id = env["id"]
+    q_key = f"cauli:q:{queue}"
+    # Create the group ourselves so the pending check below cannot race
+    # worker1's own startup (it would otherwise get there via ensure_groups,
+    # but only once it has actually started).
+    r.xgroup_create(q_key, "cauli", id="0", mkstream=True)
+    r.xadd(q_key, {"e": json.dumps(env)})
+
+    w1 = _spawn_worker(queue, "--visibility-timeout", "1", log_name="crash1")
+    try:
+        _wait_until_pending(r, queue, at_least=1, deadline_s=10)
+        time.sleep(0.3)  # give the executor a beat to actually enter the task
+        w1.send_signal(signal.SIGKILL)
+        w1.wait(timeout=10)
+    finally:
+        if w1.poll() is None:
+            w1.kill()
+            w1.wait(timeout=5)
+
+    assert _pending_count(r, queue) == 1, (
+        "a killed worker must leave its claim pending, not acked"
+    )
+
+    w2 = _spawn_worker(queue, "--visibility-timeout", "1", log_name="crash2")
+    try:
+        res = AsyncResult(task_id, m.app)
+        out = res.get(timeout=25)
+        assert out == {"slow_idemp_done": True}, "reclaimed task must genuinely execute"
+        assert res.status() == "success", "crash redelivery must not resolve as duplicate"
+
+        deadline = time.time() + 5
+        while time.time() < deadline and _pending_count(r, queue) != 0:
+            time.sleep(0.1)
+        assert _pending_count(r, queue) == 0, (
+            "a completed claim must be acked, not left reclaimable"
+        )
+    finally:
+        _stop_worker(w2)
+
+    with open(path) as f:
+        contents = f.read()
+    assert contents == "xx", (
+        f"expected exactly two invocation attempts, one killed and one "
+        f"completed: got {contents!r}"
+    )
+    os.remove(path)
 
 
 def test_worker_survived_everything(stack):
