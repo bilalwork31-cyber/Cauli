@@ -699,6 +699,35 @@ struct Pending {
     deadline: Option<Instant>,
 }
 
+/// A request accepted from `rx` but not yet fully handed to the child: at
+/// most one of these at a time (see the `job = rx.recv()` branch's guard
+/// below), tracked outside `pending`/`order` until the write actually
+/// finishes so those two only ever describe requests the child has
+/// definitely received. Written a few bytes at a time via plain `write`
+/// (never `write_all`) so a stalled write never stops this same select! loop
+/// from also polling `lines.next_line()` -- otherwise the child's own
+/// response, sent right back over the same socket, could fill its buffer and
+/// block on us reading it while we are blocked writing to it, a deadlock
+/// neither side can break.
+struct PendingWrite {
+    id: String,
+    buf: Vec<u8>,
+    sent: usize,
+    resp: oneshot::Sender<CpuOutcome>,
+    timeout_ms: u64,
+    /// How long this write may stall once nothing else in flight excuses it
+    /// (`next_deadline` is `None`): `min(timeout_ms, 5s)`, the same shape as
+    /// the old flat write budget. Applied from `write_stall_since` in
+    /// `serve_child`, NOT from when this write started -- see its comment.
+    budget: Duration,
+}
+
+impl PendingWrite {
+    fn remaining(&self) -> &[u8] {
+        &self.buf[self.sent..]
+    }
+}
+
 /// H3-style saturation: a crafted/huge `timeout_ms` must not overflow `Instant`
 /// math into a panic or wrap to a near-zero deadline.
 fn deadline_for(timeout_ms: u64) -> Instant {
@@ -797,9 +826,31 @@ async fn serve_child(
     // ADMITTING once completed + in flight reaches the budget, so staged
     // prefetch work always drains before the recycle fires.
     let mut completed: usize = 0;
+    // At most one request being written to the child at a time -- see the
+    // `job = rx.recv()` branch's guard below.
+    let mut pending_write: Option<PendingWrite> = None;
+    // The instant `pending_write` most recently became stalled with nothing
+    // in `pending` to excuse it (`next_deadline` is `None`). Recomputed every
+    // iteration below, NOT set once when the write started: a write that
+    // stalls first because the child is legitimately busy with something
+    // already in flight, and only later runs out of that excuse, must be
+    // judged against a clock that starts at the moment it ran out, not one
+    // that has been running since before it had anything to excuse.
+    let mut write_stall_since: Option<Instant> = None;
 
     let gone = loop {
         let next_deadline = pending.values().filter_map(|p| p.deadline).min();
+        if pending_write.is_some() && next_deadline.is_none() {
+            write_stall_since.get_or_insert_with(Instant::now);
+        } else {
+            write_stall_since = None;
+        }
+        // `pending_write`'s own budget (`min(timeout_ms, 5s)`), counted from
+        // `write_stall_since` above -- `None` whenever there is nothing to
+        // apply it to, or something else in flight already excuses the wait.
+        let write_fallback_at = write_stall_since
+            .zip(pending_write.as_ref())
+            .map(|(since, pw)| since + pw.budget);
         tokio::select! {
             line = lines.next_line() => {
                 match line {
@@ -851,54 +902,92 @@ async fn serve_child(
                     }
                 }
             }
-            job = rx.recv(), if pending.len() < queue_depth
+            // Only ever admit a NEW request once the last one is fully
+            // handed to the child: the socket has one write side to share.
+            job = rx.recv(), if pending_write.is_none() && pending.len() < queue_depth
                 && (recycle == 0 || completed + pending.len() < recycle) => {
                 match job {
                     Ok(job) => {
-                        let mut l = job.req_line;
-                        l.push('\n');
-                        // FS-4: write_all here runs OUTSIDE the select! race
-                        // once entered (the arm body is a plain await, not
-                        // part of the racing set), so an unbounded write
-                        // would suspend response reads AND hard-timeout
-                        // enforcement for everything already pending on this
-                        // child. A child that stops draining its socket must
-                        // be detected and treated as gone, not silently wedge
-                        // the slot forever.
-                        let write_budget =
+                        let mut buf = job.req_line.into_bytes();
+                        buf.push(b'\n');
+                        let budget =
                             Duration::from_millis(job.timeout_ms).min(Duration::from_secs(5));
-                        match timeout(write_budget, write.write_all(l.as_bytes())).await {
-                            Ok(Ok(())) => {
-                                counters.inflight_cpu.fetch_add(1, Ordering::Relaxed);
-                                order.push_back(job.id.clone());
-                                pending.insert(job.id, Pending {
-                                    resp: job.resp,
-                                    timeout_ms: job.timeout_ms,
-                                    // Armed by arm_started below only if the
-                                    // child has capacity to run it right now;
-                                    // otherwise it is prefetched and its clock
-                                    // starts when the request ahead completes.
-                                    deadline: None,
-                                });
-                                arm_started(&mut pending, &order, concurrency);
-                            }
-                            Ok(Err(e)) => {
-                                warn!("cpu[{idx}] pid={pid}: write failed: {e}");
-                                let _ = job.resp.send(CpuOutcome::Lost);
-                                break ChildGone::Wedged;
-                            }
-                            Err(_) => {
-                                warn!(
-                                    "cpu[{idx}] pid={pid}: write stalled past {write_budget:?} \
-                                     ({} in flight); SIGKILL + replacement fork",
-                                    pending.len()
-                                );
-                                let _ = job.resp.send(CpuOutcome::Lost);
-                                break ChildGone::Wedged;
-                            }
-                        }
+                        pending_write = Some(PendingWrite {
+                            id: job.id,
+                            buf,
+                            sent: 0,
+                            resp: job.resp,
+                            timeout_ms: job.timeout_ms,
+                            budget,
+                        });
                     }
                     Err(_) => break ChildGone::Shutdown,
+                }
+            }
+            // Drive an in flight write forward a `write()` call at a time
+            // (never `write_all`, which would run to completion or timeout
+            // outside this select! -- see `PendingWrite`'s doc comment for
+            // why that already deadlocked once). A blocked write is NOT by
+            // itself evidence the child is wedged: prefetch means the
+            // worker stages more requests than a busy child has drained
+            // yet, and a busy child legitimately does not read again until
+            // it finishes what it is already executing -- that is
+            // backpressure the worker itself created, not a wedge. So a
+            // stall here only counts against the child once nothing already
+            // in flight is still within ITS OWN deadline either: once
+            // `next_deadline` passes with still no write and no response,
+            // the child has stopped both reading and responding, a real
+            // hard timeout (handled by the `sleep_until(next_deadline)` arm
+            // below, which this same stall leaves free to fire). With
+            // nothing armed to excuse it, `write_fallback_at` above is this
+            // write's only bound -- nothing legitimate can excuse a stall
+            // with nothing else in flight either.
+            //
+            // The `write()` call is wrapped in an async block, not called
+            // directly as the branch expression: `tokio::select!` only skips
+            // POLLING a disabled branch, it still constructs every branch's
+            // future up front, and `write.write(buf)` needs `buf` (borrowed
+            // from `pending_write`) at construction time. An async block
+            // defers everything in it, including that borrow, to first
+            // poll -- which the `if pending_write.is_some()` guard below
+            // then ensures never happens while it is `None`.
+            r = async {
+                write.write(pending_write.as_ref().expect("guarded by is_some() below").remaining()).await
+            }, if pending_write.is_some() => {
+                match r {
+                    Ok(n) if n > 0 => {
+                        let pw = pending_write.as_mut().expect("just matched Some");
+                        pw.sent += n;
+                        if pw.sent >= pw.buf.len() {
+                            let pw = pending_write.take().expect("just matched Some");
+                            counters.inflight_cpu.fetch_add(1, Ordering::Relaxed);
+                            order.push_back(pw.id.clone());
+                            pending.insert(pw.id, Pending {
+                                resp: pw.resp,
+                                timeout_ms: pw.timeout_ms,
+                                // Armed by arm_started below only if the
+                                // child has capacity to run it right now;
+                                // otherwise it is prefetched and its clock
+                                // starts when the request ahead completes.
+                                deadline: None,
+                            });
+                            arm_started(&mut pending, &order, concurrency);
+                        }
+                    }
+                    Ok(_zero) => {
+                        // A stream write() returning 0 for a non empty
+                        // buffer means the socket will never accept more.
+                        let pw = pending_write.take().expect("just matched Some");
+                        warn!("cpu[{idx}] pid={pid}: write returned 0 bytes, treating as closed");
+                        let _ = pw.resp.send(CpuOutcome::Lost);
+                        break ChildGone::Wedged;
+                    }
+                    Err(e) => {
+                        let pw = pending_write.take().expect("just matched Some");
+                        warn!("cpu[{idx}] pid={pid}: write failed: {e}");
+                        let _ = pw.resp.send(CpuOutcome::Lost);
+                        break ChildGone::Wedged;
+                    }
                 }
             }
             // Some(_) pattern guard: the branch is disabled when nothing is
@@ -910,6 +999,14 @@ async fn serve_child(
                 );
                 break ChildGone::HardTimeout;
             }
+            _ = sleep_until(write_fallback_at.unwrap_or_else(Instant::now)), if write_fallback_at.is_some() => {
+                warn!(
+                    "cpu[{idx}] pid={pid}: write stalled past budget with nothing else in \
+                     flight ({} in flight); SIGKILL + replacement fork",
+                    pending.len()
+                );
+                break ChildGone::Wedged;
+            }
         }
     };
 
@@ -920,6 +1017,9 @@ async fn serve_child(
     // reused by an unrelated process; SIGKILLing it again would be wrong.
     if !matches!(gone, ChildGone::Exited) {
         kill_pid(pid);
+    }
+    if let Some(pw) = pending_write {
+        let _ = pw.resp.send(CpuOutcome::Lost);
     }
     let now = Instant::now();
     for (_, p) in pending.drain() {
