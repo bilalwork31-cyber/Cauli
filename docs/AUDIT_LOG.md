@@ -3218,3 +3218,42 @@ was shutting down, so the tree was not in a verifiable state and running it woul
 mixture. `RESUME.md` carries the exact commands, the WSL paths, the two archive branches that must
 be diffed before deletion, and which decision document to restart each unfinished agent from.
 
+
+### The SoftTimeLimitExceeded identity break and the countdown guard — commits 67f9c14 and 2ca6d93
+
+Both from `docs/decisions/retry-name-matching.md`, and both reproduced for real rather than pinned.
+
+**The identity break.** `shim.py`'s module body attempts `from cauli import ...` before `load_app`
+sets up cwd, the extra paths and the venv site packages. In the source built deployment shape that
+import fails, so the shim binds its own local stand in class while the user's app later imports the
+real `cauli.SoftTimeLimitExceeded`. The watchdog then injects the stand in, and the user's
+`except SoftTimeLimitExceeded:` cleanup clause does not match. Both CONFIGURATION.md and
+`exceptions.py` advertise that pattern as supported, so this silently broke something documented.
+
+I had said the failing import might not be constructible in a test and that pinning the rebind would
+be acceptable. It managed the real thing: it confirmed this process's embedded interpreter links
+system libpython with no cauli reachable, which IS the source built shape, let the shim's real module
+body genuinely fail its import, and only then injected a fake cauli into `sys.modules`. That is a
+true reproduction of the failing condition rather than a proxy for it.
+
+One deliberate simplification worth keeping in mind for future tests here: it injected into
+`sys.modules` rather than mutating `VIRTUAL_ENV` or the cwd, because those are process global and
+shared with the roughly 106 other unit tests running concurrently in the same interpreter. Mutating
+them would have made the suite order dependent.
+
+Fix is 4 lines in `load_app`, rebinding the shim global from `sys.modules.get("cauli")` immediately
+after the app module import, which is what actually pulls cauli in once the paths exist. The genuinely
+cauli-less case, which PROTOCOL section 4.2 promises and the whole worker e2e suite relies on, is
+covered by the same test's first phase.
+
+**The countdown guard.** `_exec.py` called `float(cd)` unguarded, so a non numeric countdown raised
+ValueError and that ValueError REPLACED the user's actual exception in the reported result. Also
+reproduced black box, through the documented wire protocol: it spawned a real `python -m cauli._exec`
+child, sent a retry task with countdown `"nope"`, and got back a response with no `retry` key at all,
+a KeyError before the fix. Now mirrors the guard `shim.py` already had, degrading to the computed
+backoff instead of losing the real exception.
+
+Verified: Rust 114 passing, py 254, itest 26. The e2e binary count matched baseline exactly, and the
+extra tests beyond baseline plus its own trace to other agents' commits visible in the log during the
+session rather than to anything it touched, which it checked rather than assumed.
+
