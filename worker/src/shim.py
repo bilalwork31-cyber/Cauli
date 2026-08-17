@@ -185,6 +185,18 @@ def load_app(app_spec, extra_paths_json):
     mod = importlib.import_module(module_name)
     app = getattr(mod, attr)
 
+    # The module body above may have failed to import cauli (see the try
+    # block at the top of this file): it runs before this function has set
+    # up sys.path and VIRTUAL_ENV, so a source built worker with no venv
+    # link finds nothing there yet. The app module we just imported pulls
+    # the real cauli in now that the paths exist, so rebind onto it when
+    # present, or a task's own except SoftTimeLimitExceeded clause compares
+    # against a different class object and never matches.
+    global SoftTimeLimitExceeded
+    real_cauli = sys.modules.get("cauli")
+    if real_cauli is not None and hasattr(real_cauli, "SoftTimeLimitExceeded"):
+        SoftTimeLimitExceeded = real_cauli.SoftTimeLimitExceeded
+
     # Lifecycle hooks (PROTOCOL §4.8), by getattr like everything else here:
     # keep the app's list objects so post-startup registrations are seen.
     global _before_hooks, _after_hooks

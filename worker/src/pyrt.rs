@@ -1009,4 +1009,153 @@ app = _App()
             Outcome::ForceRetry { .. } => panic!("expected a failure, got ForceRetry"),
         }
     }
+
+    /// The shim's module body runs `from cauli import SoftTimeLimitExceeded`
+    /// (top of shim.py) before `load_app` does any sys.path/VIRTUAL_ENV setup:
+    /// `PyRuntime::init` above builds the shim module and calls `load_app` back
+    /// to back with no gap between them. Installing the worker's wheel into the
+    /// app's own venv (README "Install") links that venv's interpreter, so
+    /// cauli is already on sys.path at that first import and this never bites.
+    /// Building the worker from source (same doc, the very next section) links
+    /// whatever interpreter the build found, which has no such site packages on
+    /// its default sys.path, so that first import fails and the module falls
+    /// back to its own local stand in class. Unless `load_app` rebinds once
+    /// cauli actually becomes reachable, a user's own
+    /// `except SoftTimeLimitExceeded:` then compares against a different class
+    /// object and silently never matches.
+    ///
+    /// Reproduced directly rather than through a real venv. This process's
+    /// embedded interpreter already stands in for the source built shape: no
+    /// VIRTUAL_ENV, no cauli on its default sys.path, and every other test in
+    /// this module runs with the fallback class. So the only thing left to
+    /// control is exactly when cauli becomes importable relative to the shim's
+    /// two calls. That is done through `sys.modules` directly rather than a
+    /// real install, because mutating `VIRTUAL_ENV` or the process cwd is
+    /// global state shared with every other test in this binary running at the
+    /// same time. Both phases (cauli absent throughout, cauli appearing
+    /// between the module body and `load_app`) run sequentially in this one
+    /// test, each against its own shim instance, so neither can race the
+    /// other's `sys.modules` mutation the way two separate `#[test]` functions
+    /// executing in parallel could.
+    #[test]
+    fn load_app_rebinds_soft_time_limit_exceeded_once_cauli_becomes_importable() {
+        #[allow(deprecated)]
+        pyo3::prepare_freethreaded_python();
+        Python::attach(|py| {
+            let sys_modules = py
+                .import("sys")
+                .expect("sys is always importable")
+                .getattr("modules")
+                .expect("sys.modules always exists");
+            assert!(
+                !sys_modules
+                    .contains("cauli")
+                    .expect("sys.modules supports __contains__"),
+                "test setup invalid: cauli must not already be importable in this process"
+            );
+            let code =
+                CString::new(include_str!("shim.py")).expect("shim.py contains NUL byte");
+
+            // Phase 1: PROTOCOL section 4.2's documented supported case (and
+            // how the entire fixture based e2e suite in this repo runs) is
+            // cauli never installed at all. load_app must still succeed and
+            // must not disturb the local fallback class: a working fallback
+            // must not become an import error.
+            let shim_no_cauli = PyModule::from_code(
+                py,
+                code.as_c_str(),
+                c"shim.py",
+                c"cauli_worker_shim_no_cauli_repro",
+            )
+            .expect("failed to load embedded shim");
+            let fallback_before = shim_no_cauli
+                .getattr("SoftTimeLimitExceeded")
+                .expect("shim always exposes SoftTimeLimitExceeded");
+            let app_spec_a =
+                install_fake_app_module(py, "cauli_test_no_cauli_app", MINIMAL_VALID_APP_SRC);
+            shim_no_cauli
+                .getattr("load_app")
+                .and_then(|f| f.call1((app_spec_a.as_str(), "[]")))
+                .expect("load_app must succeed with no cauli installed at all");
+            let fallback_after = shim_no_cauli
+                .getattr("SoftTimeLimitExceeded")
+                .expect("shim always exposes SoftTimeLimitExceeded");
+            assert!(
+                fallback_after.is(&fallback_before),
+                "load_app must not disturb the local fallback class when cauli is absent"
+            );
+
+            // Phase 2, the actual bug: load a second, independent shim while
+            // cauli is still not importable (its module body fails exactly
+            // like phase 1's), then make cauli importable the way the venv
+            // wheel or a source checkout would once load_app's own path
+            // setup ran, and only then call load_app.
+            let shim = PyModule::from_code(
+                py,
+                code.as_c_str(),
+                c"shim.py",
+                c"cauli_worker_shim_rebind_repro",
+            )
+            .expect("failed to load embedded shim");
+
+            // A minimal stand in "cauli" package, built now but not yet
+            // registered in sys.modules: this is what a real `import cauli`
+            // resolves to once the venv's site packages (or a source
+            // checkout) join sys.path.
+            let fake_cauli_code =
+                CString::new("class SoftTimeLimitExceeded(Exception):\n    pass\n")
+                    .expect("fake cauli source has no NUL bytes");
+            let fake_cauli = PyModule::from_code(
+                py,
+                fake_cauli_code.as_c_str(),
+                c"cauli/__init__.py",
+                c"cauli",
+            )
+            .expect("failed to build fake cauli module");
+            let real_cls = fake_cauli
+                .getattr("SoftTimeLimitExceeded")
+                .expect("fake cauli exposes SoftTimeLimitExceeded");
+
+            // Sanity check on the repro itself: before cauli is reachable at
+            // all (sys.modules still has no "cauli" entry), this second
+            // shim's module body must have landed on ITS OWN fallback class,
+            // not on the fake cauli's, or this test would pass for a reason
+            // that has nothing to do with the rebind. Each shim
+            // instance defines its own distinct fallback class object (a
+            // fresh `class SoftTimeLimitExceeded(Exception)` statement runs
+            // every time the module body does), so this compares against
+            // `real_cls`, not phase 1's `fallback_before`.
+            let before = shim
+                .getattr("SoftTimeLimitExceeded")
+                .expect("shim always exposes SoftTimeLimitExceeded");
+            assert!(
+                !before.is(&real_cls),
+                "test setup invalid: shim already matches cauli before cauli was even importable"
+            );
+
+            sys_modules
+                .set_item("cauli", &fake_cauli)
+                .expect("sys.modules supports __setitem__");
+
+            let app_spec =
+                install_fake_app_module(py, "cauli_test_rebind_app", MINIMAL_VALID_APP_SRC);
+            shim.getattr("load_app")
+                .and_then(|f| f.call1((app_spec.as_str(), "[]")))
+                .expect("load_app must still succeed once cauli is importable");
+
+            let after = shim
+                .getattr("SoftTimeLimitExceeded")
+                .expect("shim always exposes SoftTimeLimitExceeded");
+            assert!(
+                after.is(&real_cls),
+                "load_app did not rebind SoftTimeLimitExceeded to the real cauli class \
+                 once it became importable; a user's `except SoftTimeLimitExceeded:` \
+                 would silently never match"
+            );
+
+            // Best effort: do not leave the fake package poisoning sys.modules
+            // for every test that runs after this one in the same process.
+            let _ = sys_modules.del_item("cauli");
+        });
+    }
 }
