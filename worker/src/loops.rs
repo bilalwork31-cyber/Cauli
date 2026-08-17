@@ -287,14 +287,18 @@ async fn recover_page(
 /// nonzero reading means fetching is currently paused for every lane, not
 /// just cpu, which `Counters::note_cpu_backlog` also logs on the
 /// zero/nonzero edge so the pause is not only visible on a poll boundary.
+/// `oldest_ms` is the backlog's leading indicator (see `oldest_unacked_ms`).
 pub async fn stats_loop(ctx: Arc<Ctx>) {
     let mut tick = tokio::time::interval(Duration::from_secs(ctx.args.stats_interval.max(1)));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut conn = ctx.redis.clone();
     loop {
         tick.tick().await;
+        let oldest = oldest_unacked_ms(&ctx, &mut conn).await;
         info!(
-            "{} sync_live={} sync_abandoned={} pending_async={} async_rejected={} cpu_backlog={}",
+            "{} oldest_ms={} sync_live={} sync_abandoned={} pending_async={} async_rejected={} cpu_backlog={}",
             ctx.counters.stats_line(),
+            oldest,
             ctx.sync_pool.live_threads.load(Ordering::Relaxed),
             ctx.sync_pool.abandoned.load(Ordering::Relaxed),
             ctx.pyrt.pending_len(),
@@ -302,6 +306,52 @@ pub async fn stats_loop(ctx: Arc<Ctx>) {
             ctx.cpu_overflow()
         );
     }
+}
+
+/// Age in ms of the oldest entry still sitting in any of this worker's
+/// queues, or 0 when every stream is empty. Every completion path XDELs its
+/// entry (section 4.1), so what is left in a stream is exactly the unacked
+/// work, and redis stamps the entry's own arrival time into the first field
+/// of its stream id.
+///
+/// One `XRANGE q - + COUNT 1` per queue per stats tick. This is deliberately
+/// a broker probe rather than a sample taken as tasks run, because it keeps
+/// reporting while fetching is paused: a paused fetch loop starts no tasks,
+/// so per task sampling goes blind at exactly the moment the backlog is the
+/// only thing still moving.
+async fn oldest_unacked_ms(ctx: &Arc<Ctx>, conn: &mut redis::aio::ConnectionManager) -> u64 {
+    let now = now_ms();
+    let mut oldest = 0;
+    for q in &ctx.queues {
+        let reply: redis::RedisResult<redis::streams::StreamRangeReply> = redis::cmd("XRANGE")
+            .arg(broker::q_key(q))
+            .arg("-")
+            .arg("+")
+            .arg("COUNT")
+            .arg(1)
+            .query_async(conn)
+            .await;
+        match reply {
+            Ok(r) => {
+                if let Some(entry) = r.ids.first() {
+                    oldest = oldest.max(stream_id_age_ms(&entry.id, now));
+                }
+            }
+            Err(e) => warn!(queue = %q, "oldest_ms probe (XRANGE) failed: {e}"),
+        }
+    }
+    oldest
+}
+
+/// Age of a redis stream id, whose first dash separated field is the
+/// millisecond timestamp the entry was written with. 0 for an unparseable
+/// id, and 0 rather than a wrapped u64 for an id ahead of this worker's
+/// clock (skew between the redis host and this one).
+fn stream_id_age_ms(id: &str, now_ms: u64) -> u64 {
+    id.split('-')
+        .next()
+        .and_then(|ms| ms.parse::<u64>().ok())
+        .map_or(0, |ms| now_ms.saturating_sub(ms))
 }
 
 /// Seconds to milliseconds for the visibility timeout. Saturating, matching
@@ -321,5 +371,22 @@ mod tests {
     fn visibility_timeout_ms_saturates_instead_of_wrapping() {
         assert_eq!(visibility_timeout_ms(60), 60_000);
         assert_eq!(visibility_timeout_ms(u64::MAX), u64::MAX);
+    }
+
+    /// A stream id is `<ms>-<seq>`: only the millisecond field is an age, the
+    /// sequence must never leak into it, and nothing here may wrap.
+    #[test]
+    fn stream_id_age_reads_the_millisecond_field_only() {
+        assert_eq!(
+            stream_id_age_ms("1700000000000-0", 1_700_000_005_000),
+            5_000
+        );
+        assert_eq!(stream_id_age_ms("1700000000000-99", 1_700_000_000_250), 250);
+        assert_eq!(stream_id_age_ms("1700000000000-0", 1_700_000_000_000), 0);
+        // Entry id ahead of this worker's clock: saturating, never a wrap to
+        // a near u64::MAX age that would read as a catastrophic backlog.
+        assert_eq!(stream_id_age_ms("1700000009000-0", 1_700_000_000_000), 0);
+        assert_eq!(stream_id_age_ms("garbage-1", 1_700_000_000_000), 0);
+        assert_eq!(stream_id_age_ms("", 1_700_000_000_000), 0);
     }
 }
