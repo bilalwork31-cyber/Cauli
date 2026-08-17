@@ -328,6 +328,8 @@ class Cauli:
                 jitter=jitter,
                 store_result=store_result,
             )
+            if task_def.name in self._tasks:
+                raise ValueError(f"duplicate task name {task_def.name!r}")
             self._tasks[task_def.name] = task_def
             return task_def
 
