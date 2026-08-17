@@ -249,9 +249,11 @@ async fn recover_page(
 /// §7 stats line every --stats-interval seconds. `sync_live`/`sync_abandoned`
 /// (H2) make sync-pool thread loss observable instead of a silent capacity
 /// drip: sync_live is the pool's current thread count (initial + spawned
-/// replacements), sync_abandoned is the cumulative count of hard-timeout
-/// abandonments that triggered a replacement. `pending_async` (MEM-1) is the
-/// async runtime's pending-completion map size; a number that only grows
+/// replacements, capped at a fixed multiple of --io-threads), sync_abandoned
+/// is the cumulative count of hard timeout abandonments reported (each
+/// spawns a replacement thread unless the pool is already at that cap).
+/// `pending_async` (MEM-1) is the async runtime's pending completion map
+/// size; a number that only grows
 /// signals a wedged event-loop thread even though `cancel` stops the
 /// Rust-side bookkeeping from leaking on its own. `async_rejected` (MEM-5) is
 /// the field that actually moves during that same wedge: the shim's own per
