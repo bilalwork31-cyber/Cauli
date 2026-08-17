@@ -40,8 +40,14 @@ pub fn idemp_key(key: &str) -> String {
 pub const MOVER_LUA: &str = r#"
 local due = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, tonumber(ARGV[2]))
 for i, e in ipairs(due) do
-  redis.call('ZREM', KEYS[1], e)
+  -- XADD before ZREM, deliberately. A script is atomic against other
+  -- clients but does NOT roll back on its own error: every write it already
+  -- made stays committed. Publishing first means a failure here (say the
+  -- stream key now holds the wrong type) can only duplicate this entry,
+  -- never lose it. The reverse order would remove it from the set with no
+  -- guarantee it ever reached the stream. Do not swap these two lines.
   redis.call('XADD', KEYS[2], '*', 'e', e)
+  redis.call('ZREM', KEYS[1], e)
 end
 return #due
 "#;
@@ -387,5 +393,164 @@ mod tests {
                 "no hash-tag characters may survive"
             );
         }
+    }
+
+    /// A throwaway redis-server this test owns, on a port dedicated to
+    /// broker.rs's own tests: never :6392 (worker/tests/common), :6391
+    /// (py/itest), :6390 (redis_response_timeout.rs), and never :6379.
+    struct ThrowawayRedis {
+        port: u16,
+    }
+
+    impl ThrowawayRedis {
+        fn start(port: u16, cluster: bool) -> Self {
+            let _ = std::process::Command::new("redis-cli")
+                .args(["-p", &port.to_string(), "shutdown", "nosave"])
+                .output();
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            let mut args = vec![
+                "--port".to_string(),
+                port.to_string(),
+                "--save".to_string(),
+                String::new(),
+                "--appendonly".to_string(),
+                "no".to_string(),
+                "--daemonize".to_string(),
+                "yes".to_string(),
+            ];
+            if cluster {
+                let dir = std::env::temp_dir().join(format!("cauli-test-cluster-{port}"));
+                // A stale nodes.conf from an earlier run already claims
+                // every slot, and CLUSTER ADDSLOTSRANGE refuses to reclaim
+                // an already assigned slot: start genuinely blank every
+                // time, not just a fresh process.
+                let _ = std::fs::remove_dir_all(&dir);
+                std::fs::create_dir_all(&dir).expect("cluster test dir");
+                let conf = dir.join("nodes.conf");
+                args.push("--cluster-enabled".to_string());
+                args.push("yes".to_string());
+                args.push("--cluster-config-file".to_string());
+                args.push(conf.to_str().expect("utf8 tmp path").to_string());
+            }
+            let out = std::process::Command::new("redis-server")
+                .args(&args)
+                .output()
+                .expect("redis-server spawn");
+            assert!(out.status.success(), "redis-server failed: {out:?}");
+            for _ in 0..50 {
+                let ping = std::process::Command::new("redis-cli")
+                    .args(["-p", &port.to_string(), "ping"])
+                    .output();
+                if ping
+                    .map(|o| String::from_utf8_lossy(&o.stdout).contains("PONG"))
+                    .unwrap_or(false)
+                {
+                    if cluster {
+                        // Single node cluster: claim every slot so ordinary
+                        // commands work, then the crossslot check under test
+                        // comes purely from KEYS spanning two of them.
+                        let add = std::process::Command::new("redis-cli")
+                            .args([
+                                "-p",
+                                &port.to_string(),
+                                "cluster",
+                                "addslotsrange",
+                                "0",
+                                "16383",
+                            ])
+                            .output()
+                            .expect("cluster addslotsrange");
+                        assert!(
+                            add.status.success(),
+                            "cluster addslotsrange failed: {add:?}"
+                        );
+                        // cluster_state flips to "ok" on the next cluster
+                        // cron tick, not synchronously with this reply.
+                        let mut became_ok = false;
+                        for _ in 0..50 {
+                            let info = std::process::Command::new("redis-cli")
+                                .args(["-p", &port.to_string(), "cluster", "info"])
+                                .output()
+                                .expect("cluster info");
+                            if String::from_utf8_lossy(&info.stdout).contains("cluster_state:ok") {
+                                became_ok = true;
+                                break;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(100));
+                        }
+                        assert!(became_ok, "cluster never reached cluster_state:ok");
+                    }
+                    return Self { port };
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            panic!("redis on {port} did not answer PING");
+        }
+
+        fn url(&self) -> String {
+            format!("redis://127.0.0.1:{}/0", self.port)
+        }
+    }
+
+    impl Drop for ThrowawayRedis {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("redis-cli")
+                .args(["-p", &self.port.to_string(), "shutdown", "nosave"])
+                .output();
+        }
+    }
+
+    /// F1 reproduction. Forces the SECOND operation (XADD, now ordered
+    /// first) to error the way the live reproduction did: WRONGTYPE on the
+    /// target key. Asserts the actual property that matters: the entry
+    /// survives rather than vanishing. Under the old ZREM-then-XADD order
+    /// this test fails, the entry is gone from both the set and the stream.
+    #[tokio::test]
+    async fn mover_lua_creates_before_destroying_on_xadd_error() {
+        let redis = ThrowawayRedis::start(6409, false);
+        let client = redis::Client::open(redis.url()).expect("client");
+        let mut conn = ConnectionManager::new(client)
+            .await
+            .expect("connection manager");
+
+        let queue = "reorder";
+        let member = r#"{"id":"reorder-1","task":"t"}"#;
+        let due_at: u64 = 1_000;
+
+        let _: () = redis::cmd("ZADD")
+            .arg(delayed_key(queue))
+            .arg(due_at)
+            .arg(member)
+            .query_async(&mut conn)
+            .await
+            .expect("seed delayed entry");
+        // The stream key now holds the wrong type: XADD against it errors.
+        let _: () = redis::cmd("SET")
+            .arg(q_key(queue))
+            .arg("not-a-stream")
+            .query_async(&mut conn)
+            .await
+            .expect("corrupt stream key");
+
+        let script = redis::Script::new(MOVER_LUA);
+        let err = run_mover(&mut conn, &script, queue, due_at + 1)
+            .await
+            .expect_err("WRONGTYPE must surface, not be swallowed");
+        assert!(
+            err.to_string().to_uppercase().contains("WRONGTYPE"),
+            "unexpected error: {err}"
+        );
+
+        let score: Option<f64> = redis::cmd("ZSCORE")
+            .arg(delayed_key(queue))
+            .arg(member)
+            .query_async(&mut conn)
+            .await
+            .expect("zscore");
+        assert_eq!(
+            score,
+            Some(due_at as f64),
+            "entry must survive a mid script XADD failure, not vanish"
+        );
     }
 }

@@ -465,6 +465,29 @@ def test_claim_refuses_a_stale_or_missing_slot(beat_app, store, redis_client):
     assert s.claim_and_publish("tick", 500, 600, env, queue, None, {}) is True
 
 
+def test_claim_lua_creates_before_destroying_on_xadd_error(
+    beat_app, store, redis_client
+):
+    """F1 reproduction, live: force the XADD (now ordered first) to error the
+    way the real reproduction did, WRONGTYPE on the target stream key, and
+    assert the actual property under test. Before the fix, ZADD (the slot
+    advance) ran first, so this failure would have moved the slot to
+    slot + 60_000 with nothing ever published: the firing silently lost. The
+    slot must instead still read the ORIGINAL expected value, unconsumed,
+    and no run must have been counted.
+    """
+    slot = 1_700_000_000_000
+    redis_client.zadd(DUE_KEY, {"tick": slot})
+    env, queue, _ = beat_app.make_envelope("app.ping")
+    redis_client.set(f"cauli:q:{queue}", "not-a-stream")
+
+    with pytest.raises(redis_lib.exceptions.ResponseError, match="WRONGTYPE"):
+        store.claim_and_publish("tick", slot, slot + 60_000, env, queue, None, {})
+
+    assert redis_client.zscore(DUE_KEY, "tick") == slot
+    assert int(redis_client.hget(RUNS_KEY, "tick") or 0) == 0
+
+
 def test_two_beats_ticking_simultaneously_fire_each_slot_once(
     beat_app, store, redis_client
 ):

@@ -89,12 +89,19 @@ DUE_BATCH = 500
 # racing the same slot then sees a different score and returns 0.
 #
 # mode 'none' advances the slot without publishing (an entry whose firing was
-# suppressed by on_missed="skip", and the CROSSSLOT fallback path below).
+# suppressed by on_missed="skip").
+#
+# Publish before advancing the slot, deliberately. A script is atomic against
+# other clients but does NOT roll back on its own error: every write it
+# already made stays committed. Advancing first would let a failed publish
+# (say the target key now holds the wrong type) consume the slot with
+# nothing ever sent: a silently lost firing. Publishing first means a
+# failure here can only be retried and republished next tick, a duplicate,
+# never a loss. Do not move the slot ZADD back above the publish.
 _CLAIM_LUA = """
 local cur = redis.call('ZSCORE', KEYS[1], ARGV[1])
 if cur == false then return 0 end
 if tonumber(cur) ~= tonumber(ARGV[2]) then return 0 end
-redis.call('ZADD', KEYS[1], ARGV[3], ARGV[1])
 if ARGV[4] == 'stream' then
   redis.call('XADD', KEYS[4], '*', 'e', ARGV[5])
   redis.call('HINCRBY', KEYS[3], ARGV[1], 1)
@@ -102,6 +109,7 @@ elseif ARGV[4] == 'delayed' then
   redis.call('ZADD', KEYS[4], tonumber(ARGV[6]), ARGV[5])
   redis.call('HINCRBY', KEYS[3], ARGV[1], 1)
 end
+redis.call('ZADD', KEYS[1], ARGV[3], ARGV[1])
 redis.call('HSET', KEYS[2], ARGV[1], ARGV[7])
 return 1
 """
