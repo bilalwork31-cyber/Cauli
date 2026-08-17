@@ -615,7 +615,8 @@ cauli-worker --app myproj.tasks:app [--queues default,emails] [--redis-url URL]
   force the stdio child mode — both per §5.1.
 - `--stats-interval`: seconds between one line stats logs:
   `stats: fetched=N ok=N failed=N retried=N dlq=N expired=N inflight_io=N inflight_cpu=N
-  rss_mb=N sync_live=N sync_abandoned=N pending_async=N`. `expired` (§9.1) counts entries
+  rss_mb=N sync_live=N sync_abandoned=N pending_async=N async_rejected=N cpu_backlog=N`.
+  `expired` (§9.1) counts entries
   discarded unrun past their deadline; they are counted in `dlq` too, but broken out because a
   rising `expired` means the queue cannot keep up, which is a different alert from a rising
   `failed`. `sync_live` is the sync-io thread pool's
@@ -623,7 +624,15 @@ cauli-worker --app myproj.tasks:app [--queues default,emails] [--redis-url URL]
   cumulative count of hard-timeout abandonments that triggered a replacement. `pending_async`
   is the number of async tasks currently awaiting a completion callback from the embedded event
   loop(s); a value that only grows over time signals a wedged event-loop thread (one that never
-  yields back to asyncio, so its `asyncio.wait_for` timeout can never even fire).
+  yields back to asyncio, so its `asyncio.wait_for` timeout can never even fire). `async_rejected`
+  is the cumulative count of submissions the shim's own per loop queue has rejected past its cap,
+  the field that actually moves during that same wedge once `pending_async` alone would not show
+  it, since a wedged loop never runs the completion callback that clears that bookkeeping.
+  `cpu_backlog` is the live depth of dispatch tasks parked on a full cpu backlog channel (§4,
+  §5.1: bound to twice `cpu_workers` times `cpu_child_threads`); a nonzero reading means the
+  fetch loop has paused fetching for every lane, not just cpu, because it cannot know an entry's
+  lane before parsing it. The transition is logged too: a warning the moment `cpu_backlog` first
+  goes above zero, and a matching one with the total paused duration when it returns to zero.
 - Exit codes: 0 graceful, 1 fatal config/startup error, 130 forced.
 
 ### 7.1 Scheduler CLI (`cauli-beat`, Python entry point)

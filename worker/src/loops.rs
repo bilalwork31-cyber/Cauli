@@ -18,7 +18,15 @@ pub async fn fetch_loop(ctx: Arc<Ctx>, mut fetch_conn: redis::aio::ConnectionMan
     let keys: Vec<String> = ctx.queues.iter().map(|q| broker::q_key(q)).collect();
     let ids: Vec<&str> = ctx.queues.iter().map(|_| ">").collect();
     while !ctx.shutting_down() {
-        if ctx.io_sem.available_permits() == 0 || ctx.cpu_overflow() > 0 {
+        // A full cpu backlog pauses EVERY lane here, not just cpu, and that
+        // is correct, not a bug to "fix" by making this lane selective: an
+        // entry's lane lives inside its envelope, and the envelope is not
+        // parsed until after XREADGROUP returns it, so the gate cannot skip
+        // just the cpu entries without first fetching (and then having
+        // nowhere to safely put) io work it cannot dispatch either.
+        // `cpu_backlog()` keeps this pause loud instead of silent (stats
+        // line + a warn on the zero/nonzero edge); the coupling itself stays.
+        if ctx.io_sem.available_permits() == 0 || ctx.cpu_backlog() > 0 {
             tokio::time::sleep(Duration::from_millis(25)).await;
             continue;
         }
@@ -129,12 +137,13 @@ pub async fn recovery_loop(ctx: Arc<Ctx>) {
     }
 }
 
-/// Mirror of the fetch loop's admission gate: wait until at least one io slot
-/// is free and no cpu dispatch is parked on a full backlog, so reclaiming a
-/// large backlog cannot spawn an unbounded number of in-memory dispatch
-/// tasks. Returns false if shutdown began while waiting.
+/// Mirror of the fetch loop's admission gate (see its comment for why a full
+/// cpu backlog pauses every lane, not just cpu): wait until at least one io
+/// slot is free and no cpu dispatch is parked on a full backlog, so
+/// reclaiming a large backlog cannot spawn an unbounded number of in-memory
+/// dispatch tasks. Returns false if shutdown began while waiting.
 async fn admission_open(ctx: &Arc<Ctx>) -> bool {
-    while ctx.io_sem.available_permits() == 0 || ctx.cpu_overflow() > 0 {
+    while ctx.io_sem.available_permits() == 0 || ctx.cpu_backlog() > 0 {
         if ctx.shutting_down() {
             return false;
         }
@@ -258,19 +267,24 @@ async fn recover_page(
 /// Rust-side bookkeeping from leaking on its own. `async_rejected` (MEM-5) is
 /// the field that actually moves during that same wedge: the shim's own per
 /// loop queue rejects submissions past its cap instead of growing forever,
-/// and this is the running count of those rejections.
+/// and this is the running count of those rejections. `cpu_backlog` is the
+/// live depth behind the fetch loop's admission gate (see its comment): a
+/// nonzero reading means fetching is currently paused for every lane, not
+/// just cpu, which `Counters::note_cpu_backlog` also logs on the
+/// zero/nonzero edge so the pause is not only visible on a poll boundary.
 pub async fn stats_loop(ctx: Arc<Ctx>) {
     let mut tick = tokio::time::interval(Duration::from_secs(ctx.args.stats_interval.max(1)));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tick.tick().await;
         info!(
-            "{} sync_live={} sync_abandoned={} pending_async={} async_rejected={}",
+            "{} sync_live={} sync_abandoned={} pending_async={} async_rejected={} cpu_backlog={}",
             ctx.counters.stats_line(),
             ctx.sync_pool.live_threads.load(Ordering::Relaxed),
             ctx.sync_pool.abandoned.load(Ordering::Relaxed),
             ctx.pyrt.pending_len(),
-            ctx.pyrt.async_rejected()
+            ctx.pyrt.async_rejected(),
+            ctx.cpu_overflow()
         );
     }
 }

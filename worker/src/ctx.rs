@@ -72,6 +72,19 @@ impl Ctx {
             .map_or(0, |p| p.overflow.load(Ordering::SeqCst))
     }
 
+    /// Same value as `cpu_overflow()`, plus a side effect: logs the
+    /// zero/nonzero transition (`Counters::note_cpu_backlog`) so the fetch
+    /// loop and the recovery loop's admission gate, which both poll this on
+    /// every tick they are blocked, share one log line per edge instead of
+    /// each logging independently. Use this at admission gate checks; use
+    /// the plain `cpu_overflow()` where only the current depth is wanted
+    /// (the periodic stats line), so that read stays side effect free.
+    pub fn cpu_backlog(&self) -> usize {
+        let n = self.cpu_overflow();
+        self.counters.note_cpu_backlog(n, now_ms());
+        n
+    }
+
     /// Configured max age for `queue`, in ms: an exact match wins over the
     /// `"*"` fallback, and no entry at all means unbounded.
     pub fn queue_ttl_ms(&self, queue: &str) -> Option<u64> {
