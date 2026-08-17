@@ -831,9 +831,14 @@ async fn serve_child(
                                     break ChildGone::Recycled;
                                 }
                             }
+                            // rid alone, plus a length: never the response
+                            // line itself, which carries the task's own
+                            // result / error.message content (audit: the
+                            // last log site in the worker that still leaked
+                            // task data).
                             None => warn!(
-                                "cpu[{idx}] pid={pid}: response with unknown or missing id: {}",
-                                crate::envelope::safe_truncate(&l, 256)
+                                "cpu[{idx}] pid={pid}: response with unknown or missing id (rid={rid:?} len={})",
+                                l.len()
                             ),
                         }
                     }

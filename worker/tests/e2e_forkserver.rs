@@ -17,6 +17,7 @@ async fn e2e_fork_server() {
     kill_and_respawn_via_fork(&mut c).await;
     threaded_soft_timeout(&mut c).await;
     fallback_stdio_mode(&mut c).await;
+    cpu_unknown_id_log_does_not_leak_payload(&mut c).await;
 
     stop_redis();
 }
@@ -176,4 +177,44 @@ async fn fallback_stdio_mode(c: &mut redis::aio::MultiplexedConnection) {
     w.signal(libc::SIGTERM);
     assert_eq!(w.wait_code(20), 0);
     drop(w);
+}
+
+/// Audit regression: a cpu child response whose id matches no pending
+/// request used to log up to 256 bytes of the raw response line verbatim,
+/// including result/error content from the task: the one log site in the
+/// worker that still leaked task data. Only reachable with the fork server
+/// pool (`serve_child_conn`'s pending map, which is keyed by id); the stdio
+/// fallback path does no id matching at all, so it cannot exercise this
+/// branch.
+/// fx.cpu_ghost makes fake_exec.py send exactly one such unsolicited line
+/// before its real response, so the log line the worker writes for it can
+/// be checked.
+async fn cpu_unknown_id_log_does_not_leak_payload(c: &mut redis::aio::MultiplexedConnection) {
+    let log_path = fixtures_dir().join(format!("cpughost-{}.log", unique_id()));
+    let mut w = Worker::spawn_ex("cpughost", &["--cpu-workers", "1"], &[], Some(&log_path));
+    wait_group(c, "cpughost", 20).await;
+
+    let (id, e) = envelope("fx.cpu_ghost", "cpughost", |v| v["kind"] = json!("cpu"));
+    xadd(c, "cpughost", &e.to_string()).await;
+    let r = wait_result(c, &id, 15).await;
+    assert_eq!(
+        r["status"], "success",
+        "the real request must still complete"
+    );
+
+    w.signal(libc::SIGTERM);
+    assert_eq!(w.wait_code(20), 0);
+    drop(w);
+
+    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+    let line = log
+        .lines()
+        .rev()
+        .find(|l| l.contains("unknown or missing id"))
+        .unwrap_or_else(|| panic!("no 'unknown or missing id' log line found:\n{log}"));
+    assert!(
+        !line.contains("GHOST_SECRET_MARKER"),
+        "cpu unknown id log must not leak response payload content: {line}"
+    );
+    let _ = std::fs::remove_file(&log_path);
 }

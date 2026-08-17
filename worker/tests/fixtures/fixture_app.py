@@ -155,6 +155,10 @@ def cpu_die_once(counter_file):  # fake_exec: os._exit(9) once, then "revived"
     return "revived"
 
 
+def cpu_ghost():  # fake_exec: also sends one unsolicited line with no match
+    return {"echo": "ghost-real"}
+
+
 class App:
     def __init__(self):
         self.redis_url = "redis://127.0.0.1:6392/0"
@@ -187,3 +191,4 @@ app.add(TaskDef("fx.cpu_slow", cpu_slow, kind="cpu"))
 app.add(TaskDef("fx.cpu_slow_pid", cpu_slow_pid, kind="cpu"))
 app.add(TaskDef("fx.cpu_soft_slow", cpu_soft_slow, kind="cpu"))
 app.add(TaskDef("fx.cpu_die_once", cpu_die_once, kind="cpu"))
+app.add(TaskDef("fx.cpu_ghost", cpu_ghost, kind="cpu"))

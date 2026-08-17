@@ -58,6 +58,8 @@ def handle(task, args, kwargs):
         return "revived"
     if task == "fx.cpu_fail":
         raise ValueError("cpu boom")
+    if task == "fx.cpu_ghost":
+        return {"echo": "ghost-real"}
     raise KeyError("unknown fake task %r" % (task,))
 
 
@@ -165,8 +167,26 @@ def child_main(sock_path, threads):
         signal.signal(signal.SIGALRM, _on_alarm)
         for line in rfile:
             line = line.strip()
-            if line:
-                send(run_request(json.loads(line), threaded=False))
+            if not line:
+                continue
+            req = json.loads(line)
+            if req.get("task") == "fx.cpu_ghost":
+                # Audit regression fixture (worker/src/cpu.rs
+                # serve_child_conn's "response with unknown or missing id"):
+                # send one unsolicited line whose id never matches a pending
+                # request, carrying a marker string in place of real task
+                # output, before the real response. Lets an e2e test confirm
+                # the worker's log line for that branch does not include
+                # response payload content. Only reachable with the fork
+                # server pool: the stdio fallback path matches no id at all.
+                send(
+                    {
+                        "id": "ffffffffffffffffffffffffffffffff",
+                        "ok": True,
+                        "result": "GHOST_SECRET_MARKER",
+                    }
+                )
+            send(run_request(req, threaded=False))
         return 0
 
     requests = queue.Queue()
