@@ -241,6 +241,32 @@ async fn finish(ctx: &Arc<Ctx>, queue: &str, sid: &str, mut env: Envelope, outco
     }
 }
 
+/// Ceiling on how far out a retry may be scheduled, mirroring
+/// `MAX_TIMEOUT_MS` in envelope.rs: clamped rather than rejected, since an
+/// extreme value plausibly means "as long as possible". The delay is bounded
+/// rather than the resulting instant, deliberately: `fire_at = now + delay`
+/// passes any `fire_at < now + horizon` check when the local clock itself is
+/// wrong, because both sides carry the same broken clock.
+const MAX_RETRY_DELAY_MS: u64 = 30 * 86_400_000; // 30 days
+
+/// Delay before the next attempt: `cauli.Retry(countdown=...)` if the task
+/// named one (task controlled), otherwise the computed backoff (envelope
+/// controlled through `backoff_max_ms`). Neither input is bounded anywhere
+/// else, so the clamp belongs here, where both paths meet.
+fn retry_delay_ms(env: &Envelope, countdown_ms: Option<u64>) -> u64 {
+    countdown_ms
+        .unwrap_or_else(|| {
+            crate::backoff::compute_backoff_ms(
+                env.retries,
+                env.backoff_base_ms,
+                env.backoff_factor,
+                env.backoff_max_ms,
+                env.jitter,
+            )
+        })
+        .min(MAX_RETRY_DELAY_MS)
+}
+
 /// §4.2 steps 1-4. `countdown_ms` overrides the computed backoff (cauli.Retry).
 async fn schedule_retry(
     ctx: &Arc<Ctx>,
@@ -251,15 +277,7 @@ async fn schedule_retry(
     countdown_ms: Option<u64>,
 ) {
     env.retries += 1;
-    let d_ms = countdown_ms.unwrap_or_else(|| {
-        crate::backoff::compute_backoff_ms(
-            env.retries,
-            env.backoff_base_ms,
-            env.backoff_factor,
-            env.backoff_max_ms,
-            env.jitter,
-        )
-    });
+    let d_ms = retry_delay_ms(env, countdown_ms);
     // saturating_add: H3 — an attacker-chosen backoff_max_ms/countdown near
     // u64::MAX must not wrap fire_at to a tiny score (which would fire the
     // retry immediately, hot-looping until max_retries).
@@ -441,6 +459,26 @@ mod tests {
         assert!(!valid_task_id(&"g".repeat(32))); // right length, non-hex letter
                                                   // right length, one invalid char (hash-tag injection attempt)
         assert!(!valid_task_id(&format!("{{{}", "a".repeat(31))));
+    }
+
+    /// Both inputs are unbounded at their source: `backoff_max_ms` travels in
+    /// the envelope and `Retry(countdown=...)` comes from task code. Without
+    /// the clamp a retry lands past every result TTL, DLQ retention and alert
+    /// window that would let anyone notice it.
+    #[test]
+    fn retry_delay_is_clamped_at_thirty_days() {
+        let env = env_with(
+            r#"{"id":"a","task":"t","retries":1,"backoff_base_ms":18446744073709551615,
+                "backoff_max_ms":18446744073709551615,"jitter":false}"#,
+        );
+        assert_eq!(retry_delay_ms(&env, None), MAX_RETRY_DELAY_MS);
+        assert_eq!(retry_delay_ms(&env, Some(u64::MAX)), MAX_RETRY_DELAY_MS);
+        // Ordinary delays are untouched, including one just under the cap.
+        assert_eq!(retry_delay_ms(&env, Some(1_500)), 1_500);
+        assert_eq!(
+            retry_delay_ms(&env, Some(MAX_RETRY_DELAY_MS - 1)),
+            MAX_RETRY_DELAY_MS - 1
+        );
     }
 
     #[test]
