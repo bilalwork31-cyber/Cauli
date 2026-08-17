@@ -333,6 +333,36 @@ async fn idempotency_and_timeouts(c: &mut redis::aio::MultiplexedConnection) {
     let r = wait_result(c, &id, 10).await;
     assert_eq!(r["status"], "failure");
 
+    // Bug: a wrongly typed kwargs (here a list, not an object) used to
+    // parse fine, reach fn(*args, **kwargs) and raise a retryable
+    // TypeError, burning max_retries+1 executions before landing in the DLQ
+    // with reason "max_retries" and a misleading error. It must now be
+    // rejected at parse as malformed, never executed.
+    let (id, e) = envelope("fx.echo", "default", |v| {
+        v["kwargs"] = json!([1, 2]);
+    });
+    xadd(c, "default", &e.to_string()).await;
+    let (reason, _, _) = wait_dlq(c, "default", &id, 10).await;
+    assert_eq!(reason, "malformed");
+    let r = wait_result(c, &id, 10).await;
+    assert_eq!(r["status"], "failure");
+    assert_eq!(r["error"]["type"], "Malformed");
+
+    // Bug: timeout_ms 0 made the dispatcher's own timeout elapse before the
+    // pool thread could ever answer, so report_hard_timeout fired and the
+    // job was skipped as a zombie: nothing ever ran, and nothing ever
+    // would. Rejected before execution as malformed instead, with the id
+    // (perfectly valid here) still recoverable, same as the kwargs case above.
+    let (id, e) = envelope("fx.echo", "default", |v| {
+        v["timeout_ms"] = json!(0);
+    });
+    xadd(c, "default", &e.to_string()).await;
+    let (reason, _, _) = wait_dlq(c, "default", &id, 10).await;
+    assert_eq!(reason, "malformed");
+    let r = wait_result(c, &id, 10).await;
+    assert_eq!(r["status"], "failure");
+    assert_eq!(r["error"]["type"], "Malformed");
+
     // M2 regression: an envelope larger than --max-envelope-bytes (default 1
     // MiB) -> DLQ malformed before it is ever parsed, with only a truncated
     // preview stored (not the full oversize payload).

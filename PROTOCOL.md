@@ -88,10 +88,18 @@ Unknown fields must be preserved on re-enqueue (retries) if practical, otherwise
   supported version and rejects anything higher, since no forward compatibility is defined for
   a version this build predates -> DLQ reason `"malformed"` (§8) rather than guessing at an
   unknown shape.
+- `args`: JSON array or null (null behaves as `[]`). `kwargs`: JSON object or null (null behaves
+  as `{}`). Any other JSON type -> DLQ reason `"malformed"` before the task is ever executed,
+  since a wrongly shaped `kwargs` reaching `fn(*args, **kwargs)` would fail there instead, as a
+  retryable error, several executions later.
 - `kind`: `"io"` or `"cpu"`. Worker-side registry wins if it disagrees (registry is authoritative).
 - `retries`: attempts completed so far. 0 on first enqueue. The worker increments it when
   scheduling a retry.
-- `timeout_ms`: hard timeout. `soft_timeout_ms`: null or int < timeout_ms.
+- `timeout_ms`: hard timeout, must be greater than 0 (a zero timeout elapses before any attempt
+  can finish) -> DLQ reason `"malformed"` otherwise. A value above 24 hours is accepted but
+  clamped to 24 hours: the crash recovery loop's own reclaim math (§4.4) adds `timeout_ms` to an
+  idle threshold, and an unbounded value there would make a stuck entry practically
+  unreclaimable rather than merely slow to reclaim. `soft_timeout_ms`: null or int < timeout_ms.
 - `idempotency_key`: null or string (see §1 for how the worker keys it).
 - `not_before`: null normally; otherwise the absolute epoch-ms instant before which the task
   must not run. Set from either `countdown` (relative seconds → `now + countdown*1000`) or
@@ -114,7 +122,7 @@ attaches no behavior to them:
   is the field to group by when auditing "did every slot fire exactly once".
 
 Envelope contents are treated as unvalidated input by the worker (they may be crafted, not just
-client-produced). Two worker-side gates apply before an entry is ever executed:
+client-produced). Worker-side gates apply before an entry is ever executed:
 
 - `id` must match `[a-z0-9]{32}` (32 lowercase hex, matching what the client always produces);
   anything else -> DLQ reason `"malformed"`, no retry. Without this, a crafted id could collide
@@ -124,6 +132,11 @@ client-produced). Two worker-side gates apply before an entry is ever executed:
   bounds the `serde_json::Value` memory amplification and processing cost of a hostile or
   simply oversized payload. Recommendation: pass references (ids, URLs, keys) in args/kwargs,
   not large blobs.
+- `args`/`kwargs` shape and `timeout_ms` (see above) are checked once the envelope has otherwise
+  parsed successfully, the same way the `v` check above is: on a well formed id, so a DLQ entry
+  for either reason still gets a `cauli:result:{id}` failure result written, and a caller
+  blocked in `AsyncResult.get()` gets an answer instead of waiting on a key that would otherwise
+  never exist.
 
 ## 3. Client enqueue rules (Python package)
 
@@ -144,6 +157,15 @@ The bundled client uses msgspec (a required dependency, not an optional accelera
 additionally validates the object tree against the JSON type set before encoding, because
 msgspec on its own would encode `NaN`/`Infinity` as `null`, accept `set` and `bytes`, and
 coerce non-`str` dict keys — none of which this protocol defines.
+
+Integer fields (`v`, `retries`, `max_retries`, `backoff_base_ms`, `backoff_max_ms`, `timeout_ms`,
+`soft_timeout_ms`, `enqueued_at`, `expires_at`) accept either a JSON integer, or a JSON number
+written with a decimal point or an exponent as long as its value is an exact whole number, since
+a third party codec MAY represent a large integer that way (`1.7e12` for `enqueued_at`). A value
+with a fractional part (`1.5`), NaN, an infinity, or a magnitude outside the field's own integer
+range is rejected as malformed, never rounded or clamped to fit; `timeout_ms` above 24 hours is
+the one documented exception (see above), and it is clamped, not rejected, specifically because
+the value itself is otherwise valid.
 
 ## 4. Worker delivery loop
 

@@ -4,6 +4,7 @@ use crate::broker;
 use crate::ctx::{now_ms, Ctx, DecrGuard, Outcome};
 use crate::envelope::{self, Envelope, ErrorJson};
 use crate::exec;
+use serde_json::Value;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tracing::{debug, error, warn};
@@ -33,6 +34,20 @@ fn valid_task_id(id: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
+/// PROTOCOL §2: `args` must be a JSON array or null, `kwargs` must be a JSON
+/// object or null. A wrongly shaped `kwargs` (e.g. a list) used to reach
+/// `fn(*args, **kwargs)` and fail there with a retryable TypeError, burning
+/// max_retries+1 executions before landing in the DLQ under the wrong
+/// reason. Checked here, after a successful parse, rather than inside
+/// `Envelope`'s `Deserialize` (which would fail the whole parse): the id is
+/// perfectly fine in this case, so it stays recoverable and a caller
+/// blocked in `AsyncResult.get()` still gets a real answer instead of
+/// hanging, the same as the `v` version check just below.
+fn args_kwargs_shape_ok(env: &Envelope) -> bool {
+    matches!(env.args, Value::Null | Value::Array(_))
+        && matches!(env.kwargs, Value::Null | Value::Object(_))
+}
+
 async fn process(ctx: &Arc<Ctx>, queue: &str, sid: &str, raw: Option<String>) {
     let raw = match raw {
         Some(r) => r,
@@ -54,6 +69,14 @@ async fn process(ctx: &Arc<Ctx>, queue: &str, sid: &str, raw: Option<String>) {
                 v = e.v, supported = envelope::PROTOCOL_VERSION, id = %e.id,
                 "envelope protocol version unsupported -> DLQ"
             );
+            return dlq_terminal(ctx, queue, sid, &raw, "malformed", None).await;
+        }
+        Ok(e) if !args_kwargs_shape_ok(&e) => {
+            warn!(id = %e.id, "args/kwargs wrong shape (must be array/object or null) -> DLQ");
+            return dlq_terminal(ctx, queue, sid, &raw, "malformed", None).await;
+        }
+        Ok(e) if e.timeout_ms == 0 => {
+            warn!(id = %e.id, "timeout_ms 0 rejected -> DLQ");
             return dlq_terminal(ctx, queue, sid, &raw, "malformed", None).await;
         }
         Ok(e) if !e.id.is_empty() && !e.task.is_empty() && valid_task_id(&e.id) => e,
@@ -312,6 +335,47 @@ mod tests {
     fn valid_task_id_accepts_32_lowercase_hex() {
         assert!(valid_task_id("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
         assert!(valid_task_id("0123456789abcdef0123456789abcdef"));
+    }
+
+    fn env_with(json: &str) -> Envelope {
+        serde_json::from_str(json).unwrap()
+    }
+
+    /// The exact shape from the bug report: a JSON array for kwargs used to
+    /// parse fine and only blow up much later inside fn(*args, **kwargs)
+    /// with a retryable TypeError, burning max_retries+1 executions before
+    /// landing in the DLQ under the wrong reason.
+    #[test]
+    fn args_kwargs_shape_ok_accepts_array_object_or_null() {
+        assert!(args_kwargs_shape_ok(&env_with(r#"{"id":"a","task":"t"}"#)));
+        assert!(args_kwargs_shape_ok(&env_with(
+            r#"{"id":"a","task":"t","args":null,"kwargs":null}"#
+        )));
+        assert!(args_kwargs_shape_ok(&env_with(
+            r#"{"id":"a","task":"t","args":[],"kwargs":{}}"#
+        )));
+        assert!(args_kwargs_shape_ok(&env_with(
+            r#"{"id":"a","task":"t","args":[1,"x"],"kwargs":{"k":true}}"#
+        )));
+    }
+
+    #[test]
+    fn args_kwargs_shape_ok_rejects_wrong_types() {
+        assert!(!args_kwargs_shape_ok(&env_with(
+            r#"{"id":"a","task":"t","kwargs":[1,2]}"#
+        )));
+        assert!(!args_kwargs_shape_ok(&env_with(
+            r#"{"id":"a","task":"t","kwargs":"x"}"#
+        )));
+        assert!(!args_kwargs_shape_ok(&env_with(
+            r#"{"id":"a","task":"t","kwargs":5}"#
+        )));
+        assert!(!args_kwargs_shape_ok(&env_with(
+            r#"{"id":"a","task":"t","args":{"a":1}}"#
+        )));
+        assert!(!args_kwargs_shape_ok(&env_with(
+            r#"{"id":"a","task":"t","args":"x"}"#
+        )));
     }
 
     #[test]
