@@ -144,6 +144,36 @@ def test_repr_redacts_credentials():
     app2 = Cauli(redis_url="redis://dbhost:6379/0")
     assert "redis://dbhost:6379/0" in repr(app2)
 
+    # M4 follow up: userinfo is split at the LAST at sign, matching
+    # urllib.parse (what redis-py itself uses) -- splitting at the first one
+    # used to leave the rest of a password containing "@" in plaintext.
+    app3 = Cauli(redis_url="redis://user:p@ss@dbhost:6379/0")
+    r3 = repr(app3)
+    assert "p@ss" not in r3
+    assert "ss@dbhost" not in r3
+    assert "redis://***@dbhost:6379/0" in r3
+
+    # The query parameter credential form: no "@" anywhere, so the old
+    # masker returned it completely unchanged. redis-py accepts this form
+    # straight as connection kwargs, and it reaches beat and every log line
+    # too, so it is a live exposure, not a theoretical one.
+    app4 = Cauli(redis_url="redis://dbhost:6379/0?password=s3cr3t")
+    r4 = repr(app4)
+    assert "s3cr3t" not in r4
+    assert "redis://dbhost:6379/0?password=***" in r4
+
+    app5 = Cauli(redis_url="redis://dbhost:6379/0?username=svc&password=s3cr3t")
+    r5 = repr(app5)
+    assert "svc" not in r5
+    assert "s3cr3t" not in r5
+
+    # Both forms together, so the two fixes cannot interfere with each other.
+    app6 = Cauli(redis_url="redis://user:p@ss@dbhost:6379/0?password=alsosecret")
+    r6 = repr(app6)
+    assert "p@ss" not in r6
+    assert "alsosecret" not in r6
+    assert "redis://***@dbhost:6379/0?password=***" in r6
+
 
 def test_get_redis_is_thread_safe(redis_url):
     # L6 regression: concurrent first-use must not race to build two

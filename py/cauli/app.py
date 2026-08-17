@@ -126,20 +126,54 @@ def _dumps(obj: Any) -> "bytes | str":
 
 
 def _redact_redis_url(url: str) -> str:
-    """Mask ``user:password@`` userinfo before a redis URL reaches logs/repr.
+    """Mask ``user:password@`` userinfo, and ``password=``/``username=``
+    query parameters, before a redis URL reaches logs/repr.
 
-    ``redis://user:password@host/0`` is a common shape; without this the
-    password would appear in plaintext wherever ``repr(app)`` or a log line
-    includes ``redis_url`` (audit M4).
+    Both are shapes redis-py accepts as real credentials (audit M4); without
+    this either would appear in plaintext wherever ``repr(app)`` or a log
+    line includes ``redis_url``.
     """
     scheme_sep = url.find("://")
     if scheme_sep == -1:
         return url
-    after = url[scheme_sep + 3 :]
-    at = after.find("@")
-    if at == -1:
-        return url
-    return f"{url[:scheme_sep]}://***@{after[at + 1 :]}"
+    rest = url[scheme_sep + 3 :]
+    # Authority ends at the first "/", "?" or "#"; "@" means the
+    # userinfo/host boundary only within it, so an "@" inside a later
+    # password= value (masked separately below) can never be mistaken for a
+    # second one and corrupt the visible host.
+    authority_end = len(rest)
+    for ch in "/?#":
+        i = rest.find(ch)
+        if i != -1:
+            authority_end = min(authority_end, i)
+    authority, tail = rest[:authority_end], rest[authority_end:]
+    # Last "@", not first: urllib.parse (what redis-py itself uses) resolves
+    # a password containing a literal "@" the same way, so splitting at the
+    # first one would leave that password's own tail in plaintext right
+    # after the mask.
+    at = authority.rfind("@")
+    new_authority = f"***@{authority[at + 1 :]}" if at != -1 else authority
+    return f"{url[:scheme_sep]}://{new_authority}{_redact_query_credentials(tail)}"
+
+
+def _redact_query_credentials(tail: str) -> str:
+    """Mask ``password=``/``username=`` VALUES in a URL's query string (the
+    form redis-py accepts straight as connection kwargs, no userinfo
+    involved). Keys and every other query parameter stay visible.
+    """
+    q = tail.find("?")
+    if q == -1:
+        return tail
+    path, rest = tail[:q], tail[q + 1 :]
+    fragment = ""
+    h = rest.find("#")
+    if h != -1:
+        rest, fragment = rest[:h], rest[h:]
+    pairs = []
+    for pair in rest.split("&"):
+        name, sep, _value = pair.partition("=")
+        pairs.append(f"{name}=***" if sep and name in ("password", "username") else pair)
+    return f"{path}?{'&'.join(pairs)}{fragment}"
 
 
 class Cauli:

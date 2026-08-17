@@ -459,17 +459,57 @@ fn print_plan(args: &cli::Args, r: &cli::Resolved, cores: usize) {
     println!("  override any value with its flag; see --help and docs/CONFIGURATION.md");
 }
 
-/// Mask `user:password@` userinfo before a redis URL reaches logs or error
-/// messages (audit M4 — `redis://user:password@host/0` is a common shape and
-/// the password would otherwise land in plaintext logs).
+/// Mask `user:password@` userinfo, and `password=`/`username=` query
+/// parameters, before a redis URL reaches logs or error messages (audit M4
+/// — both are shapes redis-py accepts as real credentials, so either would
+/// otherwise land in plaintext logs).
 fn redact_redis_url(url: &str) -> String {
-    if let Some(scheme_end) = url.find("://") {
-        let after_scheme = &url[scheme_end + 3..];
-        if let Some(at) = after_scheme.find('@') {
-            return format!("{}://***@{}", &url[..scheme_end], &after_scheme[at + 1..]);
-        }
-    }
-    url.to_string()
+    let Some(scheme_end) = url.find("://") else {
+        return url.to_string();
+    };
+    let scheme = &url[..scheme_end];
+    let rest = &url[scheme_end + 3..];
+    // Authority ends at the first '/', '?' or '#'; '@' means the
+    // userinfo/host boundary only within it, so an '@' inside a later
+    // `?password=` value (masked separately below) can never be mistaken
+    // for a second one and corrupt the visible host.
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(authority_end);
+    // Last '@', not first: the `url` crate (and the client that uses it)
+    // resolves a password containing a literal '@' the same way, so
+    // splitting at the first one would leave that password's own tail in
+    // plaintext right after the mask.
+    let new_authority = match authority.rfind('@') {
+        Some(at) => format!("***@{}", &authority[at + 1..]),
+        None => authority.to_string(),
+    };
+    format!(
+        "{scheme}://{new_authority}{}",
+        redact_query_credentials(tail)
+    )
+}
+
+/// Mask `password=`/`username=` VALUES in a URL's query string (the form
+/// redis-py accepts straight as connection kwargs, no userinfo involved).
+/// Keys and every other query parameter stay visible.
+fn redact_query_credentials(tail: &str) -> String {
+    let Some(q) = tail.find('?') else {
+        return tail.to_string();
+    };
+    let (path, rest) = (&tail[..q], &tail[q + 1..]);
+    let (query, fragment) = match rest.find('#') {
+        Some(i) => rest.split_at(i),
+        None => (rest, ""),
+    };
+    let masked = query
+        .split('&')
+        .map(|pair| match pair.split_once('=') {
+            Some((k, _)) if k == "password" || k == "username" => format!("{k}=***"),
+            _ => pair.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    format!("{path}?{masked}{fragment}")
 }
 
 /// Seconds to milliseconds for the visibility timeout. Saturating, matching
@@ -503,6 +543,41 @@ mod tests {
         assert_eq!(
             redact_redis_url("redis://host.example:6379/0"),
             "redis://host.example:6379/0"
+        );
+    }
+
+    #[test]
+    fn redacts_password_containing_at_sign() {
+        // M4 follow up: userinfo is split at the LAST '@', matching how the
+        // `url` crate (and the redis client that uses it) actually parses
+        // it. Splitting at the first one used to leave the rest of a
+        // password containing '@' sitting in plaintext right after the mask.
+        assert_eq!(
+            redact_redis_url("redis://user:p@ss@dbhost:6379/0"),
+            "redis://***@dbhost:6379/0"
+        );
+    }
+
+    #[test]
+    fn redacts_query_string_credentials() {
+        // redis-py accepts `password=`/`username=` straight off the query
+        // string as connection kwargs, no userinfo involved, so this form
+        // carries a real credential even with no '@' anywhere in the URL.
+        assert_eq!(
+            redact_redis_url("redis://dbhost:6379/0?password=s3cr3t"),
+            "redis://dbhost:6379/0?password=***"
+        );
+        assert_eq!(
+            redact_redis_url("redis://dbhost:6379/0?username=svc&password=s3cr3t"),
+            "redis://dbhost:6379/0?username=***&password=***"
+        );
+    }
+
+    #[test]
+    fn redacts_userinfo_and_query_credentials_together() {
+        assert_eq!(
+            redact_redis_url("redis://user:p@ss@dbhost:6379/0?password=alsosecret"),
+            "redis://***@dbhost:6379/0?password=***"
         );
     }
 }
