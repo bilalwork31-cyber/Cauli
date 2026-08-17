@@ -731,26 +731,74 @@ cauli-worker --app myproj.tasks:app [--queues default,emails] [--redis-url URL]
 - `--max-envelope-bytes` (default 1 MiB): see §2.
 - `--cpu-child-threads` (default 1): per-child request concurrency, `--no-fork-server`:
   force the stdio child mode — both per §5.1.
-- `--stats-interval`: seconds between one line stats logs:
-  `stats: fetched=N ok=N failed=N retried=N dlq=N expired=N inflight_io=N inflight_cpu=N
-  rss_mb=N sync_live=N sync_abandoned=N pending_async=N async_rejected=N cpu_backlog=N`.
-  `expired` (§9.1) counts entries
-  discarded unrun past their deadline; they are counted in `dlq` too, but broken out because a
-  rising `expired` means the queue cannot keep up, which is a different alert from a rising
-  `failed`. `sync_live` is the sync-io thread pool's
-  current thread count (initial + any replacements spawned per §4.6); `sync_abandoned` is the
-  cumulative count of hard-timeout abandonments that triggered a replacement. `pending_async`
-  is the number of async tasks currently awaiting a completion callback from the embedded event
-  loop(s); a value that only grows over time signals a wedged event-loop thread (one that never
-  yields back to asyncio, so its `asyncio.wait_for` timeout can never even fire). `async_rejected`
-  is the cumulative count of submissions the shim's own per loop queue has rejected past its cap,
-  the field that actually moves during that same wedge once `pending_async` alone would not show
-  it, since a wedged loop never runs the completion callback that clears that bookkeeping.
-  `cpu_backlog` is the live depth of dispatch tasks parked on a full cpu backlog channel (§4,
-  §5.1: bound to twice `cpu_workers` times `cpu_child_threads`); a nonzero reading means the
-  fetch loop has paused fetching for every lane, not just cpu, because it cannot know an entry's
-  lane before parsing it. The transition is logged too: a warning the moment `cpu_backlog` first
-  goes above zero, and a matching one with the total paused duration when it returns to zero.
+- `--cpu-max-tasks-per-child` (default 1000): recycle a cpu child once it has completed this
+  many tasks. Children DO recycle by default; `0` opts out and lets a child live for the
+  worker's whole lifetime. Nothing else in the worker bounds cpu child memory, and under the
+  fork server a recycle is a fork of the already preloaded parent with no re import (§5.1).
+  Staged prefetch work always drains before the recycle fires, so no task is lost to it.
+- `--stats-interval`: seconds between one line stats logs. **The stats line is a stable parsing
+  contract**, not merely a human readable log line:
+
+  - after the `stats: ` prefix it is space separated `key=value` pairs, logfmt style;
+  - every value is a decimal integer: never a float, never quoted, never empty. `inflight_io`
+    and `inflight_cpu` are signed and printed raw, so a parser must accept a leading `-` on
+    those two: a negative reading is an accounting bug left deliberately visible rather
+    than clamped away;
+  - counters (`fetched`, `ok`, `failed`, `retried`, `dlq`, `expired`, `cpu_lost`,
+    `sync_abandoned`, `async_rejected`) are cumulative over the worker's lifetime;
+  - gauges (`inflight_io`, `inflight_cpu`, `rss_mb`, `cpu_rss_mb`, `oldest_ms`, `sync_live`,
+    `cpu_backlog`) are instantaneous at the tick;
+  - the latency keys (`sync_p50` through `cpu_p99`) are scoped to the interval that just ended
+    and reset at every tick, so they are the only keys that can legitimately fall;
+  - the key set is frozen for the life of a major version. A minor release may ADD a key;
+    renaming or removing one is a major version change.
+
+  Vector, promtail and awk therefore consume it with no further work.
+
+  ```
+  stats: fetched=N ok=N failed=N retried=N dlq=N expired=N cpu_lost=N inflight_io=N
+         inflight_cpu=N rss_mb=N sync_p50=N sync_p99=N async_p50=N async_p99=N cpu_p50=N
+         cpu_p99=N oldest_ms=N cpu_rss_mb=N sync_live=N sync_abandoned=N async_rejected=N
+         cpu_backlog=N
+  ```
+
+  That is one physical line, wrapped here only to fit. The extra line logged once at shutdown
+  carries the first sixteen keys only, up to and including `cpu_p99`; the remaining six are
+  produced by the periodic loop and are absent there.
+
+  - `expired` (§9.1) counts entries discarded unrun past their deadline. They are counted in
+    `dlq` too, but broken out because a rising `expired` means the queue cannot keep up, which
+    is a different alert from a rising `failed`.
+  - `cpu_lost` counts cpu children that died mid task. Broken out of `failed` for the same
+    reason: a child taken by the OOM killer or a segfault is a pool health problem, not a task
+    problem, and folded into a generic WorkerLost it left repeated child death as a scrolling
+    warning with no number to alert on.
+  - `oldest_ms` is the age of the oldest entry still sitting in any of this worker's queues,
+    from `XRANGE q - + COUNT 1` and the millisecond field of the returned stream id. Every
+    completion path XDELs its entry (§4.1), so what is left in a stream is exactly the unacked
+    work. This is the backlog's leading indicator, and it is a broker probe rather than a per
+    task sample precisely because it keeps reporting while fetching is paused, which is the
+    moment per task sampling goes blind.
+  - `sync_p50` / `sync_p99` / `async_p50` / `async_p99` / `cpu_p50` / `cpu_p99` are per lane
+    task latencies in milliseconds over the interval just ended, from a 24 bucket log2
+    histogram per lane, linearly interpolated inside the bucket carrying the target rank.
+    Resolution is 2x worst case by design: enough to see a knee, not a precision instrument.
+  - `rss_mb` is this worker process alone; `cpu_rss_mb` is summed over the cpu pool's live
+    children, which `rss_mb` never included.
+  - `sync_live` is the sync io thread pool's current thread count (initial plus any
+    replacements spawned per §4.6); `sync_abandoned` is the cumulative count of hard timeout
+    abandonments that triggered a replacement.
+  - `async_rejected` is the cumulative count of submissions the shim's own per loop queue has
+    rejected past its cap. It is the number that moves when an embedded event loop wedges (one
+    that never yields back to asyncio, so its `asyncio.wait_for` timeout can never even fire).
+    It replaces the removed `pending_async`, the pending completion map size, which stayed
+    flat through exactly that failure.
+  - `cpu_backlog` is the live depth of dispatch tasks parked on a full cpu backlog channel
+    (§4, §5.1: bound to twice `cpu_workers` times `cpu_child_threads`). A nonzero reading means
+    the fetch loop has paused fetching for every lane, not just cpu, because it cannot know an
+    entry's lane before parsing it. The transition is logged too: a warning the moment
+    `cpu_backlog` first goes above zero, and a matching one with the total paused duration when
+    it returns to zero.
 - Exit codes: 0 graceful, 1 fatal config/startup error, 130 forced.
 
 ### 7.1 Scheduler CLI (`cauli-beat`, Python entry point)
