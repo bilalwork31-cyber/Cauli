@@ -3154,3 +3154,67 @@ A CHANGELOG for 1.0.0 is being written, which the readiness review correctly ide
 deliverable rather than a nicety, since several behaviour changes tonight mean code that ran yesterday
 can raise today.
 
+
+## 2026-08-17 — Cycle 32 — the implementation phase, consolidated
+
+The audit shifted from finding to building. Nine decision documents in `docs/decisions/` carry the
+reasoning; this is what actually landed against them. 60 commits, `main` untouched at 6256854.
+
+### Implemented from the decision documents
+
+| decision | commits | state |
+|----------|---------|-------|
+| Delivery guarantee | ab3eab9, ee9af3b, a58b98c, 27c4c98 | DONE. Claim TTL derived from execution, claimant id in duplicate results, retry delay clamped at 30 days, PROTOCOL section 4 preamble. 113 Rust tests. |
+| Packaging | inside 8ce73f3 | DONE. cp314 everywhere, the libpython loader wrapper, an unmaskable CI leg, version 1.0.0 in all four gated locations. |
+| Contrib rename | 87bec56, 28d0b55 | DONE. `cauli.contrib.sqlalchemy` with `sqlalchemy_app()`, matching the sibling `django_app()`, and the old path kept as an alias with a test that fails if anyone duplicates the implementation into it. |
+| Documentation corrections | cc78f9a, 91189a5, 6f4d0bf | DONE. Cluster unqualified, beat failover caveat, persistence requirements, deploy order, `.delay()` blocking the event loop, always pass a timeout to `get()`. PROTOCOL brought into agreement. |
+| The two missing money path tests | 38ae861, 742ca3b | DONE. Blocker B2 closed. |
+| CHANGELOG for 1.0.0 | 2eb73b5 | DONE. 21 breaking changes, 13 of which I had not identified. |
+| Observability, error taxonomy, clock architecture, cluster refusal, process model | not implemented | Decisions written and committed. Recommendations stand, awaiting approval. |
+
+### The claim TTL fix deserves its own line
+
+With `idemp_ttl` 60s against a 300s task, the guard key expired 240 seconds BEFORE the task could
+finish, so the next redelivery claimed Fresh and ran concurrently. That is precisely the duplicate
+execution the idempotency key exists to prevent, and it was reachable from a configuration the
+startup warning already flagged as suspect. It now claims 302s and every retry or redelivery pushes
+it back, so a four attempt chain holds the key continuously.
+
+### The packaging work found a blocker nobody had looked for
+
+The whole packaging surface was never audited. It turned out to hold two things that would have
+embarrassed the launch: no cp314 wheels, meaning the CURRENT DEFAULT PYTHON could not install the
+worker at all; and a libpython loader failure that CI structurally could not see, because
+setup-python sets `LD_LIBRARY_PATH` itself and therefore masked it on every green run. Reproduced on
+a uv managed 3.13 under `env -i`: the raw binary exits 127 with
+`error while loading shared libraries`, and through the new wrapper it exits 0.
+
+It also caught a latent break that would have failed the release job outright:
+`pip install --no-index --find-links dist cauli cauli-worker` cannot resolve cauli's own `redis` and
+`msgspec` dependencies.
+
+### Two things I got wrong tonight, both caught by review rather than by me
+
+The readiness review found that my "combined state verified" line in this log's header covered
+commit 19 of what is now 60, and that I reported the two cycle 29 tests as "being written now" when
+they did not exist. Both were fair. The tests have since landed; the verification has not.
+
+Separately, commit 8ce73f3 was meant to be documentation only and swept in another agent's eight
+staged files, because I skipped the `git diff --cached --name-only` check that had caught all five
+earlier collisions on this shared checkout. Nothing was lost, but the packaging work is committed
+under a documentation message.
+
+### One regression introduced tonight, flagged not fixed
+
+The shipped binary's log target is now `cauli_worker_bin`, because the raw binary was renamed so a
+plain `cargo build` keeps producing `cauli-worker` for itest, bench and the docs. `RUST_LOG=debug` is
+unaffected, but `RUST_LOG=cauli_worker=debug` matches nothing in a wheel build. Alias it or document
+it before the tag.
+
+### Still not done, and it is the first thing to do
+
+**The full suite has never run against the final tree.** Two agents were mid edit when the machine
+was shutting down, so the tree was not in a verifiable state and running it would have measured a
+mixture. `RESUME.md` carries the exact commands, the WSL paths, the two archive branches that must
+be diffed before deletion, and which decision document to restart each unfinished agent from.
+
