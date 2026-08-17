@@ -267,6 +267,23 @@ fn real_main() -> i32 {
             );
         }
     }
+    // Same diagnostic, mirrored for idemp_ttl (section 4.5): it is one
+    // global value while a task's own timeout_ms is not, and nothing else
+    // cross checks them. If a task legitimately runs longer than idemp_ttl,
+    // its idempotency key expires while the task is still running, and a
+    // second attempt with the same key then claims Fresh: the exact
+    // duplicate concurrent execution the key exists to prevent.
+    let idemp_ttl_ms = idemp_ttl_ms(appcfg.idemp_ttl);
+    for (name, spec) in &appcfg.tasks {
+        if spec.timeout_ms >= idemp_ttl_ms {
+            warn!(
+                task = %name, timeout_ms = spec.timeout_ms, idemp_ttl_s = appcfg.idemp_ttl,
+                "task timeout_ms >= idemp_ttl*1000: an idempotency key can expire while \
+                 this task is still running, so a second attempt with the same key would \
+                 claim Fresh and run concurrently with the first. Consider raising idemp_ttl."
+            );
+        }
+    }
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
