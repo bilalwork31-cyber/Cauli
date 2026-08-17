@@ -136,6 +136,17 @@ dies, everything staged behind it fails as retryable `WorkerLost`, and a staged
 task waits out the tasks ahead of it. Raise it for small tasks, lower it for
 long ones.
 
+**`rss_mb` in the worker's stats line is the worker process only; it does not
+include cpu children.** Each forked child is a separate process with its own
+memory, never summed into that number. `--cpu-max-tasks-per-child` (default 0,
+never) is the ONLY mechanism that bounds a child's memory: cauli sets no
+rlimit and no cgroup on it. A task with a real leak, or one that just holds a
+large result a moment too long, grows that child until the OS OOM killer takes
+it, and that death surfaces as a generic `WorkerLost` like any other. Measured:
+a child held 331.8 MB of its own while the worker's stats line read `rss_mb=35`
+throughout. If cpu tasks are memory hungry, set a recycle threshold; do not
+rely on the stats line to notice for you.
+
 **The cpu pool starts on the first cpu task, not at boot.** An io only
 deployment that registers cpu tasks it never calls pays nothing for them. The
 first cpu task after a start waits out the pool spawn (an app import, typically
