@@ -71,7 +71,8 @@ async fn threaded_child_pipelining(c: &mut redis::aio::MultiplexedConnection) {
 /// requests a replacement fork and the retry succeeds on the fresh child.
 /// Also exercises hard-timeout SIGKILL + replacement-fork on the same pool.
 async fn kill_and_respawn_via_fork(c: &mut redis::aio::MultiplexedConnection) {
-    let mut w = Worker::spawn("fsq2", &["--cpu-workers", "1"]);
+    let log_path = std::env::temp_dir().join(format!("cauli-fs-lost-{}.log", unique_id()));
+    let mut w = Worker::spawn_ex("fsq2", &["--cpu-workers", "1"], &[], Some(&log_path));
     wait_group(c, "fsq2", 20).await;
 
     // child death mid-task -> WorkerLost -> retry on a replacement fork
@@ -90,6 +91,17 @@ async fn kill_and_respawn_via_fork(c: &mut redis::aio::MultiplexedConnection) {
     );
     assert_eq!(r["result"], "revived");
     let _ = std::fs::remove_file(&cf);
+
+    // The death has to be countable, not only loggable: folded into `failed`
+    // as a generic WorkerLost, an OOM killed or segfaulting child is just a
+    // scrolling warning with no number to alert on.
+    assert!(
+        wait_stats_field_nonzero(&log_path, "cpu_lost=", 12)
+            .await
+            .is_some(),
+        "no stats line reported cpu_lost > 0 after a child died mid task; log:\n{}",
+        std::fs::read_to_string(&log_path).unwrap_or_default()
+    );
 
     // hard timeout -> SIGKILL + replacement fork; pool keeps serving
     let (id, e) = envelope("fx.cpu_slow", "fsq2", |v| {
@@ -113,6 +125,7 @@ async fn kill_and_respawn_via_fork(c: &mut redis::aio::MultiplexedConnection) {
     w.signal(libc::SIGTERM);
     assert_eq!(w.wait_code(20), 0);
     drop(w);
+    let _ = std::fs::remove_file(&log_path);
 }
 
 /// Soft timeout in a threaded (M=4) child: injected via async-exc, reported

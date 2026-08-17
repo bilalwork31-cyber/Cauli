@@ -85,6 +85,16 @@ impl Ctx {
         n
     }
 
+    /// Summed RSS of the cpu pool's live children in MB; 0 while the pool
+    /// has not started. The pid list is cloned out from under the lock
+    /// before any /proc read, so a stats tick never holds it across io.
+    pub fn cpu_rss_mb(&self) -> u64 {
+        self.cpu.get().map_or(0, |pool| {
+            let pids = pool.child_pids.lock().unwrap().clone();
+            crate::stats::cpu_rss_mb(&pids)
+        })
+    }
+
     /// Configured max age for `queue`, in ms: an exact match wins over the
     /// `"*"` fallback, and no entry at all means unbounded.
     pub fn queue_ttl_ms(&self, queue: &str) -> Option<u64> {

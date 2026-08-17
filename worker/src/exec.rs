@@ -215,7 +215,10 @@ pub async fn run_cpu_task(ctx: &Arc<Ctx>, env: &Envelope) -> Outcome {
                 env.timeout_ms
             ),
         ),
-        Ok(crate::cpu::CpuOutcome::Lost) => fail("WorkerLost", "cpu child died during task".into()),
+        Ok(crate::cpu::CpuOutcome::Lost) => {
+            ctx.counters.cpu_lost.fetch_add(1, Ordering::Relaxed);
+            fail("WorkerLost", "cpu child died during task".into())
+        }
         Err(_) => fail("WorkerLost", "cpu child dropped the task".into()),
     };
     ctx.counters.lat_cpu.record(started.elapsed());

@@ -13,6 +13,12 @@ pub struct Counters {
     /// thrown away because the queue cannot keep up" is a different operational
     /// signal from "work is failing".
     pub expired: AtomicU64,
+    /// Cpu children that died mid task (`CpuOutcome::Lost`). Broken out of
+    /// `failed` because a child killed by the OOM killer or a segfault is a
+    /// pool health problem, not a task problem, and folding it into a generic
+    /// WorkerLost left repeated child death as a scrolling warning with no
+    /// number an operator could alert on.
+    pub cpu_lost: AtomicU64,
     pub inflight_io: AtomicI64,
     pub inflight_cpu: AtomicI64,
     /// Every dispatched entry from spawn to final broker write; drain waits on this.
@@ -39,13 +45,14 @@ impl Counters {
         let (async_p50, async_p99) = self.lat_async.take_p50_p99();
         let (cpu_p50, cpu_p99) = self.lat_cpu.take_p50_p99();
         format!(
-            "stats: fetched={} ok={} failed={} retried={} dlq={} expired={} inflight_io={} inflight_cpu={} rss_mb={} sync_p50={} sync_p99={} async_p50={} async_p99={} cpu_p50={} cpu_p99={}",
+            "stats: fetched={} ok={} failed={} retried={} dlq={} expired={} cpu_lost={} inflight_io={} inflight_cpu={} rss_mb={} sync_p50={} sync_p99={} async_p50={} async_p99={} cpu_p50={} cpu_p99={}",
             self.fetched.load(Ordering::Relaxed),
             self.ok.load(Ordering::Relaxed),
             self.failed.load(Ordering::Relaxed),
             self.retried.load(Ordering::Relaxed),
             self.dlq.load(Ordering::Relaxed),
             self.expired.load(Ordering::Relaxed),
+            self.cpu_lost.load(Ordering::Relaxed),
             // Printed raw (no .max(0) clamp): a negative value here would be
             // an accounting bug, and clamping it would hide the signal.
             self.inflight_io.load(Ordering::Relaxed),
@@ -171,9 +178,24 @@ fn percentile(counts: &[u64; LAT_BUCKETS], pct: u64) -> u64 {
     lat_bucket_edges(LAT_BUCKETS - 1).1
 }
 
-/// RSS in MB from /proc/self/status VmRSS (kB). 0 if unreadable.
+/// RSS in MB from this process's own /proc status.
 pub fn rss_mb() -> u64 {
-    let Ok(s) = std::fs::read_to_string("/proc/self/status") else {
+    rss_mb_at("/proc/self/status")
+}
+
+/// Summed RSS in MB over the cpu pool's live children, read at the stats
+/// tick only so it costs the hot path nothing. A pid that has already exited
+/// contributes 0 rather than failing the whole reading, since the pool
+/// recycles and respawns children underneath this.
+pub fn cpu_rss_mb(pids: &[u32]) -> u64 {
+    pids.iter()
+        .map(|pid| rss_mb_at(&format!("/proc/{pid}/status")))
+        .sum()
+}
+
+/// RSS in MB from any /proc PID status file's VmRSS (kB). 0 if unreadable.
+fn rss_mb_at(status_path: &str) -> u64 {
+    let Ok(s) = std::fs::read_to_string(status_path) else {
         return 0;
     };
     for line in s.lines() {
@@ -304,6 +326,61 @@ mod tests {
         assert!(counters
             .stats_line()
             .contains("sync_p50=0 sync_p99=0 async_p50=0 async_p99=0 cpu_p50=0 cpu_p99=0"));
+    }
+
+    /// VmRSS is reported in kB and must be read from an arbitrary /proc
+    /// status file, not just this process's, so the cpu children can be
+    /// summed the same way. Anything unreadable reads as 0 rather than
+    /// poisoning the sum.
+    #[test]
+    fn rss_mb_at_parses_vmrss_kb_and_tolerates_junk() {
+        let dir = std::env::temp_dir().join(format!("cauli-rss-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let good = dir.join("good");
+        std::fs::write(
+            &good,
+            "Name:	python3
+VmRSS:	  204800 kB
+Threads:	4
+",
+        )
+        .unwrap();
+        assert_eq!(rss_mb_at(good.to_str().unwrap()), 200);
+        let no_field = dir.join("nofield");
+        std::fs::write(
+            &no_field,
+            "Name:	python3
+Threads:	4
+",
+        )
+        .unwrap();
+        assert_eq!(rss_mb_at(no_field.to_str().unwrap()), 0);
+        assert_eq!(rss_mb_at(dir.join("missing").to_str().unwrap()), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The cpu pool figure is a sum over live children: no pids is 0, an
+    /// exited pid contributes 0, and naming the same live process twice
+    /// doubles, which is what proves this is a sum and not a max.
+    #[test]
+    fn cpu_rss_mb_sums_live_pids_and_skips_dead_ones() {
+        assert_eq!(cpu_rss_mb(&[]), 0);
+        assert_eq!(cpu_rss_mb(&[u32::MAX]), 0);
+        let me = std::process::id();
+        let mine = rss_mb();
+        assert!(mine > 0, "this test process should have a readable VmRSS");
+        // 1 MB of slack: RSS can genuinely move between the two reads.
+        assert!(cpu_rss_mb(&[me]).abs_diff(mine) <= 1);
+        assert!(cpu_rss_mb(&[me, me]).abs_diff(2 * mine) <= 2);
+    }
+
+    /// A dead cpu child must be countable, not just loggable.
+    #[test]
+    fn stats_line_carries_cpu_lost() {
+        let counters = Counters::default();
+        assert!(counters.stats_line().contains(" cpu_lost=0 "));
+        counters.cpu_lost.fetch_add(3, Ordering::Relaxed);
+        assert!(counters.stats_line().contains(" cpu_lost=3 "));
     }
 
     /// The flag must flip exactly once on entry and once on exit, not on

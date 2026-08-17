@@ -288,6 +288,8 @@ async fn recover_page(
 /// just cpu, which `Counters::note_cpu_backlog` also logs on the
 /// zero/nonzero edge so the pause is not only visible on a poll boundary.
 /// `oldest_ms` is the backlog's leading indicator (see `oldest_unacked_ms`).
+/// `cpu_rss_mb` is the summed resident memory of the cpu pool's children,
+/// which `rss_mb` (this process alone) never included.
 pub async fn stats_loop(ctx: Arc<Ctx>) {
     let mut tick = tokio::time::interval(Duration::from_secs(ctx.args.stats_interval.max(1)));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -296,9 +298,10 @@ pub async fn stats_loop(ctx: Arc<Ctx>) {
         tick.tick().await;
         let oldest = oldest_unacked_ms(&ctx, &mut conn).await;
         info!(
-            "{} oldest_ms={} sync_live={} sync_abandoned={} pending_async={} async_rejected={} cpu_backlog={}",
+            "{} oldest_ms={} cpu_rss_mb={} sync_live={} sync_abandoned={} pending_async={} async_rejected={} cpu_backlog={}",
             ctx.counters.stats_line(),
             oldest,
+            ctx.cpu_rss_mb(),
             ctx.sync_pool.live_threads.load(Ordering::Relaxed),
             ctx.sync_pool.abandoned.load(Ordering::Relaxed),
             ctx.pyrt.pending_len(),
