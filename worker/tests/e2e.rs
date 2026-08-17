@@ -134,14 +134,18 @@ async fn e2e_main_flows() {
     assert_eq!(r["status"], "success");
     assert_eq!(r["result"], "after-retry");
 
-    // 8. non-serializable return: final failure, NO retry despite max_retries
+    // 8. non-serializable return: final failure, NO retry despite max_retries.
+    // Audit regression: this used to dead letter with reason "max_retries"
+    // even though retries never left 0, since a `retryable: false` failure
+    // was never eligible for a retry budget in the first place, so the
+    // reason must say so instead of claiming one was exhausted.
     let (id, e) = envelope("fx.bad_return", "default", |v| v["max_retries"] = json!(3));
     xadd(&mut c, "default", &e.to_string()).await;
     let r = wait_result(&mut c, &id, 10).await;
     assert_eq!(r["status"], "failure");
     assert_eq!(r["error"]["type"], "SerializationError");
     let (reason, _, efield) = wait_dlq(&mut c, "default", &id, 5).await;
-    assert_eq!(reason, "max_retries");
+    assert_eq!(reason, "not_retryable");
     let dlq_env: serde_json::Value = serde_json::from_str(&efield).unwrap();
     assert_eq!(
         dlq_env["retries"], 0,
@@ -150,6 +154,7 @@ async fn e2e_main_flows() {
 
     idempotency_and_timeouts(&mut c).await;
     result_write_failure_is_not_counted_ok(&mut c).await;
+    write_failure_is_not_counted_for_duplicate_final_and_terminal(&mut c).await;
 
     // graceful SIGTERM with nothing in flight -> exit 0
     w.signal(libc::SIGTERM);
@@ -440,6 +445,102 @@ async fn result_write_failure_is_not_counted_ok(c: &mut redis::aio::MultiplexedC
     assert!(
         stats.contains("fetched=1 ok=0 failed=1"),
         "a failed result write must not be counted as ok: {stats}"
+    );
+    let _ = std::fs::remove_file(&log_path);
+}
+
+/// Audit regression (item D): the duplicate, final failure and terminal DLQ
+/// completion branches used to fetch_add `ok` / `failed` / `dlq`
+/// unconditionally, even when the write recording that outcome failed. This
+/// is the same truthfulness bug `result_write_failure_is_not_counted_ok`
+/// above covers for the plain success branch. Same mechanism
+/// (FIXTURE_RESULT_TTL=0 -> every `SET ... EX 0` is rejected), three more
+/// branches, one worker: a duplicate resolution, a final failure that was
+/// never retryable (SerializationError), and a terminal DLQ for a task that
+/// was never registered.
+async fn write_failure_is_not_counted_for_duplicate_final_and_terminal(
+    c: &mut redis::aio::MultiplexedConnection,
+) {
+    let log_path = fixtures_dir().join(format!("badttl2-{}.log", unique_id()));
+    let mut bad = Worker::spawn_ex(
+        "badttl2",
+        &[],
+        &[("FIXTURE_RESULT_TTL", "0")],
+        Some(&log_path),
+    );
+    wait_group(c, "badttl2", 20).await;
+
+    // The result SET is rejected on every write in this worker, so no
+    // result key ever appears; the stream entry still gets acked/deleted
+    // either way (finish() XACKs+XDELs regardless of the write outcome), so
+    // a drained queue signals that dispatch has finished, same as
+    // `result_write_failure_is_not_counted_ok` above.
+    async fn wait_drained(c: &mut redis::aio::MultiplexedConnection, queue: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let len: u64 = redis::cmd("XLEN")
+                .arg(format!("cauli:q:{queue}"))
+                .query_async(c)
+                .await
+                .unwrap();
+            if len == 0 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "badttl2 entry was never dispatched"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    // A: duplicate resolution. Same idempotency_key twice: the first claims
+    // it (and, like the plain success case above, fails to write its own
+    // result -> counted `failed`); the second resolves "duplicate" and must
+    // not count as `ok` when ITS write also fails.
+    let key = format!("badttl2-idk-{}", unique_id());
+    let (_id1, e1) = envelope("fx.echo", "badttl2", |v| {
+        v["idempotency_key"] = json!(key.clone())
+    });
+    xadd(c, "badttl2", &e1.to_string()).await;
+    wait_drained(c, "badttl2").await;
+    let (_id2, e2) = envelope("fx.echo", "badttl2", |v| {
+        v["idempotency_key"] = json!(key.clone())
+    });
+    xadd(c, "badttl2", &e2.to_string()).await;
+    wait_drained(c, "badttl2").await;
+
+    // B: a final failure that was never retryable (SerializationError, see
+    // scenario 8 above). Must not count `failed`/`dlq` when the DLQ write
+    // itself fails.
+    let (_id3, e3) = envelope("fx.bad_return", "badttl2", |_| {});
+    xadd(c, "badttl2", &e3.to_string()).await;
+    wait_drained(c, "badttl2").await;
+
+    // C: terminal DLQ for an unregistered task, never executed. Must not
+    // count `dlq` when the write fails.
+    let (_id4, e4) = envelope("fx.no_such_task", "badttl2", |_| {});
+    xadd(c, "badttl2", &e4.to_string()).await;
+    wait_drained(c, "badttl2").await;
+
+    bad.signal(libc::SIGTERM);
+    assert_eq!(bad.wait_code(20), 0, "badttl2 worker should exit 0");
+    drop(bad);
+
+    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+    let stats = log
+        .lines()
+        .rev()
+        .find(|l| l.contains("stats: fetched="))
+        .unwrap_or_else(|| panic!("no stats line in worker log:\n{log}"));
+    // fetched=4 (e1..e4); ok=0 (e1 -> failed via the success gate, e2's
+    // duplicate write also fails); failed=1 (e1 only: final_failure's own
+    // write failed for e3, so it must not count either); dlq=0 (both e3's
+    // final_failure and e4's dlq_terminal had their DLQ write fail).
+    assert!(
+        stats.contains("fetched=4 ok=0 failed=1 retried=0 dlq=0"),
+        "a failed write on the duplicate, final failure or terminal dlq \
+         path must not be counted as ok, failed or dlq: {stats}"
     );
     let _ = std::fs::remove_file(&log_path);
 }

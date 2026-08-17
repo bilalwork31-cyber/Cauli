@@ -132,13 +132,26 @@ async fn process(ctx: &Arc<Ctx>, queue: &str, sid: &str, raw: Option<String>) {
             Ok(broker::IdempClaim::Duplicate) => {
                 let rj = envelope::result_duplicate(now_ms());
                 let store = env.store_result.then_some(rj.as_str());
-                if let Err(e) =
-                    broker::finish_duplicate(&mut conn, queue, sid, &env.id, store, ctx.result_ttl)
-                        .await
+                // Gated the same way, and for the same reason, as the
+                // success branch in `finish` below: a write failure must
+                // not be counted as if it happened.
+                match broker::finish_duplicate(
+                    &mut conn,
+                    queue,
+                    sid,
+                    &env.id,
+                    store,
+                    ctx.result_ttl,
+                )
+                .await
                 {
-                    error!(id = %env.id, "duplicate finish write failed: {e}");
+                    Ok(()) => {
+                        ctx.counters.ok.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        error!(id = %env.id, "duplicate finish write failed: {e}");
+                    }
                 }
-                ctx.counters.ok.fetch_add(1, Ordering::Relaxed);
                 return;
             }
             Err(e) => {
@@ -191,14 +204,26 @@ async fn finish(ctx: &Arc<Ctx>, queue: &str, sid: &str, mut env: Envelope, outco
                 let cd_ms = countdown.map(|s| (s.max(0.0) * 1000.0).round() as u64);
                 schedule_retry(ctx, &mut conn, queue, sid, &mut env, cd_ms).await;
             } else {
-                final_failure(ctx, &mut conn, queue, sid, &env, &err, now).await;
+                // A forced retry is inherently retryable; reaching here at
+                // all means the budget ran out, never that it was refused.
+                final_failure(ctx, queue, sid, &env, &err, now, "max_retries").await;
             }
         }
         Outcome::Failure { err, retryable } => {
             if retryable && env.retries < env.max_retries {
                 schedule_retry(ctx, &mut conn, queue, sid, &mut env, None).await;
             } else {
-                final_failure(ctx, &mut conn, queue, sid, &env, &err, now).await;
+                // PROTOCOL §4.2: "max_retries" names the case where the
+                // retry budget ran out specifically. A `retryable: false`
+                // failure never had a budget to run out, however many
+                // retries are left, so it gets its own reason instead of
+                // borrowing that one.
+                let reason = if retryable {
+                    "max_retries"
+                } else {
+                    "not_retryable"
+                };
+                final_failure(ctx, queue, sid, &env, &err, now, reason).await;
             }
         }
     }
@@ -238,29 +263,39 @@ async fn schedule_retry(
     ctx.counters.retried.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Final failure: DLQ reason "max_retries" + failure result (if store_result).
+/// Final failure: DLQ `reason` ("max_retries" or "not_retryable", see
+/// `finish` above) + failure result (if store_result). Clones its own
+/// connection from `ctx` (rather than taking one as a parameter, the way
+/// `schedule_retry` does) so this stays at seven arguments instead of eight;
+/// a `ConnectionManager` clone is a cheap handle, the same one every other
+/// call site in this file already takes fresh from `ctx.redis`.
 async fn final_failure(
     ctx: &Arc<Ctx>,
-    conn: &mut redis::aio::ConnectionManager,
     queue: &str,
     sid: &str,
     env: &Envelope,
     err: &ErrorJson,
     now: u64,
+    reason: &str,
 ) {
+    let mut conn = ctx.redis.clone();
     // Infallible: same reasoning as schedule_retry above.
     let ej = serde_json::to_string(env).expect("envelope serialize");
     let rj = envelope::result_failure(err, now);
     let result = env
         .store_result
         .then_some((env.id.as_str(), rj.as_str(), ctx.result_ttl));
-    if let Err(e) =
-        broker::finish_dlq(conn, queue, sid, &ej, "max_retries", Some(err), result).await
-    {
-        error!(id = %env.id, "dlq write failed: {e}");
+    // Gated the same way, and for the same reason, as the success branch in
+    // `finish` above: a write failure must not be counted as if it happened.
+    match broker::finish_dlq(&mut conn, queue, sid, &ej, reason, Some(err), result).await {
+        Ok(()) => {
+            ctx.counters.failed.fetch_add(1, Ordering::Relaxed);
+            ctx.counters.dlq.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(e) => {
+            error!(id = %env.id, "dlq write failed: {e}");
+        }
     }
-    ctx.counters.failed.fetch_add(1, Ordering::Relaxed);
-    ctx.counters.dlq.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Best effort task id recovery for a terminal DLQ write: bounded to the
@@ -321,10 +356,16 @@ pub async fn dlq_terminal(
         (Some(id), Some(rj)) => Some((id.as_str(), rj.as_str(), ctx.result_ttl)),
         _ => None,
     };
-    if let Err(e) = broker::finish_dlq(&mut conn, queue, sid, raw_e, reason, err, store).await {
-        error!(reason, "terminal dlq write failed: {e}");
+    // Gated the same way, and for the same reason, as the success branch in
+    // `finish` above: a write failure must not be counted as if it happened.
+    match broker::finish_dlq(&mut conn, queue, sid, raw_e, reason, err, store).await {
+        Ok(()) => {
+            ctx.counters.dlq.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(e) => {
+            error!(reason, "terminal dlq write failed: {e}");
+        }
     }
-    ctx.counters.dlq.fetch_add(1, Ordering::Relaxed);
 }
 
 #[cfg(test)]

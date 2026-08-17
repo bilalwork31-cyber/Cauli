@@ -222,6 +222,14 @@ On failure with `retries >= max_retries` (final):
 2. If `store_result`: `SET cauli:result:{id} {failure result json} EX result_ttl`.
 3. XACK + XDEL.
 
+On a failure marked `retryable: false` (a deterministic failure that would fail the same way
+on every attempt, e.g. `SerializationError`), the same three steps run immediately, on the
+first and only attempt, with reason `"not_retryable"` instead of `"max_retries"`, however many
+retries remain. The two reasons are not interchangeable: `"max_retries"` claims a retry budget
+was spent and ran out; a failure that was never eligible for a retry never had a budget to
+spend, so reporting `"max_retries"` for it would be false, not just imprecise, and would hide
+from an operator matching on that reason that nothing was ever retried at all.
+
 A task may raise `cauli.Retry(countdown=X)` to force a retry with an explicit delay
 (still bounded by max_retries; the forced countdown replaces the computed backoff).
 Recognition is duck-typed, identically across both Python execution paths (the embedded io
@@ -710,6 +718,16 @@ result on, so none is written and the caller's own timeout, or lack of one, gove
 `traceback` may be truncated to 8KB. Task return values must be JSON serializable; a non
 serializable success value is a failure with type `"SerializationError"` (no retry — treat as
 final failure regardless of retries left).
+
+A few `error.type` values name a failure in the worker or executor itself catching its own
+internal problem, rather than in the task's own code. `"WorkerShimError"` covers a failure at
+the embedded Python shim boundary (an executor response that could not be parsed, or a
+submission that itself failed); it is retryable. `"UnknownError"` is synthesized when an
+executor reports failure without supplying an error object at all; it is retryable by default,
+like any other type besides `"SerializationError"`. `"ProtocolError"` is emitted by a cpu child
+(§5.1) when it receives a request line it cannot decode; that response carries no task id, so
+the worker cannot match it to a pending request and only logs it rather than turning it into a
+task outcome.
 
 Full tracebacks (and results) are stored in plaintext in `cauli:result:*` and DLQ stream
 entries. If a task's exception message or arguments embed secrets or PII, anyone with read
