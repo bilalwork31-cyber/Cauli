@@ -181,7 +181,9 @@ def _redact_query_credentials(tail: str) -> str:
     pairs = []
     for pair in rest.split("&"):
         name, sep, _value = pair.partition("=")
-        pairs.append(f"{name}=***" if sep and name in ("password", "username") else pair)
+        pairs.append(
+            f"{name}=***" if sep and name in ("password", "username") else pair
+        )
     return f"{path}?{'&'.join(pairs)}{fragment}"
 
 
