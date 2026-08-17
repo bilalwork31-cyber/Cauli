@@ -153,11 +153,13 @@ app.add_periodic_task("heartbeat", "myproj.tasks.ping", interval(30))
 cauli-beat --app myproj.tasks:app
 ```
 
-**Run two replicas.** Schedule state lives in Redis behind a leader lease, and
-every firing is an atomic compare and set on the slot, so two instances that
-both believe they lead still produce exactly one task per slot. Celery's beat
-keeps state in a local file with no locking and its own docs tell you to run
-only one.
+**Run two replicas.** Schedule state lives in Redis behind a leader lease,
+and on standalone or Sentinel Redis every firing is an atomic compare and
+set on the slot, so two instances that both believe they lead still
+produce exactly one task per slot. Celery's beat keeps state in a local
+file with no locking and its own docs tell you to run only one. This does
+not hold on Redis Cluster; see "What you should know before shipping"
+below.
 
 After downtime a due entry fires once and resumes its cadence; missed slots are
 coalesced, never replayed. Per call scheduling is the usual set:
@@ -234,11 +236,33 @@ async pool binds to whichever loop first checks a connection out, so more than
 one loop hands the same pool to more than one thread), and no `kind="cpu"`
 tasks (`asyncio.get_running_loop()` succeeds inside a cpu task's own body, so
 "no loop" is not a safe test there; use a plain synchronous SQLAlchemy engine
-on that lane instead). Committing or rolling back stays task code's job,
-exactly like `django_app()` leaves connections and transactions separated.
+on that lane instead).
+
+The pool is not sized to `--io-concurrency`. SQLAlchemy's defaults are
+`pool_size=5` plus `max_overflow=10`, 15 connections total, while
+`--io-concurrency` defaults to 256 and even the quickstart's own `-c 50`
+already exceeds 15. A task admitted past that ceiling queues for a
+connection and then raises `QueuePool limit ... connection timed out`,
+under any concurrent load, not just a spike. Raise `pool_size` plus
+`max_overflow` to match `--io-concurrency`, or lower `--io-concurrency` to
+the pool's ceiling so the semaphore applies backpressure instead of the
+pool timing out.
+
+Committing or rolling back stays task code's job. Unlike `django_app()`,
+this module adds no on commit hook: there is no `delay_on_commit`
+equivalent, so enqueueing inside a transaction can hand a task a row that
+is not committed yet unless you enqueue it yourself once the transaction
+exits.
 
 ## What you should know before shipping
 
+- **Redis Cluster is not supported for delayed or periodic tasks.**
+  `countdown`, `eta`, retries, and `cauli-beat` all rely on Lua scripts
+  whose keys never share a hash slot, so Cluster rejects every call with
+  CROSSSLOT: delayed and retried tasks sit in the sorted set forever, and
+  no periodic task ever fires. The worker logs the failure loudly, but
+  nothing is delivered. Standalone and Sentinel Redis are unaffected; see
+  PROTOCOL.md sections 4.3 and 10.5.
 - **Delivery is at least once.** A worker crash can redeliver a task, so make
   tasks safe to repeat or pass an `idempotency_key`.
 - **`--visibility-timeout` must exceed your longest task timeout.** The worker
@@ -252,6 +276,11 @@ exactly like `django_app()` leaves connections and transactions separated.
 - **Priorities are deliberately not supported.** Use queue order
   (`-Q high,default,bulk`) or separate worker fleets. Reasoning in
   [PROTOCOL.md](PROTOCOL.md) section 9.4.
+- **The dead letter queue is capped at roughly 1000 entries per queue.**
+  Past that, the oldest dead letters are dropped to make room for new
+  ones, so a worker that has been failing for a long time keeps only its
+  most recent failures. Drain or export the DLQ before it fills if it
+  doubles as an audit trail.
 
 ## Documentation
 
