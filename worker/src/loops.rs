@@ -2,7 +2,10 @@
 //! (XPENDING/XCLAIM), stats. All spawned from main.
 
 use crate::broker;
-use crate::ctx::{now_ms, Ctx};
+// The mover cutoff and the stream id age probe both compare against values
+// redis itself wrote, so both read the redis anchored clock. See clock.rs.
+use crate::clock::now_ms;
+use crate::ctx::Ctx;
 use crate::dispatch::{dlq_terminal, spawn_dispatch};
 use crate::envelope::{redelivery_limit, Envelope};
 use redis::streams::{StreamReadOptions, StreamReadReply};
@@ -26,13 +29,24 @@ pub async fn fetch_loop(ctx: Arc<Ctx>, mut fetch_conn: redis::aio::ConnectionMan
         // nowhere to safely put) io work it cannot dispatch either.
         // `cpu_backlog()` keeps this pause loud instead of silent (stats
         // line + a warn on the zero/nonzero edge); the coupling itself stays.
-        if ctx.io_sem.available_permits() == 0 || ctx.cpu_backlog() > 0 {
+        let permits = ctx.io_sem.available_permits();
+        if permits == 0 || ctx.cpu_backlog() > 0 {
             tokio::time::sleep(Duration::from_millis(25)).await;
             continue;
         }
+        // Fetch only what there is capacity to START, not a full --batch.
+        // An entry's PEL idle clock starts at XREADGROUP delivery, while the
+        // execution backstop is only armed after the io semaphore is
+        // acquired, and under saturation that wait is unbounded. A fetched
+        // entry parked on the semaphore past `timeout_ms + 2000` therefore
+        // looks idle to the section 4.4 recovery loop and gets reclaimed
+        // while its first attempt is still alive and has not started;
+        // repeated parking inflates delivery_count until the entry is dead
+        // lettered as redelivery_limit WITHOUT having executed once.
+        // Bounding COUNT by free permits means fetched entries never park.
         let opts = StreamReadOptions::default()
             .group("cauli", &ctx.consumer)
-            .count(ctx.args.batch)
+            .count(ctx.args.batch.min(permits))
             .block(1000);
         let reply: Option<StreamReadReply> =
             match fetch_conn.xread_options(&keys, &ids, &opts).await {
