@@ -3620,3 +3620,68 @@ parses strictly, a stale fixture in `worker/tests/fixtures/fake_exec.py`, or a t
 the old `TimeoutError` string. **No merge to main happens while that test is red.** An intermittent
 failure in the fork server child protocol is precisely the class this audit spent the night on.
 
+
+## 2026-08-17 — Cycles 44 and 45 — all nine decisions implemented, merged and pushed
+
+### The error taxonomy, the last decision document — commits 9f9ef5f, 82be413, 6794aba
+
+`error.origin` landed first, valued `task` or `worker`, additive so an older client simply finds it
+absent, exposed as `TaskFailedError.origin`.
+
+Then the rename, and its diagnosis is worth keeping. A previous agent had measured
+`e2e_forkserver` red, "clean HEAD 3 of 4, my tree 0 of 3", and died on a network error mid bisection.
+I verified committed HEAD myself in an isolated detached worktree rather than trusting either
+direction: `e2e_forkserver` passed, 37.54s. So the branch was mergeable and only the uncommitted
+rename was suspect.
+
+The replacement agent then found the red tree no longer existed at all, because the previous agent's
+working tree had ALSO carried uncommitted `_exec.py` edits that have since landed in `9f9ef5f`. What
+remained dirty was the rename alone, and it was green across five runs.
+
+It ruled out the interesting hypothesis by CONSTRUCTION rather than by observation, which is the
+stronger form: **no cpu child ever emits a timeout type.** The cpu hard timeout is synthesized Rust
+side in `exec.rs` on `CpuOutcome::Timeout` after the SIGKILL, and `ctx.rs` `parse_pyresp` string
+matches only `"Retry"` and `"SerializationError"`, so the type name crosses the line delimited JSON
+boundary opaquely. A wire mismatch was not possible.
+
+It also caught a claim that would have shipped FALSE: the CHANGELOG's "Known limitations" still said
+this rename had deliberately not been taken.
+
+The honest residual, documented rather than special cased: from Python 3.11 the builtin `TimeoutError`
+and `asyncio.TimeoutError` are the same class, so an async task raising `TimeoutError` itself still
+reports as the worker's limit. The sync io and cpu lanes are exact.
+
+### Shipped
+
+`main` merged with `--no-ff` at `77e5989`, so the audit stays one identifiable unit in history rather
+than 91 loose commits, and pushed to `origin/main`. `audit/overnight` pushed too, so the individual
+commits remain reviewable rather than existing only inside a merge.
+
+Verified on merged `main` BEFORE pushing, not on the branch and assumed to carry over: 125 Rust unit
+tests plus 10 across 7 e2e binaries, py 259, itest 26, `cargo fmt --check` clean, clippy with
+`-D warnings` exit 0.
+
+The merge commit states plainly that 14 commits are flagged as needing human review and that three
+items still need a decision rather than a fix. That belongs in the permanent record rather than only
+in this file, given what is in them: process termination, durability semantics and public API.
+
+### Not merged, deliberately
+
+`audit/stash-archive-58cc0f8` and `audit/dangling-archive-f2e3151` are local only and were neither
+pushed nor merged. They hold recovered STASH commits, not work, and merging them would inject raw WIP
+into `main`. One of them was rescued from a commit that was already dangling and would have been lost
+to garbage collection. Diff them before deleting.
+
+### Still open for a human
+
+The 14 flagged commits, the failure path soak verdict, and the three judgement calls recorded in the
+header's decisions table. Also `mover_crossslot_is_detected_not_treated_as_transient`, which has a
+load sensitive timeout on a real cluster startup and will be flaky on a busy CI runner.
+
+### Now running
+
+A three way dispatch ceiling benchmark, cauli against Celery and taskiq, no op task body, one process
+and six, against the pinned published build `/tmp/cauli-worker-77e5989`, sha256 prefix
+`9e97386561726883`, so every number is attributable to this exact commit rather than to whatever was
+on disk. Box cleaned first: throwaway redis and leftover workers killed, load 0.37.
+
