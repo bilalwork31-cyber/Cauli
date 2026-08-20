@@ -1,6 +1,7 @@
 mod backoff;
 mod broker;
 mod cli;
+mod clock;
 mod cpu;
 mod ctx;
 mod dispatch;
@@ -347,6 +348,12 @@ async fn run_worker(
         error!("XGROUP CREATE failed: {e}");
         return 1;
     }
+    // Anchor the wall clock on redis before anything can read it. Blocking
+    // once here is free: reaching redis is already a precondition of the call
+    // above. See clock.rs for why absolute instants must not come from this
+    // host's own clock, and why the anchor is sampled rather than read per call.
+    clock::init(&mut write_conn).await;
+    tokio::spawn(clock::sampler_loop(write_conn.clone()));
 
     // §9.2 queue TTLs, seconds -> ms. Logged so an operator can see at a
     // glance that entries in this deployment have a bounded shelf life;

@@ -1,7 +1,11 @@
 //! Per-entry dispatch: parse -> idempotency -> route -> execute -> finish.
 
 use crate::broker;
-use crate::ctx::{now_ms, Ctx, DecrGuard, Outcome};
+// Absolute instants come from the redis anchored clock, never from this
+// host's own: expiry deadlines and delayed scores are compared across
+// workers, and this file writes both. See clock.rs.
+use crate::clock::now_ms;
+use crate::ctx::{Ctx, DecrGuard, Outcome};
 use crate::envelope::{self, Envelope, ErrorJson};
 use crate::exec;
 use serde_json::Value;
