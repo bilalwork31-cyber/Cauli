@@ -320,6 +320,14 @@ Protocol and worker behaviour:
 
 ### Added
 
+- **`error.origin` on the result document**, valued `task` or `worker`, so a
+  caller can tell an exception that came out of its own code from one cauli
+  synthesized. Additive: a client reading an older result simply finds it
+  absent. Exposed as `TaskFailedError.origin`. This is what makes the
+  `TimeLimitExceeded` rename above usable, since a task raising its own
+  `TimeoutError` and the worker enforcing its limit are otherwise
+  indistinguishable.
+
 - **`cauli.contrib.sqlalchemy`**: one async SQLAlchemy session per task,
   opened and unconditionally closed around the task body through a
   `ContextVar`, with the engine built once and disposed at fork. Public
