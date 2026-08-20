@@ -81,7 +81,11 @@ impl Ctx {
     /// (the periodic stats line), so that read stays side effect free.
     pub fn cpu_backlog(&self) -> usize {
         let n = self.cpu_overflow();
-        self.counters.note_cpu_backlog(n, now_ms());
+        // The redis anchored clock, like every other instant the worker
+        // stamps: both ends of this duration are local reads, so it is self
+        // consistent either way, but an NTP step would still distort the
+        // backlog duration it reports. See clock.rs.
+        self.counters.note_cpu_backlog(n, crate::clock::now_ms());
         n
     }
 
