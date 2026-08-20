@@ -62,6 +62,13 @@ def fail(msg="boom"):
     raise ValueError(msg)
 
 
+def raise_timeout():
+    # A task raising the BUILTIN TimeoutError itself. It must stay spelled
+    # "TimeoutError" with origin task, so it is distinguishable from the
+    # worker enforced limit, which is TimeLimitExceeded with origin worker.
+    raise TimeoutError("the task's own timeout, not the worker's")
+
+
 def flaky(counter_file, fail_times):
     n = 0
     if os.path.exists(counter_file):
@@ -186,6 +193,7 @@ app = App()
 app.add(TaskDef("fx.echo", echo))
 app.add(TaskDef("fx.aecho", aecho, is_async=True))
 app.add(TaskDef("fx.fail", fail))
+app.add(TaskDef("fx.raise_timeout", raise_timeout))
 app.add(TaskDef("fx.flaky", flaky))
 app.add(TaskDef("fx.retry_once", retry_once))
 app.add(TaskDef("fx.slow", slow))

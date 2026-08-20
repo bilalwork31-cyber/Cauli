@@ -103,7 +103,7 @@ against Redis Streams per PROTOCOL.md. Module map:
   (measured); the cost is that a child death fails everything
   staged behind it as retryable WorkerLost, and staged tasks wait out the
   queue ahead of them.
-  Hard timeout: SIGKILL by pid, expired requests fail "TimeoutError", the
+  Hard timeout: SIGKILL by pid, expired requests fail "TimeLimitExceeded", the
   rest "WorkerLost" (both retryable), then a replacement fork (cheap: no
   re-import). Child death (socket EOF): all in flight "WorkerLost" +
   replacement fork; that pid is never SIGKILLed (the fork-server parent has

@@ -113,7 +113,7 @@ async fn kill_and_respawn_via_fork(c: &mut redis::aio::MultiplexedConnection) {
     xadd(c, "fsq2", &e.to_string()).await;
     let r = wait_result(c, &id, 15).await;
     assert_eq!(r["status"], "failure");
-    assert_eq!(r["error"]["type"], "TimeoutError");
+    assert_eq!(r["error"]["type"], "TimeLimitExceeded");
     let (id, e) = envelope("fx.cpu_echo", "fsq2", |v| v["kind"] = json!("cpu"));
     xadd(c, "fsq2", &e.to_string()).await;
     let r = wait_result(c, &id, 15).await;
@@ -182,7 +182,7 @@ async fn fallback_stdio_mode(c: &mut redis::aio::MultiplexedConnection) {
     xadd(c, "fbq", &e.to_string()).await;
     let r = wait_result(c, &id, 15).await;
     assert_eq!(r["status"], "failure");
-    assert_eq!(r["error"]["type"], "TimeoutError");
+    assert_eq!(r["error"]["type"], "TimeLimitExceeded");
 
     let (id, e) = envelope("fx.cpu_echo", "fbq", |v| v["kind"] = json!("cpu"));
     xadd(c, "fbq", &e.to_string()).await;
@@ -340,7 +340,7 @@ async fn genuinely_wedged_child_is_still_killed_despite_prefetch_stall(
 
     let r = wait_result(c, &slow_id, 20).await;
     assert_eq!(r["status"], "failure");
-    assert_eq!(r["error"]["type"], "TimeoutError");
+    assert_eq!(r["error"]["type"], "TimeLimitExceeded");
 
     // the prefetched sibling, whose write was blocked behind the wedged
     // task, must still recover on the replacement child rather than hang

@@ -502,9 +502,10 @@ would be strictly worse than running it; the worker logs a warning and proceeds.
 
 - async io task: wrapped in `asyncio.wait_for(coro, effective_s)` where
   `effective_s = min(soft_timeout_ms or timeout_ms, timeout_ms) / 1000`. Timeout → failure
-  (retryable) with error type `"TimeoutError"`. The Rust-side backstop around the completion
-  channel is `timeout_ms + grace` (grace = 2000ms) using saturating arithmetic, so a
-  crafted/huge `timeout_ms` (e.g. `u64::MAX`) cannot wrap into a near-zero spurious timeout.
+  (retryable) with error type `"TimeLimitExceeded"` (§8.2). The Rust-side backstop around
+  the completion channel is `timeout_ms + grace` (grace = 2000ms) using saturating
+  arithmetic, so a crafted/huge `timeout_ms` (e.g. `u64::MAX`) cannot wrap into a near-zero
+  spurious timeout.
 - sync io task (thread): soft timeout only, via `PyThreadState_SetAsyncExc` injecting
   `cauli.SoftTimeLimitExceeded` after `soft_timeout_ms` (if set). A per-thread generation
   counter fences a timer that fires after the task already finished, so a stale injection
@@ -524,7 +525,7 @@ would be strictly worse than running it; the worker logs a warning and proceeds.
   ever fires in a process's main thread), with the same generation fencing and the same
   residual injection race as the sync-io path above. Hard timeout enforced by the worker:
   SIGKILL the child, replace it (a replacement fork in fork-server mode, a fresh spawn in
-  stdio mode), mark failure (retryable) with error type `"TimeoutError"`.
+  stdio mode), mark failure (retryable) with error type `"TimeLimitExceeded"` (§8.2).
 
 ### 4.7 Graceful shutdown
 
@@ -642,7 +643,7 @@ drain, forced double-signal exit, and fork-server startup failure after a succes
 - The worker maintains `--cpu-workers` serving children by requesting forks (a replacement
   is requested whenever a child dies or is killed — respawns are cheap: no re-import). Hard
   timeout of any in flight request: SIGKILL the child by pid, fail that request as
-  `"TimeoutError"`, fail the child's other in flight requests as `"WorkerLost"` (retryable),
+  `"TimeLimitExceeded"`, fail the child's other in flight requests as `"WorkerLost"` (retryable),
   request a replacement fork. A dead child's pid is never SIGKILLed a second time (it may
   already be reused by an unrelated process once the fork-server parent reaps it via
   SIGCHLD); a child that stops draining its socket without dying (write stalls past a bounded
@@ -705,7 +706,7 @@ r.id                    # task id (hex str)
 r.status()              # "pending" | "success" | "failure" | "duplicate" | "expired"
 r.get(timeout=None, poll_interval=0.05)
     # blocks until result key exists; returns result value on success;
-    # raises TaskFailedError(type, message, traceback) on failure;
+    # raises TaskFailedError(type, message, traceback, origin) on failure (§8.1);
     # returns None with .duplicate == True semantics for duplicate (get returns None);
     # sets .expired = True and raises TaskFailedError(type="Expired") for expired;
     # raises TimeoutError if timeout expires while still pending.
@@ -938,10 +939,16 @@ Result key value (`cauli:result:{id}`):
 
 ```json
 {"status": "success", "result": <json>, "error": null, "finished_at": 123}
-{"status": "failure", "result": null, "error": {"type": "ValueError", "message": "...", "traceback": "..."}, "finished_at": 123}
+{"status": "failure", "result": null, "error": {"type": "ValueError", "message": "...", "traceback": "...", "origin": "task"}, "finished_at": 123}
 {"status": "duplicate", "result": null, "error": null, "finished_at": 123}
-{"status": "expired", "result": null, "error": {"type": "Expired", "message": "...", "traceback": ""}, "finished_at": 123}
+{"status": "expired", "result": null, "error": {"type": "Expired", "message": "...", "traceback": "", "origin": "worker"}, "finished_at": 123}
 ```
+
+**Clients must ignore unknown fields.** The result document and the error object inside it are
+both open to additive growth, and a client that rejects, or raises on, a key it does not
+recognize breaks the first time one is added. Every field this section names is safe to read;
+anything else is safe to skip. `AsyncResult` in `py/` reads with `.get()` and never validates
+the key set, which is what makes a field like `origin` below addable at all.
 
 `"expired"` (§9.1) is its own status rather than a `"failure"`: the task never ran, so there is
 no exception, no traceback and nothing to retry — reporting it as a failure would put a
@@ -977,6 +984,82 @@ Full tracebacks (and results) are stored in plaintext in `cauli:result:*` and DL
 entries. If a task's exception message or arguments embed secrets or PII, anyone with read
 access to the Redis instance can see them — this is a property of the trust model (Redis is
 trusted infra; task payloads/results are not automatically scrubbed), not a bug.
+
+### 8.1 `error.origin`
+
+`origin` says who minted the error object. The rule is mechanical, so it cannot drift as
+sentinels are added:
+
+| value | meaning |
+| --- | --- |
+| `"worker"` | cauli machinery synthesized the error object. No user code raised anything. |
+| `"task"` | an exception propagated out of user code. `type` is that exception's class name. |
+| `"client"` | the client package synthesized it locally. Never appears on the wire. |
+
+`"client"` is reserved for errors that never reach Redis at all. Today that is only
+`"InvalidResult"`, which `AsyncResult` raises when a result document exists but cannot be
+used (not valid JSON, not a JSON object, or carrying no usable `"status"`).
+
+One documented edge: a `SoftTimeLimitExceeded` that propagates carries origin `"task"`, not
+`"worker"`. The worker injected the exception, but it did leave user code, and a task is free
+to catch it and return normally instead. It is documented rather than special cased.
+
+`origin` is additive, and only that. A worker predating it writes no `origin` key at all, so a
+client must treat the absence as unknown rather than as any particular value. `TaskFailedError`
+exposes it as a single `.origin` attribute, `None` when absent; no new exception classes come
+with it, and nothing else about the error object changed. Origin is not a severity, a retry
+hint, or an answer to §8.3: it says only who wrote the object.
+
+### 8.2 A worker enforced time limit is `"TimeLimitExceeded"`
+
+Three different things used to be spelled `"TimeoutError"`, two of them indistinguishable.
+They now have three spellings:
+
+| what happened | how it surfaces |
+| --- | --- |
+| the CALLER gave up waiting | builtin `TimeoutError` from `.get(timeout=)`, raised locally, never written to a result document |
+| the WORKER killed the task at its limit | `TaskFailedError(type="TimeLimitExceeded", origin="worker")` |
+| the TASK raised `TimeoutError` itself | `TaskFailedError(type="TimeoutError", origin="task")` |
+
+`.get(timeout=)` keeps raising the builtin, which is the Python idiom for a local wait, and
+`TimeLimitExceeded` is symmetric with the `SoftTimeLimitExceeded` that already existed. Before
+this, `except TimeoutError:` around `.get()` caught only the first row, so a genuine worker
+enforced timeout sailed straight past a handler that looked correct and compiled clean.
+
+Four sites mint it: the sync io hard timeout, the async io Rust side backstop and the cpu child
+SIGKILL (`worker/src/exec.rs`), plus the `asyncio.wait_for` limit the shim enforces
+(`worker/src/shim.py`, §4.6), which is the one an async task actually reaches first.
+
+One residual, unchanged by the rename and inherent to the language: from Python 3.11 the
+builtin `TimeoutError` and `asyncio.TimeoutError` are the same class, so an ASYNC task that
+raises `TimeoutError` itself is caught by that same `wait_for` handler and reported as
+`"TimeLimitExceeded"` with origin `"worker"`. On the sync io and cpu lanes the third row above
+is exact.
+
+### 8.3 Did the task ever run?
+
+The question a caller most needs answered is derivable from the closed set of worker minted
+`type` values, so it is published here rather than encoded as another field:
+
+| `error.type` | did it run? |
+| --- | --- |
+| `"Malformed"` | never ran |
+| `"UnregisteredTask"` | never ran |
+| `"Expired"` | never ran |
+| `"SerializationError"` | ran to completion, but the result was lost |
+| everything else | side effects unknown |
+
+"Everything else" is `"TimeLimitExceeded"`, `"WorkerLost"`, `"RedeliveryLimitExceeded"`,
+`"WorkerShimError"`, `"UnknownError"`, `"DeadLettered"`, and every `origin: "task"` type. For
+those the task may have run in full, in part, or not at all, and a caller that cares has to
+reconcile against its own side effects.
+
+Reading the `"SerializationError"` row: it means the task returned a value that could not be
+encoded. The one exception is the io lane's argument check, whose message names the task's
+ARGUMENTS rather than its result; that fires before the task is called, so it never ran.
+
+An `origin: "task"` failure is always "side effects unknown": user code raising says nothing
+about what it completed first. That is why origin does not replace this table.
 
 ## 9. Scheduling controls: expiry, queue TTL, routing, priorities
 

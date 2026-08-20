@@ -139,6 +139,19 @@ Protocol and worker behaviour:
   flowing on the worker side. See Known limitations.
 - **The stats line gained two fields**, `async_rejected` and `cpu_backlog`.
   Anything parsing that line by position needs updating.
+- **A worker enforced time limit is now `"TimeLimitExceeded"`, not
+  `"TimeoutError"`.** Three different things used to share that one spelling,
+  two of them indistinguishable. A caller giving up still raises the Python
+  builtin locally from `.get(timeout=)` and never writes a result document; a
+  worker killing the task at its limit is now
+  `TaskFailedError(type="TimeLimitExceeded", origin="worker")`; a task
+  raising `TimeoutError` itself stays
+  `TaskFailedError(type="TimeoutError", origin="task")`. The new name is
+  symmetric with the `SoftTimeLimitExceeded` that already existed and no
+  longer shadows a builtin, so `except TimeoutError:` around a `.get()` no
+  longer silently misses the worker enforced case. Anything matching the old
+  string needs updating. See PROTOCOL section 8.2, and Known limitations for
+  the one async case that stays conflated.
 
 ### Fixed
 
@@ -388,14 +401,13 @@ Protocol and worker behaviour:
   This applies to the Sentinel path too, and `idempotent=True` does not
   protect against it, because the idempotency key sits in the same lost write
   window. The guarantee is exactly once per surviving Redis dataset.
-- **`TimeoutError` means three different things.** A caller timeout from
-  `.get(timeout=)` raises the Python builtin, while a worker enforced timeout
-  and a task's own raised `TimeoutError` both arrive as
-  `TaskFailedError(type="TimeoutError")`. So `except TimeoutError:` around a
-  `.get()` catches only the first case and silently misses the worker
-  enforced one. Renaming the worker's sentinel is a public API decision that
-  was deliberately not taken during the audit, and two of the three cases
-  would remain indistinguishable by type even after a rename.
+- **An async task that raises `TimeoutError` itself is reported as the
+  worker's own limit.** From Python 3.11 the builtin `TimeoutError` and
+  `asyncio.TimeoutError` are the same class, so the `asyncio.wait_for` that
+  enforces the async lane's limit catches both and reports
+  `TimeLimitExceeded` with origin `"worker"` either way. The sync io and cpu
+  lanes tell the two apart exactly. This is inherent to the language, and it
+  is the one case the `TimeLimitExceeded` rename above could not separate.
 - **The worker uses its local clock while beat reads Redis `TIME`.** An NTP
   step while computing a retry time durably writes a far future score into
   the delayed set and strands the task with no self healing. Clock skew

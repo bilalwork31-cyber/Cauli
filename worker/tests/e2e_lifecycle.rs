@@ -175,8 +175,8 @@ async fn bulk_recovery_drains_backlog_per_tick(c: &mut redis::aio::MultiplexedCo
 /// MEM-1 regression: when an async task's event-loop thread is wedged by a
 /// synchronous blocking call (so Python's own `asyncio.wait_for` timeout can
 /// never fire), the Rust-side backstop (timeout_ms + grace) must still
-/// resolve the task cleanly as a TimeoutError. This is specifically the path
-/// that calls `PyRuntime::cancel` to drop the pending-completion map entry;
+/// resolve the task cleanly as a TimeLimitExceeded. This is specifically the
+/// path that calls `PyRuntime::cancel` to drop the pending-completion entry;
 /// without it, each such backstop firing used to leak that entry (and the
 /// coroutine/args/kwargs it references) forever.
 async fn mem1_async_backstop_fires_cleanly(c: &mut redis::aio::MultiplexedConnection) {
@@ -191,7 +191,7 @@ async fn mem1_async_backstop_fires_cleanly(c: &mut redis::aio::MultiplexedConnec
     xadd(c, "mem1q", &e.to_string()).await;
     let r = wait_result(c, &id, 8).await;
     assert_eq!(r["status"], "failure");
-    assert_eq!(r["error"]["type"], "TimeoutError");
+    assert_eq!(r["error"]["type"], "TimeLimitExceeded");
     assert!(
         r["error"]["message"].as_str().unwrap().contains("grace"),
         "must be the Rust-side backstop firing, not a python-side wait_for timeout"
@@ -288,7 +288,7 @@ async fn h2_sync_pool_survives_hard_timeout_abandonment(c: &mut redis::aio::Mult
     xadd(c, "h2q", &e_a.to_string()).await;
     let r_a = wait_result(c, &id_a, 5).await;
     assert_eq!(r_a["status"], "failure");
-    assert_eq!(r_a["error"]["type"], "TimeoutError");
+    assert_eq!(r_a["error"]["type"], "TimeLimitExceeded");
 
     // Task B: a fast task submitted right after. With the sole original
     // thread still wedged in A's sleep, this only completes quickly if a

@@ -645,11 +645,16 @@ async def _arun(idx, token, name, args, kwargs, timeout_s):
                 rv = await asyncio.wait_for(fn(*args, **kwargs), timeout_s)
                 out = _finish_value(rv)
             except (asyncio.TimeoutError, TimeoutError):
+                # The worker's own limit firing, so TimeLimitExceeded, matching
+                # the three Rust side limits in exec.rs. From 3.11 the builtin
+                # and asyncio.TimeoutError are one class, so a task raising
+                # TimeoutError itself is caught here too and reported the same
+                # way; that conflation predates the rename (PROTOCOL section 8).
                 out = {
                     "ok": False,
                     "retryable": True,
                     "error": {
-                        "type": "TimeoutError",
+                        "type": "TimeLimitExceeded",
                         "message": "task timed out after %.3fs" % (timeout_s,),
                         "traceback": "",
                         "origin": "worker",

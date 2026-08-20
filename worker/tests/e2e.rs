@@ -241,7 +241,7 @@ async fn idempotency_and_timeouts(c: &mut redis::aio::MultiplexedConnection) {
     );
     assert_eq!(r["result"], "aslow-done");
 
-    // async hard timeout -> retryable TimeoutError; max_retries 0 -> DLQ now
+    // async hard timeout -> retryable TimeLimitExceeded; max_retries 0 -> DLQ now
     let (id, e) = envelope("fx.aslow", "default", |v| {
         v["args"] = json!([30.0]);
         v["timeout_ms"] = json!(700);
@@ -250,10 +250,23 @@ async fn idempotency_and_timeouts(c: &mut redis::aio::MultiplexedConnection) {
     xadd(c, "default", &e.to_string()).await;
     let r = wait_result(c, &id, 10).await;
     assert_eq!(r["status"], "failure");
-    assert_eq!(r["error"]["type"], "TimeoutError");
+    assert_eq!(r["error"]["type"], "TimeLimitExceeded");
     assert_eq!(r["error"]["origin"], "worker");
     let (reason, _, _) = wait_dlq(c, "default", &id, 5).await;
     assert_eq!(reason, "max_retries");
+
+    // The other half of the rename: a task raising the BUILTIN TimeoutError
+    // keeps that spelling and reports origin task, so the two are no longer
+    // one string. §8's third spelling, the caller's own `.get(timeout=)`,
+    // never reaches a result document at all.
+    let (id, e) = envelope("fx.raise_timeout", "default", |v| {
+        v["max_retries"] = json!(0);
+    });
+    xadd(c, "default", &e.to_string()).await;
+    let r = wait_result(c, &id, 10).await;
+    assert_eq!(r["status"], "failure");
+    assert_eq!(r["error"]["type"], "TimeoutError");
+    assert_eq!(r["error"]["origin"], "task");
 
     // sync soft timeout via PyThreadState_SetAsyncExc
     let (id, e) = envelope("fx.soft_slow", "default", |v| {
@@ -270,7 +283,7 @@ async fn idempotency_and_timeouts(c: &mut redis::aio::MultiplexedConnection) {
     // code, so it is origin task like any other propagated exception.
     assert_eq!(r["error"]["origin"], "task");
 
-    // sync hard timeout: thread abandoned, retryable TimeoutError
+    // sync hard timeout: thread abandoned, retryable TimeLimitExceeded
     let (id, e) = envelope("fx.slow", "default", |v| {
         v["args"] = json!([3.0]);
         v["timeout_ms"] = json!(600);
@@ -279,7 +292,7 @@ async fn idempotency_and_timeouts(c: &mut redis::aio::MultiplexedConnection) {
     xadd(c, "default", &e.to_string()).await;
     let r = wait_result(c, &id, 10).await;
     assert_eq!(r["status"], "failure");
-    assert_eq!(r["error"]["type"], "TimeoutError");
+    assert_eq!(r["error"]["type"], "TimeLimitExceeded");
     assert_eq!(r["error"]["origin"], "worker");
 
     // cpu hard timeout: child SIGKILL + respawn, then pool still works
@@ -292,7 +305,7 @@ async fn idempotency_and_timeouts(c: &mut redis::aio::MultiplexedConnection) {
     xadd(c, "default", &e.to_string()).await;
     let r = wait_result(c, &id, 15).await;
     assert_eq!(r["status"], "failure");
-    assert_eq!(r["error"]["type"], "TimeoutError");
+    assert_eq!(r["error"]["type"], "TimeLimitExceeded");
     assert_eq!(r["error"]["origin"], "worker");
     let (id, e) = envelope("fx.cpu_echo", "default", |v| v["kind"] = json!("cpu"));
     xadd(c, "default", &e.to_string()).await;

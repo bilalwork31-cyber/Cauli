@@ -97,7 +97,7 @@ pub async fn run_sync_task(ctx: &Arc<Ctx>, env: &Envelope) -> Outcome {
                 env.timeout_ms
             );
             fail(
-                "TimeoutError",
+                "TimeLimitExceeded",
                 format!("hard timeout after {}ms (thread abandoned)", env.timeout_ms),
             )
         }
@@ -129,7 +129,8 @@ pub async fn run_async_task(ctx: &Arc<Ctx>, env: &Envelope) -> Outcome {
         ctx.pyrt
             .queue_submit(&env.task, env.args_ref(), env.kwargs_ref(), effective_s);
     // saturating_add: H3 — an attacker-chosen timeout_ms near u64::MAX must
-    // not wrap this backstop to a near-zero duration (spurious TimeoutError).
+    // not wrap this backstop to a near-zero duration (spurious
+    // TimeLimitExceeded).
     let backstop_ms = env.timeout_ms.saturating_add(BACKSTOP_GRACE_MS);
     let started = Instant::now();
     let outcome = match timeout(Duration::from_millis(backstop_ms), rx).await {
@@ -143,7 +144,7 @@ pub async fn run_async_task(ctx: &Arc<Ctx>, env: &Envelope) -> Outcome {
             // holds) forever.
             ctx.pyrt.cancel(token);
             fail(
-                "TimeoutError",
+                "TimeLimitExceeded",
                 format!(
                     "no completion within {}ms + grace (event loop unresponsive)",
                     env.timeout_ms
@@ -209,7 +210,7 @@ pub async fn run_cpu_task(ctx: &Arc<Ctx>, env: &Envelope) -> Outcome {
     let outcome = match rx.await {
         Ok(crate::cpu::CpuOutcome::Resp(line)) => parse_pyresp(&line, true),
         Ok(crate::cpu::CpuOutcome::Timeout) => fail(
-            "TimeoutError",
+            "TimeLimitExceeded",
             format!(
                 "cpu child SIGKILLed after hard timeout {}ms",
                 env.timeout_ms
