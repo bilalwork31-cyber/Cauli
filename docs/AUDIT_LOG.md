@@ -3685,3 +3685,62 @@ and six, against the pinned published build `/tmp/cauli-worker-77e5989`, sha256 
 `9e97386561726883`, so every number is attributable to this exact commit rather than to whatever was
 on disk. Box cleaned first: throwaway redis and leftover workers killed, load 0.37.
 
+
+## 2026-08-17 — Cycle 47 — dispatch ceiling, partial results against the published build
+
+Measured against the PINNED published binary `/tmp/cauli-worker-77e5989`, sha256 prefix
+`9e97386561726883`, built from merged `main` at 77e5989, so every number is attributable to that
+commit rather than to whatever happened to be on disk. Box cleaned first, load 0.16.
+
+Every prior throughput number for this project measured real I/O work, so it measured the workload as
+much as the framework. This is a no op body, which isolates dispatch.
+
+### Single process, 20,000 no op tasks, all three drained all 20,000
+
+Drain verified by a counter each task increments, not by watching a queue empty, which is the mistake
+this repo has published once before.
+
+| framework | drain tps | steady tps | wall | peak RSS |
+|-----------|-----------|------------|------|----------|
+| cauli, sync lane, `--procs 1` | **8148.7** | window collapsed | 2.45s | 44.5 MB |
+| taskiq, 1 worker, 200 async | 1653.6 | 1907.6 | 12.09s | not captured |
+| celery, prefork `-c 1` | 747.7 | 796.0 | 26.75s | not captured |
+
+Drain to drain, cauli is about **10.9x Celery** and **4.9x taskiq** on identical work.
+
+**A caveat that cuts AGAINST cauli's number, stated because it would otherwise flatter it.** cauli
+drained 20,000 tasks in 2.45 seconds, which is faster than the harness's own 3.12 second warmup mark,
+so its steady window collapsed to zero length and only a whole drain figure exists. That figure
+INCLUDES cauli's cold start, while Celery's 796 and taskiq's 1907.6 are steady numbers with their
+warmup excluded. Comparing drain to drain, 8148.7 against 747.7 and 1653.6, is the honest comparison
+and it is the one to quote. Comparing cauli's drain against the others' steady would be quietly wrong
+in cauli's favour.
+
+### The async lane ramp, and where the knee actually is
+
+| `--io-concurrency` | drain tps |
+|--------------------|-----------|
+| 8 | 603.1 |
+| 32 | 7807.9 |
+| 64 | 25304.2 |
+| 128 | 27206.1 |
+
+An earlier contended run had suggested 590, 4.9k, 21k, 46k. The SHAPE is confirmed, steep scaling
+with the gate, but the numbers differ and the 46k figure does not reproduce. That is why it was
+labelled a hint rather than a result.
+
+The useful finding is where it flattens: doubling the gate from 64 to 128 buys 25.3k to 27.2k, about
+7 percent. So **the admission gate is the binding constraint up to roughly 64 and something else takes
+over past it.** That contradicts the intuition that more concurrency is better, and it is directly
+actionable for the tuning guide. 96 and 256 are being probed to place the knee properly.
+
+### Not yet measured
+
+The 6 process runs for all three, which is the biggest gap, since single process numbers cannot test
+the architectural claim that each process is its own GIL and scaling is therefore near linear. Also
+the async lane with a contender beside it, p50 and p99, and RSS for Celery and taskiq.
+
+Two agents died mid benchmark, once on a network error and once on a watchdog. The result files
+survived both because they are written per run rather than at the end, which is the same durability
+lesson the soak harness learned earlier tonight.
+
