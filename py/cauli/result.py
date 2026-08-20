@@ -50,6 +50,7 @@ class AsyncResult:
                 "InvalidResult",
                 f"result document for task {self.id} is not valid JSON: {exc}",
                 None,
+                "client",
             ) from exc
         if not isinstance(doc, dict):
             raise TaskFailedError(
@@ -57,6 +58,7 @@ class AsyncResult:
                 f"result document for task {self.id} must be a JSON object, "
                 f"got {type(doc).__name__}",
                 None,
+                "client",
             )
         return doc
 
@@ -80,6 +82,7 @@ class AsyncResult:
                 "InvalidResult",
                 f'result document for task {self.id} has no "status" field',
                 None,
+                "client",
             )
         return str(doc["status"])
 
@@ -87,7 +90,8 @@ class AsyncResult:
         """Block until the result key exists, then resolve it.
 
         - success: returns the result value.
-        - failure: raises :class:`TaskFailedError` (with .type/.message/.traceback).
+        - failure: raises :class:`TaskFailedError` (with
+          .type/.message/.traceback/.origin).
         - duplicate: sets ``self.duplicate = True`` and returns ``None``.
         - expired: sets ``self.expired = True`` and raises
           :class:`TaskFailedError` with ``type == "Expired"``. It raises rather
@@ -123,7 +127,12 @@ class AsyncResult:
                 if status == "failure":
                     error = doc.get("error") or {}
                     raise TaskFailedError(
-                        error.get("type"), error.get("message"), error.get("traceback")
+                        error.get("type"),
+                        error.get("message"),
+                        error.get("traceback"),
+                        # Absent against a worker predating the field, which
+                        # reads as unknown rather than as any known origin.
+                        error.get("origin"),
                     )
                 if status == "duplicate":
                     self.duplicate = True
@@ -135,9 +144,13 @@ class AsyncResult:
                         error.get("type") or "Expired",
                         error.get("message") or "task expired before it was executed",
                         None,
+                        error.get("origin"),
                     )
                 raise TaskFailedError(
-                    "InvalidResult", f"unrecognized result status {status!r}", None
+                    "InvalidResult",
+                    f"unrecognized result status {status!r}",
+                    None,
+                    "client",
                 )
             if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError(

@@ -71,6 +71,36 @@ def test_task_exception_reported_not_fatal(child):
     assert resp == {"id": "e2", "ok": True, "result": 8}
 
 
+def test_origin_separates_task_exceptions_from_worker_synthesized_errors(child):
+    """PROTOCOL.md section 8 `origin`, on the cpu lane.
+
+    The split is mechanical: an exception that propagated out of the task is
+    "task", anything cauli synthesized itself is "worker". A soft time limit
+    is the edge worth pinning down: the child injects it, but it does leave
+    user code, so it is "task" like any other propagated exception.
+    """
+    cases = [
+        ("o1", "boom", [], None, "ValueError", "task"),
+        ("o2", "nope", [], None, "UnregisteredTask", "worker"),
+        ("o3", "unser", [], None, "SerializationError", "worker"),
+        ("o4", "sleepy", [2], 200, "SoftTimeLimitExceeded", "task"),
+    ]
+    for rid, task, args, soft_ms, expected_type, expected_origin in cases:
+        resp = child.request(
+            {
+                "id": rid,
+                "task": task,
+                "args": args,
+                "kwargs": {},
+                "soft_timeout_ms": soft_ms,
+            },
+            timeout=10,
+        )
+        assert resp["ok"] is False, rid
+        assert resp["error"]["type"] == expected_type, rid
+        assert resp["error"]["origin"] == expected_origin, rid
+
+
 def test_traceback_truncated_to_8kb(child):
     resp = child.request(
         {

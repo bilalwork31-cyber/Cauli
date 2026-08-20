@@ -101,6 +101,9 @@ async fn e2e_main_flows() {
     let r = wait_result(&mut c, &id, 15).await;
     assert_eq!(r["status"], "failure");
     assert_eq!(r["error"]["type"], "ValueError");
+    // §8 origin, end to end: a task exception is "task" all the way from the
+    // shim's error dict into the stored result document.
+    assert_eq!(r["error"]["origin"], "task");
     assert!(r["error"]["traceback"]
         .as_str()
         .unwrap()
@@ -248,6 +251,7 @@ async fn idempotency_and_timeouts(c: &mut redis::aio::MultiplexedConnection) {
     let r = wait_result(c, &id, 10).await;
     assert_eq!(r["status"], "failure");
     assert_eq!(r["error"]["type"], "TimeoutError");
+    assert_eq!(r["error"]["origin"], "worker");
     let (reason, _, _) = wait_dlq(c, "default", &id, 5).await;
     assert_eq!(reason, "max_retries");
 
@@ -262,6 +266,9 @@ async fn idempotency_and_timeouts(c: &mut redis::aio::MultiplexedConnection) {
     let r = wait_result(c, &id, 10).await;
     assert_eq!(r["status"], "failure");
     assert_eq!(r["error"]["type"], "SoftTimeLimitExceeded");
+    // The documented edge: the worker injected it, but it did leave user
+    // code, so it is origin task like any other propagated exception.
+    assert_eq!(r["error"]["origin"], "task");
 
     // sync hard timeout: thread abandoned, retryable TimeoutError
     let (id, e) = envelope("fx.slow", "default", |v| {
@@ -273,6 +280,7 @@ async fn idempotency_and_timeouts(c: &mut redis::aio::MultiplexedConnection) {
     let r = wait_result(c, &id, 10).await;
     assert_eq!(r["status"], "failure");
     assert_eq!(r["error"]["type"], "TimeoutError");
+    assert_eq!(r["error"]["origin"], "worker");
 
     // cpu hard timeout: child SIGKILL + respawn, then pool still works
     let (id, e) = envelope("fx.cpu_slow", "default", |v| {
@@ -285,6 +293,7 @@ async fn idempotency_and_timeouts(c: &mut redis::aio::MultiplexedConnection) {
     let r = wait_result(c, &id, 15).await;
     assert_eq!(r["status"], "failure");
     assert_eq!(r["error"]["type"], "TimeoutError");
+    assert_eq!(r["error"]["origin"], "worker");
     let (id, e) = envelope("fx.cpu_echo", "default", |v| v["kind"] = json!("cpu"));
     xadd(c, "default", &e.to_string()).await;
     let r = wait_result(c, &id, 15).await;
@@ -301,6 +310,9 @@ async fn idempotency_and_timeouts(c: &mut redis::aio::MultiplexedConnection) {
     let r = wait_result(c, &id, 10).await;
     assert_eq!(r["status"], "failure");
     assert_eq!(r["error"]["type"], "UnregisteredTask");
+    // §8 origin: dead lettered before it ever ran, so the error object is
+    // the worker's own and no user code was involved.
+    assert_eq!(r["error"]["origin"], "worker");
 
     // malformed payload -> DLQ with raw payload preserved
     let raw = "{this is not json";

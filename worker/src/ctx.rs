@@ -320,6 +320,56 @@ mod tests {
         }
     }
 
+    /// §8 `origin` is decided by whoever minted the error, so the parser has
+    /// to carry the executor's value through untouched rather than classify
+    /// anything itself.
+    #[test]
+    fn origin_is_carried_through_from_the_executor_response() {
+        match parse_pyresp(
+            r#"{"ok":false,"error":{"type":"ValueError","message":"m","origin":"task"}}"#,
+            true,
+        ) {
+            Outcome::Failure { err, .. } => assert_eq!(err.origin, "task"),
+            _ => panic!("expected failure"),
+        }
+        match parse_pyresp(
+            r#"{"ok":false,"error":{"type":"UnregisteredTask","message":"m","origin":"worker"}}"#,
+            false,
+        ) {
+            Outcome::Failure { err, .. } => assert_eq!(err.origin, "worker"),
+            _ => panic!("expected failure"),
+        }
+    }
+
+    /// A cpu child predating the field sends no origin at all. That must
+    /// decode as unknown (empty, and so omitted from the result document)
+    /// rather than be guessed at, while every error the worker mints itself
+    /// is "worker" by construction.
+    #[test]
+    fn absent_origin_stays_unknown_and_worker_minted_errors_say_worker() {
+        match parse_pyresp(
+            r#"{"ok":false,"error":{"type":"ValueError","message":"m"}}"#,
+            true,
+        ) {
+            Outcome::Failure { err, .. } => assert_eq!(err.origin, ""),
+            _ => panic!("expected failure"),
+        }
+        match parse_pyresp("not json", false) {
+            Outcome::Failure { err, .. } => {
+                assert_eq!(err.type_, "WorkerShimError");
+                assert_eq!(err.origin, "worker");
+            }
+            _ => panic!("expected failure"),
+        }
+        match parse_pyresp(r#"{"ok":false}"#, false) {
+            Outcome::Failure { err, .. } => {
+                assert_eq!(err.type_, "UnknownError");
+                assert_eq!(err.origin, "worker");
+            }
+            _ => panic!("expected failure"),
+        }
+    }
+
     /// H4 regression: multibyte garbage that isn't valid JSON must not panic
     /// on the byte-512 truncation of the error message.
     #[test]

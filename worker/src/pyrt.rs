@@ -131,6 +131,10 @@ fn outcome_from_py(obj: &Bound<'_, PyAny>) -> Outcome {
                 type_,
                 message: f("message"),
                 traceback: f("traceback"),
+                // Passed through, not decided here: the shim knows whether an
+                // exception left user code. Absent stays empty (unknown) so
+                // §8 omits it rather than guessing.
+                origin: f("origin"),
             })
         })
         .unwrap_or_else(|| {
@@ -1069,6 +1073,8 @@ app = _App()
             Outcome::Failure { err, retryable } => {
                 assert_eq!(err.type_, "UnregisteredTask");
                 assert!(!retryable);
+                // Synthesized by the shim, no task exception behind it.
+                assert_eq!(err.origin, "worker");
             }
             Outcome::Success(_) => panic!("expected a failure, got Success"),
             Outcome::ForceRetry { .. } => panic!("expected a failure, got ForceRetry"),
@@ -1102,6 +1108,8 @@ app = _App()
             Outcome::Failure { err, retryable } => {
                 assert_eq!(err.type_, "UnregisteredTask");
                 assert!(!retryable);
+                // Synthesized by the shim, no task exception behind it.
+                assert_eq!(err.origin, "worker");
             }
             Outcome::Success(_) => panic!("expected a failure, got Success"),
             Outcome::ForceRetry { .. } => panic!("expected a failure, got ForceRetry"),

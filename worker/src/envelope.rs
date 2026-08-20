@@ -234,6 +234,9 @@ impl Envelope {
     }
 }
 
+/// PROTOCOL §8 `error.origin`: cauli machinery synthesized the error object.
+pub const ORIGIN_WORKER: &str = "worker";
+
 /// Error object, PROTOCOL §8.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct ErrorJson {
@@ -243,14 +246,27 @@ pub struct ErrorJson {
     pub message: String,
     #[serde(default)]
     pub traceback: String,
+    /// §8 `origin`: `"worker"` when cauli machinery synthesized this object,
+    /// `"task"` when an exception propagated out of user code. Empty means
+    /// unknown, which happens only for an executor response written before
+    /// the field existed; it is then omitted from the wire rather than sent
+    /// as `""`, since the empty string is not one of the defined values.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub origin: String,
 }
 
 impl ErrorJson {
+    /// Every Rust side construction is cauli machinery minting an error for
+    /// a task that raised nothing, so origin is `"worker"` by construction
+    /// and there is no call site that has to remember to set it. The one
+    /// error object Rust does NOT mint, the one decoded from an executor
+    /// response, carries the origin Python put on it.
     pub fn new(type_: &str, message: impl Into<String>) -> Self {
         ErrorJson {
             type_: type_.to_string(),
             message: message.into(),
             traceback: String::new(),
+            origin: ORIGIN_WORKER.to_string(),
         }
     }
 }
@@ -332,6 +348,7 @@ pub fn result_expired(deadline_ms: u64, finished_at: u64) -> String {
                 finished_at.saturating_sub(deadline_ms)
             ),
             "traceback": "",
+            "origin": ORIGIN_WORKER,
         },
         "finished_at": finished_at,
     })
@@ -536,6 +553,7 @@ mod tests {
         assert_eq!(v["status"], "expired");
         assert_eq!(v["result"], Value::Null);
         assert_eq!(v["error"]["type"], "Expired");
+        assert_eq!(v["error"]["origin"], ORIGIN_WORKER);
         assert!(v["error"]["message"].as_str().unwrap().contains("250ms"));
         assert_eq!(v["finished_at"], 350);
     }
@@ -568,6 +586,7 @@ mod tests {
         assert_eq!(v["result"], Value::Null);
         assert_eq!(v["error"]["type"], "ValueError");
         assert_eq!(v["error"]["message"], "boom");
+        assert_eq!(v["error"]["origin"], ORIGIN_WORKER);
 
         let d = result_duplicate(9, "0123456789abcdef0123456789abcdef");
         let v: Value = serde_json::from_str(&d).unwrap();

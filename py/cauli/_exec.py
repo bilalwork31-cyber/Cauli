@@ -69,11 +69,17 @@ def _format_traceback(exc: BaseException) -> str:
     return text
 
 
-def _error_json(exc: BaseException) -> dict[str, Any]:
+def _error_json(exc: BaseException, origin: str = "task") -> dict[str, Any]:
+    # PROTOCOL.md section 8 `origin`, same rule as worker/src/shim.py: "task"
+    # whenever a real exception ended the task invocation, which includes a
+    # propagated SoftTimeLimitExceeded (the child injected it, but it did
+    # leave user code). "worker" is passed explicitly where cauli itself
+    # synthesized the error with no task exception behind it.
     return {
         "type": type(exc).__name__,
         "message": str(exc),
         "traceback": _format_traceback(exc),
+        "origin": origin,
     }
 
 
@@ -210,6 +216,7 @@ def _execute(
                 "type": "UnregisteredTask",
                 "message": f"task {task_name!r} is not registered in this app",
                 "traceback": "",
+                "origin": "worker",
             },
         }
 
@@ -283,6 +290,7 @@ def _handle_request_line(
                 "type": "ProtocolError",
                 "message": f"malformed request line: {exc}",
                 "traceback": "",
+                "origin": "worker",
             },
         }
     try:
@@ -314,6 +322,9 @@ def _serialize_response_bytes(payload: dict[str, Any]) -> bytes:
             "type": "SerializationError",
             "message": f"task result is not JSON serializable: {exc}",
             "traceback": _format_traceback(exc),
+            # The task itself succeeded and returned; the codec is what
+            # failed, so this error object is cauli's, not the task's.
+            "origin": "worker",
         }
         # Stamped rather than left to the reader's name based default, which
         # is only a fallback for older children (PROTOCOL.md section 8).

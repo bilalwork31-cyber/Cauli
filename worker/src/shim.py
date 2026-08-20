@@ -25,7 +25,8 @@ remaining JSON payload, and it crosses exactly once at startup.
 Outcome dict shapes:
   {"ok": True,  "result": <any JSON-representable value>}
   {"ok": False, "retry": True, "countdown": <float|None>, "error": {...}}
-  {"ok": False, "retryable": <bool>, "error": {"type": ..., "message": ..., "traceback": ...}}
+  {"ok": False, "retryable": <bool>, "error": {"type": ..., "message": ...,
+                                               "traceback": ..., "origin": ...}}
 
 A result that cannot be represented as JSON is rejected on the Rust side and
 becomes a non-retryable SerializationError, the same classification the
@@ -153,8 +154,18 @@ def _tb_of(exc):
     return tb[-_MAX_TB:]
 
 
-def _error_dict(exc):
-    return {"type": type(exc).__name__, "message": str(exc), "traceback": _tb_of(exc)}
+def _error_dict(exc, origin="task"):
+    # PROTOCOL section 8 `origin`: "task" whenever a real exception ended the
+    # task invocation, which includes a propagated SoftTimeLimitExceeded --
+    # the worker injected it, but it did leave user code, so it is not
+    # special cased. "worker" is passed explicitly where the shim itself,
+    # not the task, is the thing that failed.
+    return {
+        "type": type(exc).__name__,
+        "message": str(exc),
+        "traceback": _tb_of(exc),
+        "origin": origin,
+    }
 
 
 def _is_retry(exc):
@@ -369,6 +380,7 @@ def run_sync(name, args, kwargs, soft_timeout_ms):
                     "type": "WorkerShimError",
                     "message": "shim failure",
                     "traceback": "",
+                    "origin": "worker",
                 },
             }
 
@@ -383,6 +395,7 @@ def _run_sync_inner(name, args, kwargs, soft_timeout_ms):
                 "type": "UnregisteredTask",
                 "message": "unknown task %s" % (name,),
                 "traceback": "",
+                "origin": "worker",
             },
         }
     fn = getattr(td, "fn")
@@ -615,6 +628,7 @@ async def _arun(idx, token, name, args, kwargs, timeout_s):
                     "type": "UnregisteredTask",
                     "message": "unknown task %s" % (name,),
                     "traceback": "",
+                    "origin": "worker",
                 },
             }
         else:
@@ -638,6 +652,7 @@ async def _arun(idx, token, name, args, kwargs, timeout_s):
                         "type": "TimeoutError",
                         "message": "task timed out after %.3fs" % (timeout_s,),
                         "traceback": "",
+                        "origin": "worker",
                     },
                 }
             except BaseException as e:
@@ -646,7 +661,10 @@ async def _arun(idx, token, name, args, kwargs, timeout_s):
                 if _after_hooks:
                     await _run_hooks_async(_after_hooks, "after_task")
     except BaseException as e:  # defensive: never lose a completion
-        out = {"ok": False, "retryable": True, "error": _error_dict(e)}
+        # Origin worker, not task: the task body's own exceptions are caught
+        # inside, and hooks swallow theirs, so anything reaching here came
+        # out of the shim's dispatch machinery.
+        out = {"ok": False, "retryable": True, "error": _error_dict(e, "worker")}
 
     # This loop finished something. The wedge watchdog reads this counter as
     # the corroborating signal its stale stamp needs: a loop that is merely

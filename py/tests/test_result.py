@@ -68,6 +68,66 @@ def test_failure_raises_taskfailederror_with_attrs(app, redis_client):
     assert "ValueError" in str(err) and "bad input" in str(err)
 
 
+def test_origin_is_exposed_and_absent_reads_as_unknown(app, redis_client):
+    # Section 8 `origin`, read through as one attribute. A worker predating
+    # the field sends no origin at all, which must surface as None rather
+    # than be guessed at.
+    for sent, expected in (("task", "task"), ("worker", "worker"), (None, None)):
+        ar = _ar(app)
+        error = {"type": "ValueError", "message": "boom", "traceback": ""}
+        if sent is not None:
+            error["origin"] = sent
+        _write_result(
+            redis_client,
+            ar.id,
+            {"status": "failure", "result": None, "error": error, "finished_at": 1},
+        )
+        with pytest.raises(TaskFailedError) as excinfo:
+            ar.get(timeout=1)
+        assert excinfo.value.origin == expected
+
+
+def test_client_synthesized_errors_carry_origin_client(app, redis_client):
+    # InvalidResult never crosses the wire: this package mints it locally,
+    # so it is the one error whose origin is "client".
+    ar = _ar(app)
+    redis_client.set(f"cauli:result:{ar.id}", b"{not json")
+    with pytest.raises(TaskFailedError) as excinfo:
+        ar.get(timeout=1)
+    assert excinfo.value.type == "InvalidResult"
+    assert excinfo.value.origin == "client"
+
+    ar = _ar(app)
+    _write_result(redis_client, ar.id, {"status": "sideways", "finished_at": 1})
+    with pytest.raises(TaskFailedError) as excinfo:
+        ar.get(timeout=1)
+    assert excinfo.value.type == "InvalidResult"
+    assert excinfo.value.origin == "client"
+
+
+def test_expired_carries_worker_origin(app, redis_client):
+    ar = _ar(app)
+    _write_result(
+        redis_client,
+        ar.id,
+        {
+            "status": "expired",
+            "result": None,
+            "error": {
+                "type": "Expired",
+                "message": "gone",
+                "traceback": "",
+                "origin": "worker",
+            },
+            "finished_at": 1,
+        },
+    )
+    with pytest.raises(TaskFailedError) as excinfo:
+        ar.get(timeout=1)
+    assert excinfo.value.type == "Expired"
+    assert excinfo.value.origin == "worker"
+
+
 def test_duplicate_returns_none_and_sets_flag(app, redis_client):
     ar = _ar(app)
     _write_result(
