@@ -236,6 +236,45 @@ database has forgotten. Sentinel gets the atomic scripts but no immunity; only a
 replicated store would be immune. Work that genuinely must not run twice needs a dedup check in
 a store whose durability you have chosen on purpose.
 
+### Clocks and reference points
+
+Every ABSOLUTE instant in this section is REDIS time, never the worker's own. Workers read each
+other's writes: the §4.3 delayed set has a writer and a reader on every worker in the fleet, and
+the §9.1 expiry check compares a worker's reading against a deadline a client stamped. On local
+clocks the failures are not symmetric. Since every worker runs the mover, the FASTEST clock in the
+fleet decides when all delayed work fires, so one forward stepped worker fires everything early and
+defeats backoff and eta; a forward step while a retry is being written strands that entry, with
+nothing to self heal it; and a worker running ahead of the client drops still valid work as expired,
+which is the worst of the three because the work is simply gone.
+
+A worker therefore anchors on redis `TIME`, SAMPLED and not read per call. It takes one blocking
+sample at startup, right after the `XGROUP CREATE` it already has to reach redis for, stores the
+offset between that reading and a monotonic clock, and re anchors every 15 to 30 seconds in the
+background. Reads in between extrapolate from the monotonic clock, so a local NTP step moves no
+score, no deadline and no stamp. Reading `TIME` per call instead would put two SERIAL round trips
+on every task, at the expiry check and at the finish stamp, and roughly double broker command load,
+which is not a price a timestamp is worth; drift between samples is about 3ms per minute against a
+mover that ticks every 250ms. A worker that cannot read `TIME` at all, which some managed
+deployments deny by ACL, keeps extrapolating from its last anchor and warns; it does not refuse to
+start, and its exposure is the local clock behaviour described above.
+
+Every DURATION stays monotonic and stays local: task timeouts, the visibility timeout, idle times,
+loop intervals. None of them crosses a process boundary, so none needs a shared reference.
+
+The CLIENT is on its own clock at 1.0. That covers `enqueued_at`, numeric `expires` and
+`countdown`, which therefore carry the enqueuing host's skew; `eta` and a datetime `expires` are
+absolute values the caller supplied and carry no clock at all. A skewed client mostly harms its own
+tasks, by the size of its own skew. Run NTP on every host that enqueues.
+
+| measurement | clock | zero point |
+|-------------|-------|------------|
+| delayed score: `fire_at`, retry, countdown, eta | redis, through the worker's anchor | unix epoch |
+| §9.1 expiry deadline | stamped by the client, compared on the redis anchor | unix epoch |
+| result `finished_at` and dead letter stamps | redis, through the worker's anchor | unix epoch |
+| `IDLE` and `delivery_count` in §4.4 | redis, inside redis | that entry's last delivery or `XCLAIM` |
+| `timeout_ms`, `required_idle_ms`, `visibility_timeout` | monotonic, in the worker | start of the measurement |
+| execution timeout backstop | monotonic, in the worker | when the executor takes its slot, NOT delivery |
+
 ### The read loop
 
 - One consumer group read loop:
@@ -244,6 +283,10 @@ a store whose durability you have chosen on purpose.
   a simple global gate on io slots is acceptable but do not let cpu backlog starve io fetch
   indefinitely: bound in-worker cpu backlog to twice the cpu pool's in-flight capacity,
   i.e. `2 * cpu_workers * cpu_child_threads` pending items).
+- `COUNT` is `min(batch, free io slots)`, not `batch`. An entry is charged idle time from the
+  moment it is delivered (§4.4), so fetching more than can be STARTED leaves the surplus waiting
+  on an execution slot while its idle clock runs, where the recovery loop can reclaim it mid
+  attempt. See the reference point note at the end of §4.4 for what that costs.
 - Parse envelope from field `e`. Malformed JSON: XACK + XADD to DLQ with reason
   `"malformed"` (best effort raw payload in `e`), continue. A result key is written too when the
   id can be recovered from the entry (§8).
@@ -333,6 +376,10 @@ into the stream, never lose it.
 limit = 128. Both the worker AND the Python client ship this mover (worker runs it always;
 client does not run it — single source: worker only. The client merely ZADDs).
 
+`ARGV[1]=now_ms` is the redis anchored reading, never the worker's own clock. Every worker runs
+this loop against the same sorted set, so on local clocks the earliest firing worker sets the
+firing time for the whole fleet: see the clock note at the top of §4.
+
 **Redis Cluster is not supported for this path.** `cauli:delayed:{queue}` and `cauli:q:{queue}`
 do not share a hash tag, so they never hash to the same slot, and this EVAL is rejected with
 CROSSSLOT on every invocation, not just an occasional one. The mover loop detects CROSSSLOT
@@ -381,6 +428,21 @@ Operators: size `--visibility-timeout` to exceed your longest task's `timeout_ms
 per-envelope check above is a safety net against duplicate concurrent execution, not a reason
 to ignore the invariant (a too-low visibility_timeout still means redelivery is slower than it
 needs to be for tasks that legitimately crash).
+
+**The eligibility clock and the execution clock start at different moments, and the gap is bounded
+on purpose.** `IDLE` above is measured by redis from DELIVERY. The execution timeout backstop
+starts when the executor takes its slot. Everything in between, parsing, the §4.5 claim round trip
+and any wait for a free slot, is time the entry is charged as idle but has not spent running, so an
+entry can pass `required_idle_ms` while its first attempt is alive and has not started. On an idle
+worker that is single digit milliseconds and it costs at most one at least once duplicate, which
+callers already have to tolerate. Under saturation the wait for a free slot is unbounded, and
+repeated reclaims inflate `delivery_count` until the entry dead letters as `redelivery_limit`
+having never executed. The io half is closed at the source by fetching `COUNT = min(batch, free io
+slots)` (§4 read loop), so a fetched entry never waits for a slot. The cpu half keeps a bounded
+version through the worker's cpu backlog, where each `XCLAIM` resets `IDLE` and limits how fast the
+count can climb. Do NOT close the remainder by re anchoring the executor's timeout at delivery:
+that charges queueing time against the task's own budget and changes what `timeout_ms` means for
+every queued task, to close a window duplicates already cover.
 
 ### 4.5 Idempotency guard
 
