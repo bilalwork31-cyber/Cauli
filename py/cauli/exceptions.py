@@ -38,7 +38,14 @@ class TaskFailedError(Exception):
     """Raised by :meth:`cauli.AsyncResult.get` when a task finished with status failure.
 
     Attributes mirror the error JSON from PROTOCOL.md section 8:
-    ``type`` (exception class name), ``message``, ``traceback`` (may be truncated).
+    ``type`` (exception class name), ``message``, ``traceback`` (may be truncated),
+    and ``origin``.
+
+    ``origin`` says who minted the error: ``"worker"`` for cauli machinery
+    (a time limit, a dead letter, a shim failure), ``"task"`` for an exception
+    that propagated out of your own code, and ``"client"`` for one this
+    package synthesized locally, such as ``InvalidResult``. It is ``None``
+    when unknown, which is what a worker predating the field reports.
     """
 
     def __init__(
@@ -46,11 +53,16 @@ class TaskFailedError(Exception):
         type_: str | None = None,
         message: str | None = None,
         traceback_: str | None = None,
+        origin: str | None = None,
     ) -> None:
+        # origin is deliberately kept out of the base args: ``.args`` and the
+        # repr built from it stay the same 3-tuple they were, so adding the
+        # field cannot change what an existing caller sees.
         super().__init__(type_, message, traceback_)
         self.type = type_
         self.message = message
         self.traceback = traceback_
+        self.origin = origin
 
     def __str__(self) -> str:
         text = f"{self.type}: {self.message}"

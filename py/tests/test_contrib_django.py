@@ -311,8 +311,12 @@ def _captured_app(monkeypatch):
     app = _app_no_redis()
 
     @app.task(name="t1")
-    def t1(x):
-        return x
+    def t1(*args, **kwargs):
+        # *args/**kwargs on purpose: these tests exercise option FORWARDING
+        # through a monkeypatched _enqueue below, with example args/kwargs
+        # picked per test and never actually passed to this body, so the
+        # fixture task must accept anything rather than assert a real shape.
+        return args
 
     sent = []
     monkeypatch.setattr(

@@ -1,6 +1,7 @@
 mod backoff;
 mod broker;
 mod cli;
+mod clock;
 mod cpu;
 mod ctx;
 mod dispatch;
@@ -14,7 +15,7 @@ mod supervisor;
 
 use clap::Parser;
 use ctx::Ctx;
-use redis::aio::ConnectionManager;
+use redis::aio::{ConnectionManager, ConnectionManagerConfig};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -22,8 +23,59 @@ use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::watch;
 use tracing::{error, info, warn};
 
+/// Test-only hooks for the exit-path regression (worker/tests/exit_path.rs).
+/// Gated the same way as `CAULI_EXEC_CMD` in cpu.rs: a plain `cargo build
+/// --release` carries none of this, `cargo test --features test-hooks`
+/// compiles it into the binary the e2e suite spawns as a subprocess.
+#[cfg(any(test, feature = "test-hooks"))]
+mod exit_path_test_hooks {
+    use std::sync::OnceLock;
+
+    static MARKER_PATH: OnceLock<String> = OnceLock::new();
+
+    extern "C" fn write_marker() {
+        if let Some(path) = MARKER_PATH.get() {
+            let _ = std::fs::write(path, b"atexit ran\n");
+        }
+    }
+
+    /// If `CAULI_TEST_ATEXIT_MARKER` names a file, register a real libc
+    /// atexit handler that writes it -- an observable stand-in for the
+    /// OPENSSL_cleanup handler `exit_now`'s doc comment describes, without
+    /// depending on a specific library being linked in the test build.
+    pub fn install() {
+        if let Ok(path) = std::env::var("CAULI_TEST_ATEXIT_MARKER") {
+            if MARKER_PATH.set(path).is_ok() {
+                // SAFETY: `write_marker` only reads an already-set OnceLock
+                // and calls std::fs::write; both are safe to run from libc's
+                // atexit callback context.
+                unsafe { libc::atexit(write_marker) };
+            }
+        }
+    }
+
+    /// If set, panic right now. Called right after `PyRuntime::init`
+    /// returns, so the panic lands after the interpreter's daemon asyncio
+    /// loop threads and the async-submit thread are already running -- the
+    /// exact "threads still live" condition `exit_now` exists for.
+    pub fn maybe_panic_after_pyrt_init() {
+        if std::env::var_os("CAULI_TEST_PANIC_AFTER_PYRT_INIT").is_some() {
+            panic!("test-hooks: forced main-thread panic after PyRuntime::init");
+        }
+    }
+}
+
 fn main() {
-    let code = real_main();
+    // A panic that unwinds out of real_main must not be allowed to unwind
+    // out of main itself: past that point the C runtime returns from
+    // crt0's real `main` and calls ordinary libc `exit()` -- the exact
+    // atexit/DSO-teardown race exit_now exists to prevent (see its doc
+    // comment below), and an uncaught panic here is the one path that used
+    // to bypass it. catch_unwind only guards this top-level call; it does
+    // not change how panics inside individual tasks/threads are handled
+    // (those already catch their own -- Cargo.toml is deliberately not
+    // panic = "abort").
+    let code = std::panic::catch_unwind(real_main).unwrap_or(101);
     // Explicit exit: sync pool threads and Python daemon threads must not
     // keep the process alive.
     exit_now(code);
@@ -61,6 +113,11 @@ fn main() {
 /// tracing writes. The embedded interpreter's `sys.stdout` buffer is not
 /// flushed, but it never was: CPython only flushes it from `Py_Finalize`,
 /// which an embedded worker with live daemon threads must not call.
+///
+/// Callers: this `main`, the forced exit on a second signal (130), and
+/// `loops::wedge_loop` on a confirmed event loop wedge
+/// (`loops::WEDGE_EXIT_CODE`), which is the one that runs with the whole
+/// process still executing tasks.
 fn exit_now(code: i32) -> ! {
     use std::io::Write;
     let _ = std::io::stdout().flush();
@@ -70,6 +127,9 @@ fn exit_now(code: i32) -> ! {
 }
 
 fn real_main() -> i32 {
+    #[cfg(any(test, feature = "test-hooks"))]
+    exit_path_test_hooks::install();
+
     let args = match cli::Args::try_parse() {
         Ok(a) => a,
         Err(e) => {
@@ -96,6 +156,18 @@ fn real_main() -> i32 {
     }
     if args.visibility_timeout == 0 {
         error!("--visibility-timeout must be >= 1 (0 reclaims every in-flight task on nearly every tick)");
+        return 1;
+    }
+    if args.max_envelope_bytes == 0 {
+        error!(
+            "--max-envelope-bytes must be >= 1 (0 dead letters every single message as oversize)"
+        );
+        return 1;
+    }
+    if args.redis_timeout == 0 {
+        error!(
+            "--redis-timeout must be >= 1 (0 would time out every redis round trip immediately)"
+        );
         return 1;
     }
     // FS-10: an absurd value (e.g. a typo'd extra digit) would eagerly
@@ -153,6 +225,9 @@ fn real_main() -> i32 {
             return 1;
         }
     };
+    #[cfg(any(test, feature = "test-hooks"))]
+    exit_path_test_hooks::maybe_panic_after_pyrt_init();
+
     if appcfg.tasks.is_empty() {
         warn!("app has no registered tasks");
     }
@@ -188,13 +263,30 @@ fn real_main() -> i32 {
     // floor is a strong signal of a misconfigured deployment (the invariant
     // documented in PROTOCOL.md §4.4: visibility_timeout should exceed your
     // longest task) — warn loudly at startup so operators catch it early.
-    let vt_ms = args.visibility_timeout * 1000;
+    let vt_ms = visibility_timeout_ms(args.visibility_timeout);
     for (name, spec) in &appcfg.tasks {
         if spec.timeout_ms >= vt_ms {
             warn!(
                 task = %name, timeout_ms = spec.timeout_ms, visibility_timeout_s = args.visibility_timeout,
                 "task timeout_ms >= visibility_timeout*1000 (PROTOCOL.md §4.4 invariant \
                  violated) -- consider raising --visibility-timeout"
+            );
+        }
+    }
+    // Same diagnostic, mirrored for idemp_ttl (section 4.5): it is one
+    // global value while a task's own timeout_ms is not, and nothing else
+    // cross checks them. If a task legitimately runs longer than idemp_ttl,
+    // its idempotency key expires while the task is still running, and a
+    // second attempt with the same key then claims Fresh: the exact
+    // duplicate concurrent execution the key exists to prevent.
+    let idemp_ttl_ms = idemp_ttl_ms(appcfg.idemp_ttl);
+    for (name, spec) in &appcfg.tasks {
+        if spec.timeout_ms >= idemp_ttl_ms {
+            warn!(
+                task = %name, timeout_ms = spec.timeout_ms, idemp_ttl_s = appcfg.idemp_ttl,
+                "task timeout_ms >= idemp_ttl*1000: an idempotency key can expire while \
+                 this task is still running, so a second attempt with the same key would \
+                 claim Fresh and run concurrently with the first. Consider raising idemp_ttl."
             );
         }
     }
@@ -221,18 +313,31 @@ async fn run_worker(
             return 1;
         }
     };
-    let mut write_conn = match ConnectionManager::new(client.clone()).await {
-        Ok(c) => c,
-        Err(e) => {
-            error!(
-                "cannot connect to redis at {}: {e}",
-                redact_redis_url(&redis_url)
-            );
-            return 1;
-        }
-    };
+    // Config level timeout, not tokio::time::timeout wrapped around each
+    // call: a caller side timeout only abandons the caller's own wait, the
+    // ConnectionManager itself never observes an Err, so its internal
+    // reconnect_if_io_error! never fires and the same wedged socket gets
+    // reused by every later call. Setting response_timeout here makes the
+    // manager itself see a timeout as a genuine Err (it converts to
+    // ErrorKind::IoError), which activates that already existing reconnect
+    // path instead of leaving it dormant. Do not "simplify" this back to a
+    // per call tokio::timeout; it silently breaks reconnection.
+    let conn_cfg = ConnectionManagerConfig::new()
+        .set_response_timeout(Duration::from_secs(args.redis_timeout))
+        .set_connection_timeout(Duration::from_secs(args.redis_timeout));
+    let mut write_conn =
+        match ConnectionManager::new_with_config(client.clone(), conn_cfg.clone()).await {
+            Ok(c) => c,
+            Err(e) => {
+                error!(
+                    "cannot connect to redis at {}: {e}",
+                    redact_redis_url(&redis_url)
+                );
+                return 1;
+            }
+        };
     // Dedicated connection for blocking XREADGROUP so BLOCK never stalls writes.
-    let fetch_conn = match ConnectionManager::new(client).await {
+    let fetch_conn = match ConnectionManager::new_with_config(client, conn_cfg).await {
         Ok(c) => c,
         Err(e) => {
             error!("cannot open fetch connection: {e}");
@@ -243,6 +348,12 @@ async fn run_worker(
         error!("XGROUP CREATE failed: {e}");
         return 1;
     }
+    // Anchor the wall clock on redis before anything can read it. Blocking
+    // once here is free: reaching redis is already a precondition of the call
+    // above. See clock.rs for why absolute instants must not come from this
+    // host's own clock, and why the anchor is sampled rather than read per call.
+    clock::init(&mut write_conn).await;
+    tokio::spawn(clock::sampler_loop(write_conn.clone()));
 
     // §9.2 queue TTLs, seconds -> ms. Logged so an operator can see at a
     // glance that entries in this deployment have a bounded shelf life;
@@ -318,6 +429,7 @@ async fn run_worker(
     tokio::spawn(loops::mover_loop(ctx.clone()));
     tokio::spawn(loops::recovery_loop(ctx.clone()));
     tokio::spawn(loops::stats_loop(ctx.clone()));
+    tokio::spawn(loops::wedge_loop(ctx.clone()));
 
     loops::fetch_loop(ctx.clone(), fetch_conn).await; // returns on shutdown
 
@@ -395,29 +507,128 @@ fn print_plan(args: &cli::Args, r: &cli::Resolved, cores: usize) {
     );
     println!(
         "  totals: {} io tasks in flight, {} sync threads, up to {} cpu children",
-        r.io_concurrency * r.procs,
-        r.io_threads * r.procs,
-        r.cpu_workers * r.procs
+        plan_total(r.io_concurrency, r.procs),
+        plan_total(r.io_threads, r.procs),
+        plan_total(r.cpu_workers, r.procs)
     );
     println!("  override any value with its flag; see --help and docs/CONFIGURATION.md");
 }
 
-/// Mask `user:password@` userinfo before a redis URL reaches logs or error
-/// messages (audit M4 — `redis://user:password@host/0` is a common shape and
-/// the password would otherwise land in plaintext logs).
+/// Per process value times process count, for the --print-plan totals line.
+/// Saturating, matching the overflow safe style used elsewhere for hostile or
+/// just huge input (dispatch.rs, envelope.rs, exec.rs, cpu.rs, and
+/// visibility_timeout_ms below): release builds have no overflow-checks, so a
+/// plain multiply would wrap silently instead, e.g. a 19 digit -c wrapping
+/// the printed total down to single digits.
+fn plan_total(per_process: usize, procs: usize) -> usize {
+    per_process.saturating_mul(procs)
+}
+
+/// Mask `user:password@` userinfo, and `password=`/`username=` query
+/// parameters, before a redis URL reaches logs or error messages (audit M4:
+/// both are shapes redis-py accepts as real credentials, so either would
+/// otherwise land in plaintext logs).
 fn redact_redis_url(url: &str) -> String {
-    if let Some(scheme_end) = url.find("://") {
-        let after_scheme = &url[scheme_end + 3..];
-        if let Some(at) = after_scheme.find('@') {
-            return format!("{}://***@{}", &url[..scheme_end], &after_scheme[at + 1..]);
-        }
-    }
-    url.to_string()
+    let Some(scheme_end) = url.find("://") else {
+        return url.to_string();
+    };
+    let scheme = &url[..scheme_end];
+    let rest = &url[scheme_end + 3..];
+    // Authority ends at the first '/', '?' or '#'; '@' means the
+    // userinfo/host boundary only within it, so an '@' inside a later
+    // `?password=` value (masked separately below) can never be mistaken
+    // for a second one and corrupt the visible host.
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(authority_end);
+    // Last '@', not first: the `url` crate (and the client that uses it)
+    // resolves a password containing a literal '@' the same way, so
+    // splitting at the first one would leave that password's own tail in
+    // plaintext right after the mask.
+    let new_authority = match authority.rfind('@') {
+        Some(at) => format!("***@{}", &authority[at + 1..]),
+        None => authority.to_string(),
+    };
+    format!(
+        "{scheme}://{new_authority}{}",
+        redact_query_credentials(tail)
+    )
+}
+
+/// Mask `password=`/`username=` VALUES in a URL's query string (the form
+/// redis-py accepts straight as connection kwargs, no userinfo involved).
+/// Keys and every other query parameter stay visible.
+fn redact_query_credentials(tail: &str) -> String {
+    let Some(q) = tail.find('?') else {
+        return tail.to_string();
+    };
+    let (path, rest) = (&tail[..q], &tail[q + 1..]);
+    let (query, fragment) = match rest.find('#') {
+        Some(i) => rest.split_at(i),
+        None => (rest, ""),
+    };
+    let masked = query
+        .split('&')
+        .map(|pair| match pair.split_once('=') {
+            Some((k, _)) if k == "password" || k == "username" => format!("{k}=***"),
+            _ => pair.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    format!("{path}?{masked}{fragment}")
+}
+
+/// Seconds to milliseconds for the visibility timeout. Saturating, matching
+/// the overflow safe style used elsewhere for hostile or just huge input
+/// (dispatch.rs, envelope.rs, exec.rs, cpu.rs): release builds have no
+/// overflow-checks, so a plain multiply would wrap silently instead.
+fn visibility_timeout_ms(visibility_timeout_s: u64) -> u64 {
+    visibility_timeout_s.saturating_mul(1000)
+}
+
+/// Seconds to milliseconds for idemp_ttl, same reasoning and same
+/// saturating style as `visibility_timeout_ms` above.
+fn idemp_ttl_ms(idemp_ttl_s: u64) -> u64 {
+    idemp_ttl_s.saturating_mul(1000)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn visibility_timeout_ms_saturates_instead_of_wrapping() {
+        assert_eq!(visibility_timeout_ms(60), 60_000);
+        assert_eq!(visibility_timeout_ms(u64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn idemp_ttl_ms_saturates_instead_of_wrapping() {
+        assert_eq!(idemp_ttl_ms(86_400), 86_400_000);
+        assert_eq!(idemp_ttl_ms(u64::MAX), u64::MAX);
+    }
+
+    /// F4 reproduction: idemp_ttl and a task's own timeout_ms are unrelated
+    /// numbers nothing else cross checks. The default idemp_ttl (86400s)
+    /// comfortably outlives the default task timeout (300s / 300_000ms); a
+    /// short idemp_ttl against that same default timeout is exactly the
+    /// dangerous combination the new startup warning must catch.
+    #[test]
+    fn idemp_ttl_shorter_than_task_timeout_is_detected() {
+        assert!(
+            300_000 < idemp_ttl_ms(86_400),
+            "default idemp_ttl must be safe"
+        );
+        assert!(
+            300_000 >= idemp_ttl_ms(60),
+            "a 60s idemp_ttl against a 300s task timeout must be flagged"
+        );
+    }
+
+    #[test]
+    fn plan_total_saturates_instead_of_wrapping() {
+        assert_eq!(plan_total(84, 6), 504);
+        assert_eq!(plan_total(usize::MAX, 2), usize::MAX);
+    }
 
     #[test]
     fn redacts_userinfo() {
@@ -432,6 +643,41 @@ mod tests {
         assert_eq!(
             redact_redis_url("redis://host.example:6379/0"),
             "redis://host.example:6379/0"
+        );
+    }
+
+    #[test]
+    fn redacts_password_containing_at_sign() {
+        // M4 follow up: userinfo is split at the LAST '@', matching how the
+        // `url` crate (and the redis client that uses it) actually parses
+        // it. Splitting at the first one used to leave the rest of a
+        // password containing '@' sitting in plaintext right after the mask.
+        assert_eq!(
+            redact_redis_url("redis://user:p@ss@dbhost:6379/0"),
+            "redis://***@dbhost:6379/0"
+        );
+    }
+
+    #[test]
+    fn redacts_query_string_credentials() {
+        // redis-py accepts `password=`/`username=` straight off the query
+        // string as connection kwargs, no userinfo involved, so this form
+        // carries a real credential even with no '@' anywhere in the URL.
+        assert_eq!(
+            redact_redis_url("redis://dbhost:6379/0?password=s3cr3t"),
+            "redis://dbhost:6379/0?password=***"
+        );
+        assert_eq!(
+            redact_redis_url("redis://dbhost:6379/0?username=svc&password=s3cr3t"),
+            "redis://dbhost:6379/0?username=***&password=***"
+        );
+    }
+
+    #[test]
+    fn redacts_userinfo_and_query_credentials_together() {
+        assert_eq!(
+            redact_redis_url("redis://user:p@ss@dbhost:6379/0?password=alsosecret"),
+            "redis://***@dbhost:6379/0?password=***"
         );
     }
 }

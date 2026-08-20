@@ -5,6 +5,12 @@ use rand::Rng;
 /// `attempt` is the NEW retries value (1-based).
 pub fn base_backoff_ms(attempt: u32, base_ms: u64, factor: f64, max_ms: u64) -> f64 {
     let a = attempt.max(1);
+    // A factor at or below 1.0 (zero, negative, or a fraction) would shrink
+    // or collapse the delay as attempts grow instead of backing off, exactly
+    // when a downstream dependency is already struggling. Floor it at 1.0:
+    // that is the one value for which factor^(a-1) can never drop below 1,
+    // so the delay can never fall below base_ms ("no growth", not "no wait").
+    let factor = factor.max(1.0);
     let d = (base_ms as f64) * factor.powi((a - 1) as i32);
     let maxf = max_ms as f64;
     if !d.is_finite() || d > maxf {
@@ -90,6 +96,16 @@ mod tests {
     fn zero_base_is_zero() {
         assert_eq!(compute_backoff_ms(1, 0, 2.0, 60_000, true), 0);
         assert_eq!(compute_backoff_ms(1, 0, 2.0, 60_000, false), 0);
+    }
+
+    #[test]
+    fn zero_or_negative_factor_is_floored_to_no_growth() {
+        // A factor of 0 (or less) must never collapse the delay below
+        // base_ms as attempts grow: it is floored to 1.0, i.e. a constant
+        // base_ms delay, not a shrinking or zero one.
+        assert_eq!(compute_backoff_ms(2, 500, 0.0, 60_000, false), 500);
+        assert_eq!(compute_backoff_ms(5, 500, 0.0, 60_000, false), 500);
+        assert_eq!(compute_backoff_ms(5, 500, -3.0, 60_000, false), 500);
     }
 
     #[test]

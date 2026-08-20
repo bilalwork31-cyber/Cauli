@@ -62,6 +62,13 @@ def fail(msg="boom"):
     raise ValueError(msg)
 
 
+def raise_timeout():
+    # A task raising the BUILTIN TimeoutError itself. It must stay spelled
+    # "TimeoutError" with origin task, so it is distinguishable from the
+    # worker enforced limit, which is TimeLimitExceeded with origin worker.
+    raise TimeoutError("the task's own timeout, not the worker's")
+
+
 def flaky(counter_file, fail_times):
     n = 0
     if os.path.exists(counter_file):
@@ -155,11 +162,26 @@ def cpu_die_once(counter_file):  # fake_exec: os._exit(9) once, then "revived"
     return "revived"
 
 
+def cpu_die_always():  # fake_exec: os._exit(9) unconditionally, every attempt
+    return "unreachable"
+
+
+def cpu_selfsignal(sig=None):  # fake_exec: os.kill(self, sig), default SIGSEGV
+    return "unreachable"
+
+
+def cpu_ghost():  # fake_exec: also sends one unsolicited line with no match
+    return {"echo": "ghost-real"}
+
+
 class App:
     def __init__(self):
         self.redis_url = "redis://127.0.0.1:6392/0"
         self.default_queue = "default"
-        self.result_ttl = 600
+        # Overridable so a test can spawn a second worker with a deliberately
+        # invalid result_ttl (e.g. 0, which makes Redis reject `SET ... EX 0`)
+        # without disturbing the primary worker's normal result writes.
+        self.result_ttl = int(os.environ.get("FIXTURE_RESULT_TTL", "600"))
         self.idemp_ttl = 600
         self._tasks = {}
 
@@ -171,6 +193,7 @@ app = App()
 app.add(TaskDef("fx.echo", echo))
 app.add(TaskDef("fx.aecho", aecho, is_async=True))
 app.add(TaskDef("fx.fail", fail))
+app.add(TaskDef("fx.raise_timeout", raise_timeout))
 app.add(TaskDef("fx.flaky", flaky))
 app.add(TaskDef("fx.retry_once", retry_once))
 app.add(TaskDef("fx.slow", slow))
@@ -184,3 +207,6 @@ app.add(TaskDef("fx.cpu_slow", cpu_slow, kind="cpu"))
 app.add(TaskDef("fx.cpu_slow_pid", cpu_slow_pid, kind="cpu"))
 app.add(TaskDef("fx.cpu_soft_slow", cpu_soft_slow, kind="cpu"))
 app.add(TaskDef("fx.cpu_die_once", cpu_die_once, kind="cpu"))
+app.add(TaskDef("fx.cpu_die_always", cpu_die_always, kind="cpu"))
+app.add(TaskDef("fx.cpu_selfsignal", cpu_selfsignal, kind="cpu"))
+app.add(TaskDef("fx.cpu_ghost", cpu_ghost, kind="cpu"))

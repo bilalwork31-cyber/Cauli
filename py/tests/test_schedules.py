@@ -384,3 +384,150 @@ def test_entry_dict_roundtrip():
 def test_entry_validates_on_missed():
     with pytest.raises(ValueError, match="on_missed"):
         ScheduleEntry(name="e", task="t", schedule=interval(1), on_missed="explode")
+
+
+def test_entry_validates_max_lateness():
+    # A negative max_lateness makes lateness > max_lateness_ms always true
+    # (lateness is never negative for a due slot), so the entry would never
+    # fire again, silently.
+    with pytest.raises(ValueError, match="max_lateness"):
+        ScheduleEntry(name="e", task="t", schedule=interval(1), max_lateness=-1.0)
+
+
+# ------------------------------------------------ DST: instant order vs wall order
+
+
+def fires_during_local_day(sch, tz_name, y, m, d):
+    """Every instant ``sch`` fires inside one local calendar day."""
+    tz = ZoneInfo(tz_name)
+    lo = ms(datetime(y, m, d, 0, 0, tzinfo=tz)) - 1
+    after = datetime(y, m, d, tzinfo=tz) + timedelta(days=1)
+    hi = ms(datetime(after.year, after.month, after.day, 0, 0, tzinfo=tz))
+    out, cur = [], lo
+    while True:
+        cur = sch.next_after(cur)
+        if cur >= hi:
+            return out
+        out.append(cur)
+
+
+def real_matching_instants(sch, tz_name, y, m, d):
+    """Ground truth: real minutes of that local day whose wall time matches.
+
+    Walks absolute time, so a nonexistent local time simply never appears and a
+    repeated one appears twice. This is what a wall clock cron would fire.
+    """
+    tz = ZoneInfo(tz_name)
+    lo = int(datetime(y, m, d, 0, 0, tzinfo=tz).timestamp())
+    after = datetime(y, m, d, tzinfo=tz) + timedelta(days=1)
+    hi = int(datetime(after.year, after.month, after.day, 0, 0, tzinfo=tz).timestamp())
+    out = []
+    for t in range(lo, hi, 60):
+        local = datetime.fromtimestamp(t, tz=tz)
+        if (
+            local.hour in sch.hours
+            and local.minute in sch.minutes
+            and sch._date_matches(local.date())
+        ):
+            out.append(t * 1000)
+    return out
+
+
+def test_spring_forward_over_two_hours_does_not_skip_a_real_slot():
+    """Antarctica/Troll jumps +00 to +02 on 2025-03-30, a TWO hour gap.
+
+    Wall 02:30 does not exist and resolves to 02:30Z, while the real wall 03:30
+    is 01:30Z. Wall order and instant order therefore disagree, and a scan that
+    returns the first wall match silently loses the real 03:30 slot forever.
+    """
+    tz = "Antarctica/Troll"
+    s = crontab(minute=30, hour="2,3", timezone=tz)
+    fired = fires_during_local_day(s, tz, 2025, 3, 30)
+    assert fired == [at(2025, 3, 30, 1, 30), at(2025, 3, 30, 2, 30)]
+    assert set(real_matching_instants(s, tz, 2025, 3, 30)) <= set(fired)
+
+
+def test_spring_forward_emits_instants_in_increasing_order():
+    tz = "Antarctica/Troll"
+    for expr in [("30", "2,3"), ("0,30", "2,3"), ("0", "1,2,3,4"), ("*/20", "*")]:
+        s = crontab(minute=expr[0], hour=expr[1], timezone=tz)
+        fired = fires_during_local_day(s, tz, 2025, 3, 30)
+        assert fired == sorted(fired), expr
+        assert len(fired) == len(set(fired)), expr
+        missed = set(real_matching_instants(s, tz, 2025, 3, 30)) - set(fired)
+        assert not missed, f"{expr} lost real slots {sorted(missed)}"
+
+
+@pytest.mark.parametrize(
+    "tz_name, day, minute, hour, expected",
+    [
+        # A 23 hour day: the wall times inside the gap do not exist, so the
+        # firing count is the number of REAL matching instants, not the number
+        # of wall slots written in the expression.
+        ("America/New_York", (2025, 3, 9), "30", "2,3", 1),
+        ("America/New_York", (2025, 3, 9), "0,30", "2,3", 2),
+        ("America/New_York", (2025, 3, 9), "15", "1,2,3", 2),
+        ("America/New_York", (2025, 3, 9), "0", "3", 1),
+        ("Europe/Berlin", (2025, 3, 30), "30", "2,3", 1),
+        ("Europe/Berlin", (2025, 3, 30), "0,30", "2,3", 2),
+        ("Europe/Berlin", (2025, 3, 30), "0", "0-5", 5),
+        ("Europe/Berlin", (2025, 3, 30), "0", "3", 1),
+    ],
+)
+def test_one_hour_spring_forward_fires_every_instant_that_exists(
+    tz_name, day, minute, hour, expected
+):
+    s = crontab(minute=minute, hour=hour, timezone=tz_name)
+    fired = fires_during_local_day(s, tz_name, *day)
+    assert len(fired) == expected
+    assert set(real_matching_instants(s, tz_name, *day)) <= set(fired)
+
+
+DST_DAYS = [
+    ("America/New_York", (2025, 3, 9)),
+    ("America/New_York", (2025, 11, 2)),
+    ("Europe/Berlin", (2025, 3, 30)),
+    ("Europe/Berlin", (2025, 10, 26)),
+    ("Europe/London", (2025, 3, 30)),
+    ("Europe/Dublin", (2025, 10, 26)),
+    ("Australia/Sydney", (2025, 10, 5)),
+    ("Australia/Lord_Howe", (2025, 10, 5)),
+    ("Australia/Lord_Howe", (2025, 4, 6)),
+    ("Pacific/Chatham", (2025, 9, 28)),
+    ("Pacific/Auckland", (2025, 4, 6)),
+    ("America/Santiago", (2025, 9, 7)),
+    ("America/Havana", (2025, 3, 9)),
+    ("Asia/Beirut", (2025, 10, 26)),
+    ("Antarctica/Troll", (2025, 3, 30)),
+    ("Antarctica/Troll", (2025, 10, 26)),
+]
+
+
+@pytest.mark.parametrize("tz_name, day", DST_DAYS)
+def test_no_real_slot_is_ever_lost_on_a_transition_day(tz_name, day):
+    """The only permitted deviation from a wall clock cron is the documented
+    fall back rule: the SECOND occurrence of a repeated wall time never fires.
+    Anything else missing is a silent miss."""
+    tz = ZoneInfo(tz_name)
+    for minute, hour in [
+        ("*/15", "*"),
+        ("0", "*"),
+        ("30", "2,3"),
+        ("0,30", "2,3"),
+        ("15", "1,2,3"),
+        ("0", "0-5"),
+        ("*/20", "1-4"),
+        ("0,15,30,45", "*"),
+    ]:
+        s = crontab(minute=minute, hour=hour, timezone=tz_name)
+        fired = set(fires_during_local_day(s, tz_name, *day))
+        for want in real_matching_instants(s, tz_name, *day):
+            if want in fired:
+                continue
+            local = datetime.fromtimestamp(want / 1000, tz=tz).replace(tzinfo=None)
+            first = local.replace(tzinfo=tz, fold=0)
+            second = local.replace(tzinfo=tz, fold=1)
+            repeated = first.utcoffset() != second.utcoffset()
+            assert repeated and ms(second) == want, (
+                f"{tz_name} {day} '{minute} {hour}' lost a real slot at {want}"
+            )

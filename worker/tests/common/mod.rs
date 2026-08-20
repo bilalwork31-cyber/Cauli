@@ -3,7 +3,7 @@
 #![allow(dead_code)]
 
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -73,6 +73,20 @@ pub struct Worker(pub Child);
 
 impl Worker {
     pub fn spawn(queues: &str, extra: &[&str]) -> Worker {
+        Self::spawn_ex(queues, extra, &[], None)
+    }
+
+    /// Like `spawn`, plus extra environment variables and, when `log_path` is
+    /// given, stdout redirected to that file instead of discarded -- that is
+    /// where tracing writes (see main.rs's `exit_now` doc comment), so a test
+    /// that needs to read the stats line back has to capture it there, not
+    /// stderr.
+    pub fn spawn_ex(
+        queues: &str,
+        extra: &[&str],
+        envs: &[(&str, &str)],
+        log_path: Option<&std::path::Path>,
+    ) -> Worker {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_cauli-worker"));
         cmd.current_dir(fixtures_dir())
             .args(["--app", "fixture_app:app", "--queues", queues])
@@ -98,12 +112,20 @@ impl Worker {
             cmd.args(["--log-level", "debug"]);
         }
         cmd.args(extra)
+            .envs(envs.iter().copied())
             .env(
                 "CAULI_EXEC_CMD",
                 format!("python3 {}", fixtures_dir().join("fake_exec.py").display()),
             )
-            .stdout(Stdio::null())
             .stderr(Stdio::inherit());
+        match log_path {
+            Some(p) => {
+                cmd.stdout(std::fs::File::create(p).expect("worker log file"));
+            }
+            None => {
+                cmd.stdout(Stdio::null());
+            }
+        }
         Worker(cmd.spawn().expect("worker spawn"))
     }
 
@@ -136,6 +158,29 @@ impl Drop for Worker {
 static SEQ: AtomicU64 = AtomicU64::new(1);
 
 /// 32-char lowercase hex id, unique per test run.
+/// Poll `path` for a `stats:` line where the `field` key (e.g. `"cpu_backlog="`)
+/// is present with a value > 0, up to `secs`. Returns that full line, or
+/// None on timeout.
+pub async fn wait_stats_field_nonzero(path: &Path, field: &str, secs: u64) -> Option<String> {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        let content = std::fs::read_to_string(path).unwrap_or_default();
+        for line in content.lines() {
+            if let Some(i) = line.find(field) {
+                let rest = &line[i + field.len()..];
+                let digits: String = rest.chars().take_while(|ch| ch.is_ascii_digit()).collect();
+                if digits.parse::<u64>().unwrap_or(0) > 0 {
+                    return Some(line.to_string());
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 pub fn unique_id() -> String {
     let n = SEQ.fetch_add(1, Ordering::Relaxed);
     let t = std::time::SystemTime::now()

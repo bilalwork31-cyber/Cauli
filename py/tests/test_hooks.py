@@ -103,7 +103,8 @@ def test_execute_skips_hooks_for_unknown_task():
         app,
         {"id": "3", "task": "nope", "args": [], "kwargs": {}, "soft_timeout_ms": None},
     )
-    assert resp["error"]["type"] == "UnknownTask"
+    assert resp["error"]["type"] == "UnregisteredTask"
+    assert resp["retryable"] is False
     assert events == [], "hooks wrap task execution, not registry misses"
 
 

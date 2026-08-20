@@ -33,7 +33,7 @@ license = { text = "MIT OR Apache-2.0" }
 authors = [{ name = "the cauli contributors" }]
 keywords = ["task-queue", "background-jobs", "redis", "worker", "celery"]
 classifiers = [
-    "Development Status :: 3 - Alpha",
+    "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "License :: OSI Approved :: Apache Software License",
@@ -43,12 +43,14 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: System :: Distributed Computing",
 ]
 # The worker imports the user's app through the client library, and the two
-# share one wire contract (PROTOCOL.md). Pinned rather than ranged: at 0.x the
-# protocol is still moving, so a mismatched pair is a bug, not a convenience.
-dependencies = ["cauli==0.1.0"]
+# share one wire contract (PROTOCOL.md). Pinned exactly rather than ranged: the
+# two halves are one release cut in two, so a mismatched pair is a bug and not
+# a convenience. scripts/check_versions.py gates this pin on every push.
+dependencies = ["cauli==1.0.0"]
 dynamic = ["version"]
 
 [project.urls]
@@ -61,3 +63,13 @@ Issues = "https://github.com/bilalwork31-cyber/Cauli/issues"
 # the wheel's scripts dir, so pip installs it onto PATH inside the venv.
 bindings = "bin"
 strip = true
+# Ships worker/wheel-data/scripts/cauli-worker, the console script that owns
+# the `cauli-worker` name in the venv's bin directory. It fixes the dynamic
+# loader's libpython search path and exports VIRTUAL_ENV, then execs the real
+# binary, which the build renames to `cauli-worker-bin` for exactly this
+# reason (see worker/Cargo.toml). Without it the binary dies inside the loader,
+# before main, on any interpreter whose libpython is neither in the ldconfig
+# cache nor on LD_LIBRARY_PATH: minimal containers, uv managed Python, conda
+# and pyenv. The file needs mode 755 in git, because pip copies the mode
+# straight out of the wheel.
+data = "wheel-data"

@@ -66,6 +66,26 @@ def test_default_name_and_registration():
     assert isinstance(foo, TaskDef)
 
 
+def test_duplicate_task_name_raises_and_keeps_the_first_registration():
+    app = _offline_app()
+
+    @app.task(name="jobs.run")
+    def first():
+        return 1
+
+    with pytest.raises(ValueError, match="jobs.run"):
+
+        @app.task(name="jobs.run")
+        def second():
+            return 2
+
+    # The registry must still point at the FIRST function: silently
+    # overwriting it is exactly the bug (the worker would then run a
+    # different function body than the one `.delay()` looks callable for).
+    assert app._tasks["jobs.run"] is first
+    assert first() == 1
+
+
 def test_bare_decorator_form():
     app = _offline_app()
 

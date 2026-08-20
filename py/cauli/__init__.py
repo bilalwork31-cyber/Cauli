@@ -19,7 +19,7 @@ from cauli.schedules import (
 )
 from cauli.task import TaskDef
 
-__version__ = "0.1.0"
+__version__ = "1.0.0"
 
 __all__ = [
     "Cauli",

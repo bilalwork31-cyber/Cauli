@@ -68,6 +68,66 @@ def test_failure_raises_taskfailederror_with_attrs(app, redis_client):
     assert "ValueError" in str(err) and "bad input" in str(err)
 
 
+def test_origin_is_exposed_and_absent_reads_as_unknown(app, redis_client):
+    # Section 8 `origin`, read through as one attribute. A worker predating
+    # the field sends no origin at all, which must surface as None rather
+    # than be guessed at.
+    for sent, expected in (("task", "task"), ("worker", "worker"), (None, None)):
+        ar = _ar(app)
+        error = {"type": "ValueError", "message": "boom", "traceback": ""}
+        if sent is not None:
+            error["origin"] = sent
+        _write_result(
+            redis_client,
+            ar.id,
+            {"status": "failure", "result": None, "error": error, "finished_at": 1},
+        )
+        with pytest.raises(TaskFailedError) as excinfo:
+            ar.get(timeout=1)
+        assert excinfo.value.origin == expected
+
+
+def test_client_synthesized_errors_carry_origin_client(app, redis_client):
+    # InvalidResult never crosses the wire: this package mints it locally,
+    # so it is the one error whose origin is "client".
+    ar = _ar(app)
+    redis_client.set(f"cauli:result:{ar.id}", b"{not json")
+    with pytest.raises(TaskFailedError) as excinfo:
+        ar.get(timeout=1)
+    assert excinfo.value.type == "InvalidResult"
+    assert excinfo.value.origin == "client"
+
+    ar = _ar(app)
+    _write_result(redis_client, ar.id, {"status": "sideways", "finished_at": 1})
+    with pytest.raises(TaskFailedError) as excinfo:
+        ar.get(timeout=1)
+    assert excinfo.value.type == "InvalidResult"
+    assert excinfo.value.origin == "client"
+
+
+def test_expired_carries_worker_origin(app, redis_client):
+    ar = _ar(app)
+    _write_result(
+        redis_client,
+        ar.id,
+        {
+            "status": "expired",
+            "result": None,
+            "error": {
+                "type": "Expired",
+                "message": "gone",
+                "traceback": "",
+                "origin": "worker",
+            },
+            "finished_at": 1,
+        },
+    )
+    with pytest.raises(TaskFailedError) as excinfo:
+        ar.get(timeout=1)
+    assert excinfo.value.type == "Expired"
+    assert excinfo.value.origin == "worker"
+
+
 def test_duplicate_returns_none_and_sets_flag(app, redis_client):
     ar = _ar(app)
     _write_result(
@@ -87,6 +147,19 @@ def test_pending_timeout_raises_timeouterror(app):
     with pytest.raises(TimeoutError):
         ar.get(timeout=0.3)
     assert time.monotonic() - t0 >= 0.25
+
+
+def test_pending_timeout_message_does_not_claim_the_task_is_pending(app):
+    # A task that ran and succeeded reads exactly the same (no result key)
+    # once result_ttl has elapsed, so the message must not assert "pending"
+    # as if that were a known fact; it must name the task id and state
+    # plainly that no result key is present.
+    ar = _ar(app)
+    with pytest.raises(TimeoutError) as excinfo:
+        ar.get(timeout=0.3)
+    message = str(excinfo.value)
+    assert "pending" not in message
+    assert ar.id in message
 
 
 def test_get_polls_until_late_result_arrives(app, redis_client):
@@ -110,3 +183,49 @@ def test_get_polls_until_late_result_arrives(app, redis_client):
     assert time.monotonic() - t0 >= 0.3, (
         "get() must actually have waited for the result"
     )
+
+
+def test_status_and_get_raise_named_error_for_undecodable_bytes(app, redis_client):
+    ar = _ar(app)
+    redis_client.set(f"cauli:result:{ar.id}", b"not json at all {{{")
+
+    with pytest.raises(TaskFailedError) as excinfo:
+        ar.status()
+    assert excinfo.value.type == "InvalidResult"
+    assert ar.id in str(excinfo.value)
+
+    with pytest.raises(TaskFailedError) as excinfo:
+        ar.get(timeout=1)
+    assert excinfo.value.type == "InvalidResult"
+    assert ar.id in str(excinfo.value)
+
+
+def test_status_and_get_raise_named_error_for_a_json_array_document(app, redis_client):
+    ar = _ar(app)
+    redis_client.set(f"cauli:result:{ar.id}", json.dumps([1, 2, 3]))
+
+    with pytest.raises(TaskFailedError) as excinfo:
+        ar.status()
+    assert excinfo.value.type == "InvalidResult"
+    assert ar.id in str(excinfo.value)
+
+    with pytest.raises(TaskFailedError) as excinfo:
+        ar.get(timeout=1)
+    assert excinfo.value.type == "InvalidResult"
+
+
+def test_status_matches_get_for_a_dict_missing_the_status_field(app, redis_client):
+    ar = _ar(app)
+    _write_result(redis_client, ar.id, {"result": 1, "error": None, "finished_at": 1})
+
+    # Existing good behaviour to match: get() already classifies this as
+    # InvalidResult via its own fallthrough for an unrecognized status.
+    with pytest.raises(TaskFailedError) as excinfo:
+        ar.get(timeout=1)
+    assert excinfo.value.type == "InvalidResult"
+
+    # The inconsistency this test guards against: status() used to silently
+    # return "pending" for this exact document instead of matching get().
+    with pytest.raises(TaskFailedError) as excinfo:
+        ar.status()
+    assert excinfo.value.type == "InvalidResult"

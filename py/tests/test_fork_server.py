@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import socket
 import subprocess
 import sys
@@ -365,3 +366,55 @@ def test_eof_shuts_down_parent_and_children(fs):
     # children die with the parent (PR_SET_PDEATHSIG) -> socket EOF, pid gone
     assert child.at_eof(timeout=10)
     assert _wait_pid_gone(pid), f"forked child {pid} outlived parent {parent_pid}"
+
+
+def test_reaper_logs_signal_on_abnormal_child_exit(fs):
+    """Audit item 4: the reaper used to discard the exit status entirely
+    (`pid, _status = os.waitpid(-1, os.WNOHANG)`), so a segfault, an OOM
+    kill, and any other unprompted death all looked identical to the worker
+    (cpu.rs logs every one as a plain "child connection closed"). The child
+    kills itself with SIGSEGV, standing in for a crash or an OOM kill; the
+    parent's SIGCHLD handler must report WIFSIGNALED and the signal number
+    to stderr so the two are tellable apart from the worker's own log line.
+    """
+    pid = fs.fork()
+    child = fs.accept_child()
+    child.send(
+        {
+            "id": "k1",
+            "task": "selfsignal",
+            "args": [int(signal.SIGSEGV)],
+            "kwargs": {},
+            "soft_timeout_ms": None,
+        }
+    )
+    assert child.at_eof(timeout=10), "the child must be gone, not merely slow"
+    assert _wait_pid_gone(pid)
+
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline and f"pid={pid}" not in fs.stderr():
+        time.sleep(0.05)
+    log = fs.stderr()
+    assert f"pid={pid}" in log and "signal" in log, (
+        f"reaper must log the dead child's pid and signal: {log!r}"
+    )
+    assert str(int(signal.SIGSEGV)) in log, (
+        f"reaper must log the signal number: {log!r}"
+    )
+
+
+def test_reaper_is_quiet_on_a_clean_exit(fs):
+    """The other half of the same fix: a normal exit (the worker closes the
+    connection, the child returns 0) must NOT gain a new reaper log line:
+    only an abnormal one (signaled, or a nonzero exit code) should. The
+    child's own startup line ("fork child pid=...") already mentions its
+    pid unconditionally, so this checks for the reaper's specific wording
+    rather than the pid's mere presence in the (otherwise noisy) log."""
+    pid = fs.fork()
+    child = fs.accept_child()
+    child.close()  # worker closes the connection: child sees EOF, exits 0
+    assert _wait_pid_gone(pid)
+    time.sleep(0.5)  # give the reaper a moment to run
+    log = fs.stderr()
+    assert "killed by signal" not in log, f"a clean exit must not be logged: {log!r}"
+    assert "exited with code" not in log, f"a clean exit must not be logged: {log!r}"

@@ -69,17 +69,25 @@ Two other reasons to pick `kind="cpu"`:
 
 With `-c` set, the worker derives its internals from it. Every derived value
 can still be pinned by passing its flag explicitly; an explicit flag always
-wins. The rules, each from a measured result:
+wins. Every division below is ceiling division, `⌈a / b⌉`: it rounds up, so
+`-c 65` gives 2 processes and `-c 200` gives 4, not the 1 and 3 a floor
+reading predicts. The rules, each from a measured result:
 
 | Derived | Formula | Why |
 |---|---|---|
-| `--procs` | min(cores, c / 64) | Each process is one GIL: fanning out was +74% throughput at lower p99 (measured). Scaling by `-c` keeps a small queue worker to one quiet process on a box shared with your web app and Redis, while a large `-c` on a dedicated box uses every core. The 64 slot target is a chosen default, not yet a swept one |
-| `--io-concurrency` | c / procs | The gate is the real bound for `async def` tasks; a slot costs about 4 KB |
-| `--io-threads` | min(c, 512) / procs, at most the gate | The sync knee is near 1000 threads per process; past it throughput and latency fall together. Staying at 1x the gate is the latency honest default: oversubscribing buys throughput by inflating task p99 (measured 2048 slots on 4 cores: a 20 ms body reached a 92 ms p99) |
-| `--cpu-workers` | min(cores, c) / procs | More cpu children than cores buys nothing, and more than `-c` would make `-c 8` on a cpu queue mean something other than 8 |
+| `--procs` | min(cores, ⌈c / 64⌉) | Each process is one GIL: fanning out was +74% throughput at lower p99 (measured). Scaling by `-c` keeps a small queue worker to one quiet process on a box shared with your web app and Redis, while a large `-c` on a dedicated box uses every core. The 64 slot target is a chosen default, not yet a swept one |
+| `--io-concurrency` | ⌈c / procs⌉ | The gate is the real bound for `async def` tasks; a slot costs about 4 KB |
+| `--io-threads` | ⌈min(c, 512) / procs⌉, at most the gate in this derivation | The sync knee is near 1000 threads per process; past it throughput and latency fall together. Staying at 1x the gate is the latency honest default: oversubscribing buys throughput by inflating task p99 (measured 2048 slots on 4 cores: a 20 ms body reached a 92 ms p99). The gate gets no special enforcement of its own: an explicit `--io-threads` is not capped by it, so `-c 50 --io-threads 999` really does give 999 threads against a gate of 50 |
+| `--cpu-workers` | ⌈min(cores, c) / procs⌉ | More cpu children than cores buys nothing, and more than `-c` would make `-c 8` on a cpu queue mean something other than 8 |
 | `--io-loops` | always 1 | 1 loop beat 2, 3 and 4 in every sweep: extra loops contend for one GIL |
 
-Without `-c` nothing changes: one process, the standalone defaults below.
+Without `-c`, one process and the standalone defaults below apply, unless
+`--procs` is passed alone: it still divides `cpu_workers` across the
+processes you asked for, but `--io-threads` and `--io-concurrency` stay at
+their flat per process defaults, 64 and 256. `--procs 4` alone therefore
+means 4x those defaults fleet wide, 256 threads and 1024 io slots, not 64
+and 256 split four ways. Pass `-c`, which divides both, to scale them down
+instead.
 
 ### Wiring
 
@@ -111,7 +119,7 @@ and a socket rather than a thread.
 
 | Flag | Default | Effect |
 |---|---|---|
-| `--cpu-workers` | min(cores, c) / procs | Child processes for `kind="cpu"` tasks |
+| `--cpu-workers` | ⌈min(cores, c) / procs⌉ | Child processes for `kind="cpu"` tasks |
 | `--cpu-child-threads` | 1 | Requests pipelined per child, matched by id. Range 1 to 1024 |
 | `--cpu-prefetch` | 4 | Requests staged in a child's socket buffer beyond the one it is running. 0 disables |
 | `--cpu-max-tasks-per-child` | 0 (never) | Recycle a child after this many completed tasks. The backstop for leaky C extensions and slowly dirtied copy on write pages, like Celery's maxtasksperchild. Staged work drains first; no task is lost to a recycle |
@@ -128,6 +136,17 @@ dies, everything staged behind it fails as retryable `WorkerLost`, and a staged
 task waits out the tasks ahead of it. Raise it for small tasks, lower it for
 long ones.
 
+**`rss_mb` in the worker's stats line is the worker process only; it does not
+include cpu children.** Each forked child is a separate process with its own
+memory, never summed into that number. `--cpu-max-tasks-per-child` (default 0,
+never) is the ONLY mechanism that bounds a child's memory: cauli sets no
+rlimit and no cgroup on it. A task with a real leak, or one that just holds a
+large result a moment too long, grows that child until the OS OOM killer takes
+it, and that death surfaces as a generic `WorkerLost` like any other. Measured:
+a child held 331.8 MB of its own while the worker's stats line read `rss_mb=35`
+throughout. If cpu tasks are memory hungry, set a recycle threshold; do not
+rely on the stats line to notice for you.
+
 **The cpu pool starts on the first cpu task, not at boot.** An io only
 deployment that registers cpu tasks it never calls pays nothing for them. The
 first cpu task after a start waits out the pool spawn (an app import, typically
@@ -142,11 +161,34 @@ the resident children.
 | `--visibility-timeout` | 60 | Seconds before a dead worker's in flight tasks are reclaimed by another. Must be at least 1 |
 | `--max-envelope-bytes` | 1048576 | Oversize entries go to the DLQ as `malformed` before being parsed |
 | `--drain-timeout` | 30 | Seconds to finish in flight tasks on graceful shutdown |
+| `--redis-timeout` | 5 | Response and connection timeout, in seconds, for every redis round trip |
 
 **`--visibility-timeout` must exceed your longest task's `timeout`** (PROTOCOL
 section 4.4). The worker warns at startup when a registered task violates it.
 Undersized, genuine crash recovery is slower than it needs to be, and a long
 running task risks being reclaimed and run twice.
+
+**`--redis-timeout` bounds fetch, the idempotency claim, the delayed mover,
+crash recovery, and result writes**, all of which otherwise wait on redis with
+no client side deadline at all. Without it, a redis that accepts the TCP
+connection but never answers (paused, swapping, or a network partition
+dropping packets rather than refusing them) hangs the affected call forever;
+`BLOCK` on `XREADGROUP` is a server side wait, not a client side one, and does
+not help. There is no single correct default: it depends on this deployment's
+redis tail latency. Below roughly 1 second, ordinary fork, fsync and network
+jitter risk a false trip, including the delayed mover's Lua script, which can
+touch up to 128 items in one round trip. Past roughly half of
+`--visibility-timeout`, a slow but genuinely alive redis is not caught
+meaningfully sooner than doing nothing. A trip is never a new failure mode:
+every affected call site already has a tested fallback for a redis error
+(a failed result write leaves the entry unacked for `XCLAIM` to redeliver, the
+idempotency claim fails open and executes anyway), so this only reaches an
+existing safe outcome sooner, at the cost of one log line and at most one
+`--visibility-timeout` of added latency on that task. Never data loss.
+
+The Python client built by `Cauli._get_redis()` (`py/cauli/app.py`) passes the
+same 5 second default as `socket_timeout` explicitly, for the same reason:
+redis-py's own default depends on the installed version.
 
 ### Observability
 
@@ -154,6 +196,22 @@ running task risks being reclaimed and run twice.
 |---|---|---|
 | `--stats-interval` | 10 | Seconds between stats log lines |
 | `--log-level` | `info` | `trace`, `debug`, `info`, `warn` or `error`. `RUST_LOG` overrides |
+
+**What to alert on.** Two fields in the stats line (PROTOCOL section 7) mean
+something is already broken, not that a threshold is near:
+
+- **`async_rejected` above zero.** The shim's per loop submission queue
+  rejects only once it is at its cap, and it only reaches that cap when an
+  event loop thread has wedged. That process's async lane does not recover on
+  its own; restarting the process is the only fix.
+- **`sync_abandoned` climbing.** Each abandonment is one sync io task that
+  overran its hard timeout and kept running anyway. The thread is never
+  reclaimed, and neither is anything it holds, a database connection
+  included, so a rising counter is capacity lost for good.
+
+Set `--cpu-max-tasks-per-child` to a nonzero value in production. It is the
+only bound on a cpu child's memory, and `rss_mb` cannot see that growth (see
+CPU execution above).
 
 ## App object
 
@@ -200,6 +258,18 @@ def crunch(data): ...
 The worker's registry is authoritative for `kind`: if an envelope disagrees
 with the registered task, the registry wins.
 
+Raising `cauli.Retry(countdown=...)` inside a task forces a retry with that
+delay instead of the computed backoff, still bounded by `max_retries`. The
+worker recognises it by class name plus a `countdown` attribute rather than by
+class identity, so an exception class of your own named `Retry` that carries a
+`countdown` is read the same way. Identity matching is not available here: the
+worker's interpreter is not required to have cauli installed at all, and the cpu
+lane decides in Rust from a type name read off a pipe. The collision costs
+little, since cauli retries every exception by default anyway; the only
+difference is that your `countdown` replaces the computed backoff, and the task
+still retries `max_retries` times and still dead letters with your own type and
+traceback.
+
 ## Per call options
 
 ```python
@@ -229,7 +299,7 @@ observes a row that got rolled back.
 |---|---|---|
 | `CAULI_REDIS_URL` | client and worker | Broker URL when not passed explicitly |
 | `CAULI_LOOP` | worker | Event loop policy for the embedded asyncio loops. Unset: uvloop when importable, else stock asyncio; the startup line reports which (`impl=uvloop`). `asyncio` forces the stock loop; `uvloop` makes uvloop mandatory and fails startup without it. Force a mode when you must know which loop you measured: under a venv overlay the embedded interpreter also sees system site-packages, so uvloop can appear without being in your requirements |
-| `RUST_LOG` | worker | Overrides `--log-level` |
+| `RUST_LOG` | worker | Overrides `--log-level`. A bare level such as `RUST_LOG=debug` works everywhere. A per target directive has to name the right target, and that differs between builds: the wheel ships `cauli_worker_bin`, while a local `cargo build` produces `cauli_worker`. So use `RUST_LOG=cauli_worker_bin=debug` against an installed worker and `RUST_LOG=cauli_worker=debug` against one you built yourself. Both binaries are the same `src/main.rs`; the two names exist so that `cargo build` keeps producing `cauli-worker` for the integration suite while the wheel ships its console script wrapper under that name |
 | `VIRTUAL_ENV` | worker | The embedded interpreter calls `site.addsitedir` on this venv's site-packages. **Required when running the worker against a virtualenv**, because editable installs are invisible to a `PYTHONPATH` only interpreter |
 | `CAULI_EXEC_CMD` | worker, test builds only | Overrides the cpu child command. Gated behind the `test-hooks` feature |
 
@@ -251,6 +321,29 @@ defaults.
 Celery's Django fixup: `close_old_connections` around every task, and
 `connections.close_all` at process init so a connection opened at import time
 never survives into a forked cpu child.
+
+**Connection count.** Those hooks manage connection staleness, not
+connection count. Each worker process opens its own pool, and each sync
+thread keeps one Django connection for its life, so the number of
+simultaneous Postgres backends is:
+
+```
+procs * io_threads                                  (sync lane)
++ procs * min(CAULI_ORM_EXECUTORS, io_concurrency)   (async lane)
++ procs * cpu_workers                                (cpu lane; each forked child connects on its own)
+```
+
+When `--io-threads` is derived from `-c` the total stays near `min(c, 512)`
+automatically (see Worker command line above). Without `-c`, or with
+`--io-threads` set explicitly, that cap does not apply and the sync lane is
+a plain product: `--procs 4` alone leaves `io_threads` at its standalone
+default of 64 per process, for 4 * 64 = 256 connections, and
+`--procs 4 --io-threads 30` explicitly is 4 * 30 = 120. Postgres ships with
+`max_connections` at 100, about 97 usable, so totals that look modest at
+the flag level can still exhaust it. Put a connection pooler, pgbouncer in
+transaction mode, in front of Postgres once the total climbs past roughly
+a hundred. `bench/RESULTS.md` (Claim 5) has a measured exhaustion and the
+pooler recovery.
 
 ## Tuning guide
 

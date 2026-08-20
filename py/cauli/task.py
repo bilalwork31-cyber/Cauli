@@ -87,8 +87,34 @@ class TaskDef:
         """Run the task function inline (no broker involved)."""
         return self.fn(*args, **kwargs)
 
+    def _check_signature(self, args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
+        """Raise TypeError if ``args``/``kwargs`` do not match the task function.
+
+        Without this, a bad call (a typo'd keyword, a missing required
+        argument) enqueues successfully and only fails inside the worker when
+        it finally calls ``fn(*args, **kwargs)``. By that point ``.delay()``
+        has already returned a normal looking AsyncResult, and the common
+        fire and forget pattern never calls ``.get()`` to notice. Checking the
+        same way Python itself would (``Signature.bind``) also handles a task
+        declared with ``*args``/``**kwargs`` correctly, with no special
+        casing.
+        """
+        try:
+            sig = inspect.signature(self.fn)
+        except (TypeError, ValueError):
+            # Some callables cannot be introspected (e.g. certain builtins or
+            # C extension functions). There is nothing safe to check then, so
+            # the call proceeds unchecked; the worker's own error remains the
+            # only signal for those.
+            return
+        try:
+            sig.bind(*args, **kwargs)
+        except TypeError as exc:
+            raise TypeError(f"{self.name}: {exc}") from None
+
     def delay(self, *args: Any, **kwargs: Any) -> "AsyncResult":
         """Enqueue with positional/keyword args. Returns an AsyncResult."""
+        self._check_signature(args, kwargs)
         return self.app._enqueue(self, args, kwargs)
 
     def apply_async(
@@ -117,10 +143,13 @@ class TaskDef:
         ``queue`` overrides the app's routing rules, the task queue and the app
         default queue.
         """
+        args = tuple(args)
+        kwargs = dict(kwargs or {})
+        self._check_signature(args, kwargs)
         return self.app._enqueue(
             self,
-            tuple(args),
-            dict(kwargs or {}),
+            args,
+            kwargs,
             countdown=countdown,
             queue=queue,
             idempotency_key=idempotency_key,

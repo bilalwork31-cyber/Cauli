@@ -68,6 +68,15 @@ def pidinfo():
     return {"pid": os.getpid(), "tid": threading.get_ident()}
 
 
+@app.task(name="selfsignal", kind="cpu")
+def selfsignal(sig):
+    # Kills THIS child with a real signal (e.g. SIGSEGV), standing in for a
+    # segfault or an OOM kill so the fork-server parent's reaper has a
+    # WIFSIGNALED exit status to log.
+    os.kill(os.getpid(), sig)
+    return "unreachable"
+
+
 @app.task(name="freeze_count", kind="cpu")
 def freeze_count():
     # In a fork-server child this must be > 0: the parent froze its warmed
@@ -109,6 +118,18 @@ def duck_retryme(countdown=None):
 @app.task(name="unser", kind="cpu")
 def unser():
     return {1, 2, 3}  # a set is not JSON serializable
+
+
+class SerializationError(Exception):
+    """An app's own class whose name collides with cauli's reserved type name.
+
+    Not far fetched in a Celery migration: kombu ships one.
+    """
+
+
+@app.task(name="user_serialization_error", kind="cpu")
+def user_serialization_error():
+    raise SerializationError("raised by the app, not by cauli")
 
 
 @app.task(name="noisy", kind="cpu")

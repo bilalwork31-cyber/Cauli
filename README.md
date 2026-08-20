@@ -36,9 +36,13 @@ Install the worker into the same virtualenv as your app. `cauli-worker` embeds
 CPython, so its wheel is built per CPython minor version and links that venv's
 own interpreter. Requires Linux, glibc 2.28 or newer, and a CPython built with
 `--enable-shared` (python.org builds, the `python:*` Docker images, Debian,
-Ubuntu, Fedora, conda and actions/setup-python all qualify).
+Ubuntu, Fedora and actions/setup-python all qualify). Conda does not: the
+wheel installs, then the worker fails before `main` because the loader cannot
+find that environment's `libpython`.
 
-Building from source has no such constraint:
+Building from source lifts the glibc floor, not the platform one. The worker
+is Linux only either way: it arms `PR_SET_PDEATHSIG` unconditionally, so no
+child can outlive the process that spawned it.
 
 ```bash
 git clone https://github.com/bilalwork31-cyber/Cauli.git
@@ -77,6 +81,11 @@ r.get(timeout=10)
 ```bash
 cauli-worker -A myproj.tasks:app -c 50
 ```
+
+**Pass a `timeout` to `get()`.** It polls for a result key, so a task that
+never writes one leaves an untimed `get()` waiting forever: `store_result=False`
+skips the write, and so does an envelope too malformed to recover a task id
+from. Everything with a recoverable id resolves, dead letters included.
 
 Tasks stay directly callable in tests: `crunch([1, 2])` runs inline, no broker
 needed.
@@ -153,11 +162,19 @@ app.add_periodic_task("heartbeat", "myproj.tasks.ping", interval(30))
 cauli-beat --app myproj.tasks:app
 ```
 
-**Run two replicas.** Schedule state lives in Redis behind a leader lease, and
-every firing is an atomic compare and set on the slot, so two instances that
-both believe they lead still produce exactly one task per slot. Celery's beat
-keeps state in a local file with no locking and its own docs tell you to run
-only one.
+**Run two replicas.** Schedule state lives in Redis behind a leader lease,
+and on standalone or Sentinel Redis every firing is an atomic compare and
+set on the slot, so two instances that both believe they lead still
+produce exactly one task per slot. Celery's beat keeps state in a local
+file with no locking and its own docs tell you to run only one. Redis
+Cluster is not a supported topology; see "What you should know before
+shipping" below.
+
+That guarantee is per Redis dataset. Replication is asynchronous, so a
+failover that loses the last acknowledged writes can fire the current slot a
+second time; history is never replayed either way. `idempotent=True` does not
+protect against it, because the guard key sits in the same window of lost
+writes. PROTOCOL.md section 10.5 has the detail.
 
 After downtime a due entry fires once and resumes its cadence; missed slots are
 coalesced, never replayed. Per call scheduling is the usual set:
@@ -189,10 +206,18 @@ autodiscover_tasks(app)
 DJANGO_SETTINGS_MODULE=myproj.settings cauli-worker -A myproj.cauli:app -c 50
 ```
 
-`django_app()` reads `CAULI_*` settings, calls `django.setup()`, and manages DB
-connections around every task with Celery fixup parity. Enqueueing inside a
-transaction has an on commit variant, so a task never observes a row that got
-rolled back:
+`django_app()` reads `CAULI_*` settings, calls `django.setup()`, and closes
+stale connections around every task with Celery fixup parity. That covers
+connection lifecycle, not connection count: every process and every sync
+thread keeps its own connection, so totals scale as `procs * io_threads`
+plus a smaller async and cpu share, past Postgres's default 100 connections
+sooner than the flags suggest. Put a pooler such as pgbouncer, in
+transaction mode, in front of Postgres once you approach that; see the
+Django settings section of
+[docs/CONFIGURATION.md](docs/CONFIGURATION.md) for the full formula.
+
+Enqueueing inside a transaction has an on commit variant, so a task never
+observes a row that got rolled back:
 
 ```python
 with transaction.atomic():
@@ -200,8 +225,86 @@ with transaction.atomic():
     send_receipt.delay_on_commit(order.id)
 ```
 
+## FastAPI
+
+```bash
+pip install cauli 'sqlalchemy[asyncio]' 'psycopg[binary]'   # or asyncpg
+```
+
+```python
+# myproj/cauli.py
+from cauli.contrib.sqlalchemy import sqlalchemy_app
+
+app = sqlalchemy_app("postgresql+psycopg://user:pass@host/db")
+```
+
+```bash
+cauli-worker -A myproj.cauli:app -c 50
+```
+
+The module imports no web framework, so it serves FastAPI, Starlette, Litestar or
+a bare asyncio app identically. `cauli.contrib.fastapi` remains as an alias, so
+existing imports keep working.
+
+`sqlalchemy_app()` builds one `create_async_engine()` and one `async_sessionmaker()`
+up front, opens an `AsyncSession` before every task and closes it after through
+a `ContextVar` task code reads with `get_session()`, and disposes the engine on
+process init so a pooled connection can never survive into a forked cpu child.
+Two assumptions it does not enforce in code: the default `--io-loops 1` (an
+async pool binds to whichever loop first checks a connection out, so more than
+one loop hands the same pool to more than one thread), and no `kind="cpu"`
+tasks (`asyncio.get_running_loop()` succeeds inside a cpu task's own body, so
+"no loop" is not a safe test there; use a plain synchronous SQLAlchemy engine
+on that lane instead).
+
+The pool is not sized to `--io-concurrency`. SQLAlchemy's defaults are
+`pool_size=5` plus `max_overflow=10`, 15 connections total, while
+`--io-concurrency` defaults to 256 and even the quickstart's own `-c 50`
+already exceeds 15. A task admitted past that ceiling queues for a
+connection and then raises `QueuePool limit ... connection timed out`,
+under any concurrent load, not just a spike. Raise `pool_size` plus
+`max_overflow` to match `--io-concurrency`, or lower `--io-concurrency` to
+the pool's ceiling so the semaphore applies backpressure instead of the
+pool timing out.
+
+Committing or rolling back stays task code's job. Unlike `django_app()`,
+this module adds no on commit hook: there is no `delay_on_commit`
+equivalent, so enqueueing inside a transaction can hand a task a row that
+is not committed yet unless you enqueue it yourself once the transaction
+exits.
+
+`.delay()` and `.apply_async()` are synchronous redis calls, so calling one
+from an `async def` handler blocks the event loop until redis answers, up to
+the client's 5 second socket timeout when redis degrades. There is no async
+enqueue API yet; hand the call to a thread, Starlette's
+`await run_in_threadpool(send_email.delay, addr)` for instance, when a slow
+redis must not stall the loop.
+
 ## What you should know before shipping
 
+- **Redis Cluster is not supported.** The worker builds the redis crate
+  without its cluster protocol, so it never follows a MOVED redirect and
+  ordinary operations fail against a real multi node cluster, not only the
+  delayed and periodic paths. Those fail for a second reason as well:
+  `countdown`, `eta`, retries and `cauli-beat` rely on Lua scripts whose
+  keys never share a hash slot, so Cluster rejects every call with
+  CROSSSLOT. Standalone and Sentinel are the supported topologies; see
+  PROTOCOL.md sections 4.3 and 10.5.
+- **Redis must be persistent and must never come back empty.** The stream,
+  its consumer group, the pending entries list and the delayed sorted set
+  are the only copy of accepted work. A Redis that restarts empty, which is
+  the ElastiCache default and also what an OOM kill or a restore from
+  backup looks like, loses every delayed, retried and unacknowledged task.
+  Workers survive that but do not recover from it: the consumer group is
+  created at worker startup only, so they warn on each fetch and consume
+  nothing until they are restarted. Run with AOF, or accept losing whatever
+  the last snapshot missed.
+- **Upgrade workers before producers.** A worker that does not recognise a
+  task name dead letters it terminally and writes an `UnregisteredTask`
+  failure result, so the caller stops waiting and the task is gone rather
+  than left for an upgraded worker to pick up. In a rolling deploy every
+  worker must be running the new code before anything enqueues a new task
+  name.
 - **Delivery is at least once.** A worker crash can redeliver a task, so make
   tasks safe to repeat or pass an `idempotency_key`.
 - **`--visibility-timeout` must exceed your longest task timeout.** The worker
@@ -215,6 +318,11 @@ with transaction.atomic():
 - **Priorities are deliberately not supported.** Use queue order
   (`-Q high,default,bulk`) or separate worker fleets. Reasoning in
   [PROTOCOL.md](PROTOCOL.md) section 9.4.
+- **The dead letter queue is capped at roughly 1000 entries per queue.**
+  Past that, the oldest dead letters are dropped to make room for new
+  ones, so a worker that has been failing for a long time keeps only its
+  most recent failures. Drain or export the DLQ before it fills if it
+  doubles as an audit trail.
 
 ## Documentation
 

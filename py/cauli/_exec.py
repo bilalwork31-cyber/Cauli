@@ -69,11 +69,17 @@ def _format_traceback(exc: BaseException) -> str:
     return text
 
 
-def _error_json(exc: BaseException) -> dict[str, Any]:
+def _error_json(exc: BaseException, origin: str = "task") -> dict[str, Any]:
+    # PROTOCOL.md section 8 `origin`, same rule as worker/src/shim.py: "task"
+    # whenever a real exception ended the task invocation, which includes a
+    # propagated SoftTimeLimitExceeded (the child injected it, but it did
+    # leave user code). "worker" is passed explicitly where cauli itself
+    # synthesized the error with no task exception behind it.
     return {
         "type": type(exc).__name__,
         "message": str(exc),
         "traceback": _format_traceback(exc),
+        "origin": origin,
     }
 
 
@@ -196,13 +202,21 @@ def _execute(
 
     task = getattr(app, "_tasks", {}).get(task_name)
     if task is None:
+        # Same error.type string as the worker's own pre dispatch registry
+        # check (worker/src/dispatch.rs, PROTOCOL.md section 8), and
+        # "retryable": False so this fails on this one attempt instead of
+        # burning the full backoff schedule on something that can never
+        # succeed: worker/src/ctx.rs's parse_pyresp honors an explicit
+        # "retryable" field over its own default.
         return {
             "id": request_id,
             "ok": False,
+            "retryable": False,
             "error": {
-                "type": "UnknownTask",
+                "type": "UnregisteredTask",
                 "message": f"task {task_name!r} is not registered in this app",
                 "traceback": "",
+                "origin": "worker",
             },
         }
 
@@ -235,15 +249,28 @@ def _execute(
         except BaseException as exc:  # the child must never crash on task errors
             if _is_retry(exc):
                 cd = getattr(exc, "countdown", None)
-                countdown = None if cd is None else float(cd)
+                if cd is not None:
+                    try:
+                        cd = float(cd)
+                    except Exception:
+                        cd = None
                 return {
                     "id": request_id,
                     "ok": False,
                     "retry": True,
-                    "countdown": countdown,
+                    "countdown": cd,
                     "error": _error_json(exc),
                 }
-            return {"id": request_id, "ok": False, "error": _error_json(exc)}
+            # Stamped, exactly as shim.py's `_finish_exc` stamps the io lanes:
+            # left absent, ctx.rs falls back to a name based default that makes
+            # a user exception class named "SerializationError" terminal here
+            # and retryable on io, for the same task and the same exception.
+            return {
+                "id": request_id,
+                "ok": False,
+                "retryable": True,
+                "error": _error_json(exc),
+            }
         return {"id": request_id, "ok": True, "result": result}
     finally:
         run_hooks(getattr(app, "_after_task_hooks", ()), "after_task")
@@ -263,13 +290,19 @@ def _handle_request_line(
                 "type": "ProtocolError",
                 "message": f"malformed request line: {exc}",
                 "traceback": "",
+                "origin": "worker",
             },
         }
     try:
         return _execute(app, request, watchdog=watchdog)
     except BaseException as exc:  # e.g. a soft timeout landing at the task boundary
         request_id = request.get("id") if isinstance(request, dict) else None
-        return {"id": request_id, "ok": False, "error": _error_json(exc)}
+        return {
+            "id": request_id,
+            "ok": False,
+            "retryable": True,
+            "error": _error_json(exc),
+        }
 
 
 def _serialize_response_bytes(payload: dict[str, Any]) -> bytes:
@@ -289,9 +322,14 @@ def _serialize_response_bytes(payload: dict[str, Any]) -> bytes:
             "type": "SerializationError",
             "message": f"task result is not JSON serializable: {exc}",
             "traceback": _format_traceback(exc),
+            # The task itself succeeded and returned; the codec is what
+            # failed, so this error object is cauli's, not the task's.
+            "origin": "worker",
         }
+        # Stamped rather than left to the reader's name based default, which
+        # is only a fallback for older children (PROTOCOL.md section 8).
         return _codec.encode_bytes(
-            {"id": payload.get("id"), "ok": False, "error": error}
+            {"id": payload.get("id"), "ok": False, "retryable": False, "error": error}
         )
 
 
@@ -356,14 +394,34 @@ def _rss_kb() -> tuple[int | None, int | None]:
 
 
 def _reap_children(signum: int, frame: Any) -> None:
-    """SIGCHLD handler in the fork-server parent: reap every exited child."""
+    """SIGCHLD handler in the fork-server parent: reap every exited child.
+
+    Logs WIFSIGNALED and the signal number for an abnormal exit. cpu.rs
+    learns of a child's death from EOF on that child's own socket
+    connection, which cannot carry a reason: the process is already gone by
+    the time EOF is observed, so it cannot self report why. Only this
+    parent's waitpid() status, once reaped, can tell a segfault, an OOM
+    kill, or any other unprompted signal death apart from a plain nonzero
+    exit. A normal exit (status 0) stays silent, same as before.
+    """
     while True:
         try:
-            pid, _status = os.waitpid(-1, os.WNOHANG)
+            pid, status = os.waitpid(-1, os.WNOHANG)
         except ChildProcessError:
             return
         if pid == 0:
             return
+        if os.WIFSIGNALED(status):
+            sig = os.WTERMSIG(status)
+            try:
+                name = signal.Signals(sig).name
+            except ValueError:
+                name = "?"
+            _log(f"cauli._exec: child pid={pid} killed by signal {sig} ({name})")
+        elif os.WIFEXITED(status) and os.WEXITSTATUS(status) != 0:
+            _log(
+                f"cauli._exec: child pid={pid} exited with code {os.WEXITSTATUS(status)}"
+            )
 
 
 def _fork_server_main(app_spec: str, sock_path: str, child_threads: int) -> int:
@@ -527,7 +585,7 @@ def _safe_handle_and_respond(
             rid = req.get("id") if isinstance(req, dict) else None
         except Exception:
             rid = None
-        resp = {"id": rid, "ok": False, "error": _error_json(exc)}
+        resp = {"id": rid, "ok": False, "retryable": True, "error": _error_json(exc)}
     try:
         writer.write_response(resp)
     except BaseException:

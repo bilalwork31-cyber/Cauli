@@ -33,7 +33,7 @@ env:
   # Oldest glibc the worker wheels target: manylinux_2_28 is RHEL 8, Debian 10
   # and Ubuntu 20.04 or newer.
   MANYLINUX: "2_28"
-  PYTHONS: '["3.10", "3.11", "3.12", "3.13"]'
+  PYTHONS: '["3.10", "3.11", "3.12", "3.13", "3.14"]'
 
 jobs:
   version:
@@ -73,7 +73,7 @@ jobs:
       fail-fast: false
       matrix:
         target: [x86_64, aarch64]
-        python: ["3.10", "3.11", "3.12", "3.13"]
+        python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v4
 
@@ -85,6 +85,7 @@ jobs:
           args: >-
             --release --out dist
             --interpreter python${{ matrix.python }}
+            --no-default-features --features wheel-bin
 
       # The one property that cannot be allowed to regress silently.
       #
@@ -106,7 +107,7 @@ jobs:
           fi
           rm -rf _probe && mkdir _probe
           unzip -q -o "${wheels[0]}" -d _probe
-          binary=$(ls _probe/*.data/scripts/cauli-worker)
+          binary=$(ls _probe/*.data/scripts/cauli-worker-bin)
           echo "== dynamic section of $binary =="
           readelf -d "$binary" | tee _probe/dyn.txt
           if ! grep -q "libpython${{ matrix.python }}" _probe/dyn.txt; then
@@ -120,6 +121,25 @@ jobs:
           fi
           echo "ok: dynamically linked against libpython${{ matrix.python }}"
 
+          # The console script is what users actually invoke: it repairs the
+          # loader's libpython search path and then execs the binary above.
+          # pip copies the mode straight out of the wheel, and this repo is
+          # developed on a filesystem where git records no exec bit, so a
+          # wheel carrying a mode 644 script would install something the
+          # shell cannot run. Cheap to assert, impossible to notice otherwise.
+          scripts=(_probe/*.data/scripts/cauli-worker)
+          if [ ${#scripts[@]} -ne 1 ] || [ ! -x "${scripts[0]}" ]; then
+            echo >&2
+            echo "FAIL: the cauli-worker console script is missing or is not" >&2
+            echo "executable in the wheel. pip copies the mode straight out" >&2
+            echo "of the wheel, so a mode 644 script installs unrunnable." >&2
+            echo "Fix with: git update-index --chmod=+x" >&2
+            echo "  worker/wheel-data/scripts/cauli-worker" >&2
+            exit 1
+          fi
+          head -1 "${scripts[0]}" | grep -qx '#!python'
+          echo "ok: cauli-worker console script present and executable"
+
       - uses: actions/upload-artifact@v4
         with:
           name: dist-worker-${{ matrix.target }}-cp${{ matrix.python }}
@@ -132,7 +152,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python: ["3.10", "3.11", "3.12", "3.13"]
+        python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -162,8 +182,13 @@ jobs:
           ls -l artifacts
           python -m venv .relvenv
           .relvenv/bin/pip install --upgrade pip
-          .relvenv/bin/pip install --no-index --find-links artifacts \
-            cauli cauli-worker
+          # Named by path, not by requirement: cauli and cauli-worker can then only
+          # be the files we are about to publish, while their third party
+          # dependencies resolve from the index exactly as a user's pip fetches
+          # them. --no-index cannot do this job; cauli needs redis and msgspec,
+          # and neither is in the artifact directory.
+          .relvenv/bin/pip install artifacts/cauli-*.whl \
+            artifacts/cauli_worker-*.whl
           .relvenv/bin/pip install pytest
           test -x .relvenv/bin/cauli-worker
           test -x .relvenv/bin/cauli-beat
@@ -183,9 +208,89 @@ jobs:
           CAULI_VENV: ${{ github.workspace }}/.relvenv
         run: ../.relvenv/bin/pytest -q test_integration.py
 
+  verify-bare:
+    name: verify wheel with no help from the environment (cp${{ matrix.python }})
+    needs: [worker, client]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    steps:
+      # Deliberately NO actions/setup-python. It exports LD_LIBRARY_PATH
+      # pointing at its own libpython, which is why every other job in this
+      # file is structurally blind to the failure this one exists to catch:
+      # the worker binary carries NEEDED libpython3.X.so.1.0 and no RUNPATH,
+      # so on an interpreter whose libpython is neither in the ldconfig cache
+      # nor on LD_LIBRARY_PATH it dies inside the dynamic loader, before main,
+      # and even `cauli-worker --version` fails.
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-client
+          path: artifacts
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist-worker-x86_64-cp${{ matrix.python }}
+          path: artifacts
+
+      # docker run, not a job level `container:`, so nothing from the runner
+      # environment leaks in. A uv managed CPython is the reproduction: it
+      # ships libpython in its own lib directory, which no ldconfig knows
+      # about. It also covers minimal containers, conda and pyenv, which fail
+      # the same way for the same reason.
+      - name: install and RUN the wheel on a bare ubuntu 24.04 with uv
+        run: |
+          set -euo pipefail
+          cat > bare.sh <<'SH'
+          set -eu
+          # Guard the guard: if this ever inherits a libpython search path the
+          # leg proves nothing, so fail loudly instead of passing quietly.
+          if [ -n "${LD_LIBRARY_PATH:-}" ]; then
+            echo "FAIL: LD_LIBRARY_PATH is set ($LD_LIBRARY_PATH)." >&2
+            echo "This job must run with no libpython on the search path." >&2
+            exit 1
+          fi
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq
+          apt-get install -y -qq --no-install-recommends ca-certificates curl
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          export PATH="$HOME/.local/bin:$PATH"
+          uv venv --python "$PYVER" /venv
+          uv pip install --python /venv/bin/python /artifacts/cauli-*.whl \
+            /artifacts/cauli_worker-*.whl
+          test -x /venv/bin/cauli-worker
+          test -x /venv/bin/cauli-worker-bin
+          test -x /venv/bin/cauli-beat
+
+          # Installing proves nothing here; the failure is at exec time. Run
+          # the binary, and run it the way a user does, through the console
+          # script that pip put on PATH.
+          /venv/bin/cauli-worker --version
+          /venv/bin/cauli-worker --help >/dev/null
+
+          # And confirm the raw binary really is the broken one, so a future
+          # change that makes the wrapper a no op cannot pass this job by
+          # accident.
+          if /venv/bin/cauli-worker-bin --version >/dev/null 2>&1; then
+            echo "note: the raw binary starts unaided in this image" >&2
+          else
+            echo "confirmed: the raw binary alone still cannot start here" >&2
+          fi
+
+          worker_v=$(/venv/bin/cauli-worker --version | awk '{print $2}')
+          client_v=$(/venv/bin/python -c "import cauli; print(cauli.__version__)")
+          echo "worker $worker_v / client $client_v"
+          test "$worker_v" = "$client_v"
+          SH
+          docker run --rm \
+            -e PYVER=${{ matrix.python }} \
+            -v "$PWD/artifacts:/artifacts:ro" \
+            -v "$PWD/bare.sh:/bare.sh:ro" \
+            ubuntu:24.04 bash /bare.sh
+
   github-release:
     name: attach raw binaries to the release
-    needs: verify
+    needs: [verify, verify-bare]
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     permissions:
@@ -210,7 +315,7 @@ jobs:
             tags=${base#cauli_worker-}            # <version>-cp3XX-cp3XX-<plat>
             rm -rf _u && mkdir _u
             unzip -q "$whl" -d _u
-            install -m755 _u/*.data/scripts/cauli-worker release/cauli-worker
+            install -m755 _u/*.data/scripts/cauli-worker-bin release/cauli-worker
             tar -C release -czf "release/cauli-worker-${tags}.tar.gz" cauli-worker
             rm release/cauli-worker
           done
@@ -228,7 +333,7 @@ jobs:
 
   publish:
     name: publish to PyPI
-    needs: verify
+    needs: [verify, verify-bare]
     if: github.ref_type == 'tag' || inputs.publish
     runs-on: ubuntu-latest
     environment: pypi

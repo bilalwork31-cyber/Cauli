@@ -87,6 +87,65 @@ def _app():
     return itest_app
 
 
+def _spawn_worker(queues, *extra_args, log_name):
+    """Start an extra cauli-worker process against the shared stack's redis.
+
+    For tests that need to control a worker's crash or restart timing
+    directly, beyond the one long lived worker `stack` already runs.
+    """
+    env = dict(os.environ)
+    env["VIRTUAL_ENV"] = VENV
+    env["PATH"] = f"{VENV}/bin:" + env.get("PATH", "")
+    env["CAULI_REDIS_URL"] = f"redis://127.0.0.1:{PORT}/0"
+    return subprocess.Popen(
+        [
+            BIN,
+            "--app",
+            "itest_app:app",
+            "--queues",
+            queues,
+            "--redis-url",
+            f"redis://127.0.0.1:{PORT}/0",
+            "--cpu-workers",
+            "2",
+            "--io-concurrency",
+            "64",
+            *extra_args,
+            "--python",
+            f"{VENV}/bin/python",
+            "--log-level",
+            "info",
+        ],
+        cwd=HERE,
+        env=env,
+        stdout=open(f"{HERE}/worker_{log_name}.log", "wb"),
+        stderr=subprocess.STDOUT,
+    )
+
+
+def _stop_worker(proc, timeout=15):
+    proc.send_signal(signal.SIGTERM)
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=5)
+
+
+def _pending_count(r, queue):
+    summary = r.xpending(f"cauli:q:{queue}", "cauli")
+    return summary["pending"] if summary else 0
+
+
+def _wait_until_pending(r, queue, at_least, deadline_s):
+    deadline = time.time() + deadline_s
+    while time.time() < deadline:
+        if _pending_count(r, queue) >= at_least:
+            return
+        time.sleep(0.05)
+    raise AssertionError(f"{queue} never reached {at_least} pending entries")
+
+
 def test_sync_io_roundtrip(stack):
     m = _app()
     res = m.echo.delay("hello")
@@ -124,6 +183,33 @@ def test_final_failure_dlq_and_error(stack):
     entries = r.xrange("cauli:dlq:default")
     ids = [json.loads(fields[b"e"])["id"] for _, fields in entries]
     assert res.id in ids
+
+
+def test_unregistered_task_result_resolves_instead_of_hanging(stack):
+    """Dead letter root cause fix: dlq_terminal used to always write
+    result=None, so AsyncResult.get() blocked forever on a result key that
+    would never appear. An unregistered task name is the cheapest way to
+    reach a terminal DLQ with a recoverable id: the envelope parses fine,
+    only the registry lookup fails.
+    """
+    from cauli import TaskFailedError
+    from cauli.result import AsyncResult
+
+    r, _ = stack
+    m = _app()
+    env, queue, _fire = m.app.make_envelope(
+        "itest_app.does_not_exist", args=[], task=None, queue="default"
+    )
+    r.xadd(f"cauli:q:{queue}", {"e": json.dumps(env)})
+
+    res = AsyncResult(env["id"], m.app)
+    with pytest.raises(TaskFailedError) as ei:
+        res.get(timeout=10)
+    assert ei.value.type == "UnregisteredTask"
+
+    entries = r.xrange("cauli:dlq:default")
+    ids = [json.loads(fields[b"e"])["id"] for _, fields in entries]
+    assert env["id"] in ids
 
 
 def test_idempotency_dedup(stack):
@@ -275,6 +361,187 @@ def test_app_level_routing_moves_a_task_to_another_queue(stack):
         json.loads(f[b"e"])["id"] for _sid, f in r.xrange("cauli:dlq:routed") or []
     }
     assert res.id not in routed_ids
+
+
+def test_dlq_stream_is_bounded(stack):
+    """C1 (DLQ) regression: cauli:dlq:{queue} must not grow without bound.
+
+    A sustained trickle of failures on a long lived worker used to grow the
+    DLQ stream forever (no MAXLEN), eventually running Redis out of memory
+    for every queue, not just the failing one. Malformed entries are the
+    cheapest way to generate many DLQ writes (no Python task execution, just
+    parse-fail -> XADD dlq + XACK + XDEL), so this floods the `shortlived`
+    queue's DLQ with far more entries than the 1000 entry cap and checks it
+    settles near the cap, not near the count pushed. `shortlived` is used
+    here (not `default` or `routed`) because no other test in this file
+    inspects its DLQ stream, so this cannot race with them regardless of
+    test execution order.
+    """
+    r, _ = stack
+    dlq_key = "cauli:dlq:shortlived"
+    q_key = "cauli:q:shortlived"
+    r.delete(dlq_key)
+
+    total = 4000
+    pipe = r.pipeline(transaction=False)
+    for i in range(total):
+        pipe.xadd(q_key, {"e": f"not-json-{i}"})
+        if i % 500 == 499:
+            pipe.execute()
+            pipe = r.pipeline(transaction=False)
+    pipe.execute()
+
+    deadline = time.time() + 30
+    while time.time() < deadline and r.xlen(q_key) > 0:
+        time.sleep(0.1)
+    assert r.xlen(q_key) == 0, "worker never drained the flood of malformed entries"
+
+    xlen = r.xlen(dlq_key)
+    assert xlen < total, f"dlq grew unbounded: {xlen} entries for {total} pushed"
+    assert 500 <= xlen <= 2000, f"dlq should settle near the 1000 entry cap, got {xlen}"
+
+
+def test_crash_redelivery_resolves_mine_again_not_duplicate(stack):
+    """PROTOCOL section 4.5 "mine again": a worker that dies mid task leaves
+    its claim standing in cauli:idemp:{h}. `test_idempotency_key_allows_retry`
+    above already covers the scheduled retry half of that fix; this covers
+    the other half, crash redelivery, which the coverage audit found had no
+    test anywhere despite being the half that matters most: it is what stops
+    a task being stuck forever after a worker dies mid execution.
+
+    A worker claims the task and is killed before it can finish, so the
+    entry stays in the pending entries list; a second worker's recovery loop
+    reclaims it with XCLAIM once idle exceeds the visibility timeout. The
+    guard must resolve that reclaim as MineAgain so it genuinely re-executes,
+    not Duplicate, which would strand the task forever.
+    """
+    from cauli.result import AsyncResult
+
+    r, _ = stack
+    m = _app()
+    queue = f"crashidemp-{uuid.uuid4().hex}"
+    path = f"/tmp/cauli-itest-crashidemp-{uuid.uuid4().hex}"
+    key = f"itest-crash-{uuid.uuid4().hex}"
+
+    env, _q, _fire = m.app.make_envelope(
+        m.slow_idemp.name,
+        args=[path, 1.5],
+        task=m.slow_idemp,
+        queue=queue,
+        idempotency_key=key,
+    )
+    task_id = env["id"]
+    q_key = f"cauli:q:{queue}"
+    # Create the group ourselves so the pending check below cannot race
+    # worker1's own startup (it would otherwise get there via ensure_groups,
+    # but only once it has actually started).
+    r.xgroup_create(q_key, "cauli", id="0", mkstream=True)
+    r.xadd(q_key, {"e": json.dumps(env)})
+
+    w1 = _spawn_worker(queue, "--visibility-timeout", "1", log_name="crash1")
+    try:
+        _wait_until_pending(r, queue, at_least=1, deadline_s=10)
+        time.sleep(0.3)  # give the executor a beat to actually enter the task
+        w1.send_signal(signal.SIGKILL)
+        w1.wait(timeout=10)
+    finally:
+        if w1.poll() is None:
+            w1.kill()
+            w1.wait(timeout=5)
+
+    assert _pending_count(r, queue) == 1, (
+        "a killed worker must leave its claim pending, not acked"
+    )
+
+    w2 = _spawn_worker(queue, "--visibility-timeout", "1", log_name="crash2")
+    try:
+        res = AsyncResult(task_id, m.app)
+        out = res.get(timeout=25)
+        assert out == {"slow_idemp_done": True}, "reclaimed task must genuinely execute"
+        assert res.status() == "success", (
+            "crash redelivery must not resolve as duplicate"
+        )
+
+        deadline = time.time() + 5
+        while time.time() < deadline and _pending_count(r, queue) != 0:
+            time.sleep(0.1)
+        assert _pending_count(r, queue) == 0, (
+            "a completed claim must be acked, not left reclaimable"
+        )
+    finally:
+        _stop_worker(w2)
+
+    with open(path) as f:
+        contents = f.read()
+    assert contents == "xx", (
+        f"expected exactly two invocation attempts, one killed and one "
+        f"completed: got {contents!r}"
+    )
+    os.remove(path)
+
+
+def test_redelivery_limit_dead_letters_with_result(stack):
+    """PROTOCOL section 4.4: redelivery_limit = max(3, max_retries + 1)
+    bounds how many times the recovery loop will XCLAIM the same crash
+    victim before giving up on it. `redelivery_limit_rules` in envelope.rs
+    already covers the formula; the coverage audit found the actual path,
+    repeated XCLAIM redelivery reaching that limit and then dead lettering,
+    had no end to end test anywhere.
+
+    The three prior redeliveries are simulated with the same redis primitive
+    the worker's own recovery loop uses to reclaim (XCLAIM increments
+    delivery_count identically regardless of caller), so the real worker
+    below is the one making the last, decisive call: dead letter with reason
+    redelivery_limit (not max_retries, the other dead letter reason), and
+    write a result so a waiting client gets an error instead of hanging on
+    it forever.
+    """
+    from cauli import TaskFailedError
+    from cauli.result import AsyncResult
+
+    r, _ = stack
+    m = _app()
+    queue = f"redelivery-{uuid.uuid4().hex}"
+    q_key = f"cauli:q:{queue}"
+
+    env, _q, _fire = m.app.make_envelope(
+        m.redelivery_doomed.name, args=[1], task=m.redelivery_doomed, queue=queue
+    )
+    task_id = env["id"]
+
+    r.xgroup_create(q_key, "cauli", id="0", mkstream=True)
+    r.xadd(q_key, {"e": json.dumps(env)})
+
+    # One real delivery, then three claims: times_delivered becomes 4, past
+    # this task's own limit of max(3, 0 + 1) = 3, before any worker process
+    # exists to look at it.
+    delivered = r.xreadgroup("cauli", "sim-initial", {q_key: ">"}, count=1)
+    entry_id = delivered[0][1][0][0]
+    for i in range(3):
+        r.xclaim(
+            q_key,
+            "cauli",
+            f"sim-redelivery-{i}",
+            min_idle_time=0,
+            message_ids=[entry_id],
+        )
+    pel = r.xpending_range(q_key, "cauli", min=entry_id, max=entry_id, count=1)
+    assert pel[0]["times_delivered"] == 4, "setup must land exactly one over the limit"
+
+    w = _spawn_worker(queue, "--visibility-timeout", "1", log_name="redelivery")
+    try:
+        res = AsyncResult(task_id, m.app)
+        with pytest.raises(TaskFailedError) as ei:
+            res.get(timeout=20)
+        assert ei.value.type == "RedeliveryLimitExceeded"
+
+        dlq_entries = r.xrange(f"cauli:dlq:{queue}")
+        reasons = {json.loads(f[b"e"])["id"]: f[b"reason"] for _sid, f in dlq_entries}
+        assert task_id in reasons, "doomed entry never reached the dead letter queue"
+        assert reasons[task_id] == b"redelivery_limit"
+        assert reasons[task_id] != b"max_retries"
+    finally:
+        _stop_worker(w)
 
 
 def test_worker_survived_everything(stack):

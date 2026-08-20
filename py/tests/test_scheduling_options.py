@@ -201,6 +201,19 @@ def test_queue_ttl_validation():
         Cauli(redis_url="redis://127.0.0.1:1/0", queue_ttl=True)
 
 
+def test_result_ttl_and_idemp_ttl_validation():
+    # result_ttl=0 (or negative) makes Redis reject `SET key val EX 0`; the
+    # result key is then never written and AsyncResult.get() hangs forever.
+    with pytest.raises(ValueError):
+        Cauli(redis_url="redis://127.0.0.1:1/0", result_ttl=0)
+    with pytest.raises(ValueError):
+        Cauli(redis_url="redis://127.0.0.1:1/0", result_ttl=-1)
+    with pytest.raises(ValueError):
+        Cauli(redis_url="redis://127.0.0.1:1/0", idemp_ttl=0)
+    with pytest.raises(ValueError):
+        Cauli(redis_url="redis://127.0.0.1:1/0", idemp_ttl=-1)
+
+
 # --------------------------------------------------------------- routing
 
 

@@ -72,6 +72,33 @@ impl Ctx {
             .map_or(0, |p| p.overflow.load(Ordering::SeqCst))
     }
 
+    /// Same value as `cpu_overflow()`, plus a side effect: logs the
+    /// zero/nonzero transition (`Counters::note_cpu_backlog`) so the fetch
+    /// loop and the recovery loop's admission gate, which both poll this on
+    /// every tick they are blocked, share one log line per edge instead of
+    /// each logging independently. Use this at admission gate checks; use
+    /// the plain `cpu_overflow()` where only the current depth is wanted
+    /// (the periodic stats line), so that read stays side effect free.
+    pub fn cpu_backlog(&self) -> usize {
+        let n = self.cpu_overflow();
+        // The redis anchored clock, like every other instant the worker
+        // stamps: both ends of this duration are local reads, so it is self
+        // consistent either way, but an NTP step would still distort the
+        // backlog duration it reports. See clock.rs.
+        self.counters.note_cpu_backlog(n, crate::clock::now_ms());
+        n
+    }
+
+    /// Summed RSS of the cpu pool's live children in MB; 0 while the pool
+    /// has not started. The pid list is cloned out from under the lock
+    /// before any /proc read, so a stats tick never holds it across io.
+    pub fn cpu_rss_mb(&self) -> u64 {
+        self.cpu.get().map_or(0, |pool| {
+            let pids = pool.child_pids.lock().unwrap().clone();
+            crate::stats::cpu_rss_mb(&pids)
+        })
+    }
+
     /// Configured max age for `queue`, in ms: an exact match wins over the
     /// `"*"` fallback, and no entry at all means unbounded.
     pub fn queue_ttl_ms(&self, queue: &str) -> Option<u64> {
@@ -96,10 +123,28 @@ impl Drop for DecrGuard<'_> {
 }
 
 pub fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
+    now_ms_from(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH))
+}
+
+/// Split out from `now_ms` so the pre epoch branch is unit testable without
+/// touching the real system clock: a test can hand in an `Err` built from
+/// `duration_since` on two `SystemTime`s in the wrong order.
+fn now_ms_from(since_epoch: Result<std::time::Duration, std::time::SystemTimeError>) -> u64 {
+    static CLOCK_WARNED: std::sync::Once = std::sync::Once::new();
+    since_epoch.map(|d| d.as_millis() as u64).unwrap_or_else(|_| {
+        // System clock reads before the unix epoch. Every now_ms() call
+        // collapses to 0 until the clock passes 1970, which is self
+        // consistent (all fire_at/expiry comparisons still agree with each
+        // other), so this degrades rather than corrupts anything; but it was
+        // previously silent. Warn once so an operator with a misconfigured
+        // clock can actually find out.
+        CLOCK_WARNED.call_once(|| {
+            tracing::warn!(
+                "system clock reads before the unix epoch: now_ms is returning 0 until it passes 1970"
+            );
+        });
+        0
+    })
 }
 
 /// Executor completion, normalized from shim / cpu-child response JSON.
@@ -192,6 +237,28 @@ mod tests {
     }
 
     #[test]
+    fn now_ms_returns_a_plausible_current_epoch() {
+        // Regression guard for the now_ms_from split: a normal clock must
+        // still produce real epoch millis, not accidentally always 0.
+        let ms = now_ms();
+        assert!(ms > 1_700_000_000_000, "now_ms looks wrong: {ms}");
+    }
+
+    #[test]
+    fn now_ms_from_pre_epoch_error_degrades_to_zero_not_panic() {
+        // Builds a real SystemTimeError without touching the actual clock:
+        // duration_since(later) is Err when the receiver is earlier than the
+        // argument, which is exactly the pre epoch shape now_ms() hits.
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+        let err = std::time::SystemTime::now().duration_since(later);
+        assert!(err.is_err());
+        assert_eq!(now_ms_from(err), 0);
+        // The warn-once guard must not panic or change behavior on a second hit.
+        let err2 = std::time::SystemTime::now().duration_since(later);
+        assert_eq!(now_ms_from(err2), 0);
+    }
+
+    #[test]
     fn parses_success() {
         match parse_pyresp(r#"{"ok":true,"result":{"a":1}}"#, false) {
             Outcome::Success(v) => assert_eq!(v["a"], 1),
@@ -248,6 +315,56 @@ mod tests {
             Outcome::Failure { err, retryable } => {
                 assert_eq!(err.type_, "WorkerShimError");
                 assert!(retryable);
+            }
+            _ => panic!("expected failure"),
+        }
+    }
+
+    /// §8 `origin` is decided by whoever minted the error, so the parser has
+    /// to carry the executor's value through untouched rather than classify
+    /// anything itself.
+    #[test]
+    fn origin_is_carried_through_from_the_executor_response() {
+        match parse_pyresp(
+            r#"{"ok":false,"error":{"type":"ValueError","message":"m","origin":"task"}}"#,
+            true,
+        ) {
+            Outcome::Failure { err, .. } => assert_eq!(err.origin, "task"),
+            _ => panic!("expected failure"),
+        }
+        match parse_pyresp(
+            r#"{"ok":false,"error":{"type":"UnregisteredTask","message":"m","origin":"worker"}}"#,
+            false,
+        ) {
+            Outcome::Failure { err, .. } => assert_eq!(err.origin, "worker"),
+            _ => panic!("expected failure"),
+        }
+    }
+
+    /// A cpu child predating the field sends no origin at all. That must
+    /// decode as unknown (empty, and so omitted from the result document)
+    /// rather than be guessed at, while every error the worker mints itself
+    /// is "worker" by construction.
+    #[test]
+    fn absent_origin_stays_unknown_and_worker_minted_errors_say_worker() {
+        match parse_pyresp(
+            r#"{"ok":false,"error":{"type":"ValueError","message":"m"}}"#,
+            true,
+        ) {
+            Outcome::Failure { err, .. } => assert_eq!(err.origin, ""),
+            _ => panic!("expected failure"),
+        }
+        match parse_pyresp("not json", false) {
+            Outcome::Failure { err, .. } => {
+                assert_eq!(err.type_, "WorkerShimError");
+                assert_eq!(err.origin, "worker");
+            }
+            _ => panic!("expected failure"),
+        }
+        match parse_pyresp(r#"{"ok":false}"#, false) {
+            Outcome::Failure { err, .. } => {
+                assert_eq!(err.type_, "UnknownError");
+                assert_eq!(err.origin, "worker");
             }
             _ => panic!("expected failure"),
         }

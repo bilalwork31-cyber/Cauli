@@ -89,12 +89,19 @@ DUE_BATCH = 500
 # racing the same slot then sees a different score and returns 0.
 #
 # mode 'none' advances the slot without publishing (an entry whose firing was
-# suppressed by on_missed="skip", and the CROSSSLOT fallback path below).
+# suppressed by on_missed="skip").
+#
+# Publish before advancing the slot, deliberately. A script is atomic against
+# other clients but does NOT roll back on its own error: every write it
+# already made stays committed. Advancing first would let a failed publish
+# (say the target key now holds the wrong type) consume the slot with
+# nothing ever sent: a silently lost firing. Publishing first means a
+# failure here can only be retried and republished next tick, a duplicate,
+# never a loss. Do not move the slot ZADD back above the publish.
 _CLAIM_LUA = """
 local cur = redis.call('ZSCORE', KEYS[1], ARGV[1])
 if cur == false then return 0 end
 if tonumber(cur) ~= tonumber(ARGV[2]) then return 0 end
-redis.call('ZADD', KEYS[1], ARGV[3], ARGV[1])
 if ARGV[4] == 'stream' then
   redis.call('XADD', KEYS[4], '*', 'e', ARGV[5])
   redis.call('HINCRBY', KEYS[3], ARGV[1], 1)
@@ -102,6 +109,7 @@ elseif ARGV[4] == 'delayed' then
   redis.call('ZADD', KEYS[4], tonumber(ARGV[6]), ARGV[5])
   redis.call('HINCRBY', KEYS[3], ARGV[1], 1)
 end
+redis.call('ZADD', KEYS[1], ARGV[3], ARGV[1])
 redis.call('HSET', KEYS[2], ARGV[1], ARGV[7])
 return 1
 """
@@ -112,12 +120,39 @@ return 1
 # slow replica could reseed a slot that a fast one had already fired, firing it
 # twice.
 _SEED_LUA = """
-local rev = redis.call('HGET', KEYS[3], ARGV[1])
+local rev = redis.call('HGET', KEYS[2], ARGV[1])
 if rev == ARGV[3] and redis.call('ZSCORE', KEYS[1], ARGV[1]) then return 0 end
 redis.call('ZADD', KEYS[1], ARGV[2], ARGV[1])
-redis.call('HSET', KEYS[3], ARGV[1], ARGV[3])
+redis.call('HSET', KEYS[2], ARGV[1], ARGV[3])
 return 1
 """
+
+
+class RedisClusterUnsupported(RuntimeError):
+    """A beat Lua script hit Redis Cluster's CROSSSLOT.
+
+    Deliberately not a redis.exceptions.RedisError. Every RedisError run()
+    retries below is a plausible blip: a dropped connection, a failover in
+    progress. This is not one of those. The beat keys and the target queue
+    key never share a hash tag, so the script that just failed will fail the
+    same way on the next tick, and every tick after that. Its own type keeps
+    it out of the generic handler so it can be logged as what it actually
+    is: permanent, not transient.
+    """
+
+
+def _crossslot(exc: "redis.exceptions.ResponseError") -> bool:
+    # Newer redis-py maps the server's CROSSSLOT code to a dedicated
+    # ClusterCrossSlotError whose message is a rewritten "Keys in request
+    # don't hash to the same slot", with no "CROSSSLOT" substring left in
+    # str(exc) at all -- checked by type first for that case, older redis-py
+    # (no such class; the raw "CROSSSLOT ..." server message survives) by
+    # substring after.
+    cross_slot_type = getattr(redis.exceptions, "ClusterCrossSlotError", ())
+    if isinstance(exc, cross_slot_type):
+        return True
+    return "CROSSSLOT" in str(exc).upper()
+
 
 _REFRESH_LUA = """
 if redis.call('GET', KEYS[1]) == ARGV[1] then
@@ -225,10 +260,6 @@ class RedisScheduleStore(ScheduleStore):
         self._seed = client.register_script(_SEED_LUA)
         self._refresh = client.register_script(_REFRESH_LUA)
         self._release = client.register_script(_RELEASE_LUA)
-        # Flipped to False the first time the atomic claim+publish trips over
-        # a Redis Cluster CROSSSLOT error (the beat keys and cauli:q:{queue}
-        # do not share a hash slot). See `claim_and_publish`.
-        self._atomic_publish = True
 
     # -- clock ------------------------------------------------------------
     def now_ms(self) -> int:
@@ -278,11 +309,19 @@ class RedisScheduleStore(ScheduleStore):
 
     # -- slots ------------------------------------------------------------
     def seed(self, name: str, slot_ms: int, rev: str) -> bool:
-        return bool(
-            self._seed(
-                keys=[DUE_KEY, STATE_KEY, REV_KEY], args=[name, int(slot_ms), rev]
+        try:
+            return bool(
+                self._seed(keys=[DUE_KEY, REV_KEY], args=[name, int(slot_ms), rev])
             )
-        )
+        except redis.exceptions.ResponseError as exc:
+            if not _crossslot(exc):
+                raise
+            raise RedisClusterUnsupported(
+                f"beat cannot seed schedule entries on redis cluster: {DUE_KEY} "
+                f"and {REV_KEY} do not share a hash slot, so this script always "
+                "fails with CROSSSLOT; no periodic task can ever be seeded on "
+                "this deployment"
+            ) from exc
 
     def slots_and_revs(self) -> tuple[dict[str, int], dict[str, str]]:
         """Current next-fire slots and schedule fingerprints, in one round trip.
@@ -333,58 +372,30 @@ class RedisScheduleStore(ScheduleStore):
             )
 
         state_json = _codec.encode(state)
-        if mode != "none" and self._atomic_publish:
-            try:
-                return bool(
-                    self._claim(
-                        keys=[DUE_KEY, STATE_KEY, RUNS_KEY, target],
-                        args=[
-                            name,
-                            int(expected_slot),
-                            int(next_slot),
-                            mode,
-                            payload,
-                            int(fire_at or 0),
-                            state_json,
-                        ],
-                    )
+        try:
+            return bool(
+                self._claim(
+                    keys=[DUE_KEY, STATE_KEY, RUNS_KEY, target],
+                    args=[
+                        name,
+                        int(expected_slot),
+                        int(next_slot),
+                        mode,
+                        payload,
+                        int(fire_at or 0),
+                        state_json,
+                    ],
                 )
-            except redis.exceptions.ResponseError as exc:
-                if "CROSSSLOT" not in str(exc).upper():
-                    raise
-                # Redis Cluster: the beat keys and the queue key live in
-                # different slots, so no script can touch both. Degrade
-                # explicitly rather than silently: the CAS still guarantees no
-                # DUPLICATE firing, but a crash in the gap between the advance
-                # and the publish now loses that one firing.
-                log.warning(
-                    "beat: redis cluster CROSSSLOT on the atomic claim+publish; "
-                    "falling back to claim-then-publish (a crash in the gap now "
-                    "drops a single firing instead of being atomic)"
-                )
-                self._atomic_publish = False
-
-        won = bool(
-            self._claim(
-                keys=[DUE_KEY, STATE_KEY, RUNS_KEY, DUE_KEY],
-                args=[
-                    name,
-                    int(expected_slot),
-                    int(next_slot),
-                    "none",
-                    "",
-                    0,
-                    state_json,
-                ],
             )
-        )
-        if won and envelope is not None:
-            if fire_at is not None:
-                self.client.zadd(target, {payload: fire_at})
-            else:
-                self.client.xadd(target, {"e": payload})
-            self.client.hincrby(RUNS_KEY, name, 1)
-        return won
+        except redis.exceptions.ResponseError as exc:
+            if not _crossslot(exc):
+                raise
+            raise RedisClusterUnsupported(
+                f"beat cannot claim and publish on redis cluster: cauli:beat:* "
+                f"and {target} do not share a hash slot, so this script always "
+                "fails with CROSSSLOT; no periodic task can ever fire on this "
+                "deployment"
+            ) from exc
 
     def state(self, name: str) -> dict[str, Any] | None:
         raw = self.client.hget(STATE_KEY, name)
@@ -452,6 +463,16 @@ class Beat:
         self.fired = 0
         self.skipped = 0
         self.lost_races = 0
+        # Runs here, once per process, rather than from add_periodic_task: a
+        # task name may resolve to an @app.task decorated later in the same
+        # module, so a name still missing is only a real typo once the whole
+        # app module has finished importing, which construction time
+        # guarantees. Logged instead of left to raise: one typo must not stop
+        # every other entry in the schedule from being reconciled and fired.
+        try:
+            self.app.check_periodic_tasks()
+        except ValueError as exc:
+            log.error("beat: %s", exc)
 
     # -- leadership -------------------------------------------------------
     @property
@@ -523,6 +544,11 @@ class Beat:
         for name, entry in entries.items():
             if not entry.enabled:
                 if name in slots:
+                    log.warning(
+                        "beat: entry %r is disabled; dropping its next fire slot. "
+                        "It will not run again until it is enabled",
+                        name,
+                    )
                     self.store.drop_slot(name)
                 continue
             rev = entry.rev()
@@ -544,12 +570,29 @@ class Beat:
         # A slot with no surviving definition would otherwise sit due forever.
         for name in slots:
             if name not in entries:
+                log.warning(
+                    "beat: dropping the next fire slot for %r: it has no schedule "
+                    "definition any more (deleted, or unreadable and logged above)",
+                    name,
+                )
                 self.store.drop_slot(name)
 
-        for name, slot in self.store.due(now):
+        due = self.store.due(now)
+        if len(due) >= DUE_BATCH:
+            log.warning(
+                "beat: %d entries came due at once, which is the per tick cap; "
+                "the rest are deferred to the next tick and will fire late",
+                len(due),
+            )
+        for name, slot in due:
             entry = entries.get(name)
             if entry is None or not entry.enabled:
-                # Definition deleted or disabled between the seed and now.
+                log.warning(
+                    "beat: dropping due slot %s for %r: its definition was deleted "
+                    "or disabled during this tick, so that slot will not fire",
+                    slot,
+                    name,
+                )
                 self.store.drop_slot(name)
                 continue
             self._fire(entry, slot, now)
@@ -558,7 +601,7 @@ class Beat:
 
     def _fire(self, entry: ScheduleEntry, slot: int, now: int) -> None:
         try:
-            next_slot = entry.schedule.advance_past(slot, now)
+            next_slot, missed = entry.schedule.advance_past_with_missed(slot, now)
         except ValueError as exc:
             log.error("beat: cannot advance entry %r: %s", entry.name, exc)
             return
@@ -632,8 +675,18 @@ class Beat:
             )
             return
         self.fired += 1
-        log.info(
-            "beat: fired %r (task %s -> queue %s, id %s, slot %s, %dms late, next %s)",
+        # A coalesced firing silently consumes every slot it slept through
+        # (PROTOCOL.md section 10.4), so say how many rather than leaving an
+        # operator to divide lateness by the cadence.
+        if missed is None:
+            coalesced = ", coalescing more missed slots than the fast forward bound"
+        elif missed:
+            coalesced = f", coalescing {missed} missed slots that will not fire"
+        else:
+            coalesced = ""
+        log.log(
+            logging.WARNING if coalesced else logging.INFO,
+            "beat: fired %r (task %s -> queue %s, id %s, slot %s, %dms late, next %s)%s",
             entry.name,
             entry.task,
             queue,
@@ -641,6 +694,7 @@ class Beat:
             slot,
             lateness,
             next_slot,
+            coalesced,
         )
 
     def _sleep_for(self, now: int, started: float) -> float:
@@ -668,7 +722,6 @@ class Beat:
     def run(self, stop: threading.Event | None = None) -> None:
         """Loop until ``stop`` is set (or forever). Releases the lease on exit."""
         stop = stop or threading.Event()
-        self.sync_code_entries()
         log.info(
             "cauli-beat started: instance=%s entries=%d lock_ttl=%.1fs max_interval=%.1fs",
             self.instance_id,
@@ -691,6 +744,16 @@ class Beat:
                         self.sync_code_entries()
                         self._reconciled = True
                     sleep_s = self.tick()
+                except RedisClusterUnsupported as exc:
+                    # Same lease reasoning as the generic handler below (force
+                    # a refresh, do not step down), but never logged as
+                    # "retrying in 1s": stepping down would just hand the
+                    # exact same permanent CROSSSLOT to the next leader, and
+                    # a message that reads like a blip would send an operator
+                    # chasing a network problem that does not exist.
+                    log.error("beat: %s", exc)
+                    self._next_refresh = 0.0
+                    sleep_s = 1.0
                 except redis.exceptions.RedisError as exc:
                     # Do NOT step down here. A transient error says nothing
                     # about whether the lease is still ours, and `acquire_lock`
@@ -737,7 +800,8 @@ def build_parser() -> argparse.ArgumentParser:
         prog="cauli-beat",
         description="cauli periodic scheduler (PROTOCOL.md section 10). "
         "Safe to run as several replicas: schedule state lives in Redis and "
-        "each slot fires exactly once.",
+        "each slot fires exactly once per Redis dataset (section 10.5 covers "
+        "what a failover can still replay).",
     )
     p.add_argument("--app", required=True, help="app location as module:attr")
     p.add_argument(
@@ -802,13 +866,16 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     if args.once:
-        beat.sync_code_entries()
         if beat._hold_leadership(0.0):
+            beat.sync_code_entries()
             beat.tick()
             if beat.use_lock:
                 beat.store.release_lock(beat.instance_id)
         else:
-            log.info("beat: another instance holds the lease; --once did nothing")
+            log.info(
+                "beat: another instance holds the lease and is already "
+                "reconciling and scheduling; --once did nothing"
+            )
         return 0
 
     stop = threading.Event()

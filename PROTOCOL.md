@@ -30,7 +30,7 @@ All keys use prefix `cauli:`. `{queue}` is a queue name matching `[a-zA-Z0-9_.-]
 |---|---|---|
 | `cauli:q:{queue}` | Stream | Ready tasks. Each entry has exactly one field `e` whose value is the envelope JSON (UTF-8). |
 | `cauli:delayed:{queue}` | ZSET | Delayed/retrying tasks. member = envelope JSON string, score = fire_at epoch ms. |
-| `cauli:dlq:{queue}` | Stream | Dead letters. Fields: `e` = envelope JSON, `reason` = string, `error` = error JSON (see §8) or empty string. |
+| `cauli:dlq:{queue}` | Stream | Dead letters. Fields: `e` = envelope JSON, `reason` = string, `error` = error JSON (see §8) or empty string. Capped at 1000 entries (approximate XADD MAXLEN); see below. |
 | `cauli:result:{task_id}` | String | Result JSON (see §8), `SET ... EX result_ttl`. |
 | `cauli:idemp:{h}` | String | Idempotency guard. Value = task id that claimed it. `SET NX EX idemp_ttl`. |
 | `cauli:beat:*` | (several) | Periodic scheduler state. Owned by `cauli-beat`, not by the worker; full layout in §10.1. |
@@ -40,6 +40,15 @@ All keys use prefix `cauli:`. `{queue}` is a queue name matching `[a-zA-Z0-9_.-]
 fixed size and neutralizes cluster hash-tag injection (`{...}`) or other charset abuse from an
 app-controlled string; it does not need to be cryptographic since idempotency keys are chosen
 by the app author, not an adversary distinct from the app.
+
+Every `cauli:dlq:{queue}` XADD (§4, §4.2, §4.4, §9.1) carries `MAXLEN ~ 1000`, so the stream
+never grows past roughly that size regardless of how long the worker has been running. Without
+a bound, a long lived worker under a sustained trickle of failures would grow the stream forever
+until Redis runs out of memory, taking down every queue in the deployment, not just the failing
+one. The tradeoff is deliberate: past the cap, the OLDEST dead letters are dropped to make room
+for new ones, so a worker that has been failing for a long time keeps only its most recent 1000
+(approximately, `~` trims to whole internal stream nodes so it can overshoot slightly) dead
+letters per queue. Losing old dead letters beats an out of memory event that stops every queue.
 
 Consumer group: name `cauli`, created per queue stream with
 `XGROUP CREATE cauli:q:{queue} cauli 0 MKSTREAM` (ignore BUSYGROUP error).
@@ -75,10 +84,22 @@ Unknown fields must be preserved on re-enqueue (retries) if practical, otherwise
 }
 ```
 
+- `v`: protocol version, currently always `1`. The worker accepts a `v` at or below its own
+  supported version and rejects anything higher, since no forward compatibility is defined for
+  a version this build predates -> DLQ reason `"malformed"` (§8) rather than guessing at an
+  unknown shape.
+- `args`: JSON array or null (null behaves as `[]`). `kwargs`: JSON object or null (null behaves
+  as `{}`). Any other JSON type -> DLQ reason `"malformed"` before the task is ever executed,
+  since a wrongly shaped `kwargs` reaching `fn(*args, **kwargs)` would fail there instead, as a
+  retryable error, several executions later.
 - `kind`: `"io"` or `"cpu"`. Worker-side registry wins if it disagrees (registry is authoritative).
 - `retries`: attempts completed so far. 0 on first enqueue. The worker increments it when
   scheduling a retry.
-- `timeout_ms`: hard timeout. `soft_timeout_ms`: null or int < timeout_ms.
+- `timeout_ms`: hard timeout, must be greater than 0 (a zero timeout elapses before any attempt
+  can finish) -> DLQ reason `"malformed"` otherwise. A value above 24 hours is accepted but
+  clamped to 24 hours: the crash recovery loop's own reclaim math (§4.4) adds `timeout_ms` to an
+  idle threshold, and an unbounded value there would make a stuck entry practically
+  unreclaimable rather than merely slow to reclaim. `soft_timeout_ms`: null or int < timeout_ms.
 - `idempotency_key`: null or string (see §1 for how the worker keys it).
 - `not_before`: null normally; otherwise the absolute epoch-ms instant before which the task
   must not run. Set from either `countdown` (relative seconds → `now + countdown*1000`) or
@@ -101,7 +122,7 @@ attaches no behavior to them:
   is the field to group by when auditing "did every slot fire exactly once".
 
 Envelope contents are treated as unvalidated input by the worker (they may be crafted, not just
-client-produced). Two worker-side gates apply before an entry is ever executed:
+client-produced). Worker-side gates apply before an entry is ever executed:
 
 - `id` must match `[a-z0-9]{32}` (32 lowercase hex, matching what the client always produces);
   anything else -> DLQ reason `"malformed"`, no retry. Without this, a crafted id could collide
@@ -111,6 +132,11 @@ client-produced). Two worker-side gates apply before an entry is ever executed:
   bounds the `serde_json::Value` memory amplification and processing cost of a hostile or
   simply oversized payload. Recommendation: pass references (ids, URLs, keys) in args/kwargs,
   not large blobs.
+- `args`/`kwargs` shape and `timeout_ms` (see above) are checked once the envelope has otherwise
+  parsed successfully, the same way the `v` check above is: on a well formed id, so a DLQ entry
+  for either reason still gets a `cauli:result:{id}` failure result written, and a caller
+  blocked in `AsyncResult.get()` gets an answer instead of waiting on a key that would otherwise
+  never exist.
 
 ## 3. Client enqueue rules (Python package)
 
@@ -132,7 +158,124 @@ additionally validates the object tree against the JSON type set before encoding
 msgspec on its own would encode `NaN`/`Infinity` as `null`, accept `set` and `bytes`, and
 coerce non-`str` dict keys — none of which this protocol defines.
 
+Integer fields (`v`, `retries`, `max_retries`, `backoff_base_ms`, `backoff_max_ms`, `timeout_ms`,
+`soft_timeout_ms`, `enqueued_at`, `expires_at`) accept either a JSON integer, or a JSON number
+written with a decimal point or an exponent as long as its value is an exact whole number, since
+a third party codec MAY represent a large integer that way (`1.7e12` for `enqueued_at`). A value
+with a fractional part (`1.5`), NaN, an infinity, or a magnitude outside the field's own integer
+range is rejected as malformed, never rounded or clamped to fit; `timeout_ms` above 24 hours is
+the one documented exception (see above), and it is clamped, not rejected, specifically because
+the value itself is otherwise valid.
+
 ## 4. Worker delivery loop
+
+### Delivery guarantee
+
+Once Redis has accepted an enqueue, cauli never loses the task silently: it either executes to a
+recorded outcome or lands in the dead letter stream with a stated reason. Execution is at least
+once. Every internal failure, a truncated completion pipeline, a worker crash, a mid script
+error, a failed idempotency check, resolves toward running the task again rather than dropping
+it, so duplicates are always possible; `idempotency_key` suppresses most of them for `idemp_ttl`
+seconds, best effort. Work terminates within bounds: `max_retries` failed executions, at most
+`max(3, max_retries + 1)` crash redeliveries per attempt, then a dead letter queue capped at
+roughly 1000 entries per queue. Beat fires each slot at most once per surviving Redis dataset.
+All of this is scoped to ONE Redis dataset: an async replication failover can forget
+unreplicated writes, which is the one place a task can vanish or a beat slot can fire twice, and
+delayed, retried and periodic tasks do not work on Cluster.
+
+**What a user must do.** Write every task to tolerate running twice, unconditionally.
+`idempotency_key` narrows the window; it does not remove that obligation. Work that truly must
+not run twice needs its own dedup check inside the task, keyed on something stable, `beat_slot`
+for scheduled work. Operationally: keep `--visibility-timeout` above the longest task timeout
+and `idemp_ttl` above the longest run plus retry horizon, both of which the worker now warns
+about, watch the dead letter queue before its cap rotates, and run standalone or Sentinel
+knowing a failover can duplicate recent work.
+
+The `idemp_ttl` half of that is now enforced rather than left to the operator: a claim is
+written for at least as long as the execution it guards, whatever `idemp_ttl` says (§4.5). The
+warning stays, because the configured value is still what governs suppression of a genuine
+resubmission after the task has finished.
+
+**Worst case executions of one task: `(max_retries + 1) x (redelivery_limit + 1)`.** The two
+counters are deliberately disjoint. `retries` counts failed executions and rides in the envelope
+(§4.2); `delivery_count` counts crash redeliveries of one attempt and lives in the stream's PEL,
+so each retry starts a new entry with a fresh count (§4.4). An attempt is dead lettered on the
+delivery AFTER `delivery_count` passes `redelivery_limit`, which is one execution more than the
+limit reads like. With the defaults (`max_retries` 3, `redelivery_limit` `max(3, 3 + 1)` = 4)
+that is 4 x 5 = 20 executions before the task is guaranteed to stop, not 4. Anything sized on
+the retry count, a downstream quota, a rate limit, an alert threshold, needs that product.
+
+**The guarantee requires a Redis that keeps its data.** At least once is a claim about the
+stream and its pending entries list, so it lasts exactly as long as they do. Redis must therefore
+be configured to persist (RDB, AOF, or both) and to be restored from that persistence on restart.
+This is not the default everywhere: ElastiCache ships with persistence off, and a redis that comes
+back empty after a restart, an OOM kill or a restore from an empty backup has lost every unacked
+entry, every delayed and retried task in `cauli:delayed:*`, and every idempotency claim. Nothing
+redelivers that work, because nothing remembers it. Two related settings matter as much: do not
+point `maxmemory-policy` at an eviction policy that can evict cauli's own keys (`noeviction` is
+the safe choice for a broker, since evicting a stream key silently deletes queued work), and treat
+`FLUSHALL` on a broker as data loss.
+
+Workers survive the event rather than hanging on it. A missing consumer group is detected
+specifically (NOGROUP, not a generic broker error), logged at error level naming the reset and
+what it destroyed, and the groups are recreated so consumption resumes; see §7 for the exact line.
+Recovery is of the queue, not of the work that was in flight when the dataset went.
+
+**The guarantee is per Redis dataset.** Everything above holds for as long as the write itself
+survives, and Redis replication is asynchronous, so a failover promotes whatever the replica had
+actually received. An enqueue the master acknowledged and never replicated is simply gone: the
+one failure that loses a task silently, and the only one cauli cannot route to a dead letter,
+because nothing in the promoted dataset remembers the task existed. The same lost write window
+covers the rest of this section. An idempotency claim can be lost with it, so a task already
+executing is claimed Fresh a second time elsewhere. If beat fires slot `S`, a worker consumes
+and executes it, and the master then dies before that write reaches the replica, the promoted
+node still has `S` due and fires it again (§10.5); `idempotent: true` narrows that window rather
+than closing it, since the `cauli:idemp:*` guard is written to the same node inside the same
+window. It is a property of the store, not of the scripts, which cannot defend a write the
+database has forgotten. Sentinel gets the atomic scripts but no immunity; only a synchronously
+replicated store would be immune. Work that genuinely must not run twice needs a dedup check in
+a store whose durability you have chosen on purpose.
+
+### Clocks and reference points
+
+Every ABSOLUTE instant in this section is REDIS time, never the worker's own. Workers read each
+other's writes: the §4.3 delayed set has a writer and a reader on every worker in the fleet, and
+the §9.1 expiry check compares a worker's reading against a deadline a client stamped. On local
+clocks the failures are not symmetric. Since every worker runs the mover, the FASTEST clock in the
+fleet decides when all delayed work fires, so one forward stepped worker fires everything early and
+defeats backoff and eta; a forward step while a retry is being written strands that entry, with
+nothing to self heal it; and a worker running ahead of the client drops still valid work as expired,
+which is the worst of the three because the work is simply gone.
+
+A worker therefore anchors on redis `TIME`, SAMPLED and not read per call. It takes one blocking
+sample at startup, right after the `XGROUP CREATE` it already has to reach redis for, stores the
+offset between that reading and a monotonic clock, and re anchors every 15 to 30 seconds in the
+background. Reads in between extrapolate from the monotonic clock, so a local NTP step moves no
+score, no deadline and no stamp. Reading `TIME` per call instead would put two SERIAL round trips
+on every task, at the expiry check and at the finish stamp, and roughly double broker command load,
+which is not a price a timestamp is worth; drift between samples is about 3ms per minute against a
+mover that ticks every 250ms. A worker that cannot read `TIME` at all, which some managed
+deployments deny by ACL, keeps extrapolating from its last anchor and warns; it does not refuse to
+start, and its exposure is the local clock behaviour described above.
+
+Every DURATION stays monotonic and stays local: task timeouts, the visibility timeout, idle times,
+loop intervals. None of them crosses a process boundary, so none needs a shared reference.
+
+The CLIENT is on its own clock at 1.0. That covers `enqueued_at`, numeric `expires` and
+`countdown`, which therefore carry the enqueuing host's skew; `eta` and a datetime `expires` are
+absolute values the caller supplied and carry no clock at all. A skewed client mostly harms its own
+tasks, by the size of its own skew. Run NTP on every host that enqueues.
+
+| measurement | clock | zero point |
+|-------------|-------|------------|
+| delayed score: `fire_at`, retry, countdown, eta | redis, through the worker's anchor | unix epoch |
+| §9.1 expiry deadline | stamped by the client, compared on the redis anchor | unix epoch |
+| result `finished_at` and dead letter stamps | redis, through the worker's anchor | unix epoch |
+| `IDLE` and `delivery_count` in §4.4 | redis, inside redis | that entry's last delivery or `XCLAIM` |
+| `timeout_ms`, `required_idle_ms`, `visibility_timeout` | monotonic, in the worker | start of the measurement |
+| execution timeout backstop | monotonic, in the worker | when the executor takes its slot, NOT delivery |
+
+### The read loop
 
 - One consumer group read loop:
   `XREADGROUP GROUP cauli {consumer} COUNT {batch} BLOCK 1000 STREAMS cauli:q:{q1} cauli:q:{q2} ... > > ...`
@@ -140,9 +283,15 @@ coerce non-`str` dict keys — none of which this protocol defines.
   a simple global gate on io slots is acceptable but do not let cpu backlog starve io fetch
   indefinitely: bound in-worker cpu backlog to twice the cpu pool's in-flight capacity,
   i.e. `2 * cpu_workers * cpu_child_threads` pending items).
+- `COUNT` is `min(batch, free io slots)`, not `batch`. An entry is charged idle time from the
+  moment it is delivered (§4.4), so fetching more than can be STARTED leaves the surplus waiting
+  on an execution slot while its idle clock runs, where the recovery loop can reclaim it mid
+  attempt. See the reference point note at the end of §4.4 for what that costs.
 - Parse envelope from field `e`. Malformed JSON: XACK + XADD to DLQ with reason
-  `"malformed"` (best effort raw payload in `e`), continue.
-- Unknown task name (not in registry): DLQ with reason `"unregistered"`, XACK. No retry.
+  `"malformed"` (best effort raw payload in `e`), continue. A result key is written too when the
+  id can be recovered from the entry (§8).
+- Unknown task name (not in registry): DLQ with reason `"unregistered"`, XACK. No retry. A
+  result key is written too (§8): the id is always recoverable here, since the envelope parsed.
 - Expired (past `expires_at` or the queue's TTL): DLQ with reason `"expired"`, XACK. No retry,
   no execution. Checked BEFORE the §4.5 idempotency claim — see §9.1.
 - Route by registry kind (fallback envelope kind): io/async, io/sync, cpu.
@@ -185,6 +334,14 @@ On failure with `retries >= max_retries` (final):
 2. If `store_result`: `SET cauli:result:{id} {failure result json} EX result_ttl`.
 3. XACK + XDEL.
 
+On a failure marked `retryable: false` (a deterministic failure that would fail the same way
+on every attempt, e.g. `SerializationError`), the same three steps run immediately, on the
+first and only attempt, with reason `"not_retryable"` instead of `"max_retries"`, however many
+retries remain. The two reasons are not interchangeable: `"max_retries"` claims a retry budget
+was spent and ran out; a failure that was never eligible for a retry never had a budget to
+spend, so reporting `"max_retries"` for it would be false, not just imprecise, and would hide
+from an operator matching on that reason that nothing was ever retried at all.
+
 A task may raise `cauli.Retry(countdown=X)` to force a retry with an explicit delay
 (still bounded by max_retries; the forced countdown replaces the computed backoff).
 Recognition is duck-typed, identically across both Python execution paths (the embedded io
@@ -197,20 +354,38 @@ all). `.countdown` is read as a float seconds value (`None` → use the computed
 
 ### 4.3 Delayed mover
 
-Every 250ms per queue, atomically move due members (Lua script, single EVAL):
+Every 250ms per queue, move due members (Lua script, single EVAL):
 
 ```lua
 -- KEYS[1]=cauli:delayed:{queue}  KEYS[2]=cauli:q:{queue}  ARGV[1]=now_ms  ARGV[2]=limit
 local due = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, tonumber(ARGV[2]))
 for i, e in ipairs(due) do
-  redis.call('ZREM', KEYS[1], e)
   redis.call('XADD', KEYS[2], '*', 'e', e)
+  redis.call('ZREM', KEYS[1], e)
 end
 return #due
 ```
 
+Atomic against other clients, not transactional: a Lua script does not roll back on its own
+error, so if `XADD` had run after `ZREM` a failure partway through (the target key holding the
+wrong type, or an out of memory error under `maxmemory-policy noeviction`, the default) would
+remove the entry from the sorted set with no guarantee it ever reached the stream, a silent
+loss. Publishing before removing means a failure partway through can only duplicate an entry
+into the stream, never lose it.
+
 limit = 128. Both the worker AND the Python client ship this mover (worker runs it always;
 client does not run it — single source: worker only. The client merely ZADDs).
+
+`ARGV[1]=now_ms` is the redis anchored reading, never the worker's own clock. Every worker runs
+this loop against the same sorted set, so on local clocks the earliest firing worker sets the
+firing time for the whole fleet: see the clock note at the top of §4.
+
+**Redis Cluster is not supported for this path.** `cauli:delayed:{queue}` and `cauli:q:{queue}`
+do not share a hash tag, so they never hash to the same slot, and this EVAL is rejected with
+CROSSSLOT on every invocation, not just an occasional one. The mover loop detects CROSSSLOT
+specifically and logs loudly and by name rather than folding it into the generic "mover failed,
+retrying" warning: every delayed and every retried task on that queue is stuck in the sorted set
+and never reaches the stream until the deployment moves off Cluster.
 
 ### 4.4 Crash recovery / redelivery
 
@@ -243,7 +418,8 @@ Every `visibility_timeout / 2` (visibility_timeout default 60s, CLI flag), per q
    if any registered task's `timeout_ms >= visibility_timeout * 1000`.
 3. Otherwise (idle >= required_idle_ms): if `delivery_count > redelivery_limit` (default
    `max(3, max_retries+1)`, computed per envelope after claim; use 3 if envelope unreadable):
-   claim it (`XCLAIM ... JUSTID` acceptable), DLQ with reason `"redelivery_limit"`, XACK+XDEL.
+   claim it (`XCLAIM ... JUSTID` acceptable), DLQ with reason `"redelivery_limit"`, XACK+XDEL. A
+   result key is written too when the id is recoverable (§8).
 4. Else `XCLAIM cauli:q:{queue} cauli {consumer} {visibility_timeout_ms} {id}` and execute it
    normally (same code path as a fresh delivery; do not increment `retries` for a claim).
 
@@ -253,17 +429,53 @@ per-envelope check above is a safety net against duplicate concurrent execution,
 to ignore the invariant (a too-low visibility_timeout still means redelivery is slower than it
 needs to be for tasks that legitimately crash).
 
+**The eligibility clock and the execution clock start at different moments, and the gap is bounded
+on purpose.** `IDLE` above is measured by redis from DELIVERY. The execution timeout backstop
+starts when the executor takes its slot. Everything in between, parsing, the §4.5 claim round trip
+and any wait for a free slot, is time the entry is charged as idle but has not spent running, so an
+entry can pass `required_idle_ms` while its first attempt is alive and has not started. On an idle
+worker that is single digit milliseconds and it costs at most one at least once duplicate, which
+callers already have to tolerate. Under saturation the wait for a free slot is unbounded, and
+repeated reclaims inflate `delivery_count` until the entry dead letters as `redelivery_limit`
+having never executed. The io half is closed at the source by fetching `COUNT = min(batch, free io
+slots)` (§4 read loop), so a fetched entry never waits for a slot. The cpu half keeps a bounded
+version through the worker's cpu backlog, where each `XCLAIM` resets `IDLE` and limits how fast the
+count can climb. Do NOT close the remainder by re anchoring the executor's timeout at delivery:
+that charges queueing time against the task's own budget and changes what `timeout_ms` means for
+every queued task, to close a window duplicates already cover.
+
 ### 4.5 Idempotency guard
 
 At execution start, if `idempotency_key` is not null (`{h}` = the hashed key per §1):
 
-- Atomically (single Lua script): `SET cauli:idemp:{h} {task_id} NX EX idemp_ttl`; if that fails
-  because the key already exists, `GET` the existing value and compare it to `task_id`.
+- Atomically (single Lua script):
+  `SET cauli:idemp:{h} {task_id} NX EX max(idemp_ttl, (timeout_ms + grace_ms) / 1000)`
+  (rounded up; `grace_ms` = 2000, the same window §4.4 uses); if that fails because the key
+  already exists, `GET` the existing value and compare it to `task_id`.
 - If the SET succeeded (fresh claim), OR the existing value equals THIS task's own `id`
-  (**"mine again"** — see below) → execute normally.
+  (**"mine again"**, see below) → `PEXPIRE` the key back to that same TTL and execute normally.
 - If the existing value is a DIFFERENT task id → do NOT execute. If `store_result`: write
-  result JSON with status `"duplicate"` (result null). XACK + XDEL. This is dedup within
-  idemp_ttl, best effort by design (at-least-once broker).
+  result JSON with status `"duplicate"` (result null) carrying `claimant_id`, the id of the task
+  that holds the key. XACK + XDEL. This is dedup within the claim's TTL, best effort by design
+  (the broker is at least once).
+
+**The TTL is derived from the execution, not taken as configured.** `idemp_ttl` is one global
+value and `timeout_ms` is per task, so a claim written for `idemp_ttl` alone can expire while
+its own task is still running, and the next attempt then claims fresh and runs concurrently with
+the first: the duplicate the key exists to prevent. Taking the larger of the two makes the claim
+outlive the execution it guards, and the `PEXPIRE` on "mine again" extends the lease across a
+retry chain instead of leaving the window anchored at the first claim. A configured `idemp_ttl`
+longer than the execution still wins, since it is the one that governs suppression after the
+task has finished.
+
+**A claim is never released, including after the claimant is dead lettered.** The alternative,
+releasing on terminal failure, is worse: a failed attempt may have applied part of its side
+effects, so suppression is the safer default. The cost is that a resubmission with the same key
+is suppressed for the rest of the TTL even though the work never succeeded, which is why the
+duplicate result names the claimant: read `cauli:result:{claimant_id}` (§8) to find the real
+outcome, or the queue's dead letter stream if the claimant was dead lettered without a stored
+result. `claimant_id` is null only in the race where the key expired between the failed `SET`
+and the `GET` of its holder.
 
 **"Mine again"** covers two cases that both reuse the SAME task `id`: a scheduled retry
 (§4.2 re-enqueues the same id after incrementing `retries`) and a crash-redelivered claim
@@ -290,9 +502,10 @@ would be strictly worse than running it; the worker logs a warning and proceeds.
 
 - async io task: wrapped in `asyncio.wait_for(coro, effective_s)` where
   `effective_s = min(soft_timeout_ms or timeout_ms, timeout_ms) / 1000`. Timeout → failure
-  (retryable) with error type `"TimeoutError"`. The Rust-side backstop around the completion
-  channel is `timeout_ms + grace` (grace = 2000ms) using saturating arithmetic, so a
-  crafted/huge `timeout_ms` (e.g. `u64::MAX`) cannot wrap into a near-zero spurious timeout.
+  (retryable) with error type `"TimeLimitExceeded"` (§8.2). The Rust-side backstop around
+  the completion channel is `timeout_ms + grace` (grace = 2000ms) using saturating
+  arithmetic, so a crafted/huge `timeout_ms` (e.g. `u64::MAX`) cannot wrap into a near-zero
+  spurious timeout.
 - sync io task (thread): soft timeout only, via `PyThreadState_SetAsyncExc` injecting
   `cauli.SoftTimeLimitExceeded` after `soft_timeout_ms` (if set). A per-thread generation
   counter fences a timer that fires after the task already finished, so a stale injection
@@ -312,7 +525,7 @@ would be strictly worse than running it; the worker logs a warning and proceeds.
   ever fires in a process's main thread), with the same generation fencing and the same
   residual injection race as the sync-io path above. Hard timeout enforced by the worker:
   SIGKILL the child, replace it (a replacement fork in fork-server mode, a fresh spawn in
-  stdio mode), mark failure (retryable) with error type `"TimeoutError"`.
+  stdio mode), mark failure (retryable) with error type `"TimeLimitExceeded"` (§8.2).
 
 ### 4.7 Graceful shutdown
 
@@ -430,7 +643,7 @@ drain, forced double-signal exit, and fork-server startup failure after a succes
 - The worker maintains `--cpu-workers` serving children by requesting forks (a replacement
   is requested whenever a child dies or is killed — respawns are cheap: no re-import). Hard
   timeout of any in flight request: SIGKILL the child by pid, fail that request as
-  `"TimeoutError"`, fail the child's other in flight requests as `"WorkerLost"` (retryable),
+  `"TimeLimitExceeded"`, fail the child's other in flight requests as `"WorkerLost"` (retryable),
   request a replacement fork. A dead child's pid is never SIGKILLed a second time (it may
   already be reused by an unrelated process once the fork-server parent reaps it via
   SIGCHLD); a child that stops draining its socket without dying (write stalls past a bounded
@@ -493,7 +706,7 @@ r.id                    # task id (hex str)
 r.status()              # "pending" | "success" | "failure" | "duplicate" | "expired"
 r.get(timeout=None, poll_interval=0.05)
     # blocks until result key exists; returns result value on success;
-    # raises TaskFailedError(type, message, traceback) on failure;
+    # raises TaskFailedError(type, message, traceback, origin) on failure (§8.1);
     # returns None with .duplicate == True semantics for duplicate (get returns None);
     # sets .expired = True and raises TaskFailedError(type="Expired") for expired;
     # raises TimeoutError if timeout expires while still pending.
@@ -589,24 +802,113 @@ cauli-worker --app myproj.tasks:app [--queues default,emails] [--redis-url URL]
   attacker-controlled modules — a standard Python-tooling caveat, not specific to cauli.
 - `--redis-url` precedence: CLI > env `CAULI_REDIS_URL` > `app.redis_url`.
 - `--queues` default: `app.default_queue`.
-- `--batch` and `--visibility-timeout` must be >= 1 (exit 1 at startup otherwise): `--batch 0`
-  would mean "unlimited" to Redis's `XREADGROUP COUNT`, and `--visibility-timeout 0` would make
-  the recovery loop (§4.4) reclaim every currently-executing task on nearly every tick.
+- `--batch`, `--visibility-timeout` and `--max-envelope-bytes` must be >= 1 (exit 1 at startup
+  otherwise): `--batch 0` would mean "unlimited" to Redis's `XREADGROUP COUNT`,
+  `--visibility-timeout 0` would make the recovery loop (§4.4) reclaim every currently-executing
+  task on nearly every tick, and `--max-envelope-bytes 0` would dead letter every single message
+  as oversize.
 - `--max-envelope-bytes` (default 1 MiB): see §2.
 - `--cpu-child-threads` (default 1): per-child request concurrency, `--no-fork-server`:
   force the stdio child mode — both per §5.1.
-- `--stats-interval`: seconds between one line stats logs:
-  `stats: fetched=N ok=N failed=N retried=N dlq=N expired=N inflight_io=N inflight_cpu=N
-  rss_mb=N sync_live=N sync_abandoned=N pending_async=N`. `expired` (§9.1) counts entries
-  discarded unrun past their deadline; they are counted in `dlq` too, but broken out because a
-  rising `expired` means the queue cannot keep up, which is a different alert from a rising
-  `failed`. `sync_live` is the sync-io thread pool's
-  current thread count (initial + any replacements spawned per §4.6); `sync_abandoned` is the
-  cumulative count of hard-timeout abandonments that triggered a replacement. `pending_async`
-  is the number of async tasks currently awaiting a completion callback from the embedded event
-  loop(s); a value that only grows over time signals a wedged event-loop thread (one that never
-  yields back to asyncio, so its `asyncio.wait_for` timeout can never even fire).
-- Exit codes: 0 graceful, 1 fatal config/startup error, 130 forced.
+- `--cpu-max-tasks-per-child` (default 1000): recycle a cpu child once it has completed this
+  many tasks. Children DO recycle by default; `0` opts out and lets a child live for the
+  worker's whole lifetime. Nothing else in the worker bounds cpu child memory, and under the
+  fork server a recycle is a fork of the already preloaded parent with no re import (§5.1).
+  Staged prefetch work always drains before the recycle fires, so no task is lost to it.
+- `--stats-interval`: seconds between one line stats logs. **The stats line is a stable parsing
+  contract**, not merely a human readable log line:
+
+  - after the `stats: ` prefix it is space separated `key=value` pairs, logfmt style;
+  - every value is a decimal integer: never a float, never quoted, never empty. `inflight_io`
+    and `inflight_cpu` are signed and printed raw, so a parser must accept a leading `-` on
+    those two: a negative reading is an accounting bug left deliberately visible rather
+    than clamped away;
+  - counters (`fetched`, `ok`, `failed`, `retried`, `dlq`, `expired`, `cpu_lost`,
+    `sync_abandoned`, `async_rejected`) are cumulative over the worker's lifetime;
+  - gauges (`inflight_io`, `inflight_cpu`, `rss_mb`, `cpu_rss_mb`, `oldest_ms`, `sync_live`,
+    `cpu_backlog`, `loop_lag_ms`) are instantaneous at the tick;
+  - the latency keys (`sync_p50` through `cpu_p99`) are scoped to the interval that just ended
+    and reset at every tick, so they are the only keys that can legitimately fall;
+  - the key set is frozen for the life of a major version. A minor release may ADD a key;
+    renaming or removing one is a major version change.
+
+  Vector, promtail and awk therefore consume it with no further work.
+
+  ```
+  stats: fetched=N ok=N failed=N retried=N dlq=N expired=N cpu_lost=N inflight_io=N
+         inflight_cpu=N rss_mb=N sync_p50=N sync_p99=N async_p50=N async_p99=N cpu_p50=N
+         cpu_p99=N oldest_ms=N cpu_rss_mb=N sync_live=N sync_abandoned=N async_rejected=N
+         cpu_backlog=N loop_lag_ms=N
+  ```
+
+  That is one physical line, wrapped here only to fit. The extra line logged once at shutdown
+  carries the first sixteen keys only, up to and including `cpu_p99`; the remaining seven are
+  produced by the periodic loop and are absent there.
+
+  - `expired` (§9.1) counts entries discarded unrun past their deadline. They are counted in
+    `dlq` too, but broken out because a rising `expired` means the queue cannot keep up, which
+    is a different alert from a rising `failed`.
+  - `cpu_lost` counts cpu children that died mid task. Broken out of `failed` for the same
+    reason: a child taken by the OOM killer or a segfault is a pool health problem, not a task
+    problem, and folded into a generic WorkerLost it left repeated child death as a scrolling
+    warning with no number to alert on.
+  - `oldest_ms` is the age of the oldest entry still sitting in any of this worker's queues,
+    from `XRANGE q - + COUNT 1` and the millisecond field of the returned stream id. Every
+    completion path XDELs its entry (§4.1), so what is left in a stream is exactly the unacked
+    work. This is the backlog's leading indicator, and it is a broker probe rather than a per
+    task sample precisely because it keeps reporting while fetching is paused, which is the
+    moment per task sampling goes blind.
+  - `sync_p50` / `sync_p99` / `async_p50` / `async_p99` / `cpu_p50` / `cpu_p99` are per lane
+    task latencies in milliseconds over the interval just ended, from a 24 bucket log2
+    histogram per lane, linearly interpolated inside the bucket carrying the target rank.
+    Resolution is 2x worst case by design: enough to see a knee, not a precision instrument.
+  - `rss_mb` is this worker process alone; `cpu_rss_mb` is summed over the cpu pool's live
+    children, which `rss_mb` never included.
+  - `sync_live` is the sync io thread pool's current thread count (initial plus any
+    replacements spawned per §4.6); `sync_abandoned` is the cumulative count of hard timeout
+    abandonments that triggered a replacement.
+  - `async_rejected` is the cumulative count of submissions the shim's own per loop queue has
+    rejected past its cap. It is the number that moves when an embedded event loop wedges (one
+    that never yields back to asyncio, so its `asyncio.wait_for` timeout can never even fire).
+    It replaces the removed `pending_async`, the pending completion map size, which stayed
+    flat through exactly that failure.
+  - `cpu_backlog` is the live depth of dispatch tasks parked on a full cpu backlog channel
+    (§4, §5.1: bound to twice `cpu_workers` times `cpu_child_threads`). A nonzero reading means
+    the fetch loop has paused fetching for every lane, not just cpu, because it cannot know an
+    entry's lane before parsing it. The transition is logged too: a warning the moment
+    `cpu_backlog` first goes above zero, and a matching one with the total paused duration when
+    it returns to zero.
+  - `loop_lag_ms` is the largest lag measured across the embedded asyncio loops: every few
+    seconds the worker stamps each loop through `call_soon_threadsafe`, and this is how long the
+    slowest one took to run that trivial callback, or how long it has been failing to. Near zero
+    is healthy. It rises whenever the loops are not getting scheduled, which covers both the
+    wedge below and the cross lane case nothing else here can see: a CPU heavy task
+    misclassified onto the sync pool starves the loops of the GIL, async p99 climbs, and every
+    other field stays flat.
+- Exit codes: 0 graceful, 1 fatal config/startup error, 87 self exit on a confirmed event loop
+  wedge, 130 forced.
+- **Event loop wedge, exit 87.** A blocking call inside an `async def` (a synchronous HTTP
+  request, `time.sleep`, a blocking database driver) starves the loop thread it runs on of every
+  callback, including asyncio's own `wait_for` deadline, permanently: CPython gives no safe way
+  to kill that thread. At the default `--io-loops 1` that ends all async throughput while the
+  worker keeps fetching and fails every async task at its full timeout. The worker therefore
+  stops itself instead. A loop is called wedged only when its stamp has been unanswered for
+  three stamp intervals, fifteen seconds, AND a second signal agrees the lane has stopped
+  producing (work outstanding at a loop that completed nothing over that same window, or
+  `async_rejected` rising). Both are required so that ordinary GIL starvation under load cannot
+  trigger an exit. Measured latency from wedge to exit is fifteen to twenty seconds, since the
+  wedge can begin just after a stamp was answered. The process then logs `wedged async event
+  loop confirmed` with the loop index and its lag, and exits 87 for a supervisor to restart it;
+  in flight tasks are redelivered under §4.4, exactly as for any other process death. Run the worker under something that restarts it: systemd, Kubernetes, or
+  cauli's own `--procs` supervisor, which restarts a child in about a second.
+- **Emptied broker.** A redis whose dataset was reset under a live connection answers XREADGROUP
+  with NOGROUP forever. The worker matches that code specifically and logs an error beginning
+  `redis has no consumer group`, naming what the reset destroyed: the pending entries list, so
+  nothing in flight is redelivered, and the delayed set, so pending retries, countdowns and beat
+  slots are gone. It then recreates the groups and resumes consuming, which is why that line
+  appears once per reset rather than once per read. The line, not a restart, is the alert; the
+  worker itself needs no operator action. §4 covers the persistence that stops the event
+  happening at all.
 
 ### 7.1 Scheduler CLI (`cauli-beat`, Python entry point)
 
@@ -637,10 +939,16 @@ Result key value (`cauli:result:{id}`):
 
 ```json
 {"status": "success", "result": <json>, "error": null, "finished_at": 123}
-{"status": "failure", "result": null, "error": {"type": "ValueError", "message": "...", "traceback": "..."}, "finished_at": 123}
+{"status": "failure", "result": null, "error": {"type": "ValueError", "message": "...", "traceback": "...", "origin": "task"}, "finished_at": 123}
 {"status": "duplicate", "result": null, "error": null, "finished_at": 123}
-{"status": "expired", "result": null, "error": {"type": "Expired", "message": "...", "traceback": ""}, "finished_at": 123}
+{"status": "expired", "result": null, "error": {"type": "Expired", "message": "...", "traceback": "", "origin": "worker"}, "finished_at": 123}
 ```
+
+**Clients must ignore unknown fields.** The result document and the error object inside it are
+both open to additive growth, and a client that rejects, or raises on, a key it does not
+recognize breaks the first time one is added. Every field this section names is safe to read;
+anything else is safe to skip. `AsyncResult` in `py/` reads with `.get()` and never validates
+the key set, which is what makes a field like `origin` below addable at all.
 
 `"expired"` (§9.1) is its own status rather than a `"failure"`: the task never ran, so there is
 no exception, no traceback and nothing to retry — reporting it as a failure would put a
@@ -649,14 +957,109 @@ fabricated error in front of the caller. The error object is populated anyway (`
 knows success/failure still gets something usable, and `AsyncResult.get()` raises
 `TaskFailedError(type="Expired")` rather than returning a silent `None`.
 
+A terminal dead letter that never executed at all (malformed envelope, unregistered task, or
+redelivery limit exceeded; §4/§4.4) also writes a `"failure"` result reusing this same shape,
+whenever the task id could be recovered from the entry (present and matching the §2 charset
+gate). `error.type` names why: `"Malformed"`, `"UnregisteredTask"` or
+`"RedeliveryLimitExceeded"`. Without this, `AsyncResult.get()` called with no timeout would
+block forever on a result key that would never be written. Where the id cannot be recovered
+(the envelope is not valid JSON, or its `id` fails the charset gate) there is nothing to key a
+result on, so none is written and the caller's own timeout, or lack of one, governs as before.
+
 `traceback` may be truncated to 8KB. Task return values must be JSON serializable; a non
 serializable success value is a failure with type `"SerializationError"` (no retry — treat as
 final failure regardless of retries left).
+
+A few `error.type` values name a failure in the worker or executor itself catching its own
+internal problem, rather than in the task's own code. `"WorkerShimError"` covers a failure at
+the embedded Python shim boundary (an executor response that could not be parsed, or a
+submission that itself failed); it is retryable. `"UnknownError"` is synthesized when an
+executor reports failure without supplying an error object at all; it is retryable by default,
+like any other type besides `"SerializationError"`. `"ProtocolError"` is emitted by a cpu child
+(§5.1) when it receives a request line it cannot decode; that response carries no task id, so
+the worker cannot match it to a pending request and only logs it rather than turning it into a
+task outcome.
 
 Full tracebacks (and results) are stored in plaintext in `cauli:result:*` and DLQ stream
 entries. If a task's exception message or arguments embed secrets or PII, anyone with read
 access to the Redis instance can see them — this is a property of the trust model (Redis is
 trusted infra; task payloads/results are not automatically scrubbed), not a bug.
+
+### 8.1 `error.origin`
+
+`origin` says who minted the error object. The rule is mechanical, so it cannot drift as
+sentinels are added:
+
+| value | meaning |
+| --- | --- |
+| `"worker"` | cauli machinery synthesized the error object. No user code raised anything. |
+| `"task"` | an exception propagated out of user code. `type` is that exception's class name. |
+| `"client"` | the client package synthesized it locally. Never appears on the wire. |
+
+`"client"` is reserved for errors that never reach Redis at all. Today that is only
+`"InvalidResult"`, which `AsyncResult` raises when a result document exists but cannot be
+used (not valid JSON, not a JSON object, or carrying no usable `"status"`).
+
+One documented edge: a `SoftTimeLimitExceeded` that propagates carries origin `"task"`, not
+`"worker"`. The worker injected the exception, but it did leave user code, and a task is free
+to catch it and return normally instead. It is documented rather than special cased.
+
+`origin` is additive, and only that. A worker predating it writes no `origin` key at all, so a
+client must treat the absence as unknown rather than as any particular value. `TaskFailedError`
+exposes it as a single `.origin` attribute, `None` when absent; no new exception classes come
+with it, and nothing else about the error object changed. Origin is not a severity, a retry
+hint, or an answer to §8.3: it says only who wrote the object.
+
+### 8.2 A worker enforced time limit is `"TimeLimitExceeded"`
+
+Three different things used to be spelled `"TimeoutError"`, two of them indistinguishable.
+They now have three spellings:
+
+| what happened | how it surfaces |
+| --- | --- |
+| the CALLER gave up waiting | builtin `TimeoutError` from `.get(timeout=)`, raised locally, never written to a result document |
+| the WORKER killed the task at its limit | `TaskFailedError(type="TimeLimitExceeded", origin="worker")` |
+| the TASK raised `TimeoutError` itself | `TaskFailedError(type="TimeoutError", origin="task")` |
+
+`.get(timeout=)` keeps raising the builtin, which is the Python idiom for a local wait, and
+`TimeLimitExceeded` is symmetric with the `SoftTimeLimitExceeded` that already existed. Before
+this, `except TimeoutError:` around `.get()` caught only the first row, so a genuine worker
+enforced timeout sailed straight past a handler that looked correct and compiled clean.
+
+Four sites mint it: the sync io hard timeout, the async io Rust side backstop and the cpu child
+SIGKILL (`worker/src/exec.rs`), plus the `asyncio.wait_for` limit the shim enforces
+(`worker/src/shim.py`, §4.6), which is the one an async task actually reaches first.
+
+One residual, unchanged by the rename and inherent to the language: from Python 3.11 the
+builtin `TimeoutError` and `asyncio.TimeoutError` are the same class, so an ASYNC task that
+raises `TimeoutError` itself is caught by that same `wait_for` handler and reported as
+`"TimeLimitExceeded"` with origin `"worker"`. On the sync io and cpu lanes the third row above
+is exact.
+
+### 8.3 Did the task ever run?
+
+The question a caller most needs answered is derivable from the closed set of worker minted
+`type` values, so it is published here rather than encoded as another field:
+
+| `error.type` | did it run? |
+| --- | --- |
+| `"Malformed"` | never ran |
+| `"UnregisteredTask"` | never ran |
+| `"Expired"` | never ran |
+| `"SerializationError"` | ran to completion, but the result was lost |
+| everything else | side effects unknown |
+
+"Everything else" is `"TimeLimitExceeded"`, `"WorkerLost"`, `"RedeliveryLimitExceeded"`,
+`"WorkerShimError"`, `"UnknownError"`, `"DeadLettered"`, and every `origin: "task"` type. For
+those the task may have run in full, in part, or not at all, and a caller that cares has to
+reconcile against its own side effects.
+
+Reading the `"SerializationError"` row: it means the task returned a value that could not be
+encoded. The one exception is the io lane's argument check, whose message names the task's
+ARGUMENTS rather than its result; that fires before the task is called, so it never ran.
+
+An `origin: "task"` failure is always "side effects unknown": user code raising says nothing
+about what it completed first. That is why origin does not replace this table.
 
 ## 9. Scheduling controls: expiry, queue TTL, routing, priorities
 
@@ -876,6 +1279,14 @@ instant strictly greater than `slot`.
 - *Spring forward* (a wall time never occurs): `zoneinfo` resolves the nonexistent local time
   with the pre-transition offset, so a 02:30 job fires at the instant 02:30 standard time would
   have been — 03:30 by the new wall clock. It fires once; it is not dropped.
+- *Ordering*. Wall clock order is instant order only while the offset holds still, so a day whose
+  offset changes is scanned in full and answered with the EARLIEST instant after `slot`, not with
+  the first wall time that matches. Without that rule a zone whose jump is wider than the gap
+  between two scheduled hours loses a real slot: on `Antarctica/Troll` (+00 to +02) the
+  nonexistent wall 02:30 resolves to 02:30Z while the real wall 03:30 resolves to 01:30Z, so
+  answering with the first wall match would skip 01:30Z permanently. Taking the earliest instant
+  is also what keeps the ordinary one hour case firing once, where a nonexistent 02:30 and a real
+  03:30 are the same instant.
 
 ### 10.3 Reconciliation between code and Redis
 
@@ -910,6 +1321,12 @@ strictly after BOTH `S` and `now`. So an entry that was due 500 times while beat
 **once** on recovery and then resumes its normal cadence. Replaying 500 firings is almost never
 what anyone wants from a scheduler, and it is the failure mode that turns a brief outage into
 an incident.
+
+Every slot that gets dropped announces itself at WARNING, because lateness alone does not tell an
+operator how much scheduled work never ran. A coalesced firing logs the count of slots it
+swallowed next to its lateness; an entry that loses its slot (disabled, definition deleted, or
+definition unreadable) logs which of those it was; and a tick that hits the cap of 500 due entries
+logs that the remainder is deferred to the next tick.
 
 Whether that single recovery firing happens at all is per entry and explicit:
 
@@ -957,7 +1374,6 @@ score is still exactly `S`:
 local cur = redis.call('ZSCORE', KEYS[1], ARGV[1])
 if cur == false then return 0 end
 if tonumber(cur) ~= tonumber(ARGV[2]) then return 0 end
-redis.call('ZADD', KEYS[1], ARGV[3], ARGV[1])
 if ARGV[4] == 'stream' then
   redis.call('XADD', KEYS[4], '*', 'e', ARGV[5])
   redis.call('HINCRBY', KEYS[3], ARGV[1], 1)
@@ -965,11 +1381,20 @@ elseif ARGV[4] == 'delayed' then
   redis.call('ZADD', KEYS[4], tonumber(ARGV[6]), ARGV[5])
   redis.call('HINCRBY', KEYS[3], ARGV[1], 1)
 end
+redis.call('ZADD', KEYS[1], ARGV[3], ARGV[1])
 redis.call('HSET', KEYS[2], ARGV[1], ARGV[7])
 return 1
 ```
 
 (`mode = 'none'` advances the slot without publishing: the `on_missed: "skip"` path.)
+
+The publish comes before the slot advance, deliberately. A Lua script is atomic against other
+clients but does not roll back on its own error, so every write it already made stays committed
+if a later `redis.call` in the same script fails (section 4.3 makes the identical point about
+the delayed mover). Advancing the slot first would let a failed publish, the target key holding
+the wrong type is the reproducible case, consume the slot with nothing ever sent: a silently
+lost firing with no trace anywhere. Publishing first means a failure partway through can only be
+retried and republished on a later tick, a duplicate, never a loss.
 
 Safety therefore does not depend on the lease at all. A lease can always be defeated — a
 stop-the-world GC pause, a network partition, a Redis failover — so building the exactly-once
@@ -982,16 +1407,26 @@ clock:
 
 - "Now" is `TIME` from Redis, so every replica compares against the same clock the slots are
   stored against. A replica minutes off does not fire early or late.
-- The next slot is a **pure function of the previous slot**, not of "now" (see
-  `cauli/schedules.py`). Both replicas compute the same `S'` from the same `S`, so the CAS is a
-  real mutual exclusion rather than a race between two different proposed values. If
-  `next_after` depended on `now`, two skewed replicas would propose two different `S'` and both
-  could "win" a different write.
+- The CAS compares the slot the caller **expected**, `S`, and never the value it proposes. That
+  is what makes it a mutual exclusion: the winner's `ZADD` moves the score off `S`, so every
+  other racer's `ZSCORE` stops matching and returns 0. Agreement on `S'` is not required, and
+  does not hold in general: `advance_past` fast forwards past the present (section 10.4) and so
+  does read "now", meaning two replicas that read `TIME` seconds apart genuinely propose
+  different `S'` after an outage. Only the winner's value is written, so the schedule resumes on
+  one phase rather than two. (`next_after` on its own is a pure function of the previous slot,
+  which is worth having, but the safety argument does not rest on it.)
 
-**Leader dies mid-tick.** Advance-and-publish is one script, so a slot is either
-fired-and-advanced or neither — there is no window where a slot is consumed without a task
-being published. A leader that dies partway through a tick leaves its remaining entries
-un-advanced; the next leader finds them due and fires them, late but exactly once.
+**Leader dies mid tick.** Advance and publish happen inside one script invocation, so as far as
+a dying leader process is concerned a slot is either fired and advanced or its script was never
+sent at all. A leader that dies partway through a tick simply never reaches its remaining
+entries; the next leader finds them due and fires them, late but exactly once.
+
+That guarantee is about the process dying, not about what happens inside one invocation, and it
+does NOT extend to "there is no window where a slot is consumed without a task being published."
+There is one: a `redis.call` failing partway through the script itself, covered above and in
+section 4.3. The ordering fix there is what keeps that window from losing a firing; the process
+level guarantee in this paragraph is a separate, narrower claim about what a dying leader can and
+cannot leave half done.
 
 **Leader dies between ticks.** The lease expires and a standby acquires it. Because the holder
 refreshes at `lock_ttl / 3`, the residual lease at the moment of death is between
@@ -1013,11 +1448,38 @@ only ~10s of lease remained. In all three runs the outage appears as a SINGLE co
 not a replay of the ~4/10/20 slots that elapsed, and `cauli:beat:runs` matched the number of
 envelopes published exactly.
 
-**Redis Cluster.** The claim script touches both `cauli:beat:*` and `cauli:q:{queue}`, which do
-not hash to the same slot, so Cluster rejects it with CROSSSLOT. Beat detects this once, logs a
-warning and degrades to CAS-then-publish: still no duplicate firing (the CAS is unchanged), but
-a crash in the gap between the advance and the publish now drops that single firing instead of
-being atomic. Standalone and Sentinel Redis get the atomic path.
+**The guarantee is per Redis dataset**, like every other guarantee cauli makes: the CAS cannot
+defend a write the database has forgotten, so a failover that promotes a replica which never
+received the slot advance fires `S` a second time, and `idempotent: true` narrows that window
+rather than closing it (the `cauli:idemp:*` guard is lost in the same window). Stated in full,
+with what a user has to do about it, in §4 under Delivery guarantee.
+
+**Redis Cluster is not a supported topology at all**, and the periodic path is only one of the
+reasons. The worker builds the redis crate without its cluster protocol, so it never follows a
+MOVED redirect and ordinary operations fail against a real multi node cluster, not only the
+delayed and periodic paths. What follows is the CROSSSLOT reason specific to this path. The claim
+script touches
+both `cauli:beat:*` and `cauli:q:{queue}` (or `cauli:delayed:{queue}`), which do not share a hash
+tag and so never hash to the same slot: Cluster rejects every invocation with CROSSSLOT. The
+seed script has the same problem between `cauli:beat:due` and `cauli:beat:rev`. Both are a
+permanent property of this key layout, not a transient condition, so the same script fails the
+same way on the next tick, and the one after that.
+
+An earlier version of this document described a degraded mode here: catch the CROSSSLOT once,
+fall back to a CAS only call, then publish as a separate command. It does not work. The fallback
+call itself declares `cauli:beat:due`, `cauli:beat:state` and `cauli:beat:runs`, which do not
+share a hash tag with each other either, so it also raises CROSSSLOT, and nothing was left to
+catch it. Beat does not attempt that fallback any more. Both scripts instead raise a distinct,
+named error identifying Redis Cluster as the cause, logged loudly on every tick rather than
+folded into the generic redis error retry message a transient blip would produce. No periodic
+task is ever seeded and none ever fires, and that failure is meant to be impossible to miss in
+the logs. `cauli-worker`'s own delayed mover has the identical CROSSSLOT problem against
+`cauli:q:{queue}` and `cauli:delayed:{queue}`; see section 4.3.
+
+Hash tagging the key layout would fix this properly, letting every one of these keys share a
+slot, but it is a breaking change to the key naming scheme with a migration story of its own, and
+is intentionally out of scope here. Standalone and Sentinel Redis are unaffected: neither
+partitions keys into slots, so CROSSSLOT never applies.
 
 ### 10.6 What a non-Redis broker would have to provide
 
@@ -1144,9 +1606,12 @@ loader resolves that venv's `libpython`, and `shim.py` reads `VIRTUAL_ENV` for s
 
 Requirements: Linux on x86_64 or aarch64, glibc 2.28 or newer, and a CPython configured with
 `--enable-shared`. python.org builds, the Docker `python:*` images, Debian/Ubuntu/Fedora system
-packages, conda and actions/setup-python all qualify; `pyenv` does not unless rebuilt with
-`PYTHON_CONFIGURE_OPTS="--enable-shared"`. Anything outside that builds the worker from source,
-which has no such constraints.
+packages and actions/setup-python all qualify; `pyenv` does not unless rebuilt with
+`PYTHON_CONFIGURE_OPTS="--enable-shared"`, and neither does conda, where the wheel installs and
+the worker then fails before `main` because the loader cannot find that environment's `libpython`.
+Anything outside that builds the worker from source, which lifts the glibc floor but not the
+platform one: the worker is Linux only either way, because it arms `PR_SET_PDEATHSIG`
+unconditionally.
 
 Raw binaries are also attached to each GitHub release, as
 `cauli-worker-<version>-cp3XX-cp3XX-<platform>.tar.gz`, for deployments that are not a

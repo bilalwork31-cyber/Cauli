@@ -1,6 +1,6 @@
 [package]
 name = "cauli-worker"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 description = "Rust worker runtime for cauli Python task queues"
 readme = "README.md"
@@ -11,14 +11,35 @@ keywords = ["task-queue", "background-jobs", "redis", "worker", "celery"]
 categories = ["asynchronous", "concurrency"]
 
 [features]
-default = []
+default = ["dev-bin"]
 # Enables the CAULI_EXEC_CMD test hook in src/cpu.rs (audit M5). Not part of a
 # normal release build; the e2e suite needs `cargo test --features test-hooks`.
 test-hooks = []
+# Which NAME the binary is built under. Identical code either way.
+#
+# The published wheel installs a Python console script called `cauli-worker`
+# (worker/wheel-data/scripts/cauli-worker) that points the dynamic loader at
+# libpython and then execs the real binary, so the real binary has to land
+# under a different name or the two would fight over one file in the venv's
+# bin directory. The source tree keeps building plain `cauli-worker`, because
+# itest, bench, PROTOCOL.md and both READMEs all name that path.
+#
+# maturin ships every bin target the build produced and has no flag to select
+# one, so required-features does the selecting: a plain cargo build gets
+# `cauli-worker`, and maturin is invoked with `--no-default-features -F
+# wheel-bin` to get `cauli-worker-bin` and nothing else.
+dev-bin = []
+wheel-bin = []
 
 [[bin]]
 name = "cauli-worker"
 path = "src/main.rs"
+required-features = ["dev-bin"]
+
+[[bin]]
+name = "cauli-worker-bin"
+path = "src/main.rs"
+required-features = ["wheel-bin"]
 
 [dependencies]
 anyhow = "1"
@@ -31,7 +52,14 @@ pyo3 = { version = "0.26", features = ["auto-initialize"] }
 rand = "0.9"
 redis = { version = "0.32", features = ["tokio-comp", "connection-manager"] }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# arbitrary_precision (audit CRITICAL): without it, serde_json's default
+# Number silently falls back to f64 for any integer literal outside i64/u64
+# range, at parse time, before any cauli code runs. With it, the parser keeps
+# the exact source digits instead, so json_to_py can hand Python back the
+# exact int the caller sent (see pyjson.rs). Changes how serde_json::Number
+# is represented crate wide; every inspection site was reviewed for fallout,
+# see the commit message.
+serde_json = { version = "1", features = ["arbitrary_precision"] }
 # Trimmed from "full" (audit dependency review) to the features actually used:
 # rt-multi-thread/macros (runtime + tokio::spawn + #[tokio::test]), sync
 # (oneshot/watch/Semaphore), time (timeout/interval/sleep), io-util
@@ -52,6 +80,9 @@ codegen-units = 1
 
 [dev-dependencies]
 libc = "0.2"
-redis = { version = "0.32", features = ["tokio-comp"] }
-serde_json = "1"
+# connection-manager: worker/tests/redis_response_timeout.rs exercises
+# ConnectionManager/ConnectionManagerConfig directly, the same types
+# main.rs builds its two redis connections with.
+redis = { version = "0.32", features = ["tokio-comp", "connection-manager"] }
+serde_json = { version = "1", features = ["arbitrary_precision"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

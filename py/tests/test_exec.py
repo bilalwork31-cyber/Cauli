@@ -71,6 +71,36 @@ def test_task_exception_reported_not_fatal(child):
     assert resp == {"id": "e2", "ok": True, "result": 8}
 
 
+def test_origin_separates_task_exceptions_from_worker_synthesized_errors(child):
+    """PROTOCOL.md section 8 `origin`, on the cpu lane.
+
+    The split is mechanical: an exception that propagated out of the task is
+    "task", anything cauli synthesized itself is "worker". A soft time limit
+    is the edge worth pinning down: the child injects it, but it does leave
+    user code, so it is "task" like any other propagated exception.
+    """
+    cases = [
+        ("o1", "boom", [], None, "ValueError", "task"),
+        ("o2", "nope", [], None, "UnregisteredTask", "worker"),
+        ("o3", "unser", [], None, "SerializationError", "worker"),
+        ("o4", "sleepy", [2], 200, "SoftTimeLimitExceeded", "task"),
+    ]
+    for rid, task, args, soft_ms, expected_type, expected_origin in cases:
+        resp = child.request(
+            {
+                "id": rid,
+                "task": task,
+                "args": args,
+                "kwargs": {},
+                "soft_timeout_ms": soft_ms,
+            },
+            timeout=10,
+        )
+        assert resp["ok"] is False, rid
+        assert resp["error"]["type"] == expected_type, rid
+        assert resp["error"]["origin"] == expected_origin, rid
+
+
 def test_traceback_truncated_to_8kb(child):
     resp = child.request(
         {
@@ -151,6 +181,28 @@ def test_retry_response_without_countdown(child):
     assert resp["error"]["type"] == "Retry"
 
 
+def test_retry_response_with_non_numeric_countdown_falls_back(child):
+    # A Retry.countdown that float() cannot convert must not let that
+    # ValueError replace the user's actual Retry in the response: this
+    # mirrors worker/src/shim.py's _finish_exc, which already guards this
+    # exact conversion and degrades to the computed backoff (countdown=None)
+    # instead of losing the real exception.
+    resp = child.request(
+        {
+            "id": "t4",
+            "task": "retryme",
+            "args": ["nope"],
+            "kwargs": {},
+            "soft_timeout_ms": None,
+        }
+    )
+    assert resp["id"] == "t4"
+    assert resp["ok"] is False
+    assert resp["retry"] is True
+    assert resp["countdown"] is None
+    assert resp["error"]["type"] == "Retry"
+
+
 def test_retry_recognized_by_duck_type_not_isinstance(child):
     # M6 regression: a "Retry" class that does NOT subclass cauli.exceptions.Retry
     # must still be recognized (name + .countdown duck typing), matching
@@ -177,6 +229,7 @@ def test_non_serializable_result_is_serialization_error(child):
     assert resp["id"] == "u1"
     assert resp["ok"] is False
     assert resp["error"]["type"] == "SerializationError"
+    assert resp["retryable"] is False
 
     resp = child.request(
         {
@@ -188,6 +241,26 @@ def test_non_serializable_result_is_serialization_error(child):
         }
     )
     assert resp == {"id": "u2", "ok": True, "result": 2}
+
+
+def test_user_exception_named_serialization_error_still_retries(child):
+    """The cpu lane stamps `retryable` instead of letting the worker's name
+    based default decide. An app class named SerializationError retries on the
+    io lanes (shim.py `_finish_exc` always stamps True), so it must retry here
+    too: same task, same exception, same outcome whichever lane ran it.
+    """
+    resp = child.request(
+        {
+            "id": "s1",
+            "task": "user_serialization_error",
+            "args": [],
+            "kwargs": {},
+            "soft_timeout_ms": None,
+        }
+    )
+    assert resp["ok"] is False
+    assert resp["error"]["type"] == "SerializationError"
+    assert resp["retryable"] is True
 
 
 def test_async_task_runs_via_asyncio(child):
@@ -216,7 +289,12 @@ def test_unknown_task_is_reported(child):
     )
     assert resp["id"] == "x1"
     assert resp["ok"] is False
-    assert resp["error"]["type"] == "UnknownTask"
+    # Matches the worker's own pre dispatch registry check (PROTOCOL.md
+    # section 8, worker/src/dispatch.rs): same error.type string, and
+    # non retryable so a caller matching the documented sentinel actually
+    # sees this path instead of it being retried under "max_retries".
+    assert resp["error"]["type"] == "UnregisteredTask"
+    assert resp["retryable"] is False
 
 
 def test_eof_exits_zero(child):

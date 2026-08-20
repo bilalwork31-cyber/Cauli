@@ -10,6 +10,9 @@ Contract with Rust:
   set_callback(cb)                    -> register Rust completion callback cb(token, outcome)
   submit_async(token, name, args, kwargs, timeout_s) -> schedules coroutine;
       completion is push-style via the registered callback (no polling).
+  heartbeat()                         -> per loop (lag_ms, pending, completed),
+      stamping each loop through call_soon_threadsafe on the way (wedge
+      detection and the stats line's loop_lag_ms; worker/src/loops.rs).
 
 Task arguments and outcomes cross as REAL PYTHON OBJECTS, not JSON strings.
 Rust converts in both directions (worker/src/pyjson.rs). This module therefore
@@ -22,7 +25,8 @@ remaining JSON payload, and it crosses exactly once at startup.
 Outcome dict shapes:
   {"ok": True,  "result": <any JSON-representable value>}
   {"ok": False, "retry": True, "countdown": <float|None>, "error": {...}}
-  {"ok": False, "retryable": <bool>, "error": {"type": ..., "message": ..., "traceback": ...}}
+  {"ok": False, "retryable": <bool>, "error": {"type": ..., "message": ...,
+                                               "traceback": ..., "origin": ...}}
 
 A result that cannot be represented as JSON is rejected on the Rust side and
 becomes a non-retryable SerializationError, the same classification the
@@ -66,6 +70,40 @@ _rr = 0
 _pending = []
 _pending_locks = []
 _callback = None  # Rust completion callback: cb(token:int, outcome:dict)
+
+
+class AsyncQueueFull(RuntimeError):
+    """MEM-5: raised by submit_async when a loop's pending list is already at
+    _PENDING_CAP. A distinct type, not a bare RuntimeError, so pyrt.rs can
+    count these rejections by checking the exception itself rather than
+    parsing message text."""
+
+
+# MEM-5: hard cap on each loop's pending list. A blocking call inside an
+# async task (a synchronous HTTP request, time.sleep, a blocking database
+# driver) starves that loop's own callback processing forever; _drain then
+# never runs again and this list would otherwise grow without bound, keeping
+# real args and kwargs objects alive for the rest of the process lifetime.
+# MEM-1 already keeps the Rust side bookkeeping (pyrt.rs) from leaking on its
+# own backstop timer, which is exactly why that fix hides this one: the Rust
+# side pending completion map stays flat while this list keeps growing
+# underneath it. `async_rejected` counts what this cap rejects, and
+# `loop_lag_ms` (the heartbeat below) moves long before the cap is reached.
+# 4096 is 2x the highest --io-concurrency this codebase has measured (2048,
+# see the convoying note in pyrt.rs), so a legitimate burst should never
+# reach it; past the cap a submission fails fast instead of piling up
+# forever.
+_PENDING_CAP = 4096
+_cap_warned = []  # per loop: already logged the cap hit warning once
+
+# Per loop liveness, read by the Rust wedge watchdog (worker/src/loops.rs).
+# One outstanding stamp per loop at a time: queueing a fresh stamp every few
+# seconds at a loop that is not running any of them would pile up callbacks
+# that all fire at once if it ever recovers.
+_hb_sent = []  # monotonic of the stamp this loop has not run yet, or None
+_hb_lag = []  # ms the last stamp took from scheduled to run
+_hb_sub = []  # async tasks handed to this loop (submit side writes)
+_hb_done = []  # async tasks completed on this loop (only that loop writes)
 
 # Per-task lifecycle hooks (PROTOCOL §4.8), duck-read off the app object at
 # load_app time. These are references to the app's own LISTS, not copies, so
@@ -116,8 +154,18 @@ def _tb_of(exc):
     return tb[-_MAX_TB:]
 
 
-def _error_dict(exc):
-    return {"type": type(exc).__name__, "message": str(exc), "traceback": _tb_of(exc)}
+def _error_dict(exc, origin="task"):
+    # PROTOCOL section 8 `origin`: "task" whenever a real exception ended the
+    # task invocation, which includes a propagated SoftTimeLimitExceeded --
+    # the worker injected it, but it did leave user code, so it is not
+    # special cased. "worker" is passed explicitly where the shim itself,
+    # not the task, is the thing that failed.
+    return {
+        "type": type(exc).__name__,
+        "message": str(exc),
+        "traceback": _tb_of(exc),
+        "origin": origin,
+    }
 
 
 def _is_retry(exc):
@@ -161,6 +209,18 @@ def load_app(app_spec, extra_paths_json):
         attr = "app"
     mod = importlib.import_module(module_name)
     app = getattr(mod, attr)
+
+    # The module body above may have failed to import cauli (see the try
+    # block at the top of this file): it runs before this function has set
+    # up sys.path and VIRTUAL_ENV, so a source built worker with no venv
+    # link finds nothing there yet. The app module we just imported pulls
+    # the real cauli in now that the paths exist, so rebind onto it when
+    # present, or a task's own except SoftTimeLimitExceeded clause compares
+    # against a different class object and never matches.
+    global SoftTimeLimitExceeded
+    real_cauli = sys.modules.get("cauli")
+    if real_cauli is not None and hasattr(real_cauli, "SoftTimeLimitExceeded"):
+        SoftTimeLimitExceeded = real_cauli.SoftTimeLimitExceeded
 
     # Lifecycle hooks (PROTOCOL §4.8), by getattr like everything else here:
     # keep the app's list objects so post-startup registrations are seen.
@@ -320,6 +380,7 @@ def run_sync(name, args, kwargs, soft_timeout_ms):
                     "type": "WorkerShimError",
                     "message": "shim failure",
                     "traceback": "",
+                    "origin": "worker",
                 },
             }
 
@@ -331,9 +392,10 @@ def _run_sync_inner(name, args, kwargs, soft_timeout_ms):
             "ok": False,
             "retryable": False,
             "error": {
-                "type": "Unregistered",
+                "type": "UnregisteredTask",
                 "message": "unknown task %s" % (name,),
                 "traceback": "",
+                "origin": "worker",
             },
         }
     fn = getattr(td, "fn")
@@ -427,6 +489,11 @@ def start_loops(n):
             _loops.append(loop)
             _pending.append([])
             _pending_locks.append(threading.Lock())
+            _cap_warned.append(False)
+            _hb_sent.append(None)
+            _hb_lag.append(0)
+            _hb_sub.append(0)
+            _hb_done.append(0)
     if impl is not None:
         # One line, stderr: lands in the worker's log so a benchmark or an
         # operator can see WHICH loop ran without introspecting the process.
@@ -439,6 +506,56 @@ def set_callback(cb):
     _callback = cb
 
 
+def _hb_ack(idx, sent):
+    """Runs ON the loop thread: the only proof that it still runs callbacks."""
+    _hb_lag[idx] = int((time.monotonic() - sent) * 1000)
+    _hb_sent[idx] = None
+
+
+def heartbeat():
+    """Stamp every loop and report it: one (lag_ms, outstanding, completed)
+    tuple per loop, in loop order.
+
+    Driven from Rust (worker/src/loops.rs wedge_loop) every few seconds with
+    the GIL held. `lag_ms` is the age of a stamp the loop has not run yet, or
+    the scheduled to run time of the last one it did, so it grows without
+    bound on a wedged loop and sits near zero on a healthy one, which also
+    makes it the cross lane GIL pressure reading in the stats line.
+    `outstanding` is submitted minus completed, which counts both submissions
+    still queued and Tasks the loop created and never got to run: a wedged
+    loop usually holds the second kind, since one drain can turn a whole
+    batch into Tasks before the first of them blocks the thread. `completed`
+    is that loop's finished async task count. A wedge is all three at once: a
+    stale stamp, work outstanding, and nothing finishing.
+    """
+    now = time.monotonic()
+    out = []
+    with _loops_lock:
+        loops = list(_loops)
+    for idx, loop in enumerate(loops):
+        sent = _hb_sent[idx]
+        if sent is None:
+            lag_ms = _hb_lag[idx]
+            # Recorded BEFORE scheduling, never after: the loop can run the
+            # callback and clear this slot before call_soon_threadsafe has
+            # even returned, and writing it afterwards would leave a stamp
+            # that reads as permanently outstanding.
+            _hb_sent[idx] = now
+            try:
+                loop.call_soon_threadsafe(_hb_ack, idx, now)
+            except RuntimeError:
+                _hb_sent[idx] = None  # loop closed under us
+        else:
+            lag_ms = int((now - sent) * 1000)
+        # Read in this order and floored at zero: the two counters are
+        # written by different threads, so a submission that completes
+        # between the two reads would otherwise show as negative work.
+        submitted = _hb_sub[idx]
+        completed = _hb_done[idx]
+        out.append((lag_ms, max(0, submitted - completed), completed))
+    return out
+
+
 def _drain(idx, loop):
     """Turn one loop's queued submissions into Tasks. Runs ON that loop."""
     queue = _pending[idx]
@@ -448,7 +565,7 @@ def _drain(idx, loop):
     for token, name, args, kwargs, timeout_s in batch:
         # _arun is defensive (it converts every exception into an outcome and
         # always invokes the callback), so a bare Task needs no result handle.
-        loop.create_task(_arun(token, name, args, kwargs, timeout_s))
+        loop.create_task(_arun(idx, token, name, args, kwargs, timeout_s))
 
 
 def submit_async(token, name, args, kwargs, timeout_s):
@@ -463,6 +580,8 @@ def submit_async(token, name, args, kwargs, timeout_s):
     queue is drained per wakeup (20k tasks, trivial body, one loop thread).
     Ordering within a loop is preserved; a task submitted while a drain is in
     flight simply schedules the next drain.
+
+    Raises AsyncQueueFull if that loop's queue is already at _PENDING_CAP.
     """
     global _rr
     with _loops_lock:
@@ -474,13 +593,31 @@ def submit_async(token, name, args, kwargs, timeout_s):
         loop = _loops[idx]
 
     with _pending_locks[idx]:
+        if len(_pending[idx]) >= _PENDING_CAP:
+            if not _cap_warned[idx]:
+                _cap_warned[idx] = True
+                sys.stderr.write(
+                    "cauli: async loop %d queue hit its cap of %d pending "
+                    "submissions; rejecting new ones until it drains. Likely "
+                    "cause: a blocking call inside an async task body (a "
+                    "synchronous HTTP request, time.sleep, a blocking "
+                    "database driver) in place of its non blocking "
+                    "equivalent, which starves this loop of its own event "
+                    "loop turns.\n" % (idx, _PENDING_CAP)
+                )
+            raise AsyncQueueFull(
+                "cauli: async loop %d submission queue is full (cap=%d); "
+                "rejecting so the task can be retried instead of queued "
+                "forever" % (idx, _PENDING_CAP)
+            )
         _pending[idx].append((token, name, args, kwargs, timeout_s))
+        _hb_sub[idx] += 1
         wake = len(_pending[idx]) == 1
     if wake:
         loop.call_soon_threadsafe(_drain, idx, loop)
 
 
-async def _arun(token, name, args, kwargs, timeout_s):
+async def _arun(idx, token, name, args, kwargs, timeout_s):
     try:
         td = _registry.get(name)
         if td is None:
@@ -488,9 +625,10 @@ async def _arun(token, name, args, kwargs, timeout_s):
                 "ok": False,
                 "retryable": False,
                 "error": {
-                    "type": "Unregistered",
+                    "type": "UnregisteredTask",
                     "message": "unknown task %s" % (name,),
                     "traceback": "",
+                    "origin": "worker",
                 },
             }
         else:
@@ -507,13 +645,19 @@ async def _arun(token, name, args, kwargs, timeout_s):
                 rv = await asyncio.wait_for(fn(*args, **kwargs), timeout_s)
                 out = _finish_value(rv)
             except (asyncio.TimeoutError, TimeoutError):
+                # The worker's own limit firing, so TimeLimitExceeded, matching
+                # the three Rust side limits in exec.rs. From 3.11 the builtin
+                # and asyncio.TimeoutError are one class, so a task raising
+                # TimeoutError itself is caught here too and reported the same
+                # way; that conflation predates the rename (PROTOCOL section 8).
                 out = {
                     "ok": False,
                     "retryable": True,
                     "error": {
-                        "type": "TimeoutError",
+                        "type": "TimeLimitExceeded",
                         "message": "task timed out after %.3fs" % (timeout_s,),
                         "traceback": "",
+                        "origin": "worker",
                     },
                 }
             except BaseException as e:
@@ -522,7 +666,16 @@ async def _arun(token, name, args, kwargs, timeout_s):
                 if _after_hooks:
                     await _run_hooks_async(_after_hooks, "after_task")
     except BaseException as e:  # defensive: never lose a completion
-        out = {"ok": False, "retryable": True, "error": _error_dict(e)}
+        # Origin worker, not task: the task body's own exceptions are caught
+        # inside, and hooks swallow theirs, so anything reaching here came
+        # out of the shim's dispatch machinery.
+        out = {"ok": False, "retryable": True, "error": _error_dict(e, "worker")}
+
+    # This loop finished something. The wedge watchdog reads this counter as
+    # the corroborating signal its stale stamp needs: a loop that is merely
+    # slow keeps moving it, a wedged one never touches it again. Only this
+    # loop's own thread writes this slot.
+    _hb_done[idx] += 1
 
     cb = _callback
     if cb is not None:

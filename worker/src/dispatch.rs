@@ -1,9 +1,14 @@
 //! Per-entry dispatch: parse -> idempotency -> route -> execute -> finish.
 
 use crate::broker;
-use crate::ctx::{now_ms, Ctx, DecrGuard, Outcome};
+// Absolute instants come from the redis anchored clock, never from this
+// host's own: expiry deadlines and delayed scores are compared across
+// workers, and this file writes both. See clock.rs.
+use crate::clock::now_ms;
+use crate::ctx::{Ctx, DecrGuard, Outcome};
 use crate::envelope::{self, Envelope, ErrorJson};
 use crate::exec;
+use serde_json::Value;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tracing::{debug, error, warn};
@@ -33,6 +38,20 @@ fn valid_task_id(id: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
+/// PROTOCOL §2: `args` must be a JSON array or null, `kwargs` must be a JSON
+/// object or null. A wrongly shaped `kwargs` (e.g. a list) used to reach
+/// `fn(*args, **kwargs)` and fail there with a retryable TypeError, burning
+/// max_retries+1 executions before landing in the DLQ under the wrong
+/// reason. Checked here, after a successful parse, rather than inside
+/// `Envelope`'s `Deserialize` (which would fail the whole parse): the id is
+/// perfectly fine in this case, so it stays recoverable and a caller
+/// blocked in `AsyncResult.get()` still gets a real answer instead of
+/// hanging, the same as the `v` version check just below.
+fn args_kwargs_shape_ok(env: &Envelope) -> bool {
+    matches!(env.args, Value::Null | Value::Array(_))
+        && matches!(env.kwargs, Value::Null | Value::Object(_))
+}
+
 async fn process(ctx: &Arc<Ctx>, queue: &str, sid: &str, raw: Option<String>) {
     let raw = match raw {
         Some(r) => r,
@@ -49,6 +68,21 @@ async fn process(ctx: &Arc<Ctx>, queue: &str, sid: &str, raw: Option<String>) {
         return dlq_terminal(ctx, queue, sid, preview, "malformed", None).await;
     }
     let env = match serde_json::from_str::<Envelope>(&raw) {
+        Ok(e) if e.v > envelope::PROTOCOL_VERSION => {
+            warn!(
+                v = e.v, supported = envelope::PROTOCOL_VERSION, id = %e.id,
+                "envelope protocol version unsupported -> DLQ"
+            );
+            return dlq_terminal(ctx, queue, sid, &raw, "malformed", None).await;
+        }
+        Ok(e) if !args_kwargs_shape_ok(&e) => {
+            warn!(id = %e.id, "args/kwargs wrong shape (must be array/object or null) -> DLQ");
+            return dlq_terminal(ctx, queue, sid, &raw, "malformed", None).await;
+        }
+        Ok(e) if e.timeout_ms == 0 => {
+            warn!(id = %e.id, "timeout_ms 0 rejected -> DLQ");
+            return dlq_terminal(ctx, queue, sid, &raw, "malformed", None).await;
+        }
         Ok(e) if !e.id.is_empty() && !e.task.is_empty() && valid_task_id(&e.id) => e,
         _ => return dlq_terminal(ctx, queue, sid, &raw, "malformed", None).await,
     };
@@ -83,32 +117,54 @@ async fn process(ctx: &Arc<Ctx>, queue: &str, sid: &str, raw: Option<String>) {
                 .store_result
                 .then_some((env.id.as_str(), rj.as_str(), ctx.result_ttl));
             let mut conn = ctx.redis.clone();
-            if let Err(e) =
-                broker::finish_dlq(&mut conn, queue, sid, &raw, "expired", None, store).await
-            {
-                error!(id = %env.id, "expired finish write failed: {e}");
+            match broker::finish_dlq(&mut conn, queue, sid, &raw, "expired", None, store).await {
+                Ok(()) => {
+                    ctx.counters.expired.fetch_add(1, Ordering::Relaxed);
+                    ctx.counters.dlq.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    error!(id = %env.id, "expired finish write failed: {e}");
+                }
             }
-            ctx.counters.expired.fetch_add(1, Ordering::Relaxed);
-            ctx.counters.dlq.fetch_add(1, Ordering::Relaxed);
             return;
         }
     }
 
-    // §4.5 idempotency guard, claimed at execution start.
+    // §4.5 idempotency guard, claimed at execution start. The envelope's own
+    // timeout_ms goes with it: the claim's real TTL is derived from the
+    // execution it guards, not from ctx.idemp_ttl alone (broker::claim_ttl_s).
     if let Some(key) = env.idempotency_key.clone() {
         let mut conn = ctx.redis.clone();
-        match broker::idemp_claim(&mut conn, &key, &env.id, ctx.idemp_ttl).await {
+        match broker::idemp_claim(&mut conn, &key, &env.id, ctx.idemp_ttl, env.timeout_ms).await {
             Ok(broker::IdempClaim::Fresh) | Ok(broker::IdempClaim::MineAgain) => {}
-            Ok(broker::IdempClaim::Duplicate) => {
-                let rj = envelope::result_duplicate(now_ms());
+            Ok(broker::IdempClaim::Duplicate { claimant }) => {
+                // The claim is deliberately never released, not even after
+                // the claimant is dead lettered (partial side effects make
+                // suppression the safer default), so the claimant's id is
+                // the suppressed caller's only route to the real outcome.
+                debug!(id = %env.id, claimant = %claimant, "idempotency key held -> duplicate");
+                let rj = envelope::result_duplicate(now_ms(), &claimant);
                 let store = env.store_result.then_some(rj.as_str());
-                if let Err(e) =
-                    broker::finish_duplicate(&mut conn, queue, sid, &env.id, store, ctx.result_ttl)
-                        .await
+                // Gated the same way, and for the same reason, as the
+                // success branch in `finish` below: a write failure must
+                // not be counted as if it happened.
+                match broker::finish_duplicate(
+                    &mut conn,
+                    queue,
+                    sid,
+                    &env.id,
+                    store,
+                    ctx.result_ttl,
+                )
+                .await
                 {
-                    error!(id = %env.id, "duplicate finish write failed: {e}");
+                    Ok(()) => {
+                        ctx.counters.ok.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(e) => {
+                        error!(id = %env.id, "duplicate finish write failed: {e}");
+                    }
                 }
-                ctx.counters.ok.fetch_add(1, Ordering::Relaxed);
                 return;
             }
             Err(e) => {
@@ -141,29 +197,78 @@ async fn finish(ctx: &Arc<Ctx>, queue: &str, sid: &str, mut env: Envelope, outco
             // with the size of whatever the task returned.
             let rj = env.store_result.then(|| envelope::result_success(&v, now));
             let store = rj.as_deref();
-            if let Err(e) =
-                broker::finish_success(&mut conn, queue, sid, &env.id, store, ctx.result_ttl).await
+            match broker::finish_success(&mut conn, queue, sid, &env.id, store, ctx.result_ttl)
+                .await
             {
-                error!(id = %env.id, "success finish write failed: {e}");
+                Ok(()) => {
+                    ctx.counters.ok.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    // A write failure must not count as ok, or as any of
+                    // its counterparts in the duplicate, final failure,
+                    // terminal dlq and expiry branches: the stats line is
+                    // the operator's first signal, and folding this in
+                    // would hide a broker write failure behind a healthy
+                    // number.
+                    error!(id = %env.id, "success finish write failed: {e}");
+                    ctx.counters.failed.fetch_add(1, Ordering::Relaxed);
+                }
             }
-            ctx.counters.ok.fetch_add(1, Ordering::Relaxed);
         }
         Outcome::ForceRetry { countdown, err } => {
             if env.retries < env.max_retries {
                 let cd_ms = countdown.map(|s| (s.max(0.0) * 1000.0).round() as u64);
                 schedule_retry(ctx, &mut conn, queue, sid, &mut env, cd_ms).await;
             } else {
-                final_failure(ctx, &mut conn, queue, sid, &env, &err, now).await;
+                // A forced retry is inherently retryable; reaching here at
+                // all means the budget ran out, never that it was refused.
+                final_failure(ctx, queue, sid, &env, &err, now, "max_retries").await;
             }
         }
         Outcome::Failure { err, retryable } => {
             if retryable && env.retries < env.max_retries {
                 schedule_retry(ctx, &mut conn, queue, sid, &mut env, None).await;
             } else {
-                final_failure(ctx, &mut conn, queue, sid, &env, &err, now).await;
+                // PROTOCOL §4.2: "max_retries" names the case where the
+                // retry budget ran out specifically. A `retryable: false`
+                // failure never had a budget to run out, however many
+                // retries are left, so it gets its own reason instead of
+                // borrowing that one.
+                let reason = if retryable {
+                    "max_retries"
+                } else {
+                    "not_retryable"
+                };
+                final_failure(ctx, queue, sid, &env, &err, now, reason).await;
             }
         }
     }
+}
+
+/// Ceiling on how far out a retry may be scheduled, mirroring
+/// `MAX_TIMEOUT_MS` in envelope.rs: clamped rather than rejected, since an
+/// extreme value plausibly means "as long as possible". The delay is bounded
+/// rather than the resulting instant, deliberately: `fire_at = now + delay`
+/// passes any `fire_at < now + horizon` check when the local clock itself is
+/// wrong, because both sides carry the same broken clock.
+const MAX_RETRY_DELAY_MS: u64 = 30 * 86_400_000; // 30 days
+
+/// Delay before the next attempt: `cauli.Retry(countdown=...)` if the task
+/// named one (task controlled), otherwise the computed backoff (envelope
+/// controlled through `backoff_max_ms`). Neither input is bounded anywhere
+/// else, so the clamp belongs here, where both paths meet.
+fn retry_delay_ms(env: &Envelope, countdown_ms: Option<u64>) -> u64 {
+    countdown_ms
+        .unwrap_or_else(|| {
+            crate::backoff::compute_backoff_ms(
+                env.retries,
+                env.backoff_base_ms,
+                env.backoff_factor,
+                env.backoff_max_ms,
+                env.jitter,
+            )
+        })
+        .min(MAX_RETRY_DELAY_MS)
 }
 
 /// §4.2 steps 1-4. `countdown_ms` overrides the computed backoff (cauli.Retry).
@@ -176,15 +281,7 @@ async fn schedule_retry(
     countdown_ms: Option<u64>,
 ) {
     env.retries += 1;
-    let d_ms = countdown_ms.unwrap_or_else(|| {
-        crate::backoff::compute_backoff_ms(
-            env.retries,
-            env.backoff_base_ms,
-            env.backoff_factor,
-            env.backoff_max_ms,
-            env.jitter,
-        )
-    });
+    let d_ms = retry_delay_ms(env, countdown_ms);
     // saturating_add: H3 — an attacker-chosen backoff_max_ms/countdown near
     // u64::MAX must not wrap fire_at to a tiny score (which would fire the
     // retry immediately, hot-looping until max_retries).
@@ -200,33 +297,79 @@ async fn schedule_retry(
     ctx.counters.retried.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Final failure: DLQ reason "max_retries" + failure result (if store_result).
+/// Final failure: DLQ `reason` ("max_retries" or "not_retryable", see
+/// `finish` above) + failure result (if store_result). Clones its own
+/// connection from `ctx` (rather than taking one as a parameter, the way
+/// `schedule_retry` does) so this stays at seven arguments instead of eight;
+/// a `ConnectionManager` clone is a cheap handle, the same one every other
+/// call site in this file already takes fresh from `ctx.redis`.
 async fn final_failure(
     ctx: &Arc<Ctx>,
-    conn: &mut redis::aio::ConnectionManager,
     queue: &str,
     sid: &str,
     env: &Envelope,
     err: &ErrorJson,
     now: u64,
+    reason: &str,
 ) {
+    let mut conn = ctx.redis.clone();
     // Infallible: same reasoning as schedule_retry above.
     let ej = serde_json::to_string(env).expect("envelope serialize");
     let rj = envelope::result_failure(err, now);
     let result = env
         .store_result
         .then_some((env.id.as_str(), rj.as_str(), ctx.result_ttl));
-    if let Err(e) =
-        broker::finish_dlq(conn, queue, sid, &ej, "max_retries", Some(err), result).await
-    {
-        error!(id = %env.id, "dlq write failed: {e}");
+    // Gated the same way, and for the same reason, as the success branch in
+    // `finish` above: a write failure must not be counted as if it happened.
+    match broker::finish_dlq(&mut conn, queue, sid, &ej, reason, Some(err), result).await {
+        Ok(()) => {
+            ctx.counters.failed.fetch_add(1, Ordering::Relaxed);
+            ctx.counters.dlq.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(e) => {
+            error!(id = %env.id, "dlq write failed: {e}");
+        }
     }
-    ctx.counters.failed.fetch_add(1, Ordering::Relaxed);
-    ctx.counters.dlq.fetch_add(1, Ordering::Relaxed);
 }
 
-/// Terminal DLQ for malformed / unregistered / redelivery_limit entries
-/// (no retry, no result key; error field empty string when None).
+/// Best effort task id recovery for a terminal DLQ write: bounded to the
+/// same preview cap as the oversize path (`safe_truncate`, 4096 bytes), so a
+/// hostile huge `raw_e` can never turn this into the parse that §M2 exists
+/// to avoid. A small envelope that is only oversize relative to a low
+/// --max-envelope-bytes, or one already fully read (unregistered,
+/// redelivery_limit), still parses inside that cap and its id comes back.
+fn recover_id(raw_e: &str) -> Option<String> {
+    let preview = envelope::safe_truncate(raw_e, 4096);
+    match serde_json::from_str::<Envelope>(preview) {
+        Ok(e) if valid_task_id(&e.id) => Some(e.id),
+        _ => None,
+    }
+}
+
+/// Synthetic error for a task that never ran: no Python exception exists,
+/// so a type distinguishable from a real one (mirrors `result_expired`'s
+/// "Expired") lets a caller's `except TaskFailedError` tell them apart.
+fn dlq_error(reason: &str) -> ErrorJson {
+    let type_ = match reason {
+        "malformed" => "Malformed",
+        "unregistered" => "UnregisteredTask",
+        "redelivery_limit" => "RedeliveryLimitExceeded",
+        _ => "DeadLettered",
+    };
+    ErrorJson::new(
+        type_,
+        format!("task was dead lettered before it ran (reason {reason})"),
+    )
+}
+
+/// Terminal DLQ for malformed / unregistered / redelivery_limit entries: no
+/// retry. When a task id can be recovered from `raw_e` (see `recover_id`), a
+/// failure result is written too, so a caller blocked in
+/// `AsyncResult.get()` with no timeout gets an answer instead of waiting on
+/// a `cauli:result:{id}` key that would otherwise never exist. Where no id
+/// can be recovered there is nothing to key a result on, so none is
+/// written, same as before. Error field in the DLQ stream entry is still
+/// the empty string when `err` is None.
 pub async fn dlq_terminal(
     ctx: &Arc<Ctx>,
     queue: &str,
@@ -236,10 +379,27 @@ pub async fn dlq_terminal(
     err: Option<&ErrorJson>,
 ) {
     let mut conn = ctx.redis.clone();
-    if let Err(e) = broker::finish_dlq(&mut conn, queue, sid, raw_e, reason, err, None).await {
-        error!(reason, "terminal dlq write failed: {e}");
+    let recovered_id = recover_id(raw_e);
+    let synthesized = err.is_none().then(|| dlq_error(reason));
+    let result_error = err.or(synthesized.as_ref());
+    let result_json = match (&recovered_id, result_error) {
+        (Some(_), Some(e)) => Some(envelope::result_failure(e, now_ms())),
+        _ => None,
+    };
+    let store = match (&recovered_id, &result_json) {
+        (Some(id), Some(rj)) => Some((id.as_str(), rj.as_str(), ctx.result_ttl)),
+        _ => None,
+    };
+    // Gated the same way, and for the same reason, as the success branch in
+    // `finish` above: a write failure must not be counted as if it happened.
+    match broker::finish_dlq(&mut conn, queue, sid, raw_e, reason, err, store).await {
+        Ok(()) => {
+            ctx.counters.dlq.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(e) => {
+            error!(reason, "terminal dlq write failed: {e}");
+        }
     }
-    ctx.counters.dlq.fetch_add(1, Ordering::Relaxed);
 }
 
 #[cfg(test)]
@@ -252,6 +412,47 @@ mod tests {
         assert!(valid_task_id("0123456789abcdef0123456789abcdef"));
     }
 
+    fn env_with(json: &str) -> Envelope {
+        serde_json::from_str(json).unwrap()
+    }
+
+    /// The exact shape from the bug report: a JSON array for kwargs used to
+    /// parse fine and only blow up much later inside fn(*args, **kwargs)
+    /// with a retryable TypeError, burning max_retries+1 executions before
+    /// landing in the DLQ under the wrong reason.
+    #[test]
+    fn args_kwargs_shape_ok_accepts_array_object_or_null() {
+        assert!(args_kwargs_shape_ok(&env_with(r#"{"id":"a","task":"t"}"#)));
+        assert!(args_kwargs_shape_ok(&env_with(
+            r#"{"id":"a","task":"t","args":null,"kwargs":null}"#
+        )));
+        assert!(args_kwargs_shape_ok(&env_with(
+            r#"{"id":"a","task":"t","args":[],"kwargs":{}}"#
+        )));
+        assert!(args_kwargs_shape_ok(&env_with(
+            r#"{"id":"a","task":"t","args":[1,"x"],"kwargs":{"k":true}}"#
+        )));
+    }
+
+    #[test]
+    fn args_kwargs_shape_ok_rejects_wrong_types() {
+        assert!(!args_kwargs_shape_ok(&env_with(
+            r#"{"id":"a","task":"t","kwargs":[1,2]}"#
+        )));
+        assert!(!args_kwargs_shape_ok(&env_with(
+            r#"{"id":"a","task":"t","kwargs":"x"}"#
+        )));
+        assert!(!args_kwargs_shape_ok(&env_with(
+            r#"{"id":"a","task":"t","kwargs":5}"#
+        )));
+        assert!(!args_kwargs_shape_ok(&env_with(
+            r#"{"id":"a","task":"t","args":{"a":1}}"#
+        )));
+        assert!(!args_kwargs_shape_ok(&env_with(
+            r#"{"id":"a","task":"t","args":"x"}"#
+        )));
+    }
+
     #[test]
     fn valid_task_id_rejects_malformed_ids() {
         assert!(!valid_task_id(""));
@@ -262,5 +463,59 @@ mod tests {
         assert!(!valid_task_id(&"g".repeat(32))); // right length, non-hex letter
                                                   // right length, one invalid char (hash-tag injection attempt)
         assert!(!valid_task_id(&format!("{{{}", "a".repeat(31))));
+    }
+
+    /// Both inputs are unbounded at their source: `backoff_max_ms` travels in
+    /// the envelope and `Retry(countdown=...)` comes from task code. Without
+    /// the clamp a retry lands past every result TTL, DLQ retention and alert
+    /// window that would let anyone notice it.
+    #[test]
+    fn retry_delay_is_clamped_at_thirty_days() {
+        let env = env_with(
+            r#"{"id":"a","task":"t","retries":1,"backoff_base_ms":18446744073709551615,
+                "backoff_max_ms":18446744073709551615,"jitter":false}"#,
+        );
+        assert_eq!(retry_delay_ms(&env, None), MAX_RETRY_DELAY_MS);
+        assert_eq!(retry_delay_ms(&env, Some(u64::MAX)), MAX_RETRY_DELAY_MS);
+        // Ordinary delays are untouched, including one just under the cap.
+        assert_eq!(retry_delay_ms(&env, Some(1_500)), 1_500);
+        assert_eq!(
+            retry_delay_ms(&env, Some(MAX_RETRY_DELAY_MS - 1)),
+            MAX_RETRY_DELAY_MS - 1
+        );
+    }
+
+    #[test]
+    fn recover_id_from_a_fully_parseable_envelope() {
+        let raw = r#"{"id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","task":"t"}"#;
+        assert_eq!(
+            recover_id(raw),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
+        );
+    }
+
+    #[test]
+    fn recover_id_none_when_the_id_is_past_the_preview_cap() {
+        // A hostile oversize payload never gets its id back: the preview
+        // cap (4096 bytes) lands inside the padding, well before the id
+        // field or the closing brace, so this can never become the
+        // unbounded parse §M2 exists to avoid.
+        let raw = format!(
+            r#"{{"pad":"{}","id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","task":"t"}}"#,
+            "x".repeat(5000)
+        );
+        assert_eq!(recover_id(&raw), None);
+    }
+
+    #[test]
+    fn recover_id_none_for_an_id_that_fails_the_charset_gate() {
+        let raw = r#"{"id":"not-32-hex","task":"t"}"#;
+        assert_eq!(recover_id(raw), None);
+    }
+
+    #[test]
+    fn recover_id_none_for_unparseable_input() {
+        assert_eq!(recover_id(""), None);
+        assert_eq!(recover_id("not json"), None);
     }
 }

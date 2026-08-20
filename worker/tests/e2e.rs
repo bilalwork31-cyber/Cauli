@@ -101,6 +101,9 @@ async fn e2e_main_flows() {
     let r = wait_result(&mut c, &id, 15).await;
     assert_eq!(r["status"], "failure");
     assert_eq!(r["error"]["type"], "ValueError");
+    // §8 origin, end to end: a task exception is "task" all the way from the
+    // shim's error dict into the stored result document.
+    assert_eq!(r["error"]["origin"], "task");
     assert!(r["error"]["traceback"]
         .as_str()
         .unwrap()
@@ -134,14 +137,18 @@ async fn e2e_main_flows() {
     assert_eq!(r["status"], "success");
     assert_eq!(r["result"], "after-retry");
 
-    // 8. non-serializable return: final failure, NO retry despite max_retries
+    // 8. non-serializable return: final failure, NO retry despite max_retries.
+    // Audit regression: this used to dead letter with reason "max_retries"
+    // even though retries never left 0, since a `retryable: false` failure
+    // was never eligible for a retry budget in the first place, so the
+    // reason must say so instead of claiming one was exhausted.
     let (id, e) = envelope("fx.bad_return", "default", |v| v["max_retries"] = json!(3));
     xadd(&mut c, "default", &e.to_string()).await;
     let r = wait_result(&mut c, &id, 10).await;
     assert_eq!(r["status"], "failure");
     assert_eq!(r["error"]["type"], "SerializationError");
     let (reason, _, efield) = wait_dlq(&mut c, "default", &id, 5).await;
-    assert_eq!(reason, "max_retries");
+    assert_eq!(reason, "not_retryable");
     let dlq_env: serde_json::Value = serde_json::from_str(&efield).unwrap();
     assert_eq!(
         dlq_env["retries"], 0,
@@ -149,6 +156,8 @@ async fn e2e_main_flows() {
     );
 
     idempotency_and_timeouts(&mut c).await;
+    result_write_failure_is_not_counted_ok(&mut c).await;
+    write_failure_is_not_counted_for_duplicate_final_and_terminal(&mut c).await;
 
     // graceful SIGTERM with nothing in flight -> exit 0
     w.signal(libc::SIGTERM);
@@ -232,7 +241,7 @@ async fn idempotency_and_timeouts(c: &mut redis::aio::MultiplexedConnection) {
     );
     assert_eq!(r["result"], "aslow-done");
 
-    // async hard timeout -> retryable TimeoutError; max_retries 0 -> DLQ now
+    // async hard timeout -> retryable TimeLimitExceeded; max_retries 0 -> DLQ now
     let (id, e) = envelope("fx.aslow", "default", |v| {
         v["args"] = json!([30.0]);
         v["timeout_ms"] = json!(700);
@@ -241,9 +250,23 @@ async fn idempotency_and_timeouts(c: &mut redis::aio::MultiplexedConnection) {
     xadd(c, "default", &e.to_string()).await;
     let r = wait_result(c, &id, 10).await;
     assert_eq!(r["status"], "failure");
-    assert_eq!(r["error"]["type"], "TimeoutError");
+    assert_eq!(r["error"]["type"], "TimeLimitExceeded");
+    assert_eq!(r["error"]["origin"], "worker");
     let (reason, _, _) = wait_dlq(c, "default", &id, 5).await;
     assert_eq!(reason, "max_retries");
+
+    // The other half of the rename: a task raising the BUILTIN TimeoutError
+    // keeps that spelling and reports origin task, so the two are no longer
+    // one string. §8's third spelling, the caller's own `.get(timeout=)`,
+    // never reaches a result document at all.
+    let (id, e) = envelope("fx.raise_timeout", "default", |v| {
+        v["max_retries"] = json!(0);
+    });
+    xadd(c, "default", &e.to_string()).await;
+    let r = wait_result(c, &id, 10).await;
+    assert_eq!(r["status"], "failure");
+    assert_eq!(r["error"]["type"], "TimeoutError");
+    assert_eq!(r["error"]["origin"], "task");
 
     // sync soft timeout via PyThreadState_SetAsyncExc
     let (id, e) = envelope("fx.soft_slow", "default", |v| {
@@ -256,8 +279,11 @@ async fn idempotency_and_timeouts(c: &mut redis::aio::MultiplexedConnection) {
     let r = wait_result(c, &id, 10).await;
     assert_eq!(r["status"], "failure");
     assert_eq!(r["error"]["type"], "SoftTimeLimitExceeded");
+    // The documented edge: the worker injected it, but it did leave user
+    // code, so it is origin task like any other propagated exception.
+    assert_eq!(r["error"]["origin"], "task");
 
-    // sync hard timeout: thread abandoned, retryable TimeoutError
+    // sync hard timeout: thread abandoned, retryable TimeLimitExceeded
     let (id, e) = envelope("fx.slow", "default", |v| {
         v["args"] = json!([3.0]);
         v["timeout_ms"] = json!(600);
@@ -266,7 +292,8 @@ async fn idempotency_and_timeouts(c: &mut redis::aio::MultiplexedConnection) {
     xadd(c, "default", &e.to_string()).await;
     let r = wait_result(c, &id, 10).await;
     assert_eq!(r["status"], "failure");
-    assert_eq!(r["error"]["type"], "TimeoutError");
+    assert_eq!(r["error"]["type"], "TimeLimitExceeded");
+    assert_eq!(r["error"]["origin"], "worker");
 
     // cpu hard timeout: child SIGKILL + respawn, then pool still works
     let (id, e) = envelope("fx.cpu_slow", "default", |v| {
@@ -278,7 +305,8 @@ async fn idempotency_and_timeouts(c: &mut redis::aio::MultiplexedConnection) {
     xadd(c, "default", &e.to_string()).await;
     let r = wait_result(c, &id, 15).await;
     assert_eq!(r["status"], "failure");
-    assert_eq!(r["error"]["type"], "TimeoutError");
+    assert_eq!(r["error"]["type"], "TimeLimitExceeded");
+    assert_eq!(r["error"]["origin"], "worker");
     let (id, e) = envelope("fx.cpu_echo", "default", |v| v["kind"] = json!("cpu"));
     xadd(c, "default", &e.to_string()).await;
     let r = wait_result(c, &id, 15).await;
@@ -289,6 +317,15 @@ async fn idempotency_and_timeouts(c: &mut redis::aio::MultiplexedConnection) {
     xadd(c, "default", &e.to_string()).await;
     let (reason, _, _) = wait_dlq(c, "default", &id, 10).await;
     assert_eq!(reason, "unregistered");
+    // root cause fix: a terminal DLQ with a recoverable id must still
+    // resolve AsyncResult.get() instead of leaving it blocked forever on a
+    // result key that would otherwise never be written.
+    let r = wait_result(c, &id, 10).await;
+    assert_eq!(r["status"], "failure");
+    assert_eq!(r["error"]["type"], "UnregisteredTask");
+    // §8 origin: dead lettered before it ever ran, so the error object is
+    // the worker's own and no user code was involved.
+    assert_eq!(r["error"]["origin"], "worker");
 
     // malformed payload -> DLQ with raw payload preserved
     let raw = "{this is not json";
@@ -304,6 +341,57 @@ async fn idempotency_and_timeouts(c: &mut redis::aio::MultiplexedConnection) {
     xadd(c, "default", &bad_id_env.to_string()).await;
     let (reason, _, _) = wait_dlq(c, "default", "not-a-valid-32-char-lowercase-hex-id", 10).await;
     assert_eq!(reason, "malformed");
+    // scope boundary: an id that fails the M1 charset gate must never be
+    // used as a result key either, even for this new write -- that is the
+    // same collision the gate exists to prevent, so "no id recoverable"
+    // stays exactly as it was.
+    let none: Option<String> = redis::cmd("GET")
+        .arg("cauli:result:not-a-valid-32-char-lowercase-hex-id")
+        .query_async(c)
+        .await
+        .unwrap();
+    assert!(none.is_none());
+
+    // protocol version this worker does not understand -> DLQ malformed,
+    // same as any other worker side gate failure; unlike the bad id case,
+    // the id itself is fine here, so a result is still written.
+    let (id, mut v99_env) = envelope("fx.echo", "default", |_| {});
+    v99_env["v"] = json!(99);
+    xadd(c, "default", &v99_env.to_string()).await;
+    let (reason, _, _) = wait_dlq(c, "default", &id, 10).await;
+    assert_eq!(reason, "malformed");
+    let r = wait_result(c, &id, 10).await;
+    assert_eq!(r["status"], "failure");
+
+    // Bug: a wrongly typed kwargs (here a list, not an object) used to
+    // parse fine, reach fn(*args, **kwargs) and raise a retryable
+    // TypeError, burning max_retries+1 executions before landing in the DLQ
+    // with reason "max_retries" and a misleading error. It must now be
+    // rejected at parse as malformed, never executed.
+    let (id, e) = envelope("fx.echo", "default", |v| {
+        v["kwargs"] = json!([1, 2]);
+    });
+    xadd(c, "default", &e.to_string()).await;
+    let (reason, _, _) = wait_dlq(c, "default", &id, 10).await;
+    assert_eq!(reason, "malformed");
+    let r = wait_result(c, &id, 10).await;
+    assert_eq!(r["status"], "failure");
+    assert_eq!(r["error"]["type"], "Malformed");
+
+    // Bug: timeout_ms 0 made the dispatcher's own timeout elapse before the
+    // pool thread could ever answer, so report_hard_timeout fired and the
+    // job was skipped as a zombie: nothing ever ran, and nothing ever
+    // would. Rejected before execution as malformed instead, with the id
+    // (perfectly valid here) still recoverable, same as the kwargs case above.
+    let (id, e) = envelope("fx.echo", "default", |v| {
+        v["timeout_ms"] = json!(0);
+    });
+    xadd(c, "default", &e.to_string()).await;
+    let (reason, _, _) = wait_dlq(c, "default", &id, 10).await;
+    assert_eq!(reason, "malformed");
+    let r = wait_result(c, &id, 10).await;
+    assert_eq!(r["status"], "failure");
+    assert_eq!(r["error"]["type"], "Malformed");
 
     // M2 regression: an envelope larger than --max-envelope-bytes (default 1
     // MiB) -> DLQ malformed before it is ever parsed, with only a truncated
@@ -319,4 +407,176 @@ async fn idempotency_and_timeouts(c: &mut redis::aio::MultiplexedConnection) {
         efield.len() <= 4096,
         "oversize envelope must be stored truncated, not in full"
     );
+}
+
+/// C9 regression: dispatch.rs's `finish()` used to fetch_add the `ok`
+/// counter unconditionally after a successful task, even when the result
+/// write itself failed. A second worker with result_ttl=0 makes Redis
+/// reject `SET ... EX 0` on every success, giving a real (not simulated)
+/// write failure to check the stats line against.
+async fn result_write_failure_is_not_counted_ok(c: &mut redis::aio::MultiplexedConnection) {
+    let log_path = fixtures_dir().join(format!("badttl-{}.log", unique_id()));
+    let mut bad = Worker::spawn_ex(
+        "badttl",
+        &[],
+        &[("FIXTURE_RESULT_TTL", "0")],
+        Some(&log_path),
+    );
+    wait_group(c, "badttl", 20).await;
+
+    let (id, e) = envelope("fx.echo", "badttl", |v| v["args"] = json!(["x"]));
+    xadd(c, "badttl", &e.to_string()).await;
+
+    // The SET is rejected, so no result key can ever appear; the stream
+    // entry still gets acked/deleted either way (finish() XACKs+XDELs
+    // regardless of the write outcome), so an emptied queue is the
+    // dispatch-is-done signal.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let len: u64 = redis::cmd("XLEN")
+            .arg("cauli:q:badttl")
+            .query_async(c)
+            .await
+            .unwrap();
+        if len == 0 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "badttl entry was never dispatched"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let raw: Option<String> = redis::cmd("GET")
+        .arg(format!("cauli:result:{id}"))
+        .query_async(c)
+        .await
+        .unwrap();
+    assert!(
+        raw.is_none(),
+        "SET ... EX 0 should have failed: no result key"
+    );
+
+    bad.signal(libc::SIGTERM);
+    assert_eq!(bad.wait_code(20), 0, "badttl worker should exit 0");
+    drop(bad);
+
+    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+    let stats = log
+        .lines()
+        .rev()
+        .find(|l| l.contains("stats: fetched="))
+        .unwrap_or_else(|| panic!("no stats line in worker log:\n{log}"));
+    assert!(
+        stats.contains("fetched=1 ok=0 failed=1"),
+        "a failed result write must not be counted as ok: {stats}"
+    );
+    let _ = std::fs::remove_file(&log_path);
+}
+
+/// Audit regression (item D): the duplicate, final failure, terminal DLQ and
+/// expiry completion branches used to fetch_add `ok` / `failed` / `dlq` /
+/// `expired` unconditionally, even when the write recording that outcome
+/// failed. This is the same truthfulness bug
+/// `result_write_failure_is_not_counted_ok` above covers for the plain
+/// success branch. Same mechanism (FIXTURE_RESULT_TTL=0 -> every
+/// `SET ... EX 0` is rejected), four more branches, one worker: a duplicate
+/// resolution, a final failure that was never retryable
+/// (SerializationError), a terminal DLQ for a task that was never
+/// registered, and a task that had already expired before dispatch.
+async fn write_failure_is_not_counted_for_duplicate_final_and_terminal(
+    c: &mut redis::aio::MultiplexedConnection,
+) {
+    let log_path = fixtures_dir().join(format!("badttl2-{}.log", unique_id()));
+    let mut bad = Worker::spawn_ex(
+        "badttl2",
+        &[],
+        &[("FIXTURE_RESULT_TTL", "0")],
+        Some(&log_path),
+    );
+    wait_group(c, "badttl2", 20).await;
+
+    // The result SET is rejected on every write in this worker, so no
+    // result key ever appears; the stream entry still gets acked/deleted
+    // either way (finish() XACKs+XDELs regardless of the write outcome), so
+    // a drained queue signals that dispatch has finished, same as
+    // `result_write_failure_is_not_counted_ok` above.
+    async fn wait_drained(c: &mut redis::aio::MultiplexedConnection, queue: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            let len: u64 = redis::cmd("XLEN")
+                .arg(format!("cauli:q:{queue}"))
+                .query_async(c)
+                .await
+                .unwrap();
+            if len == 0 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "badttl2 entry was never dispatched"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
+    // A: duplicate resolution. Same idempotency_key twice: the first claims
+    // it (and, like the plain success case above, fails to write its own
+    // result -> counted `failed`); the second resolves "duplicate" and must
+    // not count as `ok` when ITS write also fails.
+    let key = format!("badttl2-idk-{}", unique_id());
+    let (_id1, e1) = envelope("fx.echo", "badttl2", |v| {
+        v["idempotency_key"] = json!(key.clone())
+    });
+    xadd(c, "badttl2", &e1.to_string()).await;
+    wait_drained(c, "badttl2").await;
+    let (_id2, e2) = envelope("fx.echo", "badttl2", |v| {
+        v["idempotency_key"] = json!(key.clone())
+    });
+    xadd(c, "badttl2", &e2.to_string()).await;
+    wait_drained(c, "badttl2").await;
+
+    // B: a final failure that was never retryable (SerializationError, see
+    // scenario 8 above). Must not count `failed`/`dlq` when the DLQ write
+    // itself fails.
+    let (_id3, e3) = envelope("fx.bad_return", "badttl2", |_| {});
+    xadd(c, "badttl2", &e3.to_string()).await;
+    wait_drained(c, "badttl2").await;
+
+    // C: terminal DLQ for an unregistered task, never executed. Must not
+    // count `dlq` when the write fails.
+    let (_id4, e4) = envelope("fx.no_such_task", "badttl2", |_| {});
+    xadd(c, "badttl2", &e4.to_string()).await;
+    wait_drained(c, "badttl2").await;
+
+    // D: a task already expired before dispatch (PROTOCOL §9.1), dead
+    // lettered without ever executing. Must not count `expired`/`dlq` when
+    // the write fails.
+    let (_id5, e5) = envelope("fx.echo", "badttl2", |v| {
+        v["expires_at"] = json!(now_ms().saturating_sub(60_000))
+    });
+    xadd(c, "badttl2", &e5.to_string()).await;
+    wait_drained(c, "badttl2").await;
+
+    bad.signal(libc::SIGTERM);
+    assert_eq!(bad.wait_code(20), 0, "badttl2 worker should exit 0");
+    drop(bad);
+
+    let log = std::fs::read_to_string(&log_path).unwrap_or_default();
+    let stats = log
+        .lines()
+        .rev()
+        .find(|l| l.contains("stats: fetched="))
+        .unwrap_or_else(|| panic!("no stats line in worker log:\n{log}"));
+    // fetched=5 (e1..e5); ok=0 (e1 -> failed via the success gate, e2's
+    // duplicate write also fails); failed=1 (e1 only: final_failure's own
+    // write failed for e3, so it must not count either); dlq=0 (e3's
+    // final_failure, e4's dlq_terminal and e5's expiry write all fail);
+    // expired=0 (e5's own write failed, so it must not count either).
+    assert!(
+        stats.contains("fetched=5 ok=0 failed=1 retried=0 dlq=0 expired=0"),
+        "a failed write on the duplicate, final failure, terminal dlq or \
+         expiry path must not be counted as ok, failed, dlq or expired: {stats}"
+    );
+    let _ = std::fs::remove_file(&log_path);
 }

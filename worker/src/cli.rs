@@ -93,11 +93,14 @@ pub struct Args {
     #[arg(long, default_value_t = 4, help_heading = ADVANCED)]
     pub cpu_prefetch: usize,
 
-    /// Recycle a cpu child after it completes this many tasks (0 = never).
-    /// The backstop for leaky C extensions and slowly dirtied copy-on-write
-    /// pages, like Celery's maxtasksperchild. Staged prefetch work always
-    /// drains before the recycle fires, so no task is lost to it
-    #[arg(long, default_value_t = 0, help_heading = ADVANCED)]
+    /// Recycle a cpu child after it completes this many tasks. THE DEFAULT
+    /// IS 1000: children are recycled unless you say otherwise. Pass 0 to opt
+    /// out and let a child live for the whole worker lifetime. This is the
+    /// backstop for leaky C extensions and slowly dirtied copy on write
+    /// pages, like Celery's maxtasksperchild, and nothing else in the worker
+    /// bounds cpu child memory. Staged prefetch work always drains before the
+    /// recycle fires, so no task is lost to it
+    #[arg(long, default_value_t = 1000, help_heading = ADVANCED)]
     pub cpu_max_tasks_per_child: usize,
 
     /// Start the cpu pool at boot instead of on the first cpu task. Costs
@@ -125,6 +128,34 @@ pub struct Args {
     /// Python executable used to spawn cpu children
     #[arg(long, default_value = "python3", help_heading = ADVANCED)]
     pub python: String,
+
+    /// Response and connection timeout, in seconds, for every redis round
+    /// trip: fetch (XREADGROUP), the idempotency claim before a task body
+    /// runs, the delayed mover, crash recovery, and task result writes.
+    /// Unset in the underlying client, a redis that accepts the TCP
+    /// connection but never answers (paused, swapping, or a network
+    /// partition dropping packets rather than refusing them) hangs these
+    /// calls forever. BLOCK on XREADGROUP is a server side wait, not a
+    /// client side deadline, and does not substitute for this.
+    ///
+    /// This is new configuration surface, deliberately: the right value
+    /// depends on this deployment's redis tail latency, which cannot be
+    /// known in advance, so one hardcoded number would be wrong for either
+    /// a shared noisy redis or a dedicated local one. Below roughly 1
+    /// second, ordinary fork, fsync and network jitter risk a false trip
+    /// (the delayed mover's Lua script alone can touch up to 128 items in
+    /// one round trip). Past roughly half of visibility_timeout, a slow but
+    /// genuinely alive redis is not caught meaningfully sooner than doing
+    /// nothing.
+    ///
+    /// A trip is never a new failure mode: every affected call site already
+    /// has a tested fallback for a redis error (finish() leaves the entry
+    /// unacked for XCLAIM to redeliver; idemp_claim fails open and executes
+    /// anyway), so this only reaches an existing safe outcome sooner, at the
+    /// cost of one log line and at most one visibility timeout of added
+    /// latency on that task. Never data loss.
+    #[arg(long, default_value_t = 5, help_heading = ADVANCED)]
+    pub redis_timeout: u64,
 }
 
 /// Concrete per-process execution settings after applying the -c/--procs
@@ -235,7 +266,7 @@ mod tests {
         assert_eq!(a.io_concurrency, None);
         assert_eq!(a.cpu_workers, None);
         assert_eq!(a.cpu_child_threads, 1);
-        assert_eq!(a.cpu_max_tasks_per_child, 0);
+        assert_eq!(a.cpu_max_tasks_per_child, 1000);
         assert!(!a.eager_cpu);
         assert!(!a.print_plan);
         assert!(!a.no_fork_server);
@@ -246,6 +277,22 @@ mod tests {
         assert_eq!(a.python, "python3");
         assert_eq!(a.stats_interval, 10);
         assert_eq!(a.log_level, "info");
+        assert_eq!(a.redis_timeout, 5);
+    }
+
+    /// Behaviour change: cpu children recycle by default now. 0 has to stay
+    /// accepted, because it is the documented way to opt back out.
+    #[test]
+    fn cpu_recycle_defaults_to_1000_with_zero_as_the_opt_out() {
+        assert_eq!(parse(&[]).cpu_max_tasks_per_child, 1_000);
+        assert_eq!(
+            parse(&["--cpu-max-tasks-per-child", "0"]).cpu_max_tasks_per_child,
+            0
+        );
+        assert_eq!(
+            parse(&["--cpu-max-tasks-per-child", "7"]).cpu_max_tasks_per_child,
+            7
+        );
     }
 
     #[test]
@@ -278,6 +325,8 @@ mod tests {
             "1",
             "--log-level",
             "debug",
+            "--redis-timeout",
+            "7",
         ])
         .unwrap();
         assert_eq!(a.queues, vec!["default", "emails", "bulk-2"]);
@@ -292,6 +341,7 @@ mod tests {
         assert_eq!(a.python, "python3.12");
         assert_eq!(a.stats_interval, 1);
         assert_eq!(a.log_level, "debug");
+        assert_eq!(a.redis_timeout, 7);
     }
 
     #[test]

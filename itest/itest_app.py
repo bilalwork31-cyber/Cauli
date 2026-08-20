@@ -76,6 +76,31 @@ def flaky_idemp(path, fail_times):
     return {"succeeded_on_attempt": n}
 
 
+@app.task(timeout=4, max_retries=0)
+def slow_idemp(path, seconds):
+    """Sleeps so a killed worker can be caught mid task; paired with an
+    idempotency_key in the crash redelivery test (the MineAgain half of the
+    C1 fix, as opposed to `flaky_idemp`'s scheduled retry half). Appends to
+    `path` on every invocation attempt, so the test can tell exactly how
+    many times the body was entered.
+    """
+    with open(path, "a") as f:
+        f.write("x")
+    import time
+
+    time.sleep(seconds)
+    return {"slow_idemp_done": True}
+
+
+@app.task(max_retries=0, timeout=0.5)
+def redelivery_doomed(x):
+    """Never actually runs in the redelivery limit test: that test advances
+    this task's own delivery_count past its limit before any worker reads
+    it, so the recovery loop dead letters it on sight.
+    """
+    return x
+
+
 @app.task(kind="cpu", soft_timeout=0.3, timeout=10, max_retries=0)
 def slow_cpu():
     import time

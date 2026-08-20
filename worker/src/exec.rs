@@ -7,7 +7,7 @@ use crate::pyrt::SyncJob;
 use serde::Serialize;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 use tokio::time::timeout;
 use tracing::warn;
@@ -74,7 +74,12 @@ pub async fn run_sync_task(ctx: &Arc<Ctx>, env: &Envelope) -> Outcome {
         );
     }
 
-    match timeout(Duration::from_millis(env.timeout_ms), rx).await {
+    // Latency span, identical in all three lanes: from the job leaving this
+    // task to the outcome coming back. It starts after the handoff so it
+    // never charges a lane for pool startup or for backlog parking, both of
+    // which already have their own fields.
+    let started = Instant::now();
+    let outcome = match timeout(Duration::from_millis(env.timeout_ms), rx).await {
         // Already a normalized Outcome: the shim returned a Python object and
         // pyrt converted it directly, so there is no response text to parse.
         Ok(Ok(outcome)) => outcome,
@@ -92,11 +97,13 @@ pub async fn run_sync_task(ctx: &Arc<Ctx>, env: &Envelope) -> Outcome {
                 env.timeout_ms
             );
             fail(
-                "TimeoutError",
+                "TimeLimitExceeded",
                 format!("hard timeout after {}ms (thread abandoned)", env.timeout_ms),
             )
         }
-    }
+    };
+    ctx.counters.lat_sync.record(started.elapsed());
+    outcome
 }
 
 /// Async io task on an embedded asyncio loop; the shim wraps it in
@@ -122,9 +129,11 @@ pub async fn run_async_task(ctx: &Arc<Ctx>, env: &Envelope) -> Outcome {
         ctx.pyrt
             .queue_submit(&env.task, env.args_ref(), env.kwargs_ref(), effective_s);
     // saturating_add: H3 — an attacker-chosen timeout_ms near u64::MAX must
-    // not wrap this backstop to a near-zero duration (spurious TimeoutError).
+    // not wrap this backstop to a near-zero duration (spurious
+    // TimeLimitExceeded).
     let backstop_ms = env.timeout_ms.saturating_add(BACKSTOP_GRACE_MS);
-    match timeout(Duration::from_millis(backstop_ms), rx).await {
+    let started = Instant::now();
+    let outcome = match timeout(Duration::from_millis(backstop_ms), rx).await {
         // Already normalized by the completion callback (pyrt::outcome_from_py).
         Ok(Ok(outcome)) => outcome,
         Ok(Err(_)) => fail("WorkerLost", "async completion channel dropped".into()),
@@ -135,14 +144,16 @@ pub async fn run_async_task(ctx: &Arc<Ctx>, env: &Envelope) -> Outcome {
             // holds) forever.
             ctx.pyrt.cancel(token);
             fail(
-                "TimeoutError",
+                "TimeLimitExceeded",
                 format!(
                     "no completion within {}ms + grace (event loop unresponsive)",
                     env.timeout_ms
                 ),
             )
         }
-    }
+    };
+    ctx.counters.lat_async.record(started.elapsed());
+    outcome
 }
 
 /// Cpu task via the child pool (§5.1). Backlog is a bounded channel sized to
@@ -195,16 +206,22 @@ pub async fn run_cpu_task(ctx: &Arc<Ctx>, env: &Envelope) -> Outcome {
             return fail("WorkerLost", "cpu pool closed".into());
         }
     }
-    match rx.await {
+    let started = Instant::now();
+    let outcome = match rx.await {
         Ok(crate::cpu::CpuOutcome::Resp(line)) => parse_pyresp(&line, true),
         Ok(crate::cpu::CpuOutcome::Timeout) => fail(
-            "TimeoutError",
+            "TimeLimitExceeded",
             format!(
                 "cpu child SIGKILLed after hard timeout {}ms",
                 env.timeout_ms
             ),
         ),
-        Ok(crate::cpu::CpuOutcome::Lost) => fail("WorkerLost", "cpu child died during task".into()),
+        Ok(crate::cpu::CpuOutcome::Lost) => {
+            ctx.counters.cpu_lost.fetch_add(1, Ordering::Relaxed);
+            fail("WorkerLost", "cpu child died during task".into())
+        }
         Err(_) => fail("WorkerLost", "cpu child dropped the task".into()),
-    }
+    };
+    ctx.counters.lat_cpu.record(started.elapsed());
+    outcome
 }

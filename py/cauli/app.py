@@ -8,6 +8,7 @@ The attribute names ``_tasks``, ``redis_url``, ``default_queue``,
 from __future__ import annotations
 
 import fnmatch
+import logging
 import os
 import re
 import threading
@@ -23,7 +24,15 @@ from cauli.result import AsyncResult
 from cauli.schedules import ScheduleEntry
 from cauli.task import TaskDef
 
+log = logging.getLogger("cauli.app")
+
 _DEFAULT_REDIS_URL = "redis://localhost:6379/0"
+# Matches the Rust worker's --redis-timeout default (worker/src/cli.rs). Passed
+# explicitly to redis.Redis.from_url below: redis-py's own default for this
+# depends on the installed version (pyproject pins only "redis>=5", no upper
+# bound), so leaving it unset would make this client's hang behavior an
+# accident of whatever version happens to be installed rather than a decision.
+_DEFAULT_SOCKET_TIMEOUT = 5
 _QUEUE_NAME_RE = re.compile(r"[a-zA-Z0-9_.-]+\Z")
 
 #: Wildcard key in :attr:`Cauli.queue_ttl` meaning "every queue without an
@@ -126,20 +135,56 @@ def _dumps(obj: Any) -> "bytes | str":
 
 
 def _redact_redis_url(url: str) -> str:
-    """Mask ``user:password@`` userinfo before a redis URL reaches logs/repr.
+    """Mask ``user:password@`` userinfo, and ``password=``/``username=``
+    query parameters, before a redis URL reaches logs/repr.
 
-    ``redis://user:password@host/0`` is a common shape; without this the
-    password would appear in plaintext wherever ``repr(app)`` or a log line
-    includes ``redis_url`` (audit M4).
+    Both are shapes redis-py accepts as real credentials (audit M4); without
+    this either would appear in plaintext wherever ``repr(app)`` or a log
+    line includes ``redis_url``.
     """
     scheme_sep = url.find("://")
     if scheme_sep == -1:
         return url
-    after = url[scheme_sep + 3 :]
-    at = after.find("@")
-    if at == -1:
-        return url
-    return f"{url[:scheme_sep]}://***@{after[at + 1 :]}"
+    rest = url[scheme_sep + 3 :]
+    # Authority ends at the first "/", "?" or "#"; "@" means the
+    # userinfo/host boundary only within it, so an "@" inside a later
+    # password= value (masked separately below) can never be mistaken for a
+    # second one and corrupt the visible host.
+    authority_end = len(rest)
+    for ch in "/?#":
+        i = rest.find(ch)
+        if i != -1:
+            authority_end = min(authority_end, i)
+    authority, tail = rest[:authority_end], rest[authority_end:]
+    # Last "@", not first: urllib.parse (what redis-py itself uses) resolves
+    # a password containing a literal "@" the same way, so splitting at the
+    # first one would leave that password's own tail in plaintext right
+    # after the mask.
+    at = authority.rfind("@")
+    new_authority = f"***@{authority[at + 1 :]}" if at != -1 else authority
+    return f"{url[:scheme_sep]}://{new_authority}{_redact_query_credentials(tail)}"
+
+
+def _redact_query_credentials(tail: str) -> str:
+    """Mask ``password=``/``username=`` VALUES in a URL's query string (the
+    form redis-py accepts straight as connection kwargs, no userinfo
+    involved). Keys and every other query parameter stay visible.
+    """
+    q = tail.find("?")
+    if q == -1:
+        return tail
+    path, rest = tail[:q], tail[q + 1 :]
+    fragment = ""
+    h = rest.find("#")
+    if h != -1:
+        rest, fragment = rest[:h], rest[h:]
+    pairs = []
+    for pair in rest.split("&"):
+        name, sep, _value = pair.partition("=")
+        pairs.append(
+            f"{name}=***" if sep and name in ("password", "username") else pair
+        )
+    return f"{path}?{'&'.join(pairs)}{fragment}"
 
 
 class Cauli:
@@ -155,10 +200,26 @@ class Cauli:
         queue_ttl: Any = None,
     ) -> None:
         # Resolution order: explicit arg > env CAULI_REDIS_URL > default.
-        self.redis_url: str = (
-            redis_url or os.environ.get("CAULI_REDIS_URL") or _DEFAULT_REDIS_URL
-        )
+        env_redis_url = os.environ.get("CAULI_REDIS_URL")
+        self.redis_url: str = redis_url or env_redis_url or _DEFAULT_REDIS_URL
+        if not redis_url and not env_redis_url:
+            # Otherwise this is silent: a box with an unrelated redis already
+            # on 6379 (common) makes tasks vanish into the wrong instance with
+            # no error anywhere. warning (not info) so it is visible even with
+            # no logging configuration at all, via logging's own last resort
+            # handler.
+            log.warning(
+                "no redis_url given and CAULI_REDIS_URL is not set, defaulting to %s",
+                _DEFAULT_REDIS_URL,
+            )
         self.default_queue: str = default_queue
+        # result_ttl=0 reads like "disabled" but Redis rejects `SET key val EX
+        # 0`, so the result key would never be written and AsyncResult.get()
+        # would hang forever; validate the same way _normalize_queue_ttl does.
+        if result_ttl <= 0:
+            raise ValueError(f"result_ttl must be > 0 seconds, got {result_ttl!r}")
+        if idemp_ttl <= 0:
+            raise ValueError(f"idemp_ttl must be > 0 seconds, got {idemp_ttl!r}")
         self.result_ttl: int = result_ttl
         self.idemp_ttl: int = idemp_ttl
         # App-level routing rules (PROTOCOL.md section 9.3): pattern -> queue,
@@ -196,7 +257,9 @@ class Cauli:
         if self._redis is None:
             with self._redis_lock:
                 if self._redis is None:
-                    self._redis = redis.Redis.from_url(self.redis_url)
+                    self._redis = redis.Redis.from_url(
+                        self.redis_url, socket_timeout=_DEFAULT_SOCKET_TIMEOUT
+                    )
         return self._redis
 
     def before_task(self, fn: Callable[[], Any]) -> Callable[[], Any]:
@@ -279,6 +342,8 @@ class Cauli:
                 jitter=jitter,
                 store_result=store_result,
             )
+            if task_def.name in self._tasks:
+                raise ValueError(f"duplicate task name {task_def.name!r}")
             self._tasks[task_def.name] = task_def
             return task_def
 
@@ -331,6 +396,26 @@ class Cauli:
         )
         self._periodic[name] = entry
         return entry
+
+    def check_periodic_tasks(self) -> None:
+        """Raise if a declared periodic entry names a task this app has not registered.
+
+        Not called from :meth:`add_periodic_task`: a periodic entry may
+        legitimately name a task by string before that task's own
+        ``@app.task`` runs later in the same module, so checking at
+        declaration time would reject valid code. This is meant to be called
+        once the whole app module has finished importing (every decorator has
+        therefore run) and right before the schedule actually starts running,
+        which is the earliest point a name that is still missing is a real
+        typo rather than an ordering artifact.
+        """
+        for entry in self._periodic.values():
+            if entry.task not in self._tasks:
+                raise ValueError(
+                    f"periodic task {entry.name!r} names task {entry.task!r}, "
+                    "which is not registered on this app (typo, or its "
+                    "@app.task has not been imported yet)"
+                )
 
     def _route(self, task_name: str, args: Any, kwargs: dict[str, Any]) -> str | None:
         """First matching app-level route's queue, or None (PROTOCOL.md 9.3).

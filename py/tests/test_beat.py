@@ -9,6 +9,10 @@ in test_beat_ha.py.
 from __future__ import annotations
 
 import json
+import logging
+import os
+import shutil
+import subprocess
 import threading
 import time
 from datetime import timedelta
@@ -17,7 +21,9 @@ import pytest
 import redis as redis_lib
 
 from cauli import Cauli, crontab, interval
+from cauli import beat as beat_module
 from cauli.beat import (
+    DUE_BATCH,
     DUE_KEY,
     LOCK_KEY,
     REV_KEY,
@@ -25,6 +31,7 @@ from cauli.beat import (
     SCHEDULE_KEY,
     STATE_KEY,
     Beat,
+    RedisClusterUnsupported,
     RedisScheduleStore,
 )
 from cauli.schedules import ScheduleEntry
@@ -94,6 +101,23 @@ def test_first_tick_seeds_but_does_not_fire(beat_app, store, redis_client):
     assert (
         redis_client.hget(REV_KEY, "tick").decode() == beat_app._periodic["tick"].rev()
     )
+
+
+def test_seed_lua_no_longer_declares_the_dead_state_key(store, monkeypatch):
+    """_SEED_LUA never read its old KEYS[2] (STATE_KEY): dead, and it only
+    widened the CROSSSLOT exposure below for nothing. Deleted rather than
+    documented around; this asserts it stays deleted.
+    """
+    real_seed = store._seed
+    captured: dict[str, list] = {}
+
+    def spy(keys, args):
+        captured["keys"] = keys
+        return real_seed(keys=keys, args=args)
+
+    monkeypatch.setattr(store, "_seed", spy)
+    assert store.seed("tick", 1_700_000_000_000, "rev1") is True
+    assert captured["keys"] == [DUE_KEY, REV_KEY]
 
 
 def test_entry_fires_when_its_slot_arrives_and_advances(beat_app, store, redis_client):
@@ -182,6 +206,36 @@ def test_impossible_crontab_is_reported_not_raised(beat_app, store):
     beat.sync_code_entries()
     beat.tick()  # must not raise
     assert beat.fired == 0
+
+
+def test_unregistered_periodic_task_is_named_at_error_on_beat_startup(
+    beat_app, store, caplog
+):
+    """check_periodic_tasks() is wired into Beat.__init__, not into
+    add_periodic_task itself, since a name may resolve to an @app.task
+    decorated later in the same module. Beat startup is after the whole app
+    module has imported, so a name still missing there is a real typo: name
+    it loudly and keep going, the same as every other unusable entry."""
+
+    @beat_app.task(name="app.ping")
+    def ping():
+        return None
+
+    beat_app.add_periodic_task("good", "app.ping", interval(60))
+    beat_app.add_periodic_task("typo_job", "app.pign", interval(60))  # never registered
+
+    with caplog.at_level(logging.ERROR, logger="cauli.beat"):
+        beat = make_beat(beat_app, store)  # must not raise
+
+    errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+    assert len(errors) == 1, errors
+    assert "typo_job" in errors[0] and "app.pign" in errors[0]
+
+    beat.sync_code_entries()
+    beat.tick()
+    store.clock += 60_000
+    beat.tick()
+    assert store.state("good")["status"] == "fired", "the good entry must still fire"
 
 
 # -------------------------------------------------------- missed slots
@@ -432,6 +486,29 @@ def test_claim_refuses_a_stale_or_missing_slot(beat_app, store, redis_client):
     assert s.claim_and_publish("tick", 500, 600, env, queue, None, {}) is True
 
 
+def test_claim_lua_creates_before_destroying_on_xadd_error(
+    beat_app, store, redis_client
+):
+    """F1 reproduction, live: force the XADD (now ordered first) to error the
+    way the real reproduction did, WRONGTYPE on the target stream key, and
+    assert the actual property under test. Before the fix, ZADD (the slot
+    advance) ran first, so this failure would have moved the slot to
+    slot + 60_000 with nothing ever published: the firing silently lost. The
+    slot must instead still read the ORIGINAL expected value, unconsumed,
+    and no run must have been counted.
+    """
+    slot = 1_700_000_000_000
+    redis_client.zadd(DUE_KEY, {"tick": slot})
+    env, queue, _ = beat_app.make_envelope("app.ping")
+    redis_client.set(f"cauli:q:{queue}", "not-a-stream")
+
+    with pytest.raises(redis_lib.exceptions.ResponseError, match="WRONGTYPE"):
+        store.claim_and_publish("tick", slot, slot + 60_000, env, queue, None, {})
+
+    assert redis_client.zscore(DUE_KEY, "tick") == slot
+    assert int(redis_client.hget(RUNS_KEY, "tick") or 0) == 0
+
+
 def test_two_beats_ticking_simultaneously_fire_each_slot_once(
     beat_app, store, redis_client
 ):
@@ -607,3 +684,348 @@ def test_keys_are_namespaced_under_cauli_beat(redis_client, beat_app, store):
 
     keys = {k.decode() for k in redis_client.keys("cauli:beat:*")}
     assert keys == {SCHEDULE_KEY, DUE_KEY, REV_KEY, STATE_KEY, RUNS_KEY, LOCK_KEY}
+
+
+# --------------------------------------------------- reconciliation and the lease
+
+
+class StopAfter(threading.Event):
+    """Lets ``run()`` make exactly ``passes`` trips round the loop, then stops it."""
+
+    def __init__(self, passes: int) -> None:
+        super().__init__()
+        self.left = passes
+
+    def wait(self, timeout: float | None = None) -> bool:
+        self.left -= 1
+        if self.left <= 0:
+            self.set()
+        return True
+
+
+def test_a_standby_does_not_reconcile_before_it_holds_the_lease(
+    beat_app, store, redis_client, redis_url
+):
+    """Starting a replica must never unschedule the leader's entries.
+
+    PROTOCOL.md section 10.3: reconciliation runs only while holding the lease.
+    `run()` used to reconcile once before the loop, so during a rolling deploy a
+    replica running the OLD code deleted every entry the new code had added, and
+    the leader never restored them because it had already reconciled.
+    """
+    beat_app.add_periodic_task("kept", "app.a", interval(60))
+    beat_app.add_periodic_task("added-by-the-new-version", "app.b", interval(60))
+    leader = Beat(beat_app, store=store, use_lock=True, instance_id="leader")
+    leader.sync_code_entries()
+    assert leader._hold_leadership(0.0)
+    leader.tick()
+    assert set(store.load()) == {"kept", "added-by-the-new-version"}
+
+    old_app = Cauli(redis_url=redis_url)
+    old_app.add_periodic_task("kept", "app.a", interval(60))
+    standby = Beat(
+        old_app,
+        store=FrozenStore(redis_client, store.clock),
+        use_lock=True,
+        instance_id="standby",
+    )
+    standby.run(StopAfter(2))
+
+    assert not standby.is_leader
+    assert redis_client.get(LOCK_KEY) == b"leader"
+    assert set(store.load()) == {"kept", "added-by-the-new-version"}
+    assert redis_client.zscore(DUE_KEY, "added-by-the-new-version") is not None
+
+
+def test_once_does_not_reconcile_while_another_instance_holds_the_lease(
+    beat_app, store, redis_client, redis_url, monkeypatch
+):
+    beat_app.add_periodic_task("kept", "app.a", interval(60))
+    beat_app.add_periodic_task("added-by-the-new-version", "app.b", interval(60))
+    beat = make_beat(beat_app, store)
+    beat.sync_code_entries()
+    beat.tick()
+    RedisScheduleStore(redis_client).acquire_lock("someone-else", 60_000)
+
+    old_app = Cauli(redis_url=redis_url)
+    old_app.add_periodic_task("kept", "app.a", interval(60))
+    monkeypatch.setattr(beat_module, "load_app", lambda spec: old_app)
+
+    assert beat_module.main(["--app", "x:app", "--redis-url", redis_url, "--once"]) == 0
+
+    assert set(store.load()) == {"kept", "added-by-the-new-version"}
+    assert redis_client.get(LOCK_KEY) == b"someone-else"
+
+
+def test_once_reconciles_and_ticks_when_it_can_take_the_lease(
+    beat_app, redis_client, redis_url, monkeypatch
+):
+    """The system cron deployment: --once is the only scheduler, so it must
+    reconcile, fire, and hand the lease straight back."""
+    stale = ScheduleEntry(name="stale", task="app.gone", schedule=interval(60))
+    RedisScheduleStore(redis_client).upsert(stale)
+
+    app = Cauli(redis_url=redis_url)
+    app.add_periodic_task("live", "app.a", interval(60))
+    monkeypatch.setattr(beat_module, "load_app", lambda spec: app)
+
+    assert beat_module.main(["--app", "x:app", "--redis-url", redis_url, "--once"]) == 0
+
+    store = RedisScheduleStore(redis_client)
+    assert set(store.load()) == {"live"}
+    assert redis_client.zscore(DUE_KEY, "live") is not None
+    assert redis_client.get(LOCK_KEY) is None
+
+
+# ------------------------------------------------- announcing dropped work
+
+
+def warnings_from(caplog):
+    return [r.getMessage() for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+def test_a_coalesced_firing_reports_how_many_slots_it_swallowed(
+    beat_app, store, redis_client, caplog
+):
+    """PROTOCOL.md section 10.4 coalesces a backlog into one firing. The count
+    of slots that will never run is the number an operator needs, and lateness
+    alone does not give it."""
+    beat_app.add_periodic_task("nightly", "app.report", interval(60))
+    beat = make_beat(beat_app, store)
+    beat.sync_code_entries()
+    beat.tick()
+
+    store.clock += 6 * 3600 * 1000  # six hours down, 60s cadence
+    with caplog.at_level(logging.INFO, logger="cauli.beat"):
+        beat.tick()
+
+    assert beat.fired == 1
+    fired = [m for m in warnings_from(caplog) if "fired 'nightly'" in m]
+    assert len(fired) == 1, warnings_from(caplog)
+    assert "359 missed slots" in fired[0]
+
+
+def test_a_firing_that_is_on_time_stays_at_info_without_a_count(
+    beat_app, store, redis_client, caplog
+):
+    beat_app.add_periodic_task("p", "app.a", interval(60))
+    beat = make_beat(beat_app, store)
+    beat.sync_code_entries()
+    beat.tick()
+
+    store.clock += 60_000
+    with caplog.at_level(logging.INFO, logger="cauli.beat"):
+        beat.tick()
+
+    assert beat.fired == 1
+    assert not [m for m in warnings_from(caplog) if "fired" in m]
+    assert not [m for m in warnings_from(caplog) if "missed slots" in m]
+
+
+def test_dropping_the_slot_of_a_vanished_definition_is_announced(
+    beat_app, store, redis_client, caplog
+):
+    beat_app.add_periodic_task("a", "app.a", interval(60))
+    beat = make_beat(beat_app, store)
+    beat.sync_code_entries()
+    beat.tick()
+    redis_client.hdel(SCHEDULE_KEY, "a")
+
+    with caplog.at_level(logging.INFO, logger="cauli.beat"):
+        beat.tick()
+
+    assert redis_client.zscore(DUE_KEY, "a") is None
+    assert [m for m in warnings_from(caplog) if "'a'" in m and "no schedule" in m]
+
+
+def test_dropping_the_slot_of_a_disabled_entry_is_announced(
+    beat_app, store, redis_client, caplog
+):
+    beat_app.add_periodic_task("a", "app.a", interval(60))
+    beat = make_beat(beat_app, store)
+    beat.sync_code_entries()
+    beat.tick()
+
+    entry = store.load()["a"]
+    entry.enabled = False
+    store.upsert(entry)
+    with caplog.at_level(logging.INFO, logger="cauli.beat"):
+        beat.tick()
+        beat.tick()  # steady state: the warning must not repeat every tick
+
+    assert redis_client.zscore(DUE_KEY, "a") is None
+    disabled = [m for m in warnings_from(caplog) if "'a'" in m and "disabled" in m]
+    assert len(disabled) == 1, disabled
+
+
+def test_deferring_a_mass_due_backlog_is_announced(
+    beat_app, store, redis_client, caplog
+):
+    for i in range(DUE_BATCH + 20):
+        beat_app.add_periodic_task(f"e{i:04d}", "app.a", interval(60))
+    beat = make_beat(beat_app, store)
+    beat.sync_code_entries()
+    beat.tick()
+
+    store.clock += 60_000
+    with caplog.at_level(logging.INFO, logger="cauli.beat"):
+        beat.tick()
+
+    deferred = [m for m in warnings_from(caplog) if "came due at once" in m]
+    assert len(deferred) == 1, deferred
+    assert str(DUE_BATCH) in deferred[0]
+
+
+# --------------------------------------------------------- redis cluster
+
+# A port this module fully owns for its own throwaway cluster-enabled redis:
+# never :6391 (the rest of this suite, session scoped, see conftest.py),
+# never :6392/:6390 (the worker's own e2e suites), never :6379.
+CLUSTER_PORT = 6409
+
+
+@pytest.fixture(scope="module")
+def cluster_redis_url():
+    """A genuine single node `cluster-enabled yes` redis.
+
+    Not a mock: CROSSSLOT is a real cluster behaviour standalone redis never
+    exhibits, so the only faithful reproduction is a real cluster instance,
+    the same way the original bugs were found. Module scoped since claiming
+    every slot only needs to happen once; each test flushes its own keys.
+    """
+    server = shutil.which("redis-server")
+    if server is None:
+        pytest.skip("redis-server not installed")
+    subprocess.run(
+        ["redis-cli", "-p", str(CLUSTER_PORT), "shutdown", "nosave"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    time.sleep(0.2)
+    conf_dir = f"/tmp/cauli-test-cluster-{CLUSTER_PORT}"
+    # A stale nodes.conf from an earlier run already claims every slot, and
+    # CLUSTER ADDSLOTSRANGE refuses to reclaim an already assigned slot:
+    # start from a genuinely blank node every time, not just a fresh process.
+    shutil.rmtree(conf_dir, ignore_errors=True)
+    os.makedirs(conf_dir, exist_ok=True)
+    proc = subprocess.Popen(
+        [
+            server,
+            "--port",
+            str(CLUSTER_PORT),
+            "--save",
+            "",
+            "--appendonly",
+            "no",
+            "--cluster-enabled",
+            "yes",
+            "--cluster-config-file",
+            f"{conf_dir}/nodes.conf",
+        ],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    url = f"redis://127.0.0.1:{CLUSTER_PORT}/0"
+    client = None
+    deadline = time.monotonic() + 10
+    while client is None and time.monotonic() < deadline:
+        try:
+            candidate = redis_lib.Redis.from_url(url, socket_connect_timeout=0.25)
+            candidate.ping()
+            client = candidate
+        except Exception:
+            time.sleep(0.05)
+    if client is None:
+        proc.terminate()
+        pytest.fail(f"could not start cluster redis on {CLUSTER_PORT}")
+    client.execute_command("CLUSTER", "ADDSLOTSRANGE", 0, 16383)
+    # cluster_state flips to "ok" on the next cluster cron tick, not
+    # synchronously with ADDSLOTSRANGE's own reply.
+    deadline = time.monotonic() + 10
+    ok = False
+    while time.monotonic() < deadline:
+        if b"cluster_state:ok" in client.execute_command("CLUSTER", "INFO"):
+            ok = True
+            break
+        time.sleep(0.05)
+    if not ok:
+        proc.terminate()
+        pytest.fail("cluster never reached cluster_state:ok")
+    yield url
+    client.close()
+    proc.terminate()
+    proc.wait(timeout=5)
+
+
+def test_seed_raises_loud_not_silent_on_cluster_crossslot(cluster_redis_url):
+    """F3 reproduction, live, against a genuine cluster-enabled redis.
+
+    Before this fix the ResponseError had no handler at this call site at
+    all, so it reached run()'s generic RedisError branch, "redis error;
+    retrying in 1s", forever: nothing is ever seeded, silently. It must now
+    be a distinct, named, unmistakable failure instead.
+    """
+    client = redis_lib.Redis.from_url(cluster_redis_url)
+    client.flushall()
+    store = RedisScheduleStore(client)
+    try:
+        with pytest.raises(RedisClusterUnsupported, match="(?i)redis cluster"):
+            store.seed("tick", 1_700_000_000_000, "rev1")
+    finally:
+        client.close()
+
+
+def test_claim_and_publish_raises_loud_not_silent_on_cluster_crossslot(
+    cluster_redis_url, beat_app
+):
+    """The sibling script's failure mode, live.
+
+    Before this fix, a CROSSSLOT here was caught once and degraded to a
+    second call believed to touch only the beat keys -- but cauli:beat:due,
+    cauli:beat:state and cauli:beat:runs do not share a hash slot either, so
+    that fallback ALSO raised CROSSSLOT, uncaught that time, reaching the
+    same generic retry loop as the seed path. It must raise the same named
+    error immediately, not degrade into a fallback that cannot work.
+    """
+    client = redis_lib.Redis.from_url(cluster_redis_url)
+    client.flushall()
+    store = RedisScheduleStore(client)
+    client.zadd(DUE_KEY, {"tick": 1_700_000_000_000})
+    env, queue, _ = beat_app.make_envelope("app.ping")
+    try:
+        with pytest.raises(RedisClusterUnsupported, match="(?i)redis cluster"):
+            store.claim_and_publish(
+                "tick", 1_700_000_000_000, 1_700_000_060_000, env, queue, None, {}
+            )
+    finally:
+        client.close()
+
+
+def test_run_reports_cluster_crossslot_loudly_and_keeps_polling(
+    cluster_redis_url, beat_app, caplog
+):
+    """The user visible behaviour end to end.
+
+    run() must not fold this into "redis error; retrying in 1s" (the generic
+    message, indistinguishable from a real transient blip), and per this
+    fix's judgement call, must not crash the process either -- it keeps
+    polling, loud, rather than refusing to run outright.
+    """
+    client = redis_lib.Redis.from_url(cluster_redis_url)
+    client.flushall()
+    beat_app.add_periodic_task("tick", "app.ping", interval(10))
+    store = FrozenStore(client, now=1_700_000_000_000)
+    beat = make_beat(beat_app, store, max_interval=0.05)
+
+    stop = StopAfter(3)
+    try:
+        with caplog.at_level(logging.ERROR, logger="cauli.beat"):
+            beat.run(stop)
+    finally:
+        client.close()
+
+    messages = [r.getMessage() for r in caplog.records]
+    loud = [m for m in messages if "redis cluster" in m.lower()]
+    generic = [m for m in messages if "retrying in 1s" in m]
+    assert loud, f"no named redis cluster failure logged: {messages}"
+    assert not generic, f"fell back to the generic blip message: {generic}"

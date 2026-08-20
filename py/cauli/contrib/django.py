@@ -31,6 +31,17 @@ What :func:`django_app` gives you on top of a plain ``Cauli()``:
   worker thread that cached it. Without this, the worker's long-lived
   threads each cache a thread-local Django connection forever.
 
+Connection count is a different question from lifecycle, and this
+integration does not manage it. Each worker process opens its own pool, and
+each sync worker thread holds one Django connection for the life of the
+thread, so the number of simultaneous Postgres backends is roughly
+``procs * io_threads`` (sync lane) plus ``procs * min(CAULI_ORM_EXECUTORS,
+io_concurrency)`` (async lane) plus ``procs * cpu_workers`` (cpu lane; each
+forked child connects on its own). Postgres's default ``max_connections`` is
+100, and flags that look modest can exceed it. Put a connection pooler,
+pgbouncer in transaction mode, in front of Postgres once the total
+approaches a hundred; see ``docs/CONFIGURATION.md`` for the full formula.
+
 Enqueue-side, every task additionally has ``delay_on_commit`` /
 ``apply_async_on_commit`` (defined on ``TaskDef`` core with a lazy Django
 import) to defer publishing until the current transaction commits.
