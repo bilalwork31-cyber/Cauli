@@ -123,3 +123,64 @@ attribution in that commit message is wrong and the packaging work deserves its 
 
 `ruff format --check` was failing at HEAD on `py/cauli/beat.py` and `itest/test_integration.py`,
 pre existing and unrelated to tonight's work. Fixed in `b3d5fad`; 48 files now pass.
+
+---
+
+## FINAL STATE. This section supersedes both sections above.
+
+**82 commits on `audit/overnight`. `main` untouched at `6256854`. Nothing pushed to any remote, by
+explicit instruction.** Working tree clean.
+
+### Verified green as one combined state, at final HEAD
+
+| check | result |
+|-------|--------|
+| `cargo test --release --features test-hooks` | 125 passed, 0 failed (115 unit, 10 across 7 e2e binaries) |
+| `cargo clippy --release --features test-hooks -- -D warnings` | exit 0 |
+| `cargo fmt --check` | clean |
+| `pytest py/` | 255 passed |
+| `pytest itest/` | 26 passed |
+| ruff check and format | clean |
+
+This closes blocker B1, which stood open for most of the session and which an earlier version of this
+file overstated.
+
+### Decision documents: 7 of 9 implemented
+
+Implemented: observability, delivery guarantee, packaging, process model, retry name matching,
+plus the release readiness blockers B1, B2 and B5.
+
+**NOT implemented, and these are the two things to pick up first:**
+
+| document | what it asks for |
+|----------|------------------|
+| `docs/decisions/error-taxonomy.md` | Add `error.origin` as an additive field, and rename the worker minted `TimeoutError` to `TimeLimitExceeded`. Until then `except TimeoutError:` around `.get()` silently misses a worker enforced timeout. Measured blast radius: 3 mint sites, 11 test assertions, about 4 PROTOCOL lines, zero Python matchers. |
+| `docs/decisions/clock-architecture.md` | The `RedisClock` sampled offset, about 150 lines, plus `COUNT = min(batch, permits)` in the fetch loop. The second one closes a duplicate execution window that is real under saturation. |
+
+`docs/decisions/redis-cluster.md` recommends refusing to start against a Cluster, which was never
+implemented either; the docs now say plainly that Cluster is unsupported, which was the urgent half.
+
+### Still open, and they need a human rather than another agent
+
+- **B3**: 14 commits are flagged "needs human review before merge" in the audit log header. They
+  change process termination, durability and public API.
+- **B4**: the 4 hour failure path soak was stopped. Two shorter runs exist and are recorded. The open
+  question is whether the failure machinery carries a small residue or simply warms up more slowly;
+  the most suspicious explanation, the cpu recycle path, is already ruled out across 649 forks.
+- The 15 second wedge detection window and the NOGROUP self heal choice are both judgement calls made
+  by an agent and endorsed by me. Both are documented with their reasoning in the audit log.
+- `mover_crossslot_is_detected_not_treated_as_transient` has a load sensitive timeout on a real
+  cluster startup and failed intermittently under heavy parallel load. It will be flaky on a busy CI
+  runner. Not fixed.
+
+### Two archive branches, still do not delete without diffing
+
+`audit/stash-archive-58cc0f8` and `audit/dangling-archive-f2e3151`. The second was recovered from a
+genuinely dangling commit that would have been lost to garbage collection.
+
+### The one regression this session introduced
+
+`RUST_LOG=cauli_worker=debug` matches nothing in a wheel build, because the shipped binary's target is
+now `cauli_worker_bin`. Documented in `docs/CONFIGURATION.md` rather than reverted, since the rename
+is what keeps `cargo build` producing `cauli-worker` for the integration suite. `RUST_LOG=debug` is
+unaffected.
