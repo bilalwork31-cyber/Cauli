@@ -3567,3 +3567,56 @@ full run. It has a load sensitive timeout on a real cluster startup, which will 
 busy runner. Worth a longer timeout or a retry, and recorded here rather than fixed because neither
 agent owned it.
 
+
+## 2026-08-17 — Cycle 41 — clock architecture implemented — commits f8cbe08, 8e59df5, a342829
+
+`docs/decisions/clock-architecture.md` implemented. 8 of 9 decision documents now done.
+
+New `worker/src/clock.rs`, 317 lines with 8 unit tests, deliberately its own module rather than
+living in ctx.rs. One `AtomicI64` anchor over a monotonic `Instant`. `init()` blocks for a single
+Redis `TIME` immediately after `ensure_groups`, which is free because the worker already requires
+Redis at boot.
+
+Three design details worth keeping, none of which I specified:
+
+- The sampler re anchors every 15 to 30 seconds **spread by pid**, so a fleet restarted together does
+  not hit Redis in lockstep.
+- A failed sample keeps extrapolating monotonically and warns once per stale episode rather than per
+  attempt.
+- A DENIED `TIME`, which is what a managed Redis ACL does, degrades to the local clock rather than
+  refusing to boot. That is the right failure direction for a hosted broker, and it was not asked for.
+
+Call sites moved onto it: all five absolute instants in dispatch.rs, being the expiry comparison, the
+retry `fire_at`, and the duplicate, success and dead letter result stamps; plus the mover cutoff and
+the `oldest_unacked_ms` stream id age probe in loops.rs.
+
+`broker.rs` needed no change at all: its `now_ms` is a parameter, it reads no clock. The
+`MAX_RETRY_DELAY_MS` clamp, ranked item 2 in the decision document, was already implemented.
+
+`COUNT = min(batch, available_permits)` also landed in the fetch loop. Small, and it closes the
+duplicate execution window that cycle 20 mis-triaged as negligible: because the execution backstop is
+armed only AFTER the io semaphore is acquired, and that wait is unbounded under saturation, an entry
+could be reclaimed while its original attempt was alive and unstarted, with about three cycles
+reaching the redelivery dead letter without the task executing once. Fetching only what there are
+permits for means fetched entries never park on the semaphore.
+
+Left deliberately, and recorded so it is not lost: `ctx.rs:84` still calls `note_cpu_backlog` with the
+local `now_ms()`. Not a correctness bug, since both ends of that duration are local reads and it is
+self consistent, but an NTP step distorts the reported backlog duration. `ctx.rs:121 now_ms()` itself
+stays as the pre sample fallback, by design.
+
+Verified: unit 115 to 123, e2e 10 across 7 binaries unchanged, fmt clean, clippy exit 0.
+
+### It also caught something that would have blocked the merge
+
+`e2e_forkserver` is red in the shared working tree, and the diagnosis was done properly rather than
+guessed: it applied only its own four files to a THROWAWAY WORKTREE at HEAD and the full suite was
+green, and baseline HEAD alone is green. The failure appears only with the taxonomy agent's
+uncommitted `py/cauli/_exec.py` and `worker/src/shim.py` edits present, which is exactly the cpu child
+line delimited JSON protocol that test exercises.
+
+That agent has been warned directly, with the likely candidates named: a response field the Rust side
+parses strictly, a stale fixture in `worker/tests/fixtures/fake_exec.py`, or a test still asserting
+the old `TimeoutError` string. **No merge to main happens while that test is red.** An intermittent
+failure in the fork server child protocol is precisely the class this audit spent the night on.
+
