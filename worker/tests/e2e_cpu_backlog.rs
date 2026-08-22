@@ -114,7 +114,7 @@ async fn e2e_cpu_backlog_observability() {
             )
         });
     assert!(
-        stats_line.contains("stats: fetched="),
+        stats_line.contains("stats: ") && stats_line.contains(" fetched="),
         "expected a full stats line, got: {stats_line}"
     );
     // Removed key: its own source note named async_rejected as the field that

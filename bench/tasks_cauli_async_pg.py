@@ -12,8 +12,14 @@ from workloads import PG_DSN, PG_INSERT_SQL, PG_PAYLOAD, PG_POOL_MAX
 
 app = Cauli(redis_url=REDIS_URL)
 _r = aredis.Redis.from_url(REDIS_URL)
+# prepare_threshold=None: see tasks_cauli_sync_pg.py -- required for
+# pgbouncer transaction-pooling compatibility, ~3% cost direct-to-Postgres.
 _pool = AsyncConnectionPool(
-    PG_DSN, min_size=2, max_size=PG_POOL_MAX, kwargs={"autocommit": True}, open=False
+    PG_DSN,
+    min_size=2,
+    max_size=PG_POOL_MAX,
+    kwargs={"autocommit": True, "prepare_threshold": None},
+    open=False,
 )
 
 

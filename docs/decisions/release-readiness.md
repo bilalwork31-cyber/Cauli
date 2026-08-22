@@ -1,6 +1,15 @@
-# DECISION — 1.0 release readiness
-Produced on Fable, having read the full audit log and spot checked every load bearing fix in source.
-NOT implemented.
+# Decision: 1.0 release readiness
+> **Historical design note, not current documentation.** This is a record of how one
+> pre 1.0 decision was reached and what was known when it was reached. It is kept
+> because the reasoning is worth reading, not because it describes today's behaviour.
+> Where it disagrees with the code, with [PROTOCOL.md](../../PROTOCOL.md) or with
+> [docs/CONFIGURATION.md](../CONFIGURATION.md), those win. The status line below was
+> checked against the source, not carried over.
+>
+> **Status: superseded.** This was the readiness call at one point in the pre 1.0 series. A
+> later five lens review reopened the tree and found more; what came out of it is in
+> CHANGELOG.md under "Pre release audit fixes", together with the list of what is still
+> open. Read that rather than this document's checklist.
 
 **Ship with conditions. Nothing known and unfixed still loses data silently on a supported topology.
 But the final tree was never verified as one state, two promised tests do not exist, and the soak

@@ -465,7 +465,7 @@ async fn result_write_failure_is_not_counted_ok(c: &mut redis::aio::MultiplexedC
     let stats = log
         .lines()
         .rev()
-        .find(|l| l.contains("stats: fetched="))
+        .find(|l| l.contains("stats: ") && l.contains(" fetched="))
         .unwrap_or_else(|| panic!("no stats line in worker log:\n{log}"));
     assert!(
         stats.contains("fetched=1 ok=0 failed=1"),
@@ -566,7 +566,7 @@ async fn write_failure_is_not_counted_for_duplicate_final_and_terminal(
     let stats = log
         .lines()
         .rev()
-        .find(|l| l.contains("stats: fetched="))
+        .find(|l| l.contains("stats: ") && l.contains(" fetched="))
         .unwrap_or_else(|| panic!("no stats line in worker log:\n{log}"));
     // fetched=5 (e1..e5); ok=0 (e1 -> failed via the success gate, e2's
     // duplicate write also fails); failed=1 (e1 only: final_failure's own

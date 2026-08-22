@@ -1,5 +1,25 @@
-# DECISION — Redis Cluster support at 1.0
-Produced on Fable. Recommendation stands, awaiting human approval. NOT implemented.
+# Decision: Redis Cluster support at 1.0
+> **Historical design note, not current documentation.** This is a record of how one
+> pre 1.0 decision was reached and what was known when it was reached. It is kept
+> because the reasoning is worth reading, not because it describes today's behaviour.
+> Where it disagrees with the code, with [PROTOCOL.md](../../PROTOCOL.md) or with
+> [docs/CONFIGURATION.md](../CONFIGURATION.md), those win. The status line below was
+> checked against the source, not carried over.
+>
+> **Status: shipped in 1.0.0, with one correction to the recommendation below.** The worker
+> probes the topology at startup, before it touches a consumer group, and exits 1 with a
+> message naming the topology when the reply says the node runs in cluster mode
+> (`probe_cluster_info`, `cluster_info_says_enabled` and `cluster_decision` in
+> `worker/src/lib.rs`). The escape hatch shipped as the environment variable
+> `CAULI_ALLOW_REDIS_CLUSTER=1`, not as the `--allow-redis-cluster` flag this document
+> proposed. The command matters, and this document originally named the wrong one: the probe
+> sends `INFO cluster`, which is the only reply carrying `cluster_enabled:0` or
+> `cluster_enabled:1`. `CLUSTER INFO` is a different command. A cluster node answers it with
+> `cluster_state` and `cluster_slots_*` and no `cluster_enabled` field at all, and a
+> standalone refuses it outright, so a probe built on `CLUSTER INFO` can never prove a
+> cluster. The Sentinel half of the recommendation also changed: Sentinel is reachable from
+> the Python client and `cauli-beat` through `Cauli(redis_client=...)`, but the worker
+> connects by URL and never looks a master up again after a failover.
 
 **Do not support Cluster. 1.0 refuses at startup. Standalone and Sentinel only.**
 

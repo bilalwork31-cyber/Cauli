@@ -48,6 +48,15 @@ code raise.
   cauli nor the task. `status()` now reports a document missing its `status`
   field the same way `get()` already did, instead of returning `pending`. The
   message for an expired result no longer claims the task is still pending.
+- **`crontab()` is keyword only past `hour`.** cauli's field order is
+  `cron(8)`'s: minute, hour, day_of_month, month, day_of_week. Celery's third
+  and fourth positional arguments are the other way round, so a copied
+  `crontab(0, 4, 3)` used to build a silently different schedule. Three or more
+  positional arguments now raise `TypeError`. `crontab(0, 4)` and every keyword
+  form are unchanged. Celery's `month_of_year=` is accepted only as a trap: it
+  raises a `TypeError` naming cauli's `month=` and the swapped positions.
+  Related and unchanged: when both `day_of_month` and `day_of_week` are
+  restricted, cauli ORs them the way `cron(8)` does. Celery ANDs them.
 - **`cauli.contrib.fastapi` is now `cauli.contrib.sqlalchemy`.** Nothing in
   the module was ever FastAPI specific: it imports no web framework and is
   async SQLAlchemy session lifecycle. The old path is kept as an alias that
@@ -63,11 +72,26 @@ Protocol and worker behaviour:
   one was adopted: accept `v <= 1`, route anything higher to the dead letter
   queue with its own log line.
 - **The dead letter stream is capped at roughly 1000 entries per queue,
-  oldest dropped.** It was written on every malformed, unregistered, expired,
-  redelivery limit and exhausted retry entry, with nothing anywhere trimming
-  it. Past the cap the oldest dead letters are dropped. That is a deliberate
-  data loss tradeoff in exchange for a bound: if the dead letter queue is
-  your audit trail, drain or export it before it rotates.
+  oldest dropped, and expires 7 days after the last dead letter written to
+  it.** It was written on every malformed, unregistered, expired, redelivery
+  limit and exhausted retry entry, with nothing anywhere trimming it. Past
+  the cap the oldest dead letters are dropped. The 7 day `EXPIRE` is
+  refreshed on every write, so a queue that keeps failing keeps its stream
+  and a queue that stopped failing releases the memory instead of holding
+  task arguments in Redis forever. Both bounds are deliberate data loss
+  tradeoffs: if the dead letter queue is your audit trail, drain or export it
+  before it rotates or expires.
+- **BREAKING: idempotency keys are derived with SHA-256, not 64 bit
+  FNV-1a.** The Redis key is now `cauli:idemp:{first 128 bits of SHA-256 of
+  the key, hex}`, a fixed 32 hex characters. At 64 bits a collision was
+  silent task loss: the colliding task took the Duplicate branch, was acked,
+  XDELed, handed someone else's result and never ran. FNV-1a is also
+  invertible, so a caller who controls one key could suppress another
+  tenant's task deliberately. No new dependency: the digest is implemented in
+  crate, `sha2` is not in `Cargo.toml`. Keys minted by an older build do not
+  match new ones, so a claim in flight when a worker is replaced is invisible
+  to the new worker and a task carrying an `idempotency_key` can execute
+  twice during a rolling upgrade. See the upgrade notes.
 - **A new dead letter reason `not_retryable` is distinct from
   `max_retries`.** Every terminal failure previously dead lettered claiming
   `max_retries`, including failures that never had a retry budget. Reachable
@@ -195,6 +219,21 @@ Protocol and worker behaviour:
   earlier real one. Found by walking real UTC minutes as ground truth across
   14 zones, 16 expressions and 25 transition days; 3 lost slots before, 0
   after, all in `Antarctica/Troll`.
+- **A completion acks and deletes its stream entry in one transaction.** The
+  two commands used to travel as a bare pair, so a connection that died
+  between them left the entry acked but still resident in the stream:
+  invisible to every pending entries scan, invisible to the backlog scan,
+  reaped by nothing, and there forever. `add_ack_del` now emits MULTI, XACK,
+  XDEL, EXEC. A tear now costs the EXEC instead, Redis discards a
+  transaction whose client disconnects before EXEC, and the entry stays
+  pending for the section 4.4 recovery loop to redeliver. That trades a
+  permanent leak for a redelivery, which at least once delivery already
+  allows. The MULTI wraps only that pair and never the surrounding pipeline:
+  both commands address the one key `cauli:q:{queue}`, so the transaction
+  stays in a single hash slot and anyone running with
+  `CAULI_ALLOW_REDIS_CLUSTER=1` keeps working. Cost is two small commands on
+  a round trip that already happens. No extra round trip, no Lua, no wire
+  change.
 
 #### Tasks that blocked forever
 
@@ -241,6 +280,16 @@ Protocol and worker behaviour:
   uncapped.** A 50,000 character exception produced a 50,012 byte string in
   Redis. Capped at 8192 characters, matching the caps the two Python lanes
   already had.
+- **Every worker restart left a dead consumer behind in the group forever.**
+  Each process joins under its own consumer name, and nothing ever removed
+  the old ones, so a fleet on a daily rolling deploy accumulated one entry
+  per process per deploy in `XINFO CONSUMERS` and in Redis memory. The
+  recovery loop now reaps them once every 20 recovery ticks, strictly limited
+  to a consumer with zero pending entries, that is not this process, and that
+  has been idle for at least the greater of 4 visibility timeouts and 10
+  minutes. Zero pending is a hard rule, never a heuristic: a consumer holding
+  work is never deleted, and a `XGROUP DELCONSUMER` reply reporting a nonzero
+  pending count is logged at warning level.
 
 #### Credential exposure
 
@@ -317,6 +366,17 @@ Protocol and worker behaviour:
   connection count formula. Also corrected: `--procs N` alone leaves
   `--io-threads` and `--io-concurrency` at their flat per process defaults,
   so fleet wide totals multiply rather than stay fixed.
+- **A worker held back by a full cpu backlog no longer spins a core.** The
+  fetch loop and the recovery loop wait on a gate that is a conjunction: free
+  io permits and a cpu backlog of zero. Making that wait event driven on the
+  semaphore fixed a 25 ms latency floor but introduced a live spin, because
+  with io permits free the acquire was granted instantly, the loop went round,
+  hit the same closed gate, and burned CPU at full speed for the whole
+  duration of the backlog. The wait now branches: when the io half is already
+  open the blocker is the cpu backlog, which nothing signals, so the gate
+  checks again every 25 ms as it did before; when io permits are the blocker it
+  stays event driven and a freed slot wakes the loop immediately. No permits
+  are held while waiting. Idle latency is unchanged.
 
 ### Added
 
@@ -372,31 +432,290 @@ Protocol and worker behaviour:
   resolving to a reclaim rather than a duplicate, and the redelivery limit
   dead letter path end to end.
 
+### Pre release audit fixes
+
+1.0.0 was never tagged before this pass. A five lens review of the tree found
+5 blockers and 19 high findings; everything below landed in response, so a
+reader comparing 1.0.0 against notes written earlier in the series will find
+these behaviours changed under the same version number.
+
+**Connectivity and the client surface**
+
+- **`rediss://` works.** The worker previously linked no TLS crate at all, so
+  every TLS only managed Redis (Upstash, Azure Cache, ElastiCache with
+  encryption in transit) failed at `Client::open` and exited 1 while the Python
+  client happily kept enqueueing into it. rustls is compiled in and trusts the
+  platform certificate store; no build flag, no OpenSSL headers.
+- **`AsyncCauli` and the awaitable enqueue path.** `await task.adelay(...)`,
+  `aapply_async`, `await result.aget(...)` and `astatus`, on `redis.asyncio`.
+  The envelope is identical to the blocking path's. `AsyncCauli` subclasses
+  `Cauli`, so the blocking methods keep working on the same app.
+- **`Cauli(redis_client=...)`** takes a ready client or a zero argument
+  factory, which is the supported way to reach a Sentinel set from the Python
+  client and from `cauli-beat`. The Rust worker connects by URL and never looks
+  a master up again, so the Sentinel claim now says exactly that instead of
+  claiming a supported topology.
+- **`cauli.current_task()`** exposes the running task's id, retry count, retry
+  ceiling, name and queue on all three lanes, backed by a ContextVar so it is
+  correct on the sync thread pool and on the asyncio lanes alike. It returns
+  None outside a worker. Tasks previously had no way to log their own id or
+  tell they were on the last attempt.
+- **A task defined in a `__main__` script is registered under its importable
+  module name**, resolved from `__main__.__file__`. It used to be stamped
+  `__main__.<task>`, which no worker registry can match, so the first ten
+  minutes of the quickstart ended in a terminal dead letter.
+- **A `countdown`, `eta` or beat slot later than the envelope's own deadline
+  raises `ValueError` at enqueue.** `queue_ttl` is measured from enqueue, so
+  `Cauli(queue_ttl=300)` plus `countdown=600` used to publish cleanly, wait out
+  its delay, and then be discarded unrun with no exception and no log.
+- **`delay_on_commit` validates before it defers.** The signature check and a
+  JSON encode dry run now run at the call site, inside the atomic block, so a
+  bad call rolls the transaction back instead of raising at COMMIT with the row
+  already written. Both docstrings also state the one thing that surprises
+  every Django user: under `django.test.TestCase` nothing is ever enqueued,
+  because the test is wrapped in an atomic block that always rolls back. Use
+  `self.captureOnCommitCallbacks(execute=True)` or `TransactionTestCase`.
+- **The worker refuses to start against Redis Cluster.** The check existed but
+  asked the wrong command. `CLUSTER INFO` carries no `cluster_enabled` field on
+  a cluster node and is refused outright by a standalone, so the probe could
+  never prove a cluster and the refusal never fired. It now sends
+  `INFO cluster`, which is the only reply carrying `cluster_enabled:0` or
+  `cluster_enabled:1`, and exits 1 before touching a consumer group.
+  `CAULI_ALLOW_REDIS_CLUSTER=1` starts anyway and accepts the loss.
+- **`AsyncResult.status` reads as an attribute and as a call.** `r.status ==
+  "success"`, the Celery spelling, used to compare a bound method against a
+  string and was quietly False forever. `status` is now a property returning a
+  `str` subclass whose `__call__` returns itself, so both spellings work and
+  `r.status()` still costs exactly one Redis read.
+- **A deduplicated caller can reach the task that actually ran.**
+  `AsyncResult.claimant_id` carries the claiming task id once a `duplicate`
+  resolves, and `AsyncResult.claimant()` returns a result handle for it. Both
+  were on the wire and thrown away. `claimant_id` stays `None` for the section
+  4.5 race where the worker itself could not read the claim holder.
+- **`Cauli(max_envelope_bytes=...)`, default 1048576, refuses an oversize
+  enqueue at the call site.** The limit matches the worker's
+  `--max-envelope-bytes` default. There was no client side check at all: an
+  oversize envelope published cleanly, the worker dead lettered it as
+  malformed, and a payload past the worker's 4096 byte id recovery window left
+  no result key for `get()` to ever return. Nothing is written when the check
+  fires.
+- **`Cauli.enqueue_many()` and `AsyncCauli.aenqueue_many()`** publish N tasks
+  in one pipelined round trip instead of N. Each element is a task, or a
+  `(task, args, kwargs, options)` tuple with the trailing parts optional. The
+  whole batch is validated and encoded before the first write, so one bad or
+  oversize call aborts the batch with nothing published. The pipeline is
+  explicitly not a transaction.
+- **`tzdata` is installed on every platform, not only Windows.** Alpine and
+  distroless images are `sys_platform == "linux"` and also ship no
+  `/usr/share/zoneinfo`, so the marker dropped the wheel exactly where
+  `zoneinfo` has no database and `crontab(timezone="Europe/Berlin")` raised
+  `ValueError` at app import. Costs about 450 KB everywhere.
+- **`@app.task` no longer erases the decorated function for a type checker.**
+  The package ships `py.typed`, but the single union return type made every
+  decorated name resolve to `TaskDef | Callable`, so `.delay()` did not resolve
+  on it. Two `@overload`s fix both decorator spellings. Runtime is unchanged.
+- **A cpu child response that failed to write is logged.** The write error was
+  swallowed by a bare `except BaseException: pass`, so a broken pipe to the
+  parent left no trace anywhere.
+
+**Timeouts and lane behaviour**
+
+- **`soft_timeout` on an `async def` task raises `SoftTimeLimitExceeded`.** It
+  used to collapse to the smaller of the two limits and report
+  `TimeLimitExceeded`, so a Celery migrant porting `soft_time_limit=30,
+  time_limit=300` lost 90 percent of the budget and had a cleanup handler that
+  could never fire. The async lane signals the soft mark by cancelling the
+  task, so a body observes `asyncio.CancelledError` and its `finally` blocks
+  run; the reported failure is `SoftTimeLimitExceeded` on all three lanes.
+- **A sync task no longer spends its `timeout` waiting for a pool thread.**
+  The admission gate and the thread pool are sized independently, so a job
+  could sit in the pool's queue for the whole hard timeout and then be reported
+  as a wedged thread that never existed. The timeout now starts when a thread
+  commits to the job; a job that never reaches one fails as a retryable
+  `WorkerLost` naming that, and does not spawn a replacement thread.
+
+- **An `async def` task with `kind="cpu"` runs its before and after hooks on
+  its own event loop**, and an awaitable a hook returns is awaited there. They
+  used to run on the plain calling thread, so a hook that branches on
+  `asyncio.get_running_loop()` took the wrong branch. That is exactly what
+  `cauli.contrib.django`'s connection hooks do, so `close_old_connections` ran
+  on a thread that did not hold the connection it was closing. After hooks now
+  fire on every outcome, including a raise. Sync cpu tasks and both io lanes
+  are untouched.
+
+**Redelivery races, each of which could run a task twice or dead letter one
+that never ran**
+
+- **`XREADGROUP COUNT` is divided across streams.** Redis applies COUNT per
+  stream, so `-Q high,default,bulk` fetched three entries for one free slot and
+  parked two with their idle clocks running.
+- **The recovery page is bounded by free permits** instead of always claiming
+  a fixed 128 on a gate that proved one free slot.
+- **A cpu task takes an admission slot the fetch loop can see**, and a worker
+  skips reclaiming a stream entry it is still holding itself.
+
+**Operational**
+
+- **`--redis-timeout` is forwarded to supervised worker processes.** It was
+  the one runtime flag `child_argv` omitted, and `-c 200` takes the supervisor
+  path without anyone typing `--procs`, so an operator who raised it after an
+  incident got no effect anywhere and no log line. A test now enumerates the
+  parser's own arguments and fails unless each one is forwarded or listed with
+  a reason.
+- **`--redis-url` no longer reaches a child's argv.** The supervisor passes it
+  through the inherited `CAULI_REDIS_URL` instead, so a Redis password is not
+  in `ps aux` and in one `/proc/<pid>/cmdline` per process.
+- **The delayed and retry sweep is no longer capped at 512 per second per
+  queue per process.** It repeats within a tick until a queue returns a short
+  page. New `--mover-interval` (250 ms) and `--mover-limit` (128) flags.
+- **`--python` defaults to the embedded interpreter's own `sys.executable`.**
+  The old default was the bare string `python3` resolved through PATH, so a
+  systemd unit or a Docker CMD that never activates the venv found an
+  interpreter with no `cauli` package. That failure took the whole worker
+  offline, not only the cpu lane, at warn level.
+- **`--redis-timeout 1` no longer causes a reconnect storm.** The fetch loop
+  derives its `XREADGROUP BLOCK` window from the timeout, half the client
+  deadline capped at 1000 ms with a 50 ms floor, and logs the shortened window.
+- **The async lane's reclaim threshold clears its own backstop.** The two were
+  the same expression measured from different instants, leaving the async lane
+  no reclaim margin at all.
+- **`oldest_ms` cannot be poisoned by an orphan.** It reads the pending entries
+  list and the undelivered tail rather than a plain `XRANGE`, so an XACK whose
+  XDEL never landed no longer reports a phantom age that grows forever and
+  survives every restart.
+- **Every dead letter reason is visible at the default log level.** Four arms
+  were silent or at `debug!`: a missing `e` field, the unparseable catch all,
+  an unregistered task and an expired task. A producer and worker version skew
+  that dead lettered a whole queue used to produce no log output at all.
+- **The stats line carries `pid=`, `host=` and `duplicate=`,** and `retried`
+  is incremented only when the retry write succeeded. During a Redis brownout
+  `retried` used to climb at full rate while nothing was scheduled. Section 7
+  of PROTOCOL.md is updated: those three keys are part of the frozen 1.x key
+  set.
+
+**Documentation and repository**
+
+- Eight figures marked as measured in `docs/CONFIGURATION.md` came from a
+  campaign whose harness is not in this repository and cannot be rerun by
+  anyone, including the maintainer. They are removed, not restated. The
+  guidance they supported is kept as design rationale and marked as such.
+- Three more unbacked figures were carried by "Known limitations" itself and
+  are gone the same way: a 39 percent shutdown abort rate, a Redis outage
+  drain cost "measured at 20 of 20 runs", and a 40 minute soak reporting 0.43
+  bytes of growth per task across 216,000 tasks. None of the three appears in
+  `bench/`, and on the soak the tracked suite says the opposite: its only soak
+  was killed by an environment outage and never produced a verdict. The memory
+  entry now says that plainly instead of publishing a number over it. The rule
+  going forward is in CONTRIBUTING.md: no figure in any document without a
+  harness in `bench/` that reproduces it.
+- `--io-concurrency` defaults to 256 while `bench/RESULTS.md` reports a stall
+  above 104 per process. Both ship in this release. `docs/CONFIGURATION.md`
+  now states the disagreement, says the stall is unattributed and may be the
+  harness's own Redis connection count, and tells you to treat anything above
+  128 slots per process as untested.
+- Five entries in "Known limitations" described behaviour the shipped code
+  contradicted: NOGROUP self healing, the wedge watchdog, the clock, latency
+  telemetry and cpu child recycling. All five are rewritten against the code.
+- Internal audit records (`AUDIT.md`, `FIXES.md`, `RESUME.md`,
+  `docs/AUDIT_LOG.md`) are no longer tracked. They named unpushed branches and
+  interim verdicts that read as the project's current position.
+- `scripts/check_versions.py` reads README.md's Status section as a fifth
+  version source. Four artifacts shipped 1.0.0 marked Production/Stable while
+  the landing page said v0.1 and CI stayed green, because nothing read it.
+- `docs/decisions/` is reframed as historical design notes with a verified
+  status line per document, instead of nine documents all stamped as not
+  implemented while several of them had shipped. Two status lines were still
+  wrong after that pass and are corrected here: `redis-cluster.md` claimed the
+  startup refusal did not exist, and `delivery-guarantee.md` claimed
+  `AsyncResult` still discarded the claimant id. Both had shipped.
+- `docs/MIGRATING-FROM-CELERY.md` is new. README promised Celery migration
+  notes and pointed at CHANGELOG's upgrade notes, which are about upgrading
+  cauli, not about leaving Celery. The new document is a mapping table, the
+  eight divergences that bite silently, and the list of Celery features cauli
+  does not have.
+- `py/README.md`, the page PyPI renders, stated neither that the worker is
+  Linux only nor which CPython versions its wheels cover, and listed four of
+  the five statuses `status()` returns. Both are fixed and both are pinned by
+  tests.
+
+**Still open, and listed here rather than found later**
+
+- No CLI exists for the dead letter queue, queue depth or the delayed set.
+  `cauli-beat` is the only console script, so Celery's `inspect`, `purge` and
+  `control` have no equivalent.
+- The delayed and retry sweep has no published throughput figure, and `bench/`
+  has no retry rate lane.
+- Nothing XTRIMs `cauli:q:{queue}`. The ack and the delete are one
+  transaction now, so no new orphan can be created, but an orphan left in a
+  live stream by a pre 1.0 build stays there. A periodic sweep was considered
+  and rejected: MAXLEN and MINID cannot tell an orphan from a legitimately
+  pending or undelivered entry, so a sweep aggressive enough to reap orphans
+  can delete live work.
+- `AsyncResult.get()` and `aget()` poll `GET cauli:result:{id}` every 50ms by
+  default. There is no push notification, so a result wait carries a 25ms mean
+  floor and 20 reads per second per waiter. `poll_interval` is tunable per
+  call. Replacing the poll with pub/sub is a wire change and is not in 1.x.
+- `--io-concurrency` defaults to 256 while the only slot sweep in `bench/`
+  stalls above 104 per process. The stall is unattributed: the same harness
+  opens one Redis connection per concurrent caller, so it may have exhausted
+  the server's client slots rather than found a limit in cauli. Treat anything
+  above 128 slots per process as untested. `docs/CONFIGURATION.md` carries the
+  full note.
+- `cauli-beat` has no envelope size guard. `Cauli(max_envelope_bytes=...)`
+  covers `.delay()`, `.apply_async()` and the batch calls, but a periodic
+  entry with an oversize `args` payload still publishes and still dead letters
+  at the worker.
+- A dead lettered envelope larger than 4096 bytes yields no recoverable task
+  id, so no failure result key is written and a caller waiting on `get()`
+  waits out its own timeout. The client side size guard stops a current
+  producer creating that state. An older client, or a client whose
+  `max_envelope_bytes` is above the worker's `--max-envelope-bytes`, still
+  can.
+- Both io lanes deep clone the whole `args` and `kwargs` tree per task,
+  because the envelope owns them by value. Throughput cost only, not a
+  correctness problem. The fix is a coordinated change across four worker
+  files and was held back rather than half landed.
+
 ### Known limitations
 
-- **Redis Cluster is not supported.** The worker links no cluster protocol at
-  all, so it never follows a MOVED redirect and ordinary operations fail
-  against a real multi node cluster, not only the delayed and periodic paths.
-  Those fail for a second reason as well: the mover's two keys and beat's
-  seed keys never share a hash slot, so Cluster rejects every call with
-  CROSSSLOT. Both failures are now loud. Standalone and Sentinel are the
-  supported topologies. Hash tags would fix the CROSSSLOT half but would
-  change the key naming scheme, and beat's claim atomicity cannot be fixed
-  without a single global hash tag, which would pin every key to one slot and
-  remove the only reason to run Cluster.
+- **Redis Cluster is not supported, and the worker now refuses to start on
+  one.** The worker links no cluster protocol at all, so it never follows a
+  MOVED redirect and ordinary operations fail against a real multi node
+  cluster, not only the delayed and periodic paths. Those fail for a second
+  reason as well: the mover's two keys and beat's seed keys never share a hash
+  slot, so Cluster rejects every call with CROSSSLOT. Before it touches a
+  consumer group the worker sends `INFO cluster` and exits 1 when the reply
+  says `cluster_enabled:1`, naming the topology and the loss it would cause.
+  Set `CAULI_ALLOW_REDIS_CLUSTER=1` to start anyway and accept that loss. A
+  Redis that will not answer the probe at all starts normally, so an ACL that
+  blocks `INFO` costs nothing. Standalone is the supported topology. Sentinel
+  is reachable from the Python client and `cauli-beat` through
+  `Cauli(redis_client=...)`, but the worker connects by URL and never looks a
+  master up again after a failover. Hash tags would fix the CROSSSLOT half but
+  would change the key naming scheme, and beat's claim atomicity cannot be
+  fixed without a single global hash tag, which would pin every key to one
+  slot and remove the only reason to run Cluster.
 - **Redis must be persistent and must never come back empty.** The stream,
   its consumer group, the pending entries list and the delayed sorted set are
-  the only copy of accepted work. The consumer group is created at worker
-  startup only, so a Redis that restarts empty leaves workers alive but deaf:
-  they warn on each fetch and consume nothing until they are restarted. That
-  is the ElastiCache default, and it is also what an out of memory kill or a
-  restore from backup looks like.
-- **A wedged event loop needs a process restart.** One blocking call inside
-  an `async def` ends that process's async throughput for the life of the
-  process. Nothing detects a wedged loop thread, nothing replaces it, and at
-  the default `--io-loops 1` that is the entire async lane of that process.
-  `async_rejected` is the signal, and it only starts moving once 4096
-  submissions have accumulated behind the wedge.
+  the only copy of accepted work. A Redis that restarts empty loses all four.
+  That is the ElastiCache default, and it is also what an out of memory kill
+  or a restore from backup looks like. The worker itself recovers without
+  help: `loops.rs` catches `NOGROUP` on the next fetch, recreates the consumer
+  groups, logs what that means in plain words, and resumes. Recovering the
+  groups is not recovering the work, and nothing in cauli can recover the
+  work. Run with AOF.
+- **A wedged event loop costs a process restart, taken automatically.** One
+  blocking call inside an `async def` starves that loop thread of every
+  callback for the life of the process, and CPython offers no safe way to kill
+  a thread, so the loop cannot be replaced in place. A watchdog stamps every
+  embedded loop every 5 seconds and, when a loop has made no progress for 15
+  seconds and a second signal agrees, exits the process with code 87 so the
+  supervisor restarts it in about a second. In flight tasks are redelivered
+  under the at least once guarantee. Two things this does not do: it does not
+  save the wedged task, and it does not stop a blocking call being a bug in
+  your task. `loop_lag_ms` in the stats line is the leading indicator;
+  `async_rejected` is the lagging one and only moves once 4096 submissions
+  have piled up behind the wedge.
 - **A hard timed out sync thread and its database connection are lost until
   restart.** CPython has no safe way to stop a running thread. The task is
   marked failed and a replacement thread is spawned so capacity is preserved,
@@ -416,22 +735,34 @@ Protocol and worker behaviour:
   `TimeLimitExceeded` with origin `"worker"` either way. The sync io and cpu
   lanes tell the two apart exactly. This is inherent to the language, and it
   is the one case the `TimeLimitExceeded` rename above could not separate.
-- **The worker uses its local clock while beat reads Redis `TIME`.** An NTP
-  step while computing a retry time durably writes a far future score into
-  the delayed set and strands the task with no self healing. Clock skew
-  across a fleet desynchronises retry and expiry timing, and since every
-  worker runs the mover, the fastest clock in the fleet decides when delayed
-  work fires. Keep workers on NTP.
-- **The stats line carries no latency telemetry.** All fields are counts and
-  gauges. A degradation that preserves throughput while inflating latency is
-  invisible: an operator sees `ok` still climbing and nothing else. Precision
-  measurement lives in `bench/`.
-- **cpu child memory is invisible and recycling is off by default.** `rss_mb`
-  covers the worker process only; forked children are separate processes and
-  are never summed into it. A child was measured holding 331.8 MB while
-  `rss_mb` read 35. `--cpu-max-tasks-per-child`, default 0 meaning never
-  recycle, is the only bound on a child's memory: cauli sets no rlimit and no
-  cgroup. Set it to a nonzero value in production.
+- **The enqueuing client's clock is the one that can still hurt you.** Both
+  the worker and beat are anchored on Redis now: `clock.rs` samples Redis
+  `TIME`, re anchors on it, and warns at boot about a skew worth naming, so an
+  NTP step on a worker no longer writes a far future score into the delayed
+  set and every worker in a fleet agrees on when delayed work is due. The
+  Python client is not anchored: it stamps `enqueued_at` and `expires_at` from
+  `time.time_ns()` on the enqueuing host. A client whose clock runs behind
+  Redis shortens every deadline it stamps by the skew, and far enough behind,
+  with an app wide `queue_ttl`, the worker discards everything that host
+  enqueues. Keep the hosts that enqueue on NTP, not only the workers.
+- **The stats line is the whole operator interface, and it is a log line.**
+  It now carries per lane latency, `sync_p50`, `sync_p99`, `async_p50`,
+  `async_p99`, `cpu_p50` and `cpu_p99`, so a degradation that preserves
+  throughput while inflating latency is visible rather than silent, plus
+  `pid=` and `host=` so one supervised process can be told from another. What
+  is still missing is the shape of it: there is no metrics endpoint, no JSON
+  logging, no health endpoint and no queue depth field, all rejected for 1.0
+  in `docs/decisions/observability.md`. Scraping means parsing a log line.
+  Percentiles are per interval and are drained on read, so a scraper and a
+  human tailing the log will not see the same numbers.
+- **cpu child memory is invisible in `rss_mb`.** That field covers the worker
+  process only; forked children are separate processes and are never summed
+  into it, so a child can grow to hundreds of megabytes while `rss_mb` never
+  moves. `--cpu-max-tasks-per-child` is the only bound on a child's memory:
+  cauli sets no rlimit and no cgroup on it. It defaults to 1000 rather than to
+  never, so an ordinary deployment is bounded without doing anything; pass 0
+  to opt out. A child killed by the OS OOM killer surfaces as a generic
+  `WorkerLost`, the same as any other child death.
 - **A background task that outlives a cauli task resurrects its SQLAlchemy
   session.** `AsyncSession` transparently reopens after `close()`, so a
   leaked reference does database work the session lifecycle cannot see and
@@ -442,23 +773,31 @@ Protocol and worker behaviour:
   active for the query's natural duration, holding locks, invisible to cauli.
   Inherent to asyncio cancellation over psycopg, which sends no server side
   cancel.
-- **`.delay()` is synchronous Redis I/O.** Inside an async handler it blocks
-  the event loop, for up to the client's 5 second socket timeout when Redis
-  degrades. There is no async enqueue API.
+- **`.delay()` is synchronous Redis I/O, and the async twin is opt in.**
+  Inside an async handler `.delay()` blocks the event loop for up to the
+  client's 5 second socket timeout when Redis degrades. `AsyncCauli` with
+  `await task.adelay(...)` and `await result.aget(...)` is the way out, but it
+  is a different app class: an app built as `Cauli` has no awaitable enqueue
+  and raises a message saying so. One `AsyncCauli` per event loop, because
+  `redis.asyncio` binds its pool to the loop that first uses it.
 - **No Python `atexit` handler ever runs.** The worker leaves through an
   immediate process exit, deliberately, because running C library atexit
   handlers while Python threads are live is what caused the corruption
-  incident that shaped this design: one cleanup path aborted 39 percent of
-  shutdowns at 80 io threads before the change. The practical cost is that
-  exit time flushes do not happen, so Sentry and OpenTelemetry users must
-  flush explicitly, and buffered task output at shutdown is lost.
+  incident that shaped this design: `OPENSSL_cleanup`, pulled in by a Postgres
+  driver's libssl, raced per thread teardown at shutdown and reported a
+  corrupted heap as a clean drain. `bench/RESULTS.md` records that discovery,
+  the switch to `libc::_exit()` and the 23 clean runs at configurations that
+  previously corrupted reliably. The practical cost is that exit time flushes
+  do not happen, so Sentry and OpenTelemetry users must flush explicitly, and
+  buffered task output at shutdown is lost.
 - **A stalled fetch loop delays the start of the drain.** The worker waits
   for the fetch loop to return before it computes the drain deadline. The
   Redis response timeout shrinks that window sharply, since the loop can no
   longer hang forever, but does not close it. Separately, a Redis outage
-  during shutdown costs the full `--drain-timeout` every time, measured at 20
-  of 20 runs: worth knowing when sizing a container's termination grace
-  period.
+  during shutdown costs the full `--drain-timeout` every time, because there
+  is nothing left to acknowledge against and the deadline is the only thing
+  that ends the wait. Size a container's termination grace period above
+  `--drain-timeout`, not at it.
 - **conda environments cannot run the worker.** The wheel installs and the
   worker then fails before it starts, because the loader cannot find that
   environment's libpython. `pyenv` needs `PYTHON_CONFIGURE_OPTS="--enable-shared"`.
@@ -466,12 +805,17 @@ Protocol and worker behaviour:
   those, distro packages and `actions/setup-python` all work. The worker is
   Linux only, including from source, because it arms `PR_SET_PDEATHSIG`
   unconditionally.
-- **Memory was measured on the happy path only, so far.** A 40 minute soak at
-  216,000 tasks reached genuinely flat, with post warmup growth of 0.43 bytes
-  per task, at or below page quantization and therefore an upper bound rather
-  than a measured leak rate. That run never exercised retries, dead letters
-  or expiry. A longer soak against a deliberately failing workload is the
-  routine that continues after this release.
+- **Memory over a long run is unverified, and this release does not claim
+  otherwise.** The only soak in the tracked benchmark suite was killed by an
+  environment outage partway through and never produced a verdict.
+  `bench/RESULTS.md` says so under "Soak test", and names what a redo needs.
+  Shorter runs have looked flat, but their output is not in this repository,
+  so it is not a number this project can defend and it is not published here.
+  Nothing has soaked against a workload that deliberately fails, so retries,
+  dead letters and expiry are the least exercised paths of all. Watch `rss_mb`
+  in the stats line, and remember it does not include cpu children. A soak
+  against a failing workload is the routine that continues after this
+  release.
 
 ### Upgrade notes
 
@@ -484,6 +828,18 @@ the rollout to be picked up by a newer worker, so in a rolling deploy every
 worker must be running 1.0 and must know the new task name before anything
 enqueues it.
 
+**Idempotency keys change shape, so a rolling upgrade can run a guarded task
+twice.** The Redis key is now derived with SHA-256 instead of 64 bit FNV-1a,
+so a key minted by a pre 1.0 worker never matches the key a 1.0 worker
+computes for the same string. A claim written by an old worker is invisible
+to a new one. For the length of the rollout, and for as long as any old claim
+is still live afterwards, a task carrying an `idempotency_key` can execute
+twice. Nothing in cauli can bridge the two derivations. If your workload
+cannot tolerate that, drain the queues and stop every old worker before
+starting a 1.0 one, rather than rolling. If it can, roll normally and accept
+duplicates for the window. Old claim keys are not read again and expire on
+their own TTL.
+
 Before deploying:
 
 - Check for duplicate task names. A second registration under the same name
@@ -495,6 +851,9 @@ Before deploying:
   instead of failing later.
 - Move imports from `cauli.contrib.fastapi` to `cauli.contrib.sqlalchemy`.
   The old path still works.
+- Check every `crontab()` call for three or more positional arguments. Those
+  now raise `TypeError`. Pass `day_of_month=`, `month=` and `day_of_week=` by
+  name.
 - If you match on the dead letter `reason` field, handle `not_retryable`
   alongside `max_retries`.
 - If you parse the stats line, it gained `async_rejected` and `cpu_backlog`.
@@ -502,4 +861,7 @@ Before deploying:
   `--redis-timeout`. A false trip costs one log line and at most one
   visibility timeout of added latency on that task, never data loss.
 - If the dead letter queue is your audit trail, arrange to drain or export it:
-  it now holds roughly the most recent 1000 entries per queue.
+  it now holds roughly the most recent 1000 entries per queue, and the stream
+  expires 7 days after the last dead letter written to it.
+- If you run with `CAULI_ALLOW_REDIS_CLUSTER=1`, nothing changes: the ack and
+  delete transaction touches one key, so it stays inside a single hash slot.

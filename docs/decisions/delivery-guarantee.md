@@ -1,5 +1,19 @@
-# DECISION — the delivery guarantee at 1.0
-Produced on Fable. Recommendation stands, awaiting human approval. NOT implemented.
+# Decision: the delivery guarantee at 1.0
+> **Historical design note, not current documentation.** This is a record of how one
+> pre 1.0 decision was reached and what was known when it was reached. It is kept
+> because the reasoning is worth reading, not because it describes today's behaviour.
+> Where it disagrees with the code, with [PROTOCOL.md](../../PROTOCOL.md) or with
+> [docs/CONFIGURATION.md](../CONFIGURATION.md), those win. The status line below was
+> checked against the source, not carried over.
+>
+> **Status: shipped in 1.0.0.** The idempotency claim TTL now
+> derives from the execution it guards (`broker::claim_ttl_s`), the worker carries the
+> claimant id back on a suppressed duplicate, PROTOCOL.md section 4 carries the delivery
+> guarantee preamble, and README no longer offers an idempotency key as an alternative to
+> writing a repeatable task body. The last piece landed in the release audit pass:
+> `AsyncResult.claimant_id` now carries the claiming task id after a duplicate resolves, and
+> `AsyncResult.claimant()` hands back a result handle for it, so a suppressed caller can read
+> the outcome that actually ran.
 
 **The guarantee is coherent, not a pile of caveats.** Every cauli side failure resolves the same
 direction: toward duplicate execution or a loud dead letter, never toward silent loss. That composes.

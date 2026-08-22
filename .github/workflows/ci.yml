@@ -109,6 +109,9 @@ jobs:
       - name: Versions agree across cauli and cauli-worker
         run: python scripts/check_versions.py
 
+      - name: Packaged license copies match the repository originals
+        run: python scripts/check_licenses.py
+
       - name: Build the client sdist and wheel
         run: |
           pip install build
@@ -174,6 +177,25 @@ jobs:
             -v "$PWD/dist:/dist:ro" \
             -v "$PWD/bare.sh:/bare.sh:ro" \
             ubuntu:24.04 bash /bare.sh
+
+      # `pip install cauli` on its own has to leave the user with a worker
+      # binary. Every other step here installs the two wheels by path, so this
+      # is the only one that reads the client's dependency metadata at all.
+      - name: Plain `pip install cauli` lands a working worker
+        run: |
+          set -euo pipefail
+          python -m venv .onecmd
+          .onecmd/bin/pip install --upgrade pip
+          # Third party dependencies from the index first, so the resolve below
+          # can be --no-index and cauli/cauli-worker can only be the wheels
+          # just built rather than an older pair already on PyPI.
+          .onecmd/bin/pip install "redis>=5" "msgspec>=0.18"
+          .onecmd/bin/pip install --no-index --find-links dist cauli
+          .onecmd/bin/pip show cauli-worker >/dev/null
+          test -x .onecmd/bin/cauli-worker
+          # --print-plan needs no Redis and no app: the cheapest proof that
+          # what pip installed actually starts.
+          .onecmd/bin/cauli-worker --print-plan
 
       - name: Install the wheels into a clean venv and run itest
         run: |

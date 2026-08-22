@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import importlib.machinery
+import sys
+import types
+
 import pytest
 
 from cauli import Cauli, TaskDef
@@ -119,3 +123,58 @@ def test_soft_timeout_must_be_less_than_timeout():
         @app.task(timeout=5, soft_timeout=5)
         def equal_limits():
             return None
+
+
+def _fake_main(monkeypatch, *, file=None, spec_name=None):
+    """Stand in for the __main__ module of a process started various ways."""
+    main = types.ModuleType("__main__")
+    main.__spec__ = (
+        None if spec_name is None else importlib.machinery.ModuleSpec(spec_name, None)
+    )
+    if file is not None:
+        main.__file__ = file
+    monkeypatch.setitem(sys.modules, "__main__", main)
+
+
+def _main_fn():
+    def hello(x):
+        return x
+
+    hello.__module__ = "__main__"
+    hello.__qualname__ = "hello"  # as if defined at module level, not nested
+    return hello
+
+
+def test_script_run_task_name_uses_the_importable_module_not_dunder_main(monkeypatch):
+    """`python tasks.py` must not mint `__main__.hello`.
+
+    The worker imports the same file by module name, so its registry is keyed
+    `tasks.hello`; an envelope stamped `__main__.hello` misses that registry
+    and is terminally dead lettered on the very first enqueue.
+    """
+    _fake_main(monkeypatch, file="/srv/app/tasks.py")
+    t = _offline_app().task()(_main_fn())
+    assert t.name == "tasks.hello"
+
+
+def test_dash_m_run_task_name_prefers_the_dotted_spec_name(monkeypatch):
+    """`python -m pkg.tasks` knows its own dotted name; the stem would lose
+    the package and mis-key the worker registry."""
+    _fake_main(monkeypatch, file="/srv/app/pkg/tasks.py", spec_name="pkg.tasks")
+    t = _offline_app().task()(_main_fn())
+    assert t.name == "pkg.tasks.hello"
+
+
+def test_unresolvable_main_module_warns_instead_of_minting_a_dead_name(monkeypatch):
+    """A REPL or `python -c` has no importable name to recover, so the only
+    honest option is to say so loudly rather than fail silently at enqueue."""
+    _fake_main(monkeypatch)  # no __file__, no spec
+    with pytest.warns(RuntimeWarning, match="dead lettered"):
+        t = _offline_app().task()(_main_fn())
+    assert t.name == "__main__.hello"
+
+
+def test_explicit_name_skips_the_main_module_fixup_entirely(monkeypatch):
+    _fake_main(monkeypatch)
+    t = _offline_app().task(name="jobs.hello")(_main_fn())
+    assert t.name == "jobs.hello"

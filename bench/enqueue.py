@@ -33,6 +33,14 @@ LANES = {
     "dramatiq_pg": ("tasks_dramatiq_pg", "insert", "send", ()),
     "celery_hold": ("tasks_celery_hold", "hold", "delay", ()),
     "cauli_async_hold": ("tasks_cauli_async_hold", "hold", "delay", ()),
+    "celery_gevent": ("tasks_celery_gevent", "noop", "delay", ()),
+    "celery_gevent_hold": ("tasks_celery_gevent", "hold", "delay", ()),
+    "celery_threads": ("tasks_celery_threads", "noop", "delay", ()),
+    "celery_threads_hold": ("tasks_celery_threads", "hold", "delay", ()),
+    "cauli_sync_django": ("tasks_cauli_sync_django", "insert", "delay", ()),
+    "celery_django": ("tasks_celery_django", "insert", "delay", ()),
+    "cauli_async_sqlalchemy": ("tasks_cauli_async_sqlalchemy", "insert", "delay", ()),
+    "taskiq_sqlalchemy": ("tasks_taskiq_sqlalchemy", "insert", "kiq", ()),
 }
 
 

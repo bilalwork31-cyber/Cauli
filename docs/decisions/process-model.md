@@ -1,5 +1,15 @@
-# DECISION — process, teardown and threading model at 1.0
-Produced on Fable. Recommendation stands, awaiting human approval. NOT implemented.
+# Decision: process, teardown and threading model at 1.0
+> **Historical design note, not current documentation.** This is a record of how one
+> pre 1.0 decision was reached and what was known when it was reached. It is kept
+> because the reasoning is worth reading, not because it describes today's behaviour.
+> Where it disagrees with the code, with [PROTOCOL.md](../../PROTOCOL.md) or with
+> [docs/CONFIGURATION.md](../CONFIGURATION.md), those win. The status line below was
+> checked against the source, not carried over.
+>
+> **Status: shipped in 1.0.0.** The wedge watchdog in `worker/src/loops.rs` stamps every
+> embedded loop every 5 seconds and exits the process with code 87 once a loop has been
+> unresponsive for 15 seconds and a second signal agrees. The other four questions were
+> frozen as they were.
 
 **The model is sound. Freeze four of five questions. One thing should not ship as is: a wedged async
 loop must trigger self exit, or the flagship lane's failure mode is a permanent brownout that no

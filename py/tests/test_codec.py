@@ -162,3 +162,72 @@ def test_non_str_dict_keys_rejected_identically(codec):
     for key in (1, 2.5, True, False, None):
         with pytest.raises(TypeError):
             codec.encode({key: "v"})
+
+
+def test_rejection_names_the_offending_argument(codec):
+    """The whole complaint about `send_receipt.delay(order.id)` on a UUID pk
+    was that the error named the type and nothing else. The walk now records
+    the key/index of every container it unwinds through, so the message points
+    at the argument."""
+    import datetime
+    import decimal
+    import uuid
+
+    for bad in (uuid.uuid4(), datetime.datetime(2020, 1, 1), decimal.Decimal("1.5")):
+        with pytest.raises(TypeError) as info:
+            codec.encode({"args": [bad], "kwargs": {}})
+        message = str(info.value)
+        assert message.startswith("args[0]: ")
+        assert type(bad).__name__ in message
+        # and it says what the wire format WOULD take
+        assert "allowed types:" in message
+
+
+def test_path_walks_nested_containers(codec):
+    with pytest.raises(TypeError) as info:
+        codec.encode({"kwargs": {"meta": {"tags": [1, {2, 3}]}}})
+    assert str(info.value).startswith("kwargs['meta']['tags'][1]: ")
+
+    with pytest.raises(ValueError) as info:
+        codec.encode({"args": [0, [1, [float("inf")]]]})
+    assert str(info.value).startswith("args[1][1][0]: ")
+
+
+def test_non_str_dict_key_path_points_at_the_containing_dict(codec):
+    """The bad key is not itself a traversable segment, so the path stops at
+    the dict that holds it."""
+    with pytest.raises(TypeError) as info:
+        codec.encode({"kwargs": {"meta": {1: "v"}}})
+    assert str(info.value) == "kwargs['meta']: dict keys must be str, got int"
+
+
+def test_top_level_rejection_keeps_its_bare_message(codec):
+    """Nothing was traversed, so there is no path to prepend and the message
+    must not grow a stray `: ` prefix."""
+    with pytest.raises(TypeError) as info:
+        codec.encode(object())
+    assert str(info.value).startswith("Object of type object is not JSON serializable")
+
+    with pytest.raises(ValueError) as info:
+        codec.encode(float("nan"))
+    assert str(info.value) == "Out of range float values are not JSON compliant"
+
+
+def test_path_annotation_survives_the_envelope_shape(codec):
+    """The real call site encodes the whole envelope, not just the args, so
+    the outermost segment is an envelope field and reads bare."""
+    envelope = dict(ENVELOPE)
+    envelope["args"] = [1, {"attachment": b"pdf"}]
+    with pytest.raises(TypeError) as info:
+        codec.encode(envelope)
+    assert str(info.value).startswith("args[1]['attachment']: ")
+
+
+def test_cyclic_payload_still_raises_recursion_error(codec):
+    """RecursionError is deliberately not annotated with a path (there is no
+    finite one), and must still reach the caller as a member of
+    ENCODE_ERRORS rather than being swallowed by the annotation handler."""
+    loop: list = [1]
+    loop.append(loop)
+    with pytest.raises(RecursionError):
+        codec.encode({"args": loop})

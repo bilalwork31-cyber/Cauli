@@ -27,10 +27,23 @@ class Retry(Exception):
 
 
 class SoftTimeLimitExceeded(Exception):
-    """Injected into a running task when its soft time limit expires.
+    """Raised when a task's soft time limit expires, so it can stop early.
 
     A task may catch this to do cleanup and return normally; if it propagates,
     the task is treated as failed (retryable).
+
+    **The two io lanes signal the soft mark differently.** In a ``def`` task
+    this class is raised into the running thread, so ``except
+    SoftTimeLimitExceeded`` inside the body works and can return a value. An
+    ``async def`` task is cancelled at the soft mark instead, because asyncio
+    has no way to throw an arbitrary exception into a coroutine at its await
+    point: the body observes ``asyncio.CancelledError`` and its ``finally``
+    blocks run, while an ``except SoftTimeLimitExceeded`` inside that body
+    never fires.
+
+    The failure cauli reports is ``SoftTimeLimitExceeded`` on both lanes, so
+    callers, the DLQ and the result document agree. See the ``soft_timeout``
+    row in docs/CONFIGURATION.md.
     """
 
 

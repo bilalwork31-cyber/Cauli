@@ -6,7 +6,8 @@ Define tasks with ``@app.task(...)``, enqueue with ``.delay()`` /
 See PROTOCOL.md for the full wire contract.
 """
 
-from cauli.app import Cauli
+from cauli._context import TaskContext, current_task
+from cauli.app import AsyncCauli, Cauli
 from cauli.exceptions import Retry, SoftTimeLimitExceeded, TaskFailedError
 from cauli.result import AsyncResult
 from cauli.schedules import (
@@ -23,11 +24,14 @@ __version__ = "1.0.0"
 
 __all__ = [
     "Cauli",
+    "AsyncCauli",
     "Retry",
     "SoftTimeLimitExceeded",
     "TaskFailedError",
     "AsyncResult",
     "TaskDef",
+    "TaskContext",
+    "current_task",
     "Schedule",
     "ScheduleEntry",
     "IntervalSchedule",

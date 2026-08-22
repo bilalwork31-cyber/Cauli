@@ -1,12 +1,20 @@
 #!/usr/bin/env python3
-"""Assert the four places that carry cauli's version agree.
+"""Assert the six places that carry cauli's version agree.
 
-`cauli-worker` pins `cauli==<version>` (worker/pyproject.toml), so a release
-where the two drift produces a wheel that cannot resolve its own dependency --
-and it fails at the user's `pip install`, not in our CI. Cheap to check, so it
-runs on every push rather than only at tag time.
+The two distributions pin each other. `cauli-worker` pins `cauli==<version>`
+(worker/pyproject.toml) and `cauli` pins `cauli-worker==<version>` behind a
+platform marker (py/pyproject.toml), so that a plain `pip install cauli` lands
+a worker binary too. Either pin drifting produces a wheel that cannot resolve
+its own dependency -- and it fails at the user's `pip install`, not in our CI.
+Cheap to check, so it runs on every push rather than only at tag time.
 
-    python scripts/check_versions.py            # the four files agree
+README.md's Status section is checked too, and for a reason
+this project already lived through: four artifacts shipped 1.0.0 marked
+Production/Stable while the landing page still said "v0.1", and CI stayed green
+the whole time because nothing read the README. The Status section must open
+with a full `cauli X.Y.Z` version, and it must be the same one.
+
+    python scripts/check_versions.py            # the six places agree
     python scripts/check_versions.py v0.2.0     # ...and match this git tag
 """
 
@@ -37,14 +45,49 @@ def _dunder_version(path: Path) -> str:
     return match.group(1)
 
 
-def _worker_pin(path: Path) -> str:
-    """The `cauli==X` pin inside cauli-worker's dependencies."""
+def _readme_status_version(path: Path) -> str:
+    """The version the README's Status section states.
+
+    Read from the Status section specifically rather than the whole file, so a
+    version number quoted in an example or a dependency line cannot satisfy the
+    check. A partial version such as "v0.1" does not match and fails here with
+    a message naming what to write instead, which is the exact drift this
+    function exists to catch.
+    """
+    text = path.read_text(encoding="utf-8")
+    heading = re.search(r"^##\s+Status\s*$", text, re.M)
+    if heading is None:
+        raise SystemExit(f"{path}: no '## Status' section to read a version from")
+    section = text[heading.end() :]
+    end = re.search(r"^##\s", section, re.M)
+    if end is not None:
+        section = section[: end.start()]
+    match = re.search(
+        r"(?<![A-Za-z])cauli +([0-9]+[.][0-9]+[.][0-9]+)(?![0-9])", section
+    )
+    if match is None:
+        raise SystemExit(
+            f"{path}: the Status section must state the full version as "
+            f"'cauli X.Y.Z'. A partial version such as 'v0.1' does not count: "
+            f"it is what let the README drift away from the shipped artifacts."
+        )
+    return match.group(1)
+
+
+def _pin(path: Path, name: str) -> str:
+    """The `<name>==X` pin inside a pyproject's [project].dependencies.
+
+    The version is read up to the PEP 508 marker, because the client's pin on
+    the worker carries one: the worker wheels exist only for Linux on x86_64
+    and aarch64, and off that set the requirement has to disappear rather than
+    fail the client's install.
+    """
     deps = tomllib.loads(path.read_text(encoding="utf-8"))["project"]["dependencies"]
     for dep in deps:
-        match = re.fullmatch(r"cauli\s*==\s*(\S+)", dep)
+        match = re.match(rf"{re.escape(name)}\s*==\s*([^\s;]+)\s*(?:;|$)", dep)
         if match:
             return match.group(1)
-    raise SystemExit(f"{path}: dependencies must pin cauli==<version>, got {deps!r}")
+    raise SystemExit(f"{path}: dependencies must pin {name}==<version>, got {deps!r}")
 
 
 def main(argv: list[str]) -> int:
@@ -52,8 +95,11 @@ def main(argv: list[str]) -> int:
         "worker/Cargo.toml [package].version": _cargo_version(
             ROOT / "worker" / "Cargo.toml"
         ),
-        "worker/pyproject.toml cauli== pin": _worker_pin(
-            ROOT / "worker" / "pyproject.toml"
+        "worker/pyproject.toml cauli== pin": _pin(
+            ROOT / "worker" / "pyproject.toml", "cauli"
+        ),
+        "py/pyproject.toml cauli-worker== pin": _pin(
+            ROOT / "py" / "pyproject.toml", "cauli-worker"
         ),
         "py/pyproject.toml [project].version": _project_version(
             ROOT / "py" / "pyproject.toml"
@@ -61,6 +107,7 @@ def main(argv: list[str]) -> int:
         "py/cauli/__init__.py __version__": _dunder_version(
             ROOT / "py" / "cauli" / "__init__.py"
         ),
+        "README.md Status section": _readme_status_version(ROOT / "README.md"),
     }
 
     # worker/pyproject.toml has `dynamic = ["version"]`; maturin takes it from

@@ -203,11 +203,25 @@ impl Envelope {
         }
     }
 
-    /// Effective async timeout seconds, §4.6:
-    /// `min(soft_timeout_ms or timeout_ms, timeout_ms) / 1000`.
-    pub fn effective_async_timeout_s(&self) -> f64 {
-        let soft = self.soft_timeout_ms.unwrap_or(self.timeout_ms);
-        (soft.min(self.timeout_ms) as f64) / 1000.0
+    /// §4.6 async lane deadlines, as `(soft_s, hard_s)` in seconds.
+    ///
+    /// `hard_s` is always this envelope's own `timeout_ms`. `soft_s` is
+    /// `Some` only when a soft limit was actually set AND lands strictly
+    /// before the hard one, the only case where it can do anything.
+    ///
+    /// This replaced a single `min(soft, hard)` value handed to one
+    /// `asyncio.wait_for`, which collapsed the pair: `SoftTimeLimitExceeded`
+    /// could never be raised, the task silently got the SOFT budget as its
+    /// whole budget, and a Celery migrant porting `soft_time_limit=30,
+    /// time_limit=300` lost 90% of the deadline with no warning and a
+    /// cleanup handler that could never fire.
+    pub fn async_timeouts_s(&self) -> (Option<f64>, f64) {
+        let hard_s = (self.timeout_ms as f64) / 1000.0;
+        let soft_s = match self.soft_timeout_ms {
+            Some(soft) if soft > 0 && soft < self.timeout_ms => Some((soft as f64) / 1000.0),
+            _ => None,
+        };
+        (soft_s, hard_s)
     }
 
     /// PROTOCOL §9.1/§9.2: the instant past which this entry must not run,
@@ -472,15 +486,27 @@ mod tests {
         assert!(serde_json::from_str::<Envelope>(r#"{"id":"x"}"#).is_err()); // no task
     }
 
+    /// The async lane must carry BOTH deadlines, never their min: the soft
+    /// mark is where `SoftTimeLimitExceeded` is raised and the hard one stays
+    /// the backstop. `min(soft, hard)` is the exact bug this replaced.
     #[test]
-    fn effective_async_timeout() {
+    fn async_timeouts_keep_soft_and_hard_apart() {
         let mut e: Envelope = serde_json::from_str(r#"{"id":"a","task":"t"}"#).unwrap();
         e.timeout_ms = 10_000;
-        assert_eq!(e.effective_async_timeout_s(), 10.0);
+        assert_eq!(e.async_timeouts_s(), (None, 10.0));
+
+        // The Celery migration shape: soft_time_limit=4, time_limit=10. The
+        // hard budget must stay 10, not collapse to 4.
         e.soft_timeout_ms = Some(4_000);
-        assert_eq!(e.effective_async_timeout_s(), 4.0);
-        e.soft_timeout_ms = Some(50_000); // soft > hard: hard wins
-        assert_eq!(e.effective_async_timeout_s(), 10.0);
+        assert_eq!(e.async_timeouts_s(), (Some(4.0), 10.0));
+
+        // soft >= hard can never fire, so it is dropped rather than armed.
+        e.soft_timeout_ms = Some(50_000);
+        assert_eq!(e.async_timeouts_s(), (None, 10.0));
+        e.soft_timeout_ms = Some(10_000);
+        assert_eq!(e.async_timeouts_s(), (None, 10.0));
+        e.soft_timeout_ms = Some(0);
+        assert_eq!(e.async_timeouts_s(), (None, 10.0));
     }
 
     /// §9.1/§9.2: the deadline is the EARLIER of the envelope's own

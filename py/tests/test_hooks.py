@@ -4,6 +4,7 @@ process-init timing."""
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -156,3 +157,95 @@ def test_stdio_child_runs_process_init_once_and_task_hooks_per_request(
         assert phases == ["process_init", "before", "after", "before", "after"]
     finally:
         child.terminate()
+
+
+def _running_loop():
+    try:
+        return asyncio.get_running_loop()
+    except RuntimeError:
+        return None
+
+
+def test_async_task_runs_hooks_on_its_own_event_loop():
+    """An `async def` cpu task's hooks must run INSIDE `asyncio.run`.
+
+    Both hook phases used to run on the plain thread around it, so a hook
+    that branches on a running loop (the Django contrib's
+    `close_old_connections` does, to hop onto asgiref's thread-sensitive
+    executor) took the sync branch while the body's ORM work ran on a
+    different thread -- and Django connections are thread-local, so the
+    body's connection was closed by neither hook.
+    """
+    app = _app_no_redis()
+    events = []
+
+    @app.task(name="aok", kind="cpu")
+    async def aok():
+        events.append(("task", _running_loop()))
+        return 5
+
+    async def _after_awaited():
+        events.append("after-awaited")
+
+    app.before_task(lambda: events.append(("before", _running_loop())))
+
+    def after():
+        events.append(("after", _running_loop()))
+        return _after_awaited()  # awaitable hooks are awaited on the loop
+
+    app.after_task(after)
+
+    resp = _exec._execute(
+        app,
+        {"id": "a1", "task": "aok", "args": [], "kwargs": {}, "soft_timeout_ms": None},
+    )
+    assert resp == {"id": "a1", "ok": True, "result": 5}
+    assert [e[0] for e in events[:3]] == ["before", "task", "after"]
+    loops = [e[1] for e in events[:3]]
+    assert all(loop is not None for loop in loops), "hooks ran off the task's loop"
+    assert len(set(loops)) == 1, "hooks and body must share one loop"
+    assert events[3] == "after-awaited"
+
+
+def test_async_task_runs_after_hooks_on_failure():
+    app = _app_no_redis()
+    events = []
+
+    @app.task(name="aboom", kind="cpu")
+    async def aboom():
+        raise RuntimeError("nope")
+
+    app.before_task(lambda: events.append("before"))
+    app.after_task(lambda: events.append("after"))
+
+    resp = _exec._execute(
+        app,
+        {
+            "id": "a2",
+            "task": "aboom",
+            "args": [],
+            "kwargs": {},
+            "soft_timeout_ms": None,
+        },
+    )
+    assert resp["ok"] is False and resp["error"]["type"] == "RuntimeError"
+    assert events == ["before", "after"]
+
+
+def test_async_task_survives_raising_hooks():
+    app = _app_no_redis()
+
+    @app.task(name="aok2", kind="cpu")
+    async def aok2():
+        return "fine"
+
+    def explode():
+        raise OSError("hook down")
+
+    app.before_task(explode)
+    app.after_task(explode)
+    resp = _exec._execute(
+        app,
+        {"id": "a3", "task": "aok2", "args": [], "kwargs": {}, "soft_timeout_ms": None},
+    )
+    assert resp == {"id": "a3", "ok": True, "result": "fine"}

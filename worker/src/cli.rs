@@ -7,8 +7,13 @@ const ADVANCED: &str = "Advanced tuning (derived from -c; see docs/CONFIGURATION
 #[command(name = "cauli-worker", version, about)]
 pub struct Args {
     /// App location as module:attr (e.g. myproj.tasks:app)
-    #[arg(short = 'A', long)]
-    pub app: String,
+    ///
+    /// Optional for --print-plan alone. That flag derives the plan from -c
+    /// and the core count with no interpreter and no Redis, which is the
+    /// contract docs/CONFIGURATION.md states, so demanding an importable app
+    /// there would make it unusable for capacity planning off the host.
+    #[arg(short = 'A', long, required_unless_present = "print_plan")]
+    pub app: Option<String>,
 
     /// Comma separated queue names. Default: app.default_queue
     #[arg(short = 'Q', long, value_delimiter = ',')]
@@ -67,6 +72,18 @@ pub struct Args {
 
     /// Max in flight io tasks (admission semaphore), sync and async together.
     /// Default: 256, or derived from -c as c/procs
+    ///
+    /// Not a free knob, and the measured band ends below the default. The
+    /// single process async sweep (docs/AUDIT_LOG.md) has the gate binding
+    /// up to about 64 per process and flat past it: 64 gave 25.3k tps, 128
+    /// gave 27.2k, about 7% for twice the slots. The `--procs 6` sweep in
+    /// bench/RESULTS.md peaked at 96 per process and then saw runs finish
+    /// 91% to 99% and stall above 104, completing 11% at 512. That cliff is
+    /// unresolved: the harness opened one redis connection per slot, so it
+    /// may have measured its own connection count rather than cauli. Until
+    /// it is re run with connections pinned, treat anything above 128 per
+    /// process as untested rather than supported, and size your database
+    /// pool for the gate (docs/CONFIGURATION.md, connection sizing).
     #[arg(long, help_heading = ADVANCED)]
     pub io_concurrency: Option<usize>,
 
@@ -125,9 +142,20 @@ pub struct Args {
     #[arg(long, default_value_t = 1_048_576, help_heading = ADVANCED)]
     pub max_envelope_bytes: usize,
 
-    /// Python executable used to spawn cpu children
-    #[arg(long, default_value = "python3", help_heading = ADVANCED)]
-    pub python: String,
+    /// Python executable used to spawn cpu children.
+    /// Default: this worker's own embedded interpreter (`sys.executable`)
+    ///
+    /// The old default was the bare string "python3", resolved through PATH
+    /// by `Command::new`. A systemd `ExecStart=/opt/app/venv/bin/cauli-worker`
+    /// or a Docker CMD never activates the venv, so it found the base
+    /// interpreter with no `cauli` package installed: the fork server failed,
+    /// the stdio fallback respawn looped, the cpu channel filled, and the
+    /// fetch loop's cpu backlog gate then stopped fetching io work too. One
+    /// misrouted interpreter took the whole worker offline at warn level.
+    /// The embedded interpreter is by construction the one that imported the
+    /// app, so it is the right default.
+    #[arg(long, help_heading = ADVANCED)]
+    pub python: Option<String>,
 
     /// Response and connection timeout, in seconds, for every redis round
     /// trip: fetch (XREADGROUP), the idempotency claim before a task body
@@ -156,6 +184,19 @@ pub struct Args {
     /// latency on that task. Never data loss.
     #[arg(long, default_value_t = 5, help_heading = ADVANCED)]
     pub redis_timeout: u64,
+
+    /// Delayed and retry sweep interval in milliseconds (PROTOCOL §4.3)
+    #[arg(long, default_value_t = 250, help_heading = ADVANCED)]
+    pub mover_interval: u64,
+
+    /// Entries the delayed/retry sweep moves per queue per EVAL. The sweep
+    /// now repeats within one tick until a queue comes back short, so this
+    /// bounds one round trip, not the drain rate. It used to be a hard,
+    /// unflaggable ceiling of `limit * (1000 / interval)` per queue per
+    /// process -- 512 per second on the defaults, 40x below the headline
+    /// throughput, with every retry, countdown and eta passing through it.
+    #[arg(long, default_value_t = 128, help_heading = ADVANCED)]
+    pub mover_limit: usize,
 }
 
 /// Concrete per-process execution settings after applying the -c/--procs
@@ -182,7 +223,10 @@ const SLOTS_PER_PROC: usize = 64;
 /// - procs: explicit, else min(cores, c/SLOTS_PER_PROC) with -c, else 1
 ///   (standalone behavior unchanged).
 /// - io_concurrency: explicit, else c/procs with -c, else 256. The gate is
-///   the bound for async tasks (a slot costs ~4 KB).
+///   the bound for async tasks (a slot costs ~4 KB). The standalone 256 sits
+///   above every band this repo has measured; the flag's own help carries the
+///   numbers and the unresolved stall, so `--help` warns before a user tunes
+///   past them.
 /// - io_threads: explicit, else min(c, 512)/procs with -c, else 64. Capped at
 ///   the gate (a thread above it never receives work) and at 512 total: the
 ///   sync knee is ~1000 threads/proc and past it throughput and latency fall
@@ -237,6 +281,18 @@ pub fn resolve(args: &Args, cores: usize) -> Resolved {
     }
 }
 
+impl Args {
+    /// The app spec, for every consumer downstream of the --print-plan early
+    /// return in main. clap keeps -A mandatory unless --print-plan is set,
+    /// and that path exits before any caller here runs, so None at this
+    /// point is a control flow bug rather than bad input.
+    pub fn app_spec(&self) -> &str {
+        self.app
+            .as_deref()
+            .expect("-A is required unless --print-plan, which exits earlier")
+    }
+}
+
 pub fn valid_queue_name(q: &str) -> bool {
     !q.is_empty()
         && q.chars()
@@ -256,7 +312,7 @@ mod tests {
     #[test]
     fn parses_defaults() {
         let a = parse(&[]);
-        assert_eq!(a.app, "m.tasks:app");
+        assert_eq!(a.app.as_deref(), Some("m.tasks:app"));
         assert!(a.queues.is_empty());
         assert_eq!(a.redis_url, None);
         assert_eq!(a.concurrency, None);
@@ -274,7 +330,9 @@ mod tests {
         assert_eq!(a.visibility_timeout, 60);
         assert_eq!(a.max_envelope_bytes, 1_048_576);
         assert_eq!(a.drain_timeout, 30);
-        assert_eq!(a.python, "python3");
+        assert_eq!(a.python, None);
+        assert_eq!(a.mover_interval, 250);
+        assert_eq!(a.mover_limit, 128);
         assert_eq!(a.stats_interval, 10);
         assert_eq!(a.log_level, "info");
         assert_eq!(a.redis_timeout, 5);
@@ -338,17 +396,35 @@ mod tests {
         assert_eq!(a.batch, 4);
         assert_eq!(a.visibility_timeout, 2);
         assert_eq!(a.drain_timeout, 5);
-        assert_eq!(a.python, "python3.12");
+        assert_eq!(a.python.as_deref(), Some("python3.12"));
         assert_eq!(a.stats_interval, 1);
         assert_eq!(a.log_level, "debug");
         assert_eq!(a.redis_timeout, 7);
+    }
+
+    /// docs/CONFIGURATION.md states --print-plan needs no app and no Redis.
+    /// clap made -A unconditionally required, so the documented invocation
+    /// exited 2 on a usage error instead of printing the plan.
+    #[test]
+    fn print_plan_alone_needs_no_app() {
+        let a = Args::try_parse_from(["cauli-worker", "--print-plan"])
+            .expect("--print-plan must parse without -A");
+        assert!(a.print_plan);
+        assert_eq!(a.app, None);
+    }
+
+    /// The other half of the same contract: -A stays mandatory for every
+    /// invocation that will actually import an app and connect to Redis.
+    #[test]
+    fn app_is_still_required_without_print_plan() {
+        assert!(Args::try_parse_from(["cauli-worker", "-c", "50"]).is_err());
     }
 
     #[test]
     fn short_flags_match_celery_muscle_memory() {
         let a = Args::try_parse_from(["cauli-worker", "-A", "m:app", "-c", "50", "-Q", "high,low"])
             .unwrap();
-        assert_eq!(a.app, "m:app");
+        assert_eq!(a.app.as_deref(), Some("m:app"));
         assert_eq!(a.concurrency, Some(50));
         assert_eq!(a.queues, vec!["high", "low"]);
     }
@@ -370,6 +446,22 @@ mod tests {
                 cpu_workers: 6,
             }
         );
+    }
+
+    /// The standalone gate default of 256 is above every band this repo has
+    /// measured, and bench/RESULTS.md asked for the mismatch to be fixed or
+    /// loudly documented. It is documented, in the one place a tuning user
+    /// looks: `--help`. Deleting that text is a regression, so pin it.
+    #[test]
+    fn io_concurrency_long_help_carries_the_measured_band() {
+        use clap::CommandFactory;
+        let help = Args::command().render_long_help().to_string();
+        for token in ["--io-concurrency", "bench/RESULTS.md", "104", "128"] {
+            assert!(
+                help.contains(token),
+                "--io-concurrency long help lost {token}"
+            );
+        }
     }
 
     #[test]

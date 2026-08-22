@@ -40,6 +40,14 @@ measurement doesn't map to a claim below, it doesn't belong in this suite.
    discover (see chaos/ section of RESULTS.md: blast radius of a
    segfaulting ctypes call).
 
+5. **Real framework code (Django's ORM, SQLAlchemy's async ORM), not just a
+   raw driver call, still dispatches fast.** Every other I/O claim above
+   uses a raw psycopg3 call; production task bodies go through an ORM.
+   Measured: light single-row INSERT through Django's ORM (cauli sync vs
+   Celery prefork, matched config) and through SQLAlchemy 2.0's async ORM
+   (cauli async vs taskiq, matched config), both against the same raw-driver
+   baseline at the same worker config to isolate the ORM's own cost.
+
 ## What is explicitly NOT claimed
 
 - Priorities, chains, chords: not supported (see PROTOCOL.md §11), not

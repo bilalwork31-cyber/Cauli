@@ -15,7 +15,7 @@ import threading
 import time
 import uuid
 from datetime import datetime
-from typing import Any, Callable
+from typing import Any, Callable, Iterable, overload
 
 import redis
 
@@ -33,6 +33,10 @@ _DEFAULT_REDIS_URL = "redis://localhost:6379/0"
 # bound), so leaving it unset would make this client's hang behavior an
 # accident of whatever version happens to be installed rather than a decision.
 _DEFAULT_SOCKET_TIMEOUT = 5
+# Matches the Rust worker's --max-envelope-bytes default (worker/src/cli.rs).
+# The two are one setting in two places: the client refuses to write what the
+# worker would refuse to read.
+_DEFAULT_MAX_ENVELOPE_BYTES = 1_048_576
 _QUEUE_NAME_RE = re.compile(r"[a-zA-Z0-9_.-]+\Z")
 
 #: Wildcard key in :attr:`Cauli.queue_ttl` meaning "every queue without an
@@ -127,10 +131,52 @@ def _normalize_queue_ttl(queue_ttl: Any) -> dict[str, float]:
     return out
 
 
-def _dumps(obj: Any) -> "bytes | str":
-    # _codec rejects NaN/Infinity on both backends: they are not valid JSON
-    # and would poison the Rust-side parser; fail loudly at enqueue time
-    # instead. Returns bytes (msgspec) or str (stdlib); redis accepts both.
+#: Keyword options one :meth:`Cauli.enqueue_many` element may carry: the
+#: same set :meth:`cauli.task.TaskDef.apply_async` accepts, minus args/kwargs.
+_CALL_OPTIONS = ("countdown", "queue", "idempotency_key", "eta", "expires")
+
+
+def _normalize_call(
+    call: Any,
+) -> tuple[TaskDef, tuple[Any, ...], dict[str, Any], dict[str, Any]]:
+    """Normalize one :meth:`Cauli.enqueue_many` element.
+
+    Accepts a bare :class:`TaskDef` (called with no arguments) or a tuple (or
+    list) ``(task, args, kwargs, options)`` whose trailing parts may be
+    omitted. Returns ``(task, args, kwargs, options)``.
+    """
+    if isinstance(call, TaskDef):
+        return call, (), {}, {}
+    if not isinstance(call, (tuple, list)) or not call:
+        raise TypeError(
+            "enqueue_many element must be a TaskDef or a non-empty (task, args, "
+            f"kwargs, options) tuple, got {type(call).__name__}"
+        )
+    if len(call) > 4:
+        raise ValueError(
+            f"enqueue_many element has {len(call)} parts; the tuple form is "
+            "(task, args, kwargs, options), at most 4"
+        )
+    task, args, kwargs, options = list(call) + [None] * (4 - len(call))
+    if not isinstance(task, TaskDef):
+        raise TypeError(
+            "enqueue_many element must start with a registered task "
+            f"(@app.task), got {type(task).__name__}"
+        )
+    opts = dict(options or {})
+    unknown = sorted(set(opts) - set(_CALL_OPTIONS))
+    if unknown:
+        raise TypeError(
+            f"unknown enqueue_many option(s) {unknown} for task {task.name!r}; "
+            f"allowed: {list(_CALL_OPTIONS)}"
+        )
+    return task, tuple(args or ()), dict(kwargs or {}), opts
+
+
+def _dumps(obj: Any) -> bytes:
+    # _codec rejects NaN/Infinity: they are not valid JSON and would poison
+    # the Rust-side parser; fail loudly at enqueue time instead. Compact UTF-8
+    # bytes, so len() of the result is the wire size the worker measures.
     return _codec.encode(obj)
 
 
@@ -198,6 +244,8 @@ class Cauli:
         idemp_ttl: int = 86400,
         task_routes: Any = None,
         queue_ttl: Any = None,
+        redis_client: Any = None,
+        max_envelope_bytes: int = _DEFAULT_MAX_ENVELOPE_BYTES,
     ) -> None:
         # Resolution order: explicit arg > env CAULI_REDIS_URL > default.
         env_redis_url = os.environ.get("CAULI_REDIS_URL")
@@ -222,6 +270,14 @@ class Cauli:
             raise ValueError(f"idemp_ttl must be > 0 seconds, got {idemp_ttl!r}")
         self.result_ttl: int = result_ttl
         self.idemp_ttl: int = idemp_ttl
+        # The client half of the worker's --max-envelope-bytes (PROTOCOL.md
+        # section 2). Keep the two equal: the client then refuses to write
+        # exactly what the worker would refuse to read.
+        if max_envelope_bytes <= 0:
+            raise ValueError(
+                f"max_envelope_bytes must be > 0 bytes, got {max_envelope_bytes!r}"
+            )
+        self.max_envelope_bytes: int = int(max_envelope_bytes)
         # App-level routing rules (PROTOCOL.md section 9.3): pattern -> queue,
         # applied at enqueue time. They OVERRIDE a task's own decorator queue,
         # which is the point -- an operator re-routes without editing task code
@@ -244,8 +300,32 @@ class Cauli:
         self._before_task_hooks: list[Callable[[], Any]] = []
         self._after_task_hooks: list[Callable[[], Any]] = []
         self._process_init_hooks: list[Callable[[], Any]] = []
+        # Client injection. `redis_url` covers exactly what
+        # `redis.Redis.from_url` can parse, which is standalone only: a Sentinel
+        # set has no URL form redis-py accepts, and neither has a client that
+        # needs a custom retry policy, a TLS context, or a pool shared with the
+        # rest of the application. So accept a ready client, or a zero-arg
+        # factory returning one, and let the caller build it however redis-py
+        # wants:
+        #
+        #     sentinel = redis.sentinel.Sentinel([("h1", 26379), ("h2", 26379)])
+        #     app = Cauli(redis_client=lambda: sentinel.master_for("mymaster"))
+        #
+        # The FACTORY form is the useful one for Sentinel: it is called once,
+        # lazily, on first use, so importing the app module does not resolve the
+        # master. `redis_url` is still recorded (it is what an operator points
+        # the worker and `cauli-beat` at) but is not used to connect here.
+        self.redis_client: Any = redis_client
         self._redis: redis.Redis | None = None
         self._redis_lock = threading.Lock()
+
+    def _new_redis(self) -> redis.Redis:
+        """Build the client: the injected one (or its factory), else ``redis_url``."""
+        if self.redis_client is None:
+            return redis.Redis.from_url(
+                self.redis_url, socket_timeout=_DEFAULT_SOCKET_TIMEOUT
+            )
+        return self.redis_client() if callable(self.redis_client) else self.redis_client
 
     def _get_redis(self) -> redis.Redis:
         """Lazily create the redis-py client (no connection is made until first command).
@@ -257,9 +337,7 @@ class Cauli:
         if self._redis is None:
             with self._redis_lock:
                 if self._redis is None:
-                    self._redis = redis.Redis.from_url(
-                        self.redis_url, socket_timeout=_DEFAULT_SOCKET_TIMEOUT
-                    )
+                    self._redis = self._new_redis()
         return self._redis
 
     def before_task(self, fn: Callable[[], Any]) -> Callable[[], Any]:
@@ -303,6 +381,27 @@ class Cauli:
         self._process_init_hooks.append(fn)
         return fn
 
+    @overload
+    def task(self, _fn: Callable[..., Any]) -> TaskDef: ...
+
+    @overload
+    def task(
+        self,
+        _fn: None = ...,
+        *,
+        name: str | None = ...,
+        kind: str | None = ...,
+        queue: str | None = ...,
+        max_retries: int = ...,
+        timeout: float = ...,
+        soft_timeout: float | None = ...,
+        backoff_base: float = ...,
+        backoff_factor: float = ...,
+        backoff_max: float = ...,
+        jitter: bool = ...,
+        store_result: bool = ...,
+    ) -> Callable[[Callable[..., Any]], TaskDef]: ...
+
     def task(
         self,
         _fn: Callable[..., Any] | None = None,
@@ -324,6 +423,13 @@ class Cauli:
         Seconds-based options (timeout, soft_timeout, backoff_*) are converted
         to milliseconds on the TaskDef. ``kind=None`` means ``"io"``; ``"cpu"``
         must be explicit.
+
+        The two ``@overload``s above carry no runtime behaviour: they exist so
+        a type checker resolves ``@app.task`` to a :class:`TaskDef` and
+        ``@app.task(...)`` to a decorator returning one. With only the single
+        union return type below, every decorated name typed as
+        ``TaskDef | Callable`` and ``.delay()`` did not resolve on it -- in a
+        package that ships ``py.typed`` and so claims to be checkable.
         """
 
         def decorate(fn: Callable[..., Any]) -> TaskDef:
@@ -503,6 +609,9 @@ class Cauli:
         the registered :class:`TaskDef` when known; when it is not (a schedule
         entry naming a task this process has not imported), protocol defaults
         are used and the worker's registry still wins at execution time.
+
+        Raises ValueError when the computed fire time is already past the
+        envelope's expiry, since that task could only ever be discarded unrun.
         """
         if countdown is not None and eta is not None:
             raise ValueError(
@@ -528,6 +637,7 @@ class Cauli:
         if fire_at is not None and fire_at <= now:
             fire_at = None
 
+        queue_ttl_ms = self._queue_ttl_ms(queue_name)
         expires_at: int | None = None
         if expires is not None:
             if isinstance(expires, datetime):
@@ -541,16 +651,42 @@ class Cauli:
                     "expires must be seconds (number) or a timezone-aware datetime, "
                     f"got {type(expires).__name__}"
                 )
-        else:
-            ttl_ms = self._queue_ttl_ms(queue_name)
-            if ttl_ms is not None:
-                # Only a client-side DEFAULT, which is why it is in the `else`:
-                # an explicit `expires` is stamped as given and is never clamped
-                # here. The queue TTL is still a ceiling -- the worker takes the
-                # earlier of the two at dispatch (PROTOCOL.md section 9.2), so
-                # an over-long `expires` cannot outlive the queue's configured
-                # max age. Enforcing that is the worker's job, not the client's.
-                expires_at = now + ttl_ms
+        elif queue_ttl_ms is not None:
+            # Only a client-side DEFAULT, which is why it is in the `elif`:
+            # an explicit `expires` is stamped as given and is never clamped
+            # here. The queue TTL is still a ceiling -- the worker takes the
+            # earlier of the two at dispatch (PROTOCOL.md section 9.2), so
+            # an over-long `expires` cannot outlive the queue's configured
+            # max age. Enforcing that is the worker's job, not the client's.
+            expires_at = now + queue_ttl_ms
+
+        # Both halves of that deadline are measured from ENQUEUE, never from
+        # the due time (PROTOCOL.md section 9.2). So a countdown/eta landing
+        # past it describes a task that can never run: it waits out its delay
+        # in the zset, gets published on time, and is then discarded unrun at
+        # dispatch -- with nothing at all raised or logged at the call site.
+        # `Cauli(queue_ttl=300)` plus `countdown=600` is the whole trap, and
+        # an app-wide TTL makes it every delayed task in the application.
+        # Refuse at enqueue, where the caller can still see which of the two
+        # settings to move.
+        deadline = expires_at
+        if queue_ttl_ms is not None:
+            ttl_deadline = now + queue_ttl_ms
+            deadline = ttl_deadline if deadline is None else min(deadline, ttl_deadline)
+        if not_before is not None and deadline is not None and not_before > deadline:
+            sources = []
+            if expires is not None:
+                sources.append(f"expires={expires!r}")
+            if queue_ttl_ms is not None:
+                sources.append(f"queue_ttl {queue_ttl_ms / 1000:g}s on {queue_name!r}")
+            raise ValueError(
+                f"task {task_name!r} would fire {(not_before - deadline) / 1000:g}s "
+                f"after it expires, so a worker would discard it unrun. Its "
+                f"expiry is measured from enqueue, not from the due time "
+                f"(PROTOCOL.md section 9.2): {' and '.join(sources)} versus a "
+                f"delay of {(not_before - now) / 1000:g}s. Raise the expiry "
+                "above the delay, or enqueue the task nearer to when it is due."
+            )
 
         envelope: dict[str, Any] = {
             "v": 1,
@@ -606,15 +742,248 @@ class Cauli:
             eta=eta,
             expires=expires,
         )
-        client = self._get_redis()
-        if fire_at is not None:
-            client.zadd(f"cauli:delayed:{queue_name}", {_dumps(envelope): fire_at})
-        else:
-            client.xadd(f"cauli:q:{queue_name}", {"e": _dumps(envelope)})
+        raw = self._encode_envelope(envelope)
+        self._publish(self._get_redis(), raw, queue_name, fire_at)
         return AsyncResult(envelope["id"], self)
+
+    def enqueue_many(
+        self, calls: Iterable["TaskDef | tuple[Any, ...]"]
+    ) -> list[AsyncResult]:
+        """Enqueue a batch of calls in ONE pipelined round trip.
+
+        ``calls`` is an iterable of either a bare task (called with no
+        arguments) or a tuple ``(task, args, kwargs, options)`` whose trailing
+        parts may be omitted. ``options`` is a mapping of the same keywords
+        :meth:`~cauli.task.TaskDef.apply_async` takes (``countdown``,
+        ``queue``, ``idempotency_key``, ``eta``, ``expires``)::
+
+            app.enqueue_many([
+                (send_email, ("a@example.com",)),
+                (send_email, ("b@example.com",), {"template": "welcome"}),
+                (rebuild, (), {}, {"countdown": 30, "queue": "slow"}),
+            ])
+
+        Each call still goes through :meth:`make_envelope`, so routing, queue
+        TTL and expiry behave exactly as they do for ``.delay()``; what changes
+        is that the N writes leave in one batch instead of paying N round
+        trips. Delayed and immediate calls may be mixed freely.
+
+        Every call is validated and encoded BEFORE anything is written, so a
+        bad one (unknown option, unencodable argument, oversize envelope)
+        raises with nothing published. The pipeline is deliberately NOT a
+        transaction: it is one batched write, not an atomic one, so a Redis
+        failure part way through can still leave earlier entries published.
+
+        Returns one :class:`~cauli.result.AsyncResult` per call, in order.
+        """
+        prepared = self._prepare_many(calls)
+        if not prepared:
+            return []
+        with self._get_redis().pipeline(transaction=False) as pipe:
+            for _task_id, raw, queue_name, fire_at in prepared:
+                self._publish(pipe, raw, queue_name, fire_at)
+            pipe.execute()
+        return [AsyncResult(task_id, self) for task_id, _raw, _q, _f in prepared]
+
+    def _prepare_many(
+        self, calls: Iterable["TaskDef | tuple[Any, ...]"]
+    ) -> list[tuple[str, bytes, str, int | None]]:
+        """Validate and encode a batch into ``(id, raw, queue, fire_at)`` rows.
+
+        Shared by the sync and the asyncio batch paths so both build identical
+        envelopes, and kept separate from the write so the whole batch is known
+        good before the first byte goes out.
+        """
+        prepared: list[tuple[str, bytes, str, int | None]] = []
+        for call in calls:
+            task, args, kwargs, options = _normalize_call(call)
+            task._check_signature(args, kwargs)
+            envelope, queue_name, fire_at = self.make_envelope(
+                task.name,
+                args,
+                kwargs,
+                task=task,
+                queue=options.get("queue"),
+                idempotency_key=options.get("idempotency_key"),
+                countdown=options.get("countdown"),
+                eta=options.get("eta"),
+                expires=options.get("expires"),
+            )
+            prepared.append(
+                (envelope["id"], self._encode_envelope(envelope), queue_name, fire_at)
+            )
+        return prepared
+
+    def _encode_envelope(self, envelope: dict[str, Any]) -> bytes:
+        """Encode one envelope for the wire, refusing an oversize payload.
+
+        A worker discards an entry bigger than its ``--max-envelope-bytes``
+        BEFORE parsing it, so it never learns the task id, never writes
+        ``cauli:result:{id}``, and an :meth:`~cauli.result.AsyncResult.get`
+        with no timeout polls forever. Refusing at the call site turns that
+        silent hang into an exception on the line that built the payload.
+        """
+        raw = _dumps(envelope)
+        if len(raw) > self.max_envelope_bytes:
+            raise ValueError(
+                f"task {envelope['task']!r} envelope is {len(raw)} bytes, over "
+                f"the {self.max_envelope_bytes} byte limit set by "
+                "Cauli(max_envelope_bytes=...), which must match the worker's "
+                "--max-envelope-bytes. A worker discards an oversize entry "
+                "before parsing it, so it would never write a result and "
+                ".get() would wait forever. Pass a reference (an object key, a "
+                "row id) instead of the payload itself, or raise both limits."
+            )
+        return raw
+
+    @staticmethod
+    def _publish(client: Any, raw: bytes, queue: str, fire_at: int | None) -> Any:
+        """Issue the ONE Redis write an enqueue makes, and return whatever the
+        client returns. ``raw`` is an envelope already encoded, and size
+        checked, by :meth:`_encode_envelope`.
+
+        Shared verbatim by the sync and the asyncio paths: redis-py's asyncio
+        client exposes the same method names, so the async half awaits this
+        return value instead of calling it. Keeping the key names and the
+        delayed/immediate decision in one place is the point -- the two paths
+        must put byte-identical envelopes in identical keys or the worker sees
+        two different protocols.
+        """
+        if fire_at is not None:
+            return client.zadd(f"cauli:delayed:{queue}", {raw: fire_at})
+        return client.xadd(f"cauli:q:{queue}", {"e": raw})
 
     def __repr__(self) -> str:
         return (
-            f"<Cauli default_queue={self.default_queue!r} "
+            f"<{type(self).__name__} default_queue={self.default_queue!r} "
             f"tasks={len(self._tasks)} redis_url={_redact_redis_url(self.redis_url)!r}>"
         )
+
+
+class AsyncCauli(Cauli):
+    """A :class:`Cauli` that can also enqueue from a running event loop.
+
+    Everything a plain ``Cauli`` does it still does: the same ``@app.task``
+    registry, the same routing, the same ``make_envelope``, the same blocking
+    ``.delay()``. What it adds is a second client built on ``redis.asyncio``
+    and the ``a``-prefixed calls that use it::
+
+        app = AsyncCauli(redis_url="redis://localhost:6379/0")
+
+        @app.task
+        async def send_email(to: str) -> None: ...
+
+        @router.post("/signup")
+        async def signup(...):
+            result = await send_email.adelay("a@example.com")
+            return {"task_id": result.id}
+
+    Without this, an enqueue from an ``async def`` handler blocks the loop
+    thread for a full Redis round trip -- and for up to ``socket_timeout``
+    seconds when Redis degrades, which stalls every other request that loop is
+    serving, not just this one.
+
+    The envelope written is byte-for-byte what ``.delay()`` writes: the async
+    path reuses :meth:`make_envelope` and :meth:`_publish` unchanged, so there
+    is no second wire format to keep in step.
+
+    The asyncio client is created lazily and cached, and redis-py binds its
+    connections to the loop that first uses them. So use one ``AsyncCauli`` per
+    event loop, and call ``await app.aclose()`` at shutdown (FastAPI's lifespan
+    handler is the natural place) to close the pool.
+    """
+
+    def __init__(
+        self, *args: Any, async_redis_client: Any = None, **kwargs: Any
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        # The asyncio twin of ``redis_client``: a ready ``redis.asyncio.Redis``
+        # or a zero-arg factory returning one. Same reason it exists -- a
+        # Sentinel set, a TLS context or a shared pool has no URL form.
+        self.async_redis_client: Any = async_redis_client
+        self._aredis: Any = None
+
+    def _new_async_redis(self) -> Any:
+        # Imported here, not at module scope: the worker's embedded interpreter
+        # imports this module on every start and does not enqueue, so it should
+        # not pay for redis.asyncio (and asyncio itself) to be imported.
+        from redis import asyncio as aioredis
+
+        if self.async_redis_client is None:
+            return aioredis.Redis.from_url(
+                self.redis_url, socket_timeout=_DEFAULT_SOCKET_TIMEOUT
+            )
+        supplied = self.async_redis_client
+        return supplied() if callable(supplied) else supplied
+
+    def _get_async_redis(self) -> Any:
+        """The cached ``redis.asyncio`` client. Creating it opens no connection.
+
+        Guarded by the SAME threading lock as the sync client rather than an
+        ``asyncio.Lock``: an asyncio lock binds to the first loop that awaits
+        it, which would make a second ``asyncio.run()`` in the same process
+        fail on a lock that has nothing to do with the task at hand. Building
+        the client object does no I/O, so a plain lock costs nothing here.
+        """
+        if self._aredis is None:
+            with self._redis_lock:
+                if self._aredis is None:
+                    self._aredis = self._new_async_redis()
+        return self._aredis
+
+    async def _aenqueue(
+        self,
+        task: TaskDef,
+        args: tuple[Any, ...],
+        kwargs: dict[str, Any] | None,
+        countdown: float | None = None,
+        queue: str | None = None,
+        idempotency_key: str | None = None,
+        eta: "datetime | None" = None,
+        expires: "float | datetime | None" = None,
+    ) -> AsyncResult:
+        """The asyncio mirror of :meth:`_enqueue`; identical envelope and keys."""
+        envelope, queue_name, fire_at = self.make_envelope(
+            task.name,
+            args,
+            kwargs,
+            task=task,
+            queue=queue,
+            idempotency_key=idempotency_key,
+            countdown=countdown,
+            eta=eta,
+            expires=expires,
+        )
+        raw = self._encode_envelope(envelope)
+        await self._publish(self._get_async_redis(), raw, queue_name, fire_at)
+        return AsyncResult(envelope["id"], self)
+
+    async def aenqueue_many(
+        self, calls: Iterable["TaskDef | tuple[Any, ...]"]
+    ) -> list[AsyncResult]:
+        """The asyncio mirror of :meth:`Cauli.enqueue_many`: same call shapes,
+        same envelopes, same single pipelined round trip."""
+        prepared = self._prepare_many(calls)
+        if not prepared:
+            return []
+        async with self._get_async_redis().pipeline(transaction=False) as pipe:
+            for _task_id, raw, queue_name, fire_at in prepared:
+                # NOT awaited: a buffered pipeline command returns the pipeline
+                # itself on both clients. Only execute() is a coroutine here.
+                self._publish(pipe, raw, queue_name, fire_at)
+            await pipe.execute()
+        return [AsyncResult(task_id, self) for task_id, _raw, _q, _f in prepared]
+
+    async def aclose(self) -> None:
+        """Close the asyncio client and its pool. Safe to call more than once.
+
+        Does NOT touch the sync client: that one has its own lifetime and is
+        not bound to any event loop.
+        """
+        client, self._aredis = self._aredis, None
+        if client is None:
+            return
+        # redis-py renamed the coroutine to `aclose()` in 5.0.1 and deprecated
+        # `close()`; pyproject pins only `redis>=5`, so accept either.
+        closer = getattr(client, "aclose", None) or client.close
+        await closer()

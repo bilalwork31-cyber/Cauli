@@ -45,6 +45,7 @@ import importlib
 import os
 import queue
 import random
+import re
 import signal
 import socket
 import sys
@@ -54,10 +55,18 @@ import traceback
 from typing import Any, TextIO
 
 from cauli import _codec
+from cauli._context import make_context, reset_current_task, set_current_task
 from cauli._hooks import run_hooks
 from cauli.exceptions import SoftTimeLimitExceeded
 
 _TRACEBACK_CAP = 8192  # max chars of formatted traceback kept in error JSON (section 8)
+
+# The cpu lane's wire id is "{envelope id}.{hex sequence}" (worker/src/exec.rs
+# builds it so one envelope's retries stay distinguishable on the child's
+# multiplexed connection). cauli.current_task() must report the bare envelope
+# id -- the one the enqueuing side holds as AsyncResult.id -- so the suffix is
+# stripped, and only when the tail really is that generated hex counter.
+_WIRE_SUFFIX_RE = re.compile(r"\.[0-9a-f]+\Z")
 
 _set_async_exc = ctypes.pythonapi.PyThreadState_SetAsyncExc
 
@@ -186,6 +195,72 @@ class _SoftTimeoutWatchdog:
         _set_async_exc(ctypes.c_ulong(tid), ctypes.py_object(SoftTimeLimitExceeded))
 
 
+async def _run_hooks_async(hooks: Any, where: str) -> None:
+    """:func:`cauli._hooks.run_hooks` for a coroutine context.
+
+    A hook may return an awaitable (the Django contrib's
+    ``close_old_connections`` hook does, via ``sync_to_async(...,
+    thread_sensitive=True)``, so the cleanup lands on the very thread
+    asgiref runs the task's sync ORM work in); it is awaited on the loop
+    thread. Sync hooks behave exactly as on the other paths, and a raising
+    hook is still reported and skipped. Mirrors worker/src/shim.py's
+    ``_run_hooks_async`` on the io async lane -- kept local to this module
+    rather than in ``cauli._hooks`` for the same reason the shim carries its
+    own copy: the sync helper must stay importable with no asyncio context.
+    """
+    for hook in hooks:
+        try:
+            r = hook()
+            if r is not None and hasattr(r, "__await__"):
+                await r
+        except Exception:
+            print(f"cauli: {where} hook {hook!r} raised (ignored):", file=sys.stderr)
+            traceback.print_exc()
+
+
+async def _run_async_task(
+    app: Any,
+    task: Any,
+    args: Any,
+    kwargs: Any,
+    soft_timeout_ms: Any,
+    watchdog: _SoftTimeoutWatchdog | None,
+    use_alarm: bool,
+) -> Any:
+    """Run one ``async def`` cpu task with its hooks INSIDE the event loop.
+
+    An async task's body runs under ``asyncio.run``, so its before/after
+    hooks have to run there too: a hook that branches on
+    ``asyncio.get_running_loop()`` (the Django contrib's does) would
+    otherwise take its sync branch on this thread while the body's
+    thread-sensitive ORM work executes on asgiref's executor thread, and
+    Django connections are thread-local -- the connection the body opened
+    would be closed by neither hook. Same shape as the io async lane in
+    worker/src/shim.py.
+
+    The soft timeout is armed after the before hooks and disarmed before the
+    after hooks, exactly as on the sync path: hook time is not charged
+    against the task's soft budget and an injection cannot land in a hook.
+    ``asyncio.run`` executes on the calling thread, so both the SIGALRM and
+    the watchdog scheme still target the right thread.
+    """
+    await _run_hooks_async(getattr(app, "_before_task_hooks", ()), "before_task")
+    try:
+        if use_alarm:
+            signal.setitimer(signal.ITIMER_REAL, float(soft_timeout_ms) / 1000.0)
+        elif watchdog is not None:
+            watchdog.arm(float(soft_timeout_ms))
+        try:
+            return await task.fn(*args, **kwargs)
+        finally:
+            if use_alarm:
+                signal.setitimer(signal.ITIMER_REAL, 0.0)
+            elif watchdog is not None:
+                watchdog.disarm()
+    finally:
+        await _run_hooks_async(getattr(app, "_after_task_hooks", ()), "after_task")
+
+
 def _execute(
     app: Any, request: dict[str, Any], watchdog: _SoftTimeoutWatchdog | None = None
 ) -> dict[str, Any]:
@@ -196,6 +271,14 @@ def _execute(
     """
     request_id = request.get("id")
     task_name = request.get("task")
+    # The bare envelope id for cauli.current_task(): `request_id` carries the
+    # per-attempt wire suffix the worker adds (`{envelope id}.{seq}`,
+    # worker/src/exec.rs) and must keep it in every response, but a task that
+    # asks for its own id has to get back the id the caller holds as
+    # AsyncResult.id.
+    bare_id = request_id
+    if isinstance(bare_id, str):
+        bare_id = _WIRE_SUFFIX_RE.sub("", bare_id)
     args = request.get("args") or []
     kwargs = request.get("kwargs") or {}
     soft_timeout_ms = request.get("soft_timeout_ms")
@@ -229,23 +312,47 @@ def _execute(
     # against the task's soft budget, and an injection cannot land inside a
     # hook); after hooks run in the outer finally, after the disarm, on every
     # outcome path (success, task exception, forced retry).
-    run_hooks(getattr(app, "_before_task_hooks", ()), "before_task")
+    #
+    # cauli.current_task() is installed first, so the hooks see the same id the
+    # task body will, and released in that same outer finally: a cpu child
+    # reuses its worker threads across requests, and a leaked context would
+    # show the next task on the thread the previous task's id.
+    #
+    # An `async def` cpu task takes both hook phases into `_run_async_task`
+    # instead, so they run on the event loop the body runs on (a hook that
+    # branches on a running loop must see the same answer the body would).
+    is_async = bool(getattr(task, "is_async", False))
+    ctx_token = set_current_task(make_context(request, task_id=bare_id))
     try:
+        if not is_async:
+            run_hooks(getattr(app, "_before_task_hooks", ()), "before_task")
         try:
-            if use_alarm:
-                signal.setitimer(signal.ITIMER_REAL, float(soft_timeout_ms) / 1000.0)
-            elif use_watchdog:
-                watchdog.arm(float(soft_timeout_ms))
-            try:
-                if task.is_async:
-                    result = asyncio.run(task.fn(*args, **kwargs))
-                else:
-                    result = task.fn(*args, **kwargs)
-            finally:
+            if is_async:
+                result = asyncio.run(
+                    _run_async_task(
+                        app,
+                        task,
+                        args,
+                        kwargs,
+                        soft_timeout_ms,
+                        watchdog if use_watchdog else None,
+                        use_alarm,
+                    )
+                )
+            else:
                 if use_alarm:
-                    signal.setitimer(signal.ITIMER_REAL, 0.0)
+                    signal.setitimer(
+                        signal.ITIMER_REAL, float(soft_timeout_ms) / 1000.0
+                    )
                 elif use_watchdog:
-                    watchdog.disarm()
+                    watchdog.arm(float(soft_timeout_ms))
+                try:
+                    result = task.fn(*args, **kwargs)
+                finally:
+                    if use_alarm:
+                        signal.setitimer(signal.ITIMER_REAL, 0.0)
+                    elif use_watchdog:
+                        watchdog.disarm()
         except BaseException as exc:  # the child must never crash on task errors
             if _is_retry(exc):
                 cd = getattr(exc, "countdown", None)
@@ -273,7 +380,9 @@ def _execute(
             }
         return {"id": request_id, "ok": True, "result": result}
     finally:
-        run_hooks(getattr(app, "_after_task_hooks", ()), "after_task")
+        if not is_async:
+            run_hooks(getattr(app, "_after_task_hooks", ()), "after_task")
+        reset_current_task(ctx_token)
 
 
 def _handle_request_line(
@@ -588,8 +697,15 @@ def _safe_handle_and_respond(
         resp = {"id": rid, "ok": False, "retryable": True, "error": _error_json(exc)}
     try:
         writer.write_response(resp)
-    except BaseException:
-        pass  # connection likely gone; the caller's read-EOF check ends serving
+    except BaseException as exc:
+        # Connection likely gone; the caller's read-EOF check ends serving.
+        # Not silent, though: a response lost here is a task the worker will
+        # only learn about when its own hard timeout fires, so say which one
+        # and why on stderr (the child's passthrough logging channel).
+        _log(
+            "cauli._exec: response write failed for request "
+            f"{resp.get('id')!r}: {exc!r}"
+        )
     if watchdog is not None:
         # Belt-and-suspenders: make sure this thread's generation has moved
         # on before it picks up another request, even on the exception path

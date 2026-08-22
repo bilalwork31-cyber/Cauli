@@ -3,7 +3,7 @@
 
 use crate::ctx::{parse_pyresp, Ctx, DecrGuard, Outcome};
 use crate::envelope::{Envelope, ErrorJson};
-use crate::pyrt::SyncJob;
+use crate::pyrt::{SyncJob, TaskMeta};
 use serde::Serialize;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -35,6 +35,18 @@ fn fail(type_: &str, msg: String) -> Outcome {
     }
 }
 
+/// What the io lanes hand to the shim so a task can read `cauli.current_task()`
+/// (py/cauli/_context.py). Two short string clones per task, against args and
+/// kwargs trees that are already cloned whole on both of these paths.
+fn task_meta(env: &Envelope) -> TaskMeta {
+    TaskMeta {
+        id: env.id.clone(),
+        retries: env.retries,
+        max_retries: env.max_retries,
+        queue: env.queue.clone(),
+    }
+}
+
 /// Sync io task on the dedicated OS thread pool. Soft timeout is injected by
 /// the shim watchdog (PyThreadState_SetAsyncExc). Hard timeout cannot kill a
 /// thread: we mark the task failed (retry path), abandon the thread result,
@@ -52,6 +64,7 @@ pub async fn run_sync_task(ctx: &Arc<Ctx>, env: &Envelope) -> Outcome {
     let _dec = DecrGuard(&ctx.counters.inflight_io); // panic-safe: MEM-3
 
     let (tx, rx) = oneshot::channel();
+    let (started_tx, started_rx) = oneshot::channel();
     if ctx
         .sync_pool
         .submit(SyncJob {
@@ -61,6 +74,8 @@ pub async fn run_sync_task(ctx: &Arc<Ctx>, env: &Envelope) -> Outcome {
             args: env.args_ref().clone(),
             kwargs: env.kwargs_ref().clone(),
             soft_timeout_ms: env.soft_timeout_ms,
+            meta: Some(Box::new(task_meta(env))),
+            started: started_tx,
             resp: tx,
         })
         .is_err()
@@ -74,10 +89,50 @@ pub async fn run_sync_task(ctx: &Arc<Ctx>, env: &Envelope) -> Outcome {
         );
     }
 
+    // Two phase, deliberately. The pool queue and the io gate are sized
+    // independently (`--io-threads` against `--io-concurrency`: 64 against
+    // 256 on the standalone defaults), so a submitted job can sit in the
+    // channel with no thread behind it. Charging that wait against
+    // `timeout_ms` stole the task's own budget, and the single timeout arm
+    // could not tell a queued job from a running one: it called
+    // `report_hard_timeout()`, counted a `sync_abandoned`, spawned a
+    // replacement thread and logged "abandoning thread result" for a job
+    // that had never left the queue.
+    //
+    // Phase one waits for a pool thread to pick the job up. Its budget is
+    // the task's own `timeout_ms` as well, but nothing is charged to the
+    // task for it: a job that cannot even reach a thread within that window
+    // means the pool is oversubscribed far past capacity, and failing it as
+    // retryable is both true and useful. Dropping `rx` on the way out flips
+    // `job.resp` closed, so the pool skips the job rather than running it
+    // late as a zombie (see pyrt::SyncPool's worker loop).
+    let queue_budget = Duration::from_millis(env.timeout_ms);
+    match timeout(queue_budget, started_rx).await {
+        Ok(Ok(())) => {}
+        Ok(Err(_)) => {
+            return fail("WorkerLost", "sync executor thread vanished".into());
+        }
+        Err(_) => {
+            warn!(
+                task = %env.task, id = %env.id, waited_ms = env.timeout_ms,
+                "sync task never reached a pool thread; every io thread is busy \
+                 (--io-threads is below the --io-concurrency gate). Not a wedged \
+                 thread: nothing was abandoned and no replacement is needed"
+            );
+            return fail(
+                "WorkerLost",
+                format!(
+                    "sync pool queue wait exceeded {}ms with no free io thread",
+                    env.timeout_ms
+                ),
+            );
+        }
+    }
+
     // Latency span, identical in all three lanes: from the job leaving this
-    // task to the outcome coming back. It starts after the handoff so it
-    // never charges a lane for pool startup or for backlog parking, both of
-    // which already have their own fields.
+    // task to the outcome coming back. It starts when a pool thread commits
+    // to the job so it never charges a lane for pool startup or for backlog
+    // parking, both of which already have their own fields.
     let started = Instant::now();
     let outcome = match timeout(Duration::from_millis(env.timeout_ms), rx).await {
         // Already a normalized Outcome: the shim returned a Python object and
@@ -85,11 +140,9 @@ pub async fn run_sync_task(ctx: &Arc<Ctx>, env: &Envelope) -> Outcome {
         Ok(Ok(outcome)) => outcome,
         Ok(Err(_)) => fail("WorkerLost", "sync executor thread vanished".into()),
         Err(_) => {
-            // `rx` is dropped right here (the timeout()'s inner future is
-            // discarded once it loses the race), which flips job.resp closed
-            // for the pool thread side. If the job is still queued (never
-            // dequeued), the pool skips it instead of running it late as a
-            // zombie (see pyrt::SyncPool's worker loop).
+            // A thread really did take this job and really has not answered
+            // within its own budget, so the abandon-and-replace path is the
+            // right one here (and only here).
             ctx.sync_pool.report_hard_timeout();
             warn!(
                 task = %env.task, id = %env.id,
@@ -106,9 +159,10 @@ pub async fn run_sync_task(ctx: &Arc<Ctx>, env: &Envelope) -> Outcome {
     outcome
 }
 
-/// Async io task on an embedded asyncio loop; the shim wraps it in
-/// asyncio.wait_for(effective_s) per §4.6. A Rust-side backstop timeout
-/// (hard + grace) guards against a wedged loop thread.
+/// Async io task on an embedded asyncio loop. The shim enforces the soft
+/// deadline first (SoftTimeLimitExceeded) and the hard one behind it per
+/// §4.6; a Rust-side backstop timeout (hard + grace) guards against a wedged
+/// loop thread that never answers at all.
 pub async fn run_async_task(ctx: &Arc<Ctx>, env: &Envelope) -> Outcome {
     let _permit = ctx
         .io_sem
@@ -119,15 +173,23 @@ pub async fn run_async_task(ctx: &Arc<Ctx>, env: &Envelope) -> Outcome {
     ctx.counters.inflight_io.fetch_add(1, Ordering::Relaxed);
     let _dec = DecrGuard(&ctx.counters.inflight_io); // panic-safe: MEM-3
 
-    let effective_s = env.effective_async_timeout_s();
+    // BOTH deadlines cross, not their min: the shim raises
+    // SoftTimeLimitExceeded at `soft_s` and keeps `hard_s` as the backstop
+    // (envelope::async_timeouts_s).
+    let (soft_s, hard_s) = env.async_timeouts_s();
     // Queued to the dedicated submitter thread: no GIL from here, no
     // spawn_blocking. Args cross as parsed values and become Python objects
     // inside the batch submit; no JSON text is produced on this path. A
     // Python-side submit failure comes back through the oneshot as a normal
     // retryable outcome (pyrt::submit_batch_under_gil).
-    let (token, rx) =
-        ctx.pyrt
-            .queue_submit(&env.task, env.args_ref(), env.kwargs_ref(), effective_s);
+    let (token, rx) = ctx.pyrt.queue_submit(
+        &env.task,
+        env.args_ref(),
+        env.kwargs_ref(),
+        hard_s,
+        soft_s,
+        Some(task_meta(env)),
+    );
     // saturating_add: H3 — an attacker-chosen timeout_ms near u64::MAX must
     // not wrap this backstop to a near-zero duration (spurious
     // TimeLimitExceeded).
@@ -192,6 +254,27 @@ pub async fn run_cpu_task(ctx: &Arc<Ctx>, env: &Envelope) -> Outcome {
         resp: tx,
     };
     let cpu = ctx.cpu_pool().await;
+    // Admission slot first, and held until the outcome comes back. Without
+    // it the cpu lane had no gate at all: `io_sem` stayed full, the fetch
+    // loop's bound did nothing, and entries parked in the backlog channel
+    // and in each child's staged queue with their PEL idle clocks running
+    // from delivery -- long enough to be reclaimed and, after
+    // `redelivery_limit` reclaims, dead lettered as
+    // `RedeliveryLimitExceeded` without having executed once. Waiting for a
+    // slot counts into `overflow`, the same signal a full backlog raises, so
+    // the fetch loop and the recovery loop's admission gate both pause.
+    let _slot = match cpu.admission.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            cpu.overflow.fetch_add(1, Ordering::SeqCst);
+            let permit = cpu.admission.clone().acquire_owned().await;
+            cpu.overflow.fetch_sub(1, Ordering::SeqCst);
+            match permit {
+                Ok(p) => p,
+                Err(_) => return fail("WorkerLost", "cpu pool closed".into()),
+            }
+        }
+    };
     match cpu.tx.try_send(job) {
         Ok(()) => {}
         Err(async_channel::TrySendError::Full(job)) => {
