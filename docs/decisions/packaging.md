@@ -52,7 +52,7 @@ pull it in.
 | uv managed Python | ok | **loader error** |
 | conda | ok | **loader error**, and the README wrongly lists conda as qualifying |
 | pyenv default | ok | **loader error**, README does warn |
-| Alpine or musl, glibc below 2.28, macOS, Windows | pip rejects | clear and pre deploy |
+| Alpine or musl, glibc below 2.35, macOS, Windows | pip rejects | clear and pre deploy |
 
 Recommended fix, which closes two findings at once: a small Python entry point wrapper that sets
 `LD_LIBRARY_PATH` from `sysconfig.get_config_var("LIBDIR")` and `VIRTUAL_ENV` from `sys.prefix`, then
@@ -76,7 +76,7 @@ append "is VIRTUAL_ENV set?" to that error.
 Linux only is real and enforced by construction: `libc::prctl(PR_SET_PDEATHSIG)` is unconditional in
 both cpu.rs and supervisor.rs and will not compile elsewhere. But README line 41, "building from
 source has no such constraint", reads as cross platform when it only means the glibc constraint.
-Source builds are still Linux only. The glibc 2.28 claim is accurate. Alpine users learn at install
+Source builds are still Linux only. The glibc 2.35 claim is accurate. Alpine users learn at install
 time from pip, which is acceptable, but the README never says musl requires a source build.
 
 Version coupling gap worth noting: the dead letter reason for an unsupported protocol version is

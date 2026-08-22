@@ -1663,7 +1663,7 @@ construction rather than by configuration. pip places the binary in that venv's 
 loader resolves that venv's `libpython`, and `shim.py` reads `VIRTUAL_ENV` for site-packages
 (§6). The three cannot disagree.
 
-Requirements: Linux on x86_64 or aarch64, glibc 2.28 or newer, and a CPython configured with
+Requirements: Linux on x86_64 or aarch64, glibc 2.35 or newer, and a CPython configured with
 `--enable-shared`. python.org builds, the Docker `python:*` images, Debian/Ubuntu/Fedora system
 packages and actions/setup-python all qualify; `pyenv` does not unless rebuilt with
 `PYTHON_CONFIGURE_OPTS="--enable-shared"`, and neither does conda, where the wheel installs and

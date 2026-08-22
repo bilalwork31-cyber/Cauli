@@ -7,7 +7,7 @@ alongside it.
 
 Three things to settle before anything else, because each one is a hard stop:
 
-1. **The worker is Linux only.** Prebuilt wheels cover glibc 2.28 or newer on
+1. **The worker is Linux only.** Prebuilt wheels cover glibc 2.35 or newer on
    x86_64 and aarch64, CPython 3.10 through 3.14. macOS and Windows can
    enqueue and can run `cauli-beat`, but cannot run tasks. musl (Alpine) and
    the free threaded build have no wheel and fail the install.

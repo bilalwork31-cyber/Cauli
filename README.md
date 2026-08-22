@@ -57,7 +57,7 @@ and pip puts it on PATH inside your virtualenv. No Rust toolchain, no cargo,
 no compiler, no second step. Check it with `cauli-worker --print-plan`, which
 needs no Redis and no app.
 
-Worker wheels cover Linux on x86_64 and aarch64, glibc 2.28 or newer, CPython
+Worker wheels cover Linux on x86_64 and aarch64, glibc 2.35 or newer, CPython
 3.10 through 3.14, on an interpreter built with `--enable-shared` (python.org,
 the Docker `python:*` images, distro packages, uv). musl (Alpine), conda and
 the free threaded build have no worker wheel.
