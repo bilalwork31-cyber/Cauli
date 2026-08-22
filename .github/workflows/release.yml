@@ -29,10 +29,24 @@ on:
 permissions:
   contents: read
 
-env:
-  # Oldest glibc the worker wheels target: manylinux_2_28 is RHEL 8, Debian 10
-  # and Ubuntu 20.04 or newer.
-  MANYLINUX: "2_28"
+# Oldest glibc the worker wheels target: 2.35, which is Ubuntu 22.04, Debian
+# 12 and RHEL 9 or newer, and every current python:3.x-slim image.
+#
+# The floor is set by the RUNNER each wheel is built on, not by a manylinux
+# container, because those two requirements are in direct conflict here. The
+# worker embeds CPython and must link it dynamically, and the manylinux_2_28
+# images ship a CPython with no shared libpython, so pyo3 refuses to build
+# against them:
+#
+#   error: The `auto-initialize` feature is enabled, but your python
+#   installation only supports embedding the Python interpreter statically.
+#
+# That is not theoretical. It failed every run from 2026-07-29 onward, so no
+# worker wheel was ever produced. A 2.28 floor that cannot build is worth
+# less than a 2.35 floor that ships, and Ubuntu 20.04 and RHEL 8 are past the
+# point where a new async Python worker needs to target them. Lowering the
+# floor again means finding a build environment that has BOTH an old glibc
+# and a shared CPython, for every version in the matrix.
 
 # The supported CPython list is spelled out in the `worker`, `verify` and
 # `verify-bare` matrices below rather than once here, because GitHub does not
@@ -74,20 +88,39 @@ jobs:
   worker:
     name: cauli-worker (${{ matrix.target }}, cp${{ matrix.python }})
     needs: version
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
         target: [x86_64, aarch64]
         python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        include:
+          - target: x86_64
+            runner: ubuntu-22.04
+          - target: aarch64
+            runner: ubuntu-22.04-arm
     steps:
       - uses: actions/checkout@v4
 
+      # The interpreter the worker will embed. setup-python ships CPython
+      # built with --enable-shared, which is the property the manylinux
+      # images lack and the readelf assertion below depends on.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      # Native build per architecture rather than a cross container, for the
+      # same reason: a cross image would put a static CPython back in the way.
       - uses: PyO3/maturin-action@v1
         with:
           working-directory: worker
           target: ${{ matrix.target }}
-          manylinux: ${{ env.MANYLINUX }}
+          # container off builds on the runner itself, where CPython is
+          # shared. manylinux auto still tags the wheel by the glibc the
+          # binary actually needs, so it uploads as manylinux_2_35_* rather
+          # than a bare linux_* tag, which PyPI refuses.
+          container: off
+          manylinux: auto
           args: >-
             --release --out dist
             --interpreter python${{ matrix.python }}

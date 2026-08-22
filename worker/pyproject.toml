@@ -7,7 +7,7 @@
 # something that dies at exec time with a linker error.
 #
 # A wheel is the one packaging format whose tags express exactly that
-# constraint: `cp312-cp312-manylinux_2_28_x86_64` means "this binary needs
+# constraint: `cp312-cp312-manylinux_2_35_x86_64` means "this binary needs
 # CPython 3.12 on that platform", and pip refuses to install it anywhere else.
 # Installing it into the user's virtualenv also settles "which interpreter does
 # the worker embed" by construction -- pip puts the binary in the venv's own

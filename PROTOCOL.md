@@ -1637,7 +1637,7 @@ Two artifacts per release, published together and versioned in lockstep.
 | Package | Contents | Wheel tag |
 |---|---|---|
 | `cauli` | the pure-Python client, plus the `cauli-beat` entry point | `py3-none-any` |
-| `cauli-worker` | the prebuilt Rust worker binary | `cp3XX-cp3XX-manylinux_2_28_{x86_64,aarch64}` |
+| `cauli-worker` | the prebuilt Rust worker binary | `cp3XX-cp3XX-manylinux_2_35_{x86_64,aarch64}` |
 
 `pip install cauli` is the whole install. The client requires `cauli-worker` behind a PEP 508
 marker naming the exact set of wheels that exist, so on a supported platform pip lands both
@@ -1652,8 +1652,11 @@ path that skips the binary.
 portable static binary, and shipping it as one would only move the failure to exec time.
 
 Wheel tags describe exactly that constraint, which is why the worker is distributed as a wheel
-rather than a tarball: `cp312-cp312-manylinux_2_28_x86_64` means "needs CPython 3.12 on glibc
-2.28 or newer", and pip refuses to install it anywhere else.
+rather than a tarball: `cp312-cp312-manylinux_2_35_x86_64` means "needs CPython 3.12 on glibc
+2.35 or newer", and pip refuses to install it anywhere else. That floor is Ubuntu 22.04, Debian
+12 and RHEL 9 or newer, and every current `python:3.x-slim` image. It is set by the runner the
+wheel is built on, because the worker embeds CPython and so needs a build interpreter compiled
+with `--enable-shared`, which the manylinux images do not provide.
 
 Installing into the app's virtualenv also settles which interpreter the worker embeds, by
 construction rather than by configuration. pip places the binary in that venv's own `bin/`, the

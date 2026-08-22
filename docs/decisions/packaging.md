@@ -18,7 +18,7 @@ and two of them block 1.0.**
 ## What is already good, and should be kept
 
 `release.yml` builds a maturin `bindings = "bin"` wheel per CPython minor per arch, cp310 to cp313,
-x86_64 and aarch64, manylinux_2_28. It gates dynamic linking with readelf on every wheel, verifies in
+x86_64 and aarch64, manylinux_2_35. It gates dynamic linking with readelf on every wheel, verifies in
 a clean venv against a real redis itest, publishes via OIDC trusted publishing, and asserts that the
 installed `cauli-worker --version` equals `cauli.__version__`. `scripts/check_versions.py` gates four
 locations plus the tag on every push, and the worker wheel pins `cauli==0.1.0` exactly. That lockstep
