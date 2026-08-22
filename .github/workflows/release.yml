@@ -218,7 +218,7 @@ jobs:
           # below can be --no-index: cauli and cauli-worker then have exactly
           # one possible source, the artifacts we are about to publish, and
           # cannot quietly come from an older release already on PyPI.
-          .onecmd/bin/pip install "redis>=5" "msgspec>=0.18"
+          .onecmd/bin/pip install "redis>=5" "msgspec>=0.18" tzdata
           .onecmd/bin/pip install --no-index --find-links artifacts cauli
           .onecmd/bin/pip show cauli-worker >/dev/null
           test -x .onecmd/bin/cauli-worker

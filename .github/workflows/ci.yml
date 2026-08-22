@@ -57,7 +57,15 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y redis-server
       - name: Install cauli (editable, dev extras) and ruff
         run: |
-          pip install -e "py[dev]"
+          # cauli requires cauli-worker, the prebuilt binary wheel that this
+          # repository BUILDS rather than downloads, and that only exists on
+          # the index once a release has been cut. Resolving it here would
+          # make this job's result depend on the state of PyPI instead of on
+          # the code under test, so the third party dependencies are installed
+          # first and the client goes in with --no-deps. The packaging job is
+          # where that pin is proved, against the wheels it just built.
+          pip install "redis>=5" "msgspec>=0.18" tzdata "pytest>=8"
+          pip install -e py --no-deps
           pip install ruff==0.15.22
       - name: ruff check
         run: |
@@ -87,7 +95,12 @@ jobs:
         working-directory: worker
         run: cargo build --release --bin cauli-worker
       - name: Install cauli (editable) and pytest
-        run: pip install -e py pytest
+        # --no-deps for the same reason as the py job: cauli-worker is built
+        # here, not fetched, and this job runs against the binary cargo just
+        # produced.
+        run: |
+          pip install "redis>=5" "msgspec>=0.18" tzdata pytest
+          pip install -e py --no-deps
       - name: Run itest
         working-directory: itest
         env:
@@ -189,7 +202,7 @@ jobs:
           # Third party dependencies from the index first, so the resolve below
           # can be --no-index and cauli/cauli-worker can only be the wheels
           # just built rather than an older pair already on PyPI.
-          .onecmd/bin/pip install "redis>=5" "msgspec>=0.18"
+          .onecmd/bin/pip install "redis>=5" "msgspec>=0.18" tzdata
           .onecmd/bin/pip install --no-index --find-links dist cauli
           .onecmd/bin/pip show cauli-worker >/dev/null
           test -x .onecmd/bin/cauli-worker

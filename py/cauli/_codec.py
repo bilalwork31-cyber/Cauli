@@ -187,7 +187,9 @@ def _validate_json_types(obj: Any) -> None:
                 _push_path(exc, i)
                 raise
         return
-    raise TypeError(f"Object of type {t.__name__} is not JSON serializable ({_ALLOWED})")
+    raise TypeError(
+        f"Object of type {t.__name__} is not JSON serializable ({_ALLOWED})"
+    )
 
 
 def encode(obj: Any) -> bytes:

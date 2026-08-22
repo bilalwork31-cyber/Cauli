@@ -35,8 +35,8 @@ const SHA256_K: [u32; 64] = [
 /// One FIPS 180-4 §6.2.2 compression round over a 64-byte block.
 fn sha256_block(h: &mut [u32; 8], block: &[u8; 64]) {
     let mut w = [0u32; 64];
-    for (wi, chunk) in w.iter_mut().zip(block.chunks_exact(4)) {
-        *wi = u32::from_be_bytes(chunk.try_into().expect("4-byte chunk"));
+    for (wi, chunk) in w.iter_mut().zip(block.as_chunks::<4>().0) {
+        *wi = u32::from_be_bytes(*chunk);
     }
     for i in 16..64 {
         let a = w[i - 15];
@@ -79,28 +79,24 @@ fn sha256(data: &[u8]) -> [u8; 32] {
         0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
         0x5be0cd19,
     ];
-    let mut block = [0u8; 64];
-    let mut chunks = data.chunks_exact(64);
-    for chunk in chunks.by_ref() {
-        block.copy_from_slice(chunk);
-        sha256_block(&mut h, &block);
+    let (blocks, rem) = data.as_chunks::<64>();
+    for block in blocks {
+        sha256_block(&mut h, block);
     }
     // Padding: 0x80, zeros, then the message length in BITS as a big-endian
     // u64. One extra block when the remainder leaves no room for both.
-    let rem = chunks.remainder();
     let mut tail = [0u8; 128];
     tail[..rem.len()].copy_from_slice(rem);
     tail[rem.len()] = 0x80;
     let tail_len = if rem.len() + 9 <= 64 { 64 } else { 128 };
     let bits = (data.len() as u64).wrapping_mul(8);
     tail[tail_len - 8..tail_len].copy_from_slice(&bits.to_be_bytes());
-    for chunk in tail[..tail_len].chunks_exact(64) {
-        block.copy_from_slice(chunk);
-        sha256_block(&mut h, &block);
+    for block in tail[..tail_len].as_chunks::<64>().0 {
+        sha256_block(&mut h, block);
     }
     let mut out = [0u8; 32];
-    for (slot, word) in out.chunks_exact_mut(4).zip(h) {
-        slot.copy_from_slice(&word.to_be_bytes());
+    for (slot, word) in out.as_chunks_mut::<4>().0.iter_mut().zip(h) {
+        *slot = word.to_be_bytes();
     }
     out
 }
