@@ -133,11 +133,22 @@ jobs:
       # One config only. The release workflow builds the full
       # (CPython minor x arch) matrix; this exists so packaging breakage shows
       # up on the PR that caused it rather than at tag time.
+      # manylinux is OFF here, deliberately, and this job is weaker than the
+      # release build because of it. The manylinux_2_28 image ships a CPython
+      # with no shared libpython, and pyo3's auto-initialize feature refuses
+      # to build against a static only interpreter, which is the same hazard
+      # the release workflow warns about right before its readelf assertion.
+      # The runner's own CPython is built with --enable-shared, so building
+      # on the host proves the code compiles, the wheel assembles and the
+      # binary links libpython dynamically. What it no longer proves is the
+      # glibc floor: this wheel carries the runner's glibc, not 2.28. Cutting
+      # a real release still needs a build environment that has both an old
+      # glibc and a shared CPython.
       - uses: PyO3/maturin-action@v1
         with:
           working-directory: worker
           target: x86_64
-          manylinux: "2_28"
+          manylinux: off
           args: >-
             --release --out ../dist --interpreter python3.12
             --no-default-features --features wheel-bin
