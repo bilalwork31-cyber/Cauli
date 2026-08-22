@@ -1,0 +1,63 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 450" width="880" height="450" role="img" aria-label="Bar chart of dispatch throughput in tasks per second: raw asyncio and redis 79,792; cauli async 30,438; cauli sync 21,713; Dramatiq 12,843.6; taskiq 9,622; Celery prefork 850.6; arq 248.2">
+  <title>Dispatch throughput, tasks per second</title>
+  <desc>Drain rate on a task body of one Redis INCR, each framework tuned to its own optimum, measured on WSL2 with 6 shared vCPUs in August 2026. Source: bench/RESULTS.md, claim 2.</desc>
+
+  <g font-family="system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
+
+    <text x="8" y="28" fill="#767b85" font-size="18" font-weight="700">Dispatch throughput: one Redis INCR per task, nothing else</text>
+    <text x="8" y="50" fill="#767b85" font-size="13">Every framework tuned to its own optimum, not left at library defaults.</text>
+
+    <g stroke="#7f8a99" stroke-width="1" opacity="0.28">
+      <line x1="200" y1="72" x2="200" y2="356"/>
+      <line x1="340" y1="72" x2="340" y2="356"/>
+      <line x1="480" y1="72" x2="480" y2="356"/>
+      <line x1="620" y1="72" x2="620" y2="356"/>
+      <line x1="760" y1="72" x2="760" y2="356"/>
+    </g>
+    <line x1="200" y1="356" x2="760" y2="356" stroke="#7f8a99" stroke-width="1.5" opacity="0.6"/>
+
+    <g fill="#767b85" font-size="12" text-anchor="middle">
+      <text x="200" y="374">0</text>
+      <text x="340" y="374">20,000</text>
+      <text x="480" y="374">40,000</text>
+      <text x="620" y="374">60,000</text>
+      <text x="760" y="374">80,000</text>
+    </g>
+    <text x="480" y="396" fill="#767b85" font-size="13" font-weight="600" text-anchor="middle">tasks per second, higher is better</text>
+
+    <g fill="#767b85" font-size="13" text-anchor="end">
+      <text x="188" y="96">raw asyncio + redis</text>
+      <text x="188" y="136" font-weight="700">cauli async</text>
+      <text x="188" y="176" font-weight="700">cauli sync</text>
+      <text x="188" y="216">Dramatiq</text>
+      <text x="188" y="256">taskiq</text>
+      <text x="188" y="296">Celery prefork</text>
+      <text x="188" y="336">arq</text>
+    </g>
+
+    <rect x="200" y="80" width="558.5" height="22" rx="2" fill="#7f8a99" fill-opacity="0.3" stroke="#7f8a99" stroke-width="1.5" stroke-dasharray="5 4"/>
+    <rect x="200" y="120" width="213.1" height="22" rx="2" fill="#2f9e73"/>
+    <rect x="200" y="160" width="152.0" height="22" rx="2" fill="#2f9e73"/>
+    <rect x="200" y="200" width="89.9" height="22" rx="2" fill="#7f8a99"/>
+    <rect x="200" y="240" width="67.4" height="22" rx="2" fill="#7f8a99"/>
+    <rect x="200" y="280" width="6.0" height="22" rx="1" fill="#7f8a99"/>
+    <rect x="200" y="320" width="1.7" height="22" fill="#7f8a99"/>
+
+    <g fill="#767b85" font-size="13" font-weight="700">
+      <text x="766" y="96">79,792</text>
+      <text x="420" y="136">30,438</text>
+      <text x="359" y="176">21,713</text>
+      <text x="297" y="216">12,843.6</text>
+      <text x="274" y="256">9,622</text>
+      <text x="213" y="296">850.6</text>
+      <text x="209" y="336">248.2 *</text>
+    </g>
+    <text x="766" y="112" fill="#767b85" font-size="11">no framework ceiling</text>
+
+    <g fill="#767b85" font-size="11">
+      <text x="8" y="418">* arq tuned to poll_delay=0.01 and max_jobs=200, and it still timed out at 20,000 tasks. Read it as a poor fit for this harness, not as a clean architectural result.</text>
+      <text x="8" y="436">WSL2 (Ubuntu 24.04), 6 shared vCPUs, 11 GiB RAM, Redis 7.0.15, shared and virtualized, not bare metal. Measured August 2026. Source: bench/RESULTS.md, claim 2.</text>
+    </g>
+
+  </g>
+</svg>

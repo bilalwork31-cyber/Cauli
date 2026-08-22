@@ -8,6 +8,12 @@ pub struct Counters {
     pub failed: AtomicU64,
     pub retried: AtomicU64,
     pub dlq: AtomicU64,
+    /// §4.5 executions suppressed because their idempotency key was already
+    /// held. Counted in `ok` too (the caller does get a result document);
+    /// broken out for the same reason `expired` is, and because without it a
+    /// constant or badly derived `idempotency_key` suppresses every task
+    /// while the throughput graph climbs normally.
+    pub duplicate: AtomicU64,
     /// §9.1 entries discarded unrun past their expiry / queue TTL. Counted in
     /// `dlq` too (they do get a DLQ entry); broken out because "work is being
     /// thrown away because the queue cannot keep up" is a different operational
@@ -36,6 +42,37 @@ pub struct Counters {
     pub lat_cpu: LatencyHist,
 }
 
+/// Hostname for the stats line, resolved once. PROTOCOL §7 makes this line
+/// the entire operator interface, and `-c 500` on a six core box derives six
+/// supervised processes each emitting an independent cumulative line with
+/// identical field names: without an identity, the two alerting signals
+/// docs/CONFIGURATION.md names cannot be traced back to a process to restart.
+/// Sanitized because §7 makes the line a logfmt parsing contract: a
+/// hostname carrying a space (or anything else that is not DNS-shaped)
+/// would split into two pseudo-fields and corrupt every following key for
+/// awk, promtail and vector alike. `pid` needs no such treatment.
+fn host() -> &'static str {
+    static HOST: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    HOST.get_or_init(|| {
+        let raw = gethostname::gethostname().to_string_lossy().into_owned();
+        let safe: String = raw
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        if safe.is_empty() {
+            "unknown".to_string()
+        } else {
+            safe
+        }
+    })
+}
+
 impl Counters {
     /// The periodic section 7 line. Draining the latency histograms is a
     /// side effect of building it, so call this exactly once per stats tick
@@ -45,13 +82,16 @@ impl Counters {
         let (async_p50, async_p99) = self.lat_async.take_p50_p99();
         let (cpu_p50, cpu_p99) = self.lat_cpu.take_p50_p99();
         format!(
-            "stats: fetched={} ok={} failed={} retried={} dlq={} expired={} cpu_lost={} inflight_io={} inflight_cpu={} rss_mb={} sync_p50={} sync_p99={} async_p50={} async_p99={} cpu_p50={} cpu_p99={}",
+            "stats: pid={} host={} fetched={} ok={} failed={} retried={} dlq={} expired={} duplicate={} cpu_lost={} inflight_io={} inflight_cpu={} rss_mb={} sync_p50={} sync_p99={} async_p50={} async_p99={} cpu_p50={} cpu_p99={}",
+            std::process::id(),
+            host(),
             self.fetched.load(Ordering::Relaxed),
             self.ok.load(Ordering::Relaxed),
             self.failed.load(Ordering::Relaxed),
             self.retried.load(Ordering::Relaxed),
             self.dlq.load(Ordering::Relaxed),
             self.expired.load(Ordering::Relaxed),
+            self.duplicate.load(Ordering::Relaxed),
             self.cpu_lost.load(Ordering::Relaxed),
             // Printed raw (no .max(0) clamp): a negative value here would be
             // an accounting bug, and clamping it would hide the signal.

@@ -7,6 +7,15 @@ Define tasks in Python, enqueue from any web framework, execute on the Rust work
 
     pip install cauli               # Python >= 3.10 (deps: redis>=5, msgspec)
 
+That also installs the `cauli-worker` binary, but only where its wheels exist:
+Linux (glibc) on x86_64 or aarch64, CPython 3.10 through 3.14. Anywhere else, a
+macOS laptop, Windows, PyPy, a CPython newer than the release matrix, the worker
+requirement is dropped rather than failing the install: the client still lands
+and enqueueing still works, there is simply no `cauli-worker` to run. Two
+targets fail the install instead, because no marker can describe them: musl
+(Alpine) and the free threaded build. For those, and for enqueue only web dynos
+that never run a worker, see `PROTOCOL.md` section 13.4.
+
 ## Define an app and tasks (myproj/tasks.py)
 
     from cauli import Cauli
@@ -29,7 +38,7 @@ Define tasks in Python, enqueue from any web framework, execute on the Rust work
     r = send_email.delay("a@b.com")
     r = send_email.apply_async(args=("a@b.com",), countdown=30, queue="emails",
                                idempotency_key="welcome:a@b.com")
-    r.status()           # "pending" | "success" | "failure" | "duplicate"
+    r.status()           # "pending" | "success" | "failure" | "duplicate" | "expired"
     r.get(timeout=10)    # value on success; raises TaskFailedError / TimeoutError
 
 Tasks stay directly callable for tests: `crunch(10)` runs inline, no broker needed.

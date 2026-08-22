@@ -31,6 +31,16 @@ test-hooks = []
 dev-bin = []
 wheel-bin = []
 
+# The runtime itself, so that the two names below are two THREE LINE entry
+# points over one compilation rather than two build targets pointing at one
+# `src/main.rs` -- which cargo reports on every single command as "file
+# `src/main.rs` found to be present in multiple build targets". Nothing
+# outside this crate consumes the library; `cauli_worker::run` is its only
+# public item.
+[lib]
+name = "cauli_worker"
+path = "src/lib.rs"
+
 [[bin]]
 name = "cauli-worker"
 path = "src/main.rs"
@@ -38,7 +48,7 @@ required-features = ["dev-bin"]
 
 [[bin]]
 name = "cauli-worker-bin"
-path = "src/main.rs"
+path = "src/wheel_main.rs"
 required-features = ["wheel-bin"]
 
 [dependencies]
@@ -50,7 +60,24 @@ gethostname = "1"
 libc = "0.2"
 pyo3 = { version = "0.26", features = ["auto-initialize"] }
 rand = "0.9"
-redis = { version = "0.32", features = ["tokio-comp", "connection-manager"] }
+# tokio-rustls-comp (audit BLOCKER, TLS): with no TLS feature compiled in,
+# redis::Client::open("rediss://...") fails at parse, so every managed redis
+# that requires TLS in transit (Upstash, ElastiCache with encryption in
+# transit, Redis Cloud, Azure Cache) is unreachable while redis-py happily
+# keeps enqueueing into it. rustls rather than native-tls deliberately: no
+# OpenSSL headers, no system build dependency. Plain `tls-rustls` (pulled in
+# by tokio-rustls-comp) trusts the PLATFORM certificate store through
+# rustls-native-certs; `tls-rustls-webpki-roots` would REPLACE that with a
+# baked in bundle, which is the wrong default for a worker that has to trust
+# a private CA or a corporate proxy.
+redis = { version = "0.32", features = ["tokio-comp", "connection-manager", "tokio-rustls-comp"] }
+# Direct dependency for exactly one reason: redis depends on rustls with
+# default-features off, so no crypto provider is selected and
+# `ClientConfig::builder()` would panic on the first rediss:// connection.
+# `ring` builds with cc alone (aws-lc-rs would add cmake + nasm to every
+# build). main.rs installs it explicitly so the choice is deterministic
+# rather than left to feature unification.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 serde = { version = "1", features = ["derive"] }
 # arbitrary_precision (audit CRITICAL): without it, serde_json's default
 # Number silently falls back to f64 for any integer literal outside i64/u64

@@ -192,6 +192,62 @@ def test_explicit_expires_beats_the_queue_ttl_client_side(redis_url, redis_clien
     assert env["expires_at"] - now_ms() > 3_000_000
 
 
+def test_countdown_past_the_queue_ttl_is_refused_at_enqueue(redis_url, redis_client):
+    # queue_ttl is measured from ENQUEUE, not from the due time (PROTOCOL
+    # section 9.2), so this task would sit in the delayed zset for 10 minutes
+    # and then be discarded unrun. Refused at the call site instead.
+    app = Cauli(redis_url=redis_url, queue_ttl=300)
+
+    @app.task(name="t")
+    def t():
+        return None
+
+    with pytest.raises(ValueError, match="after it expires"):
+        t.apply_async(countdown=600)
+    assert redis_client.zcard("cauli:delayed:default") == 0
+    assert redis_client.xlen("cauli:q:default") == 0
+
+
+def test_eta_past_the_queue_ttl_is_refused_even_with_a_long_expires(
+    redis_url, redis_client
+):
+    # The effective deadline is the EARLIER of `expires` and the queue TTL, so
+    # a generous per-call `expires` does not rescue the task.
+    app = Cauli(redis_url=redis_url, queue_ttl=60)
+
+    @app.task(name="t")
+    def t():
+        return None
+
+    later = datetime.now(timezone.utc) + timedelta(hours=2)
+    with pytest.raises(ValueError, match="queue_ttl 60s"):
+        t.apply_async(eta=later, expires=7200)
+    assert redis_client.zcard("cauli:delayed:default") == 0
+
+
+def test_countdown_past_an_explicit_expires_is_refused(redis_url, redis_client):
+    app = Cauli(redis_url=redis_url)
+
+    @app.task(name="t")
+    def t():
+        return None
+
+    with pytest.raises(ValueError, match="expires=30"):
+        t.apply_async(countdown=120, expires=30)
+    assert redis_client.zcard("cauli:delayed:default") == 0
+
+
+def test_countdown_within_the_queue_ttl_still_enqueues(redis_url, redis_client):
+    app = Cauli(redis_url=redis_url, queue_ttl=600)
+
+    @app.task(name="t")
+    def t():
+        return None
+
+    t.apply_async(countdown=60)
+    assert redis_client.zcard("cauli:delayed:default") == 1
+
+
 def test_queue_ttl_validation():
     with pytest.raises(ValueError):
         Cauli(redis_url="redis://127.0.0.1:1/0", queue_ttl=0)

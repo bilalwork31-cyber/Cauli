@@ -15,11 +15,43 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{error, info, warn};
 
+/// Server side BLOCK window for XREADGROUP, in ms.
+///
+/// Clamped against `--redis-timeout` rather than used raw: the client side
+/// response deadline applies to this very call, so a BLOCK window at or
+/// above it turns every empty poll into a dead heat decided by scheduling
+/// jitter. Each loss surfaces as an IoError, tears the fetch connection
+/// down, logs, and backs off 500ms -- a permanent reconnect storm on an idle
+/// queue, from a flag whose own help text reads as an endorsement of 1.
+/// Halving keeps a comfortable gap at every value instead of failing the
+/// deployment over it.
+const FETCH_BLOCK_MS: u64 = 1_000;
+
+fn fetch_block_ms(redis_timeout_s: u64) -> u64 {
+    let half_deadline = redis_timeout_s.saturating_mul(1000) / 2;
+    FETCH_BLOCK_MS.min(half_deadline).max(50)
+}
+
 /// §4 fetch loop. Gate: fetch only when io slots are free and no cpu dispatch
 /// is blocked on a full backlog (bounded starvation, see ARCHITECTURE.md).
 pub async fn fetch_loop(ctx: Arc<Ctx>, mut fetch_conn: redis::aio::ConnectionManager) {
     let keys: Vec<String> = ctx.queues.iter().map(|q| broker::q_key(q)).collect();
     let ids: Vec<&str> = ctx.queues.iter().map(|_| ">").collect();
+    let streams = keys.len().max(1);
+    let block_ms = fetch_block_ms(ctx.args.redis_timeout);
+    if block_ms < FETCH_BLOCK_MS {
+        info!(
+            block_ms,
+            redis_timeout_s = ctx.args.redis_timeout,
+            "XREADGROUP BLOCK window shortened to stay clear of --redis-timeout"
+        );
+    }
+    // With N streams, one free slot is not enough to fetch safely (see the
+    // per stream COUNT note below); the loop needs N. On a deployment whose
+    // whole gate is smaller than its queue count, N is unreachable, so the
+    // requirement is capped at the gate's own capacity or the loop would
+    // never fetch at all.
+    let min_permits = streams.min(ctx.io_concurrency.max(1));
     while !ctx.shutting_down() {
         // A full cpu backlog pauses EVERY lane here, not just cpu, and that
         // is correct, not a bug to "fix" by making this lane selective: an
@@ -30,8 +62,8 @@ pub async fn fetch_loop(ctx: Arc<Ctx>, mut fetch_conn: redis::aio::ConnectionMan
         // `cpu_backlog()` keeps this pause loud instead of silent (stats
         // line + a warn on the zero/nonzero edge); the coupling itself stays.
         let permits = ctx.io_sem.available_permits();
-        if permits == 0 || ctx.cpu_backlog() > 0 {
-            tokio::time::sleep(Duration::from_millis(25)).await;
+        if permits < min_permits || ctx.cpu_backlog() > 0 {
+            gate_wait(&ctx.io_sem, min_permits, permits, GATE_POLL).await;
             continue;
         }
         // Fetch only what there is capacity to START, not a full --batch.
@@ -44,10 +76,22 @@ pub async fn fetch_loop(ctx: Arc<Ctx>, mut fetch_conn: redis::aio::ConnectionMan
         // repeated parking inflates delivery_count until the entry is dead
         // lettered as redelivery_limit WITHOUT having executed once.
         // Bounding COUNT by free permits means fetched entries never park.
+        //
+        // COUNT is applied PER STREAM by redis, not across the read, so the
+        // budget has to be divided by the stream count or a worker on
+        // `-Q high,default,bulk` fetches up to 3x what it can start. The
+        // surplus parked with its PEL idle clock running, which is the exact
+        // state this bound exists to prevent: repeated parking inflates
+        // delivery_count until the entry is dead lettered as
+        // redelivery_limit without ever executing. The `min_permits` gate
+        // above guarantees `permits >= streams` (or the gate is smaller than
+        // the queue count and every slot is already free), so the worst case
+        // -- every stream returning a full page -- still fits.
+        let per_stream = (ctx.args.batch.min(permits) / streams).max(1);
         let opts = StreamReadOptions::default()
             .group("cauli", &ctx.consumer)
-            .count(ctx.args.batch.min(permits))
-            .block(1000);
+            .count(per_stream)
+            .block(block_ms as usize);
         let reply: Option<StreamReadReply> =
             match fetch_conn.xread_options(&keys, &ids, &opts).await {
                 Ok(r) => r,
@@ -112,35 +156,83 @@ async fn recreate_groups(
     }
 }
 
-/// §4.3 delayed mover: every 250ms per queue, single EVAL each.
+/// EVALs the mover is allowed to run for one queue within a single tick.
+///
+/// The sweep repeats until a queue comes back short, so the per-EVAL
+/// `--mover-limit` no longer caps the drain rate; this bounds how long one
+/// queue may hold the tick when the delayed set is being refilled as fast as
+/// it drains, so the other queues in `-Q a,b,c` still get swept.
+const MOVER_ROUNDS_PER_TICK: usize = 32;
+
+/// §4.3 delayed mover: every `--mover-interval` ms per queue, repeated
+/// within the tick until the queue drains.
+///
+/// It used to be one fixed `LIMIT 128` EVAL per queue per 250ms tick with
+/// the returned count discarded: a hard, unflaggable ceiling of 512 entries
+/// per second per queue per process through which every retry, countdown,
+/// eta and beat firing passes — 40x below the worker's own headline
+/// throughput. A modest failure rate at full speed produced more retries per
+/// second than the mover could move, and the delayed zset then grew without
+/// bound while `oldest_ms`, which only watches the stream, reported nothing.
 pub async fn mover_loop(ctx: Arc<Ctx>) {
     let script = redis::Script::new(broker::MOVER_LUA);
     let mut conn = ctx.redis.clone();
-    let mut tick = tokio::time::interval(Duration::from_millis(250));
+    let limit = ctx.args.mover_limit.max(1);
+    let mut tick = tokio::time::interval(Duration::from_millis(ctx.args.mover_interval.max(1)));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tick.tick().await;
         for q in &ctx.queues {
-            if let Err(e) = broker::run_mover(&mut conn, &script, q, now_ms()).await {
-                if broker::is_crossslot(&e) {
-                    // Not a blip: cauli:q:{queue} and cauli:delayed:{queue}
-                    // never share a hash slot, so this EVAL fails with
-                    // CROSSSLOT on every future tick too, not just this one.
-                    // Name the real cause instead of letting it read like an
-                    // ordinary retryable error.
-                    error!(
-                        queue = %q,
-                        "redis cluster is not supported for the delayed path: {e}; \
-                         cauli:q:{{queue}} and cauli:delayed:{{queue}} do not share a hash \
-                         slot, so this queue's delayed and retried tasks can never reach \
-                         the stream on this deployment (PROTOCOL.md section 4.3)"
-                    );
-                } else {
-                    warn!(queue = %q, "delayed mover failed: {e}");
+            for _ in 0..MOVER_ROUNDS_PER_TICK {
+                match broker::run_mover(&mut conn, &script, q, now_ms(), limit).await {
+                    // Short page: this queue is drained for now, so the tick
+                    // moves on instead of paying another round trip.
+                    Ok(n) if (n as usize) < limit => break,
+                    Ok(_) => continue,
+                    Err(e) => {
+                        report_mover_error(q, &e);
+                        break;
+                    }
                 }
             }
         }
     }
+}
+
+fn report_mover_error(q: &str, e: &anyhow::Error) {
+    if broker::is_crossslot(e) {
+        // Not a blip: cauli:q:{queue} and cauli:delayed:{queue} never share
+        // a hash slot, so this EVAL fails with CROSSSLOT on every future
+        // tick too, not just this one. Name the real cause instead of
+        // letting it read like an ordinary retryable error.
+        error!(
+            queue = %q,
+            "redis cluster is not supported for the delayed path: {e}; \
+             cauli:q:{{queue}} and cauli:delayed:{{queue}} do not share a hash \
+             slot, so this queue's delayed and retried tasks can never reach \
+             the stream on this deployment (PROTOCOL.md section 4.3)"
+        );
+    } else {
+        warn!(queue = %q, "delayed mover failed: {e}");
+    }
+}
+
+/// Extra idle margin the reclaim threshold carries ON TOP of an envelope's
+/// own execution backstop.
+///
+/// The async lane's backstop is `timeout_ms + BACKSTOP_GRACE_MS` counted
+/// from AFTER the submit, while the PEL idle clock starts at delivery. With
+/// the identical expression on both sides an entry became reclaim eligible
+/// while its own backstop had not fired yet -- zero margin, and the sync
+/// lane's plain `timeout_ms` backstop was the only one that had any. The
+/// difference is dispatch overhead: envelope parse, the idempotency round
+/// trip (up to a full `--redis-timeout`) and the admission wait, so the
+/// margin is sized on the one part of that which is configurable.
+fn reclaim_margin_ms(ctx: &Ctx) -> u64 {
+    ctx.args
+        .redis_timeout
+        .saturating_mul(1000)
+        .max(crate::exec::BACKSTOP_GRACE_MS)
 }
 
 /// One XPENDING page while draining a queue's reclaim backlog. Deliberately
@@ -173,17 +265,26 @@ const RECOVERY_SCAN_BATCH: usize = 128;
 /// overflow) so a huge reclaimed backlog queues in Redis, not in worker
 /// memory. A still-running long task skipped this tick is simply
 /// re-examined next tick (the cursor resets to "-" every tick).
+///
+/// Every `CONSUMER_REAP_EVERY_TICKS` ticks the same loop also reaps the
+/// group's dead consumers (see `reap_stale_consumers`), which nothing else
+/// in the process ever removes.
 pub async fn recovery_loop(ctx: Arc<Ctx>) {
     let vt_ms = visibility_timeout_ms(ctx.args.visibility_timeout);
     let period = Duration::from_millis((vt_ms / 2).max(500));
     let mut conn = ctx.redis.clone();
     let mut tick = tokio::time::interval(period);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut ticks: u64 = 0;
     loop {
         tick.tick().await;
         if ctx.shutting_down() {
             continue; // no new work during drain; mover/acks keep running
         }
+        if ticks.is_multiple_of(CONSUMER_REAP_EVERY_TICKS) {
+            reap_stale_consumers(&ctx, &mut conn, vt_ms).await;
+        }
+        ticks = ticks.wrapping_add(1);
         // Per-queue cursor: Some(start) = more pages may remain, None = done.
         let mut cursors: Vec<(String, Option<String>)> = ctx
             .queues
@@ -193,28 +294,194 @@ pub async fn recovery_loop(ctx: Arc<Ctx>) {
         'drain: while cursors.iter().any(|(_, c)| c.is_some()) && !ctx.shutting_down() {
             for (q, cursor) in cursors.iter_mut() {
                 let Some(start) = cursor.take() else { continue };
-                if !admission_open(&ctx).await {
+                let Some(page) = admission_open(&ctx).await else {
                     break 'drain; // shutdown began while waiting for capacity
-                }
-                *cursor = recover_page(&ctx, &mut conn, q, vt_ms, &start).await;
+                };
+                *cursor = recover_page(&ctx, &mut conn, q, vt_ms, &start, page).await;
             }
         }
     }
 }
 
 /// Mirror of the fetch loop's admission gate (see its comment for why a full
-/// cpu backlog pauses every lane, not just cpu): wait until at least one io
-/// slot is free and no cpu dispatch is parked on a full backlog, so
-/// reclaiming a large backlog cannot spawn an unbounded number of in-memory
-/// dispatch tasks. Returns false if shutdown began while waiting.
-async fn admission_open(ctx: &Arc<Ctx>) -> bool {
-    while ctx.io_sem.available_permits() == 0 || ctx.cpu_backlog() > 0 {
+/// cpu backlog pauses every lane, not just cpu): wait until io slots are
+/// free and no cpu dispatch is parked on a full backlog, so reclaiming a
+/// large backlog cannot spawn an unbounded number of in-memory dispatch
+/// tasks. `None` if shutdown began while waiting.
+///
+/// Returns the page size the caller may reclaim, which is the free permit
+/// count, not `RECOVERY_SCAN_BATCH`. The gate used to prove one free slot
+/// and then let `recover_page` XCLAIM and dispatch a full page of 128: with
+/// one permit free that is 127 entries parked on `io_sem`, holding 127
+/// parsed envelopes in memory, in exactly the state the fetch loop's own
+/// bound exists to prevent. Reclaims carry no JUSTID, so every one of them
+/// increments `delivery_count`, and `redelivery_limit` of those dead letters
+/// a task as `RedeliveryLimitExceeded` that may never have run.
+async fn admission_open(ctx: &Arc<Ctx>) -> Option<usize> {
+    loop {
         if ctx.shutting_down() {
-            return false;
+            return None;
         }
-        tokio::time::sleep(Duration::from_millis(25)).await;
+        let permits = ctx.io_sem.available_permits();
+        if permits > 0 && ctx.cpu_backlog() == 0 {
+            return Some(permits.min(RECOVERY_SCAN_BATCH));
+        }
+        gate_wait(&ctx.io_sem, 1, permits, GATE_POLL).await;
     }
-    !ctx.shutting_down()
+}
+
+/// Ceiling on how long either admission gate may sit on a condition it
+/// cannot wait for (cpu backlog depth, shutdown). Not the io wait: that one
+/// is event driven, see `await_capacity`.
+const GATE_POLL: Duration = Duration::from_millis(25);
+
+/// Wait on whichever half of the shut gate can actually be waited on.
+///
+/// The gate is a conjunction, and `free >= want` means the io half of it was
+/// already open: the caller was stopped by the cpu backlog, which no
+/// semaphore ever signals. Waiting on `io_sem` in that state returns
+/// INSTANTLY, and the caller loops straight back into the same closed gate --
+/// a full speed spin for as long as the backlog lasts, on the worker's
+/// hottest loop. So the poll is the wait there, and the semaphore is the wait
+/// only when the semaphore is the thing that is shut.
+async fn gate_wait(io_sem: &tokio::sync::Semaphore, want: usize, free: usize, poll: Duration) {
+    if free >= want.max(1) {
+        tokio::time::sleep(poll).await;
+    } else {
+        await_capacity(io_sem, want, poll).await;
+    }
+}
+
+/// Wait until the admission gate has a chance of being open again.
+///
+/// Both gates are a conjunction of one waitable condition (free io permits)
+/// and two that are not (the cpu backlog depth, shutdown), so this waits on
+/// the semaphore and keeps `poll` as the ceiling for the rest. It replaced a
+/// blind `sleep(25ms)` on both sides: under saturation every slot freed just
+/// inside a window idled until the next poll, which is task start latency
+/// and nothing else.
+///
+/// The permits are taken as a SIGNAL and dropped immediately -- the dispatch
+/// task that eventually runs acquires its own, exactly as before -- so this
+/// changes when the loop wakes, never who owns a slot. Cancellation by the
+/// `poll` arm returns anything already accumulated, so a `want` larger than
+/// the free count cannot hoard permits from real dispatch for longer than
+/// one window.
+async fn await_capacity(io_sem: &tokio::sync::Semaphore, want: usize, poll: Duration) {
+    let want = want.max(1).min(u32::MAX as usize) as u32;
+    tokio::select! {
+        biased;
+        res = io_sem.acquire_many(want) => {
+            if res.is_err() {
+                // Closed semaphore: it will never hand out another permit,
+                // and acquire returns instantly, so fall back to the poll
+                // rather than spin the loop at full speed.
+                tokio::time::sleep(poll).await;
+            }
+        }
+        _ = tokio::time::sleep(poll) => {}
+    }
+}
+
+/// Recovery ticks between two consumer reaps. The tick is
+/// `visibility_timeout/2`, so at the default 60s this is one sweep every ten
+/// minutes: the leak it drains is one dead consumer per process start, and
+/// two XINFO calls per queue per ten minutes is the right price for it.
+const CONSUMER_REAP_EVERY_TICKS: u64 = 20;
+
+/// Floor on how long a consumer must have been idle before it is reaped, on
+/// top of the visibility multiple. A worker whose fetch loop is paused (a
+/// full cpu backlog pauses every lane) still issues no XREADGROUP, so the
+/// floor has to be far longer than any pause that is not itself an incident.
+const CONSUMER_REAP_MIN_IDLE_MS: u64 = 10 * 60 * 1000;
+
+fn consumer_reap_idle_ms(vt_ms: u64) -> u64 {
+    vt_ms.saturating_mul(4).max(CONSUMER_REAP_MIN_IDLE_MS)
+}
+
+/// Whether one XINFO CONSUMERS row is a corpse this worker may delete.
+///
+/// `pending == 0` is the hard rule and is never a heuristic: XGROUP
+/// DELCONSUMER drops that consumer's pending entries list, so reaping a
+/// consumer that still owns entries would strand them in the stream, in no
+/// PEL and behind `last-delivered-id`, where no recovery path can ever reach
+/// them again. Idle is the soft one: a false positive on a live but silent
+/// consumer costs nothing, because an empty consumer is recreated by its
+/// owner's next XREADGROUP.
+fn consumer_is_reapable(
+    name: &str,
+    pending: usize,
+    idle_ms: u64,
+    self_name: &str,
+    min_idle_ms: u64,
+) -> bool {
+    pending == 0 && name != self_name && idle_ms >= min_idle_ms
+}
+
+/// Delete the group's dead consumers, which nothing else ever does.
+///
+/// The consumer name is minted once per process start (hostname + pid), so
+/// every restart, supervised child, rolling pod replacement and wedge self
+/// exit leaves its old name in the group forever. Redis never reaps them:
+/// they cost memory in the group, and they lengthen XINFO CONSUMERS and the
+/// summary form of XPENDING for every operator and every worker that reads
+/// them. Slow burn rather than an outage, and this is the drain.
+async fn reap_stale_consumers(
+    ctx: &Arc<Ctx>,
+    conn: &mut redis::aio::ConnectionManager,
+    vt_ms: u64,
+) {
+    let min_idle_ms = consumer_reap_idle_ms(vt_ms);
+    for q in &ctx.queues {
+        let key = broker::q_key(q);
+        let info: redis::streams::StreamInfoConsumersReply = match redis::cmd("XINFO")
+            .arg("CONSUMERS")
+            .arg(&key)
+            .arg("cauli")
+            .query_async(conn)
+            .await
+        {
+            Ok(i) => i,
+            Err(e) => {
+                warn!(queue = %q, "XINFO CONSUMERS failed, not reaping this tick: {e}");
+                continue;
+            }
+        };
+        for c in info.consumers {
+            if !consumer_is_reapable(
+                &c.name,
+                c.pending,
+                c.idle as u64,
+                &ctx.consumer,
+                min_idle_ms,
+            ) {
+                continue;
+            }
+            let deleted: redis::RedisResult<u64> = redis::cmd("XGROUP")
+                .arg("DELCONSUMER")
+                .arg(&key)
+                .arg("cauli")
+                .arg(&c.name)
+                .query_async(conn)
+                .await;
+            match deleted {
+                // The reply is how many pending entries went with it. XINFO
+                // said zero and the consumer had been silent for
+                // `min_idle_ms`, so anything else means it came back to life
+                // inside that window and its entries are now unreachable.
+                Ok(0) => info!(
+                    queue = %q, consumer = %c.name, idle_ms = c.idle,
+                    "reaped stale stream consumer (no pending entries)"
+                ),
+                Ok(n) => warn!(
+                    queue = %q, consumer = %c.name, pending = n,
+                    "reaped a consumer that took {n} pending entries with it; those entries are \
+                     no longer in any pending entries list and will not be redelivered"
+                ),
+                Err(e) => warn!(queue = %q, consumer = %c.name, "XGROUP DELCONSUMER failed: {e}"),
+            }
+        }
+    }
 }
 
 /// Process one XPENDING page for `queue` starting at `start` (see §4.4 /
@@ -227,8 +494,10 @@ async fn recover_page(
     queue: &str,
     vt_ms: u64,
     start: &str,
+    page: usize,
 ) -> Option<String> {
-    let pend = match broker::xpending_idle(conn, queue, vt_ms, start, RECOVERY_SCAN_BATCH).await {
+    let margin_ms = reclaim_margin_ms(ctx);
+    let pend = match broker::xpending_idle(conn, queue, vt_ms, start, page).await {
         Ok(p) => p,
         Err(e) => {
             warn!(queue = %queue, "XPENDING failed: {e}");
@@ -239,7 +508,7 @@ async fn recover_page(
     let next_cursor = match pend.last() {
         // Exclusive-range resume (`(id`): never re-reads entries this tick,
         // including ones skipped as still-running below.
-        Some(last) if page_len == RECOVERY_SCAN_BATCH => Some(format!("({}", last.0)),
+        Some(last) if page_len == page => Some(format!("({}", last.0)),
         _ => None,
     };
 
@@ -265,13 +534,22 @@ async fn recover_page(
         let required_idle_ms = match &parsed {
             Some(env) => vt_ms.max(
                 env.timeout_ms
-                    .saturating_add(crate::exec::BACKSTOP_GRACE_MS),
+                    .saturating_add(crate::exec::BACKSTOP_GRACE_MS)
+                    .saturating_add(margin_ms),
             ),
             None => vt_ms,
         };
         if idle < required_idle_ms {
             // Still within its own timeout budget: legitimately running,
             // not stuck. Do not reclaim yet.
+            continue;
+        }
+        if ctx.holds_entry(queue, &entry_id) {
+            // This very process is still holding the entry. Whatever the
+            // idle clock says, reclaiming here would run a second copy
+            // alongside the live first attempt and burn a delivery_count
+            // against it -- four of which dead letter a task as
+            // RedeliveryLimitExceeded that may not have executed once.
             continue;
         }
         eligible.push((entry_id, idle, delivery_count, parsed));
@@ -568,36 +846,43 @@ pub async fn stats_loop(ctx: Arc<Ctx>) {
     }
 }
 
-/// Age in ms of the oldest entry still sitting in any of this worker's
-/// queues, or 0 when every stream is empty. Every completion path XDELs its
-/// entry (section 4.1), so what is left in a stream is exactly the unacked
-/// work, and redis stamps the entry's own arrival time into the first field
-/// of its stream id.
+/// Age in ms of the oldest piece of outstanding work in any of this worker's
+/// queues, or 0 when there is none. Deliberately a broker probe rather than a
+/// sample taken as tasks run, because it keeps reporting while fetching is
+/// paused: a paused fetch loop starts no tasks, so per task sampling goes
+/// blind at exactly the moment the backlog is the only thing still moving.
 ///
-/// One `XRANGE q - + COUNT 1` per queue per stats tick. This is deliberately
-/// a broker probe rather than a sample taken as tasks run, because it keeps
-/// reporting while fetching is paused: a paused fetch loop starts no tasks,
-/// so per task sampling goes blind at exactly the moment the backlog is the
-/// only thing still moving.
+/// Outstanding work is the older of two things, and each has to be asked for
+/// separately:
+///
+///   * the oldest entry in the group's pending entries list (delivered,
+///     still unacked), from `XPENDING`;
+///   * the oldest entry the group has not delivered yet (pure backlog),
+///     which is the first entry after the group's `last-delivered-id`.
+///
+/// This replaced a single `XRANGE q - + COUNT 1`, which read the oldest
+/// entry in the STREAM regardless of its state. `add_ack_del` used to
+/// pipeline XACK and XDEL unwrapped, so a connection drop between them left
+/// an entry acked but present. Such an orphan is in no PEL and behind
+/// `last-delivered-id`, so no recovery path can ever reach it and nothing
+/// XTRIMs the stream, and the old probe reported its ever growing age
+/// forever, across restarts, as though the queue were permanently wedged.
+/// That pair is now one `MULTI`/`EXEC` over the single stream key, which
+/// closes the window; reading the two real states keeps this leading
+/// indicator correct regardless.
 async fn oldest_unacked_ms(ctx: &Arc<Ctx>, conn: &mut redis::aio::ConnectionManager) -> u64 {
     let now = now_ms();
     let mut oldest = 0;
     for q in &ctx.queues {
-        let reply: redis::RedisResult<redis::streams::StreamRangeReply> = redis::cmd("XRANGE")
-            .arg(broker::q_key(q))
-            .arg("-")
-            .arg("+")
-            .arg("COUNT")
-            .arg(1)
-            .query_async(conn)
-            .await;
-        match reply {
-            Ok(r) => {
-                if let Some(entry) = r.ids.first() {
-                    oldest = oldest.max(stream_id_age_ms(&entry.id, now));
-                }
-            }
-            Err(e) => warn!(queue = %q, "oldest_ms probe (XRANGE) failed: {e}"),
+        match broker::oldest_pending_id(conn, q).await {
+            Ok(Some(id)) => oldest = oldest.max(stream_id_age_ms(&id, now)),
+            Ok(None) => {}
+            Err(e) => warn!(queue = %q, "oldest_ms probe (XPENDING) failed: {e}"),
+        }
+        match broker::oldest_undelivered_id(conn, q).await {
+            Ok(Some(id)) => oldest = oldest.max(stream_id_age_ms(&id, now)),
+            Ok(None) => {}
+            Err(e) => warn!(queue = %q, "oldest_ms probe (backlog) failed: {e}"),
         }
     }
     oldest
@@ -685,5 +970,131 @@ mod tests {
         // Wedged but idle: nothing was submitted, so nothing corroborates and
         // nothing is being lost yet.
         assert!(!wedge_confirmed(OVER, 0, OVER, None));
+    }
+
+    /// The one rule that can lose work: a consumer holding pending entries is
+    /// never reaped, however dead it looks, because DELCONSUMER would drop
+    /// its pending entries list and strand those entries.
+    #[test]
+    fn a_consumer_with_pending_entries_is_never_reaped() {
+        let min = consumer_reap_idle_ms(60_000);
+        assert!(!consumer_is_reapable(
+            "host-a-1",
+            1,
+            u64::MAX,
+            "host-b-2",
+            min
+        ));
+        assert!(!consumer_is_reapable(
+            "host-a-1",
+            128,
+            u64::MAX,
+            "host-b-2",
+            min
+        ));
+    }
+
+    #[test]
+    fn only_long_silent_foreign_consumers_are_reaped() {
+        let min = consumer_reap_idle_ms(60_000);
+        // The leak this drains: a previous incarnation of this very pod.
+        assert!(consumer_is_reapable("host-a-1", 0, min, "host-a-2", min));
+        // Idle but not long enough: a live worker between polls.
+        assert!(!consumer_is_reapable(
+            "host-a-1",
+            0,
+            min - 1,
+            "host-a-2",
+            min
+        ));
+        // This process's own consumer, which the recovery loop is using right
+        // now to XCLAIM.
+        assert!(!consumer_is_reapable(
+            "host-a-2",
+            0,
+            u64::MAX,
+            "host-a-2",
+            min
+        ));
+    }
+
+    /// The threshold is a multiple of the visibility timeout with a floor, so
+    /// it stays far past any legitimate quiet spell at both ends of the
+    /// configuration range, and never wraps.
+    #[test]
+    fn the_reap_threshold_clears_the_visibility_floor() {
+        assert_eq!(consumer_reap_idle_ms(60_000), CONSUMER_REAP_MIN_IDLE_MS);
+        assert_eq!(consumer_reap_idle_ms(3_600_000), 4 * 3_600_000);
+        assert_eq!(consumer_reap_idle_ms(u64::MAX), u64::MAX);
+    }
+
+    /// Never poll: a freed slot must wake the gate immediately, or the wait
+    /// is pure task start latency. `poll` is 30s here, so passing means the
+    /// wake came from the semaphore and not from the timer.
+    #[tokio::test]
+    async fn the_gate_wakes_on_a_freed_permit_not_on_the_poll() {
+        let long_poll = Duration::from_secs(30);
+        let sem = Arc::new(tokio::sync::Semaphore::new(4));
+        let t0 = Instant::now();
+        await_capacity(&sem, 2, long_poll).await;
+        assert!(t0.elapsed() < Duration::from_secs(1), "already free");
+
+        let sem = Arc::new(tokio::sync::Semaphore::new(0));
+        let freeing = sem.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            freeing.add_permits(2);
+        });
+        let t0 = Instant::now();
+        await_capacity(&sem, 2, long_poll).await;
+        assert!(t0.elapsed() < Duration::from_secs(5), "freed while waiting");
+    }
+
+    /// The other half of the gate (cpu backlog, shutdown) is not waitable, so
+    /// a saturated semaphore must still return at the poll -- and a CLOSED
+    /// one, whose acquire fails instantly, must not turn the loop into a spin.
+    #[tokio::test]
+    async fn the_gate_still_returns_at_the_poll_without_permits() {
+        let poll = Duration::from_millis(30);
+        let sem = Arc::new(tokio::sync::Semaphore::new(0));
+        let t0 = Instant::now();
+        await_capacity(&sem, 1, poll).await;
+        assert!(t0.elapsed() >= poll);
+
+        let closed = Arc::new(tokio::sync::Semaphore::new(0));
+        closed.close();
+        let t0 = Instant::now();
+        await_capacity(&closed, 1, poll).await;
+        assert!(t0.elapsed() >= poll, "closed semaphore must not spin");
+    }
+
+    /// The gate shut on the cpu backlog alone, with io permits free. Nothing
+    /// signals a draining backlog, so waiting on the semaphore here would be
+    /// granted instantly and the caller would loop back into the same closed
+    /// gate at full speed. The poll has to be the wait.
+    #[tokio::test]
+    async fn the_gate_does_not_spin_when_only_the_cpu_backlog_holds_it() {
+        let poll = Duration::from_millis(30);
+        let sem = Arc::new(tokio::sync::Semaphore::new(8));
+        let t0 = Instant::now();
+        gate_wait(&sem, 2, 8, poll).await;
+        assert!(t0.elapsed() >= poll, "free permits must not short circuit");
+        // The permits were never held: dispatch still sees all eight.
+        assert_eq!(sem.available_permits(), 8);
+    }
+
+    /// ...and when the semaphore IS the shut half, the wait stays event
+    /// driven: a freed slot wakes the loop long before the poll.
+    #[tokio::test]
+    async fn the_gate_waits_on_the_semaphore_when_io_is_the_blocker() {
+        let sem = Arc::new(tokio::sync::Semaphore::new(0));
+        let freeing = sem.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            freeing.add_permits(2);
+        });
+        let t0 = Instant::now();
+        gate_wait(&sem, 2, 0, Duration::from_secs(30)).await;
+        assert!(t0.elapsed() < Duration::from_secs(5), "freed while waiting");
     }
 }

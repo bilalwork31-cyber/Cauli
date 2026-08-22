@@ -394,3 +394,62 @@ def test_delay_on_commit_outside_atomic_publishes_immediately(monkeypatch):
     t1, sent = _captured_app(monkeypatch)
     t1.delay_on_commit(7)
     assert [s[0:2] for s in sent] == [("t1", (7,))]
+
+
+def test_on_commit_rejects_a_bad_signature_inside_the_transaction(monkeypatch):
+    """A mistyped call must raise INSIDE the atomic block, not at COMMIT.
+
+    Deferring the check past the commit is the whole footgun: by the time the
+    enqueue fails the row is already durable, so the view 500s with committed
+    state and no task at all. Raising here lets the transaction roll back.
+    """
+    from django.db import transaction
+
+    t1, sent = _captured_app(monkeypatch)
+
+    @t1.app.task(name="t2")
+    def t2(a, b):
+        return a + b
+
+    with transaction.atomic():
+        with pytest.raises(TypeError, match="t2"):
+            t2.delay_on_commit(1, bee=2)
+    assert sent == [], "a call that fails validation must never be published"
+
+
+def test_on_commit_rejects_an_unencodable_argument_inside_the_transaction(monkeypatch):
+    """The encode dry run must fire at the call site too.
+
+    The audit's exact case: a model with a UUID primary key. The codec refuses
+    a UUID, and without the dry run that refusal lands at COMMIT, after the
+    row is written.
+    """
+    import uuid
+
+    from django.db import transaction
+
+    t1, sent = _captured_app(monkeypatch)
+    with transaction.atomic():
+        with pytest.raises(TypeError, match="not JSON encodable"):
+            t1.apply_async_on_commit(args=(uuid.uuid4(),))
+        with pytest.raises(TypeError, match="not JSON encodable"):
+            t1.delay_on_commit(pk=uuid.uuid4())
+    assert sent == []
+
+
+def test_on_commit_docstrings_warn_about_django_testcase():
+    """The TestCase wall has to be documented where the user reads it.
+
+    ``django.test.TestCase`` rolls its atomic block back, so an on_commit
+    enqueue is discarded and the task is silently never published. That is
+    indistinguishable from a broken integration, and the only signal is a
+    failing assertion, so both docstrings must name the two escapes.
+    """
+    from cauli.task import TaskDef
+
+    both = (TaskDef.delay_on_commit.__doc__ or "") + (
+        TaskDef.apply_async_on_commit.__doc__ or ""
+    )
+    assert "TestCase" in both
+    assert "captureOnCommitCallbacks(execute=True)" in both
+    assert "TransactionTestCase" in both

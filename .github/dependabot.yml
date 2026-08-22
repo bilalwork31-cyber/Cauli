@@ -1,0 +1,32 @@
+version: 2
+
+# Three ecosystems, three manifests. Grouped so a quiet week produces one pull
+# request per ecosystem rather than one per crate: this repository has 136
+# crates in Cargo.lock and a single maintainer.
+updates:
+  - package-ecosystem: cargo
+    directory: /worker
+    schedule:
+      interval: weekly
+    groups:
+      cargo:
+        patterns:
+          - "*"
+
+  - package-ecosystem: pip
+    directory: /py
+    schedule:
+      interval: weekly
+    groups:
+      python:
+        patterns:
+          - "*"
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns:
+          - "*"

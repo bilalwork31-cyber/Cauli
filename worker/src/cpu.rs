@@ -49,7 +49,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixListener;
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Semaphore};
 use tokio::time::{sleep_until, timeout, Instant};
 use tracing::{info, warn};
 
@@ -84,10 +84,26 @@ pub struct CpuJob {
 #[derive(Clone)]
 pub struct CpuPool {
     pub tx: async_channel::Sender<CpuJob>,
-    /// Number of dispatch tasks currently blocked on a full backlog; the fetch
-    /// loop pauses while > 0 so the in-worker cpu backlog stays bounded
-    /// without starving io fetch indefinitely (children always make progress
-    /// thanks to the hard-timeout SIGKILL).
+    /// Admission slots for cpu work: `workers * (child_threads + prefetch)`,
+    /// the number of requests the pool can hold without a new one queueing
+    /// behind work that has not started.
+    ///
+    /// `run_cpu_task` never took an io slot, so `io_sem` sat at full and the
+    /// fetch loop's bound did nothing for cpu work: entries piled into the
+    /// backlog channel, into blocked dispatch tasks and into each child's
+    /// staged queue, all with their PEL idle clocks running from delivery.
+    /// Past `max(visibility_timeout, timeout_ms + grace)` the recovery loop
+    /// reclaimed them, and four reclaims dead lettered a task as
+    /// `RedeliveryLimitExceeded` that had executed zero instructions. This
+    /// gives the cpu lane an admission gate of its own, and a dispatch
+    /// waiting on it counts into `overflow`, which is what the fetch loop
+    /// and the recovery loop's admission gate already watch.
+    pub admission: Arc<Semaphore>,
+    /// Number of dispatch tasks currently blocked on a full backlog or
+    /// waiting for an admission slot; the fetch loop pauses while > 0 so the
+    /// in-worker cpu backlog stays bounded without starving io fetch
+    /// indefinitely (children always make progress thanks to the
+    /// hard-timeout SIGKILL).
     pub overflow: Arc<AtomicUsize>,
     /// Live executor pids: fork-server parent + serving children (fork mode)
     /// or the spawned children (stdio mode). Killed on worker exit paths.
@@ -138,6 +154,7 @@ pub fn disabled() -> CpuPool {
     drop(rx);
     CpuPool {
         tx,
+        admission: Arc::new(Semaphore::new(1)),
         overflow: Arc::new(AtomicUsize::new(0)),
         child_pids: Arc::new(Mutex::new(Vec::new())),
         sock_path: None,
@@ -181,6 +198,15 @@ pub async fn start(cfg: StartCfg, counters: Arc<Counters>) -> CpuPool {
     // the per-child queue depth rather than here.
     let cap = (2 * workers * child_threads).max(1);
     let (tx, rx) = async_channel::bounded::<CpuJob>(cap);
+    // One admission slot per request the pool can actually hold: the
+    // executing ones plus the deliberately staged prefetch depth. Anything
+    // beyond that would be parking with its idle clock running (see the
+    // `admission` field on CpuPool).
+    let admission = Arc::new(Semaphore::new(
+        workers
+            .saturating_mul(child_threads.saturating_add(prefetch))
+            .max(1),
+    ));
     let overflow = Arc::new(AtomicUsize::new(0));
     let pids = Arc::new(Mutex::new(Vec::new()));
     let (prog, argv) = child_argv(&python, &app_spec);
@@ -204,6 +230,7 @@ pub async fn start(cfg: StartCfg, counters: Arc<Counters>) -> CpuPool {
             Ok(sock_path) => {
                 return CpuPool {
                     tx,
+                    admission,
                     overflow,
                     child_pids: pids,
                     sock_path: Some(Arc::new(sock_path)),
@@ -226,6 +253,7 @@ pub async fn start(cfg: StartCfg, counters: Arc<Counters>) -> CpuPool {
     }
     CpuPool {
         tx,
+        admission,
         overflow,
         child_pids: pids,
         sock_path: None,
@@ -1191,19 +1219,35 @@ async fn stdio_child_loop(
                     }
                 }
                 Ok(_) => {
-                    // EOF or read error: child died mid-task. A best effort,
-                    // non blocking peek at its exit status (WIFSIGNALED and
-                    // the signal number) so an operator can tell a segfault,
-                    // an OOM kill, and any other unprompted death apart,
-                    // since by the time this fires the child cannot self
-                    // report why it is gone.
-                    let cause = match child.try_wait() {
-                        Ok(Some(status)) => match status.signal() {
-                            Some(sig) => format!(" (signal {sig})"),
-                            None => format!(" (exit code {:?})", status.code()),
-                        },
-                        _ => String::new(),
-                    };
+                    // EOF or read error: child died mid-task. Read its exit
+                    // status (WIFSIGNALED and the signal number) so an
+                    // operator can tell a segfault, an OOM kill, and any
+                    // other unprompted death apart, since by the time this
+                    // fires the child cannot self report why it is gone.
+                    //
+                    // Polled rather than probed once: the pipe reaches EOF
+                    // when the kernel tears the child's fds down, which can
+                    // land before its exit status is reapable, so a single
+                    // try_wait loses the race often enough to drop the
+                    // signal number from the log (it did, intermittently, in
+                    // tests/e2e_forkserver.rs). Bounded and never a blocking
+                    // wait: EOF does not prove the child is gone, since one
+                    // can close stdout and keep running, and this path must
+                    // not hang on that case.
+                    let mut cause = String::new();
+                    for _ in 0..100 {
+                        match child.try_wait() {
+                            Ok(Some(status)) => {
+                                cause = match status.signal() {
+                                    Some(sig) => format!(" (signal {sig})"),
+                                    None => format!(" (exit code {:?})", status.code()),
+                                };
+                                break;
+                            }
+                            Ok(None) => tokio::time::sleep(Duration::from_millis(2)).await,
+                            Err(_) => break,
+                        }
+                    }
                     warn!("cpu[{idx}] pid={pid}: child died mid-task{cause} (WorkerLost)");
                     let _ = job.resp.send(CpuOutcome::Lost);
                     respawn = true;

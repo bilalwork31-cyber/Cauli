@@ -132,6 +132,13 @@ client-produced). Worker-side gates apply before an entry is ever executed:
   bounds the `serde_json::Value` memory amplification and processing cost of a hostile or
   simply oversized payload. Recommendation: pass references (ids, URLs, keys) in args/kwargs,
   not large blobs.
+- **The limit is enforced on both ends.** A conforming producer MUST also refuse to publish an
+  encoded envelope past its own configured ceiling, raising at the call site and writing
+  nothing (`Cauli(max_envelope_bytes=...)`, same 1 MiB default). The worker side check is the
+  backstop, not the only one, because the worker recovers a task id from at most a 4096 byte
+  preview: past that there is nothing to key a failure result on, so a caller blocked in
+  `get()` gets no answer and waits out its own timeout. Keep the producer limit at or below the
+  worker's.
 - `args`/`kwargs` shape and `timeout_ms` (see above) are checked once the envelope has otherwise
   parsed successfully, the same way the `v` check above is: on a well formed id, so a DLQ entry
   for either reason still gets a `cauli:result:{id}` failure result written, and a caller
@@ -703,13 +710,26 @@ r = send_email.apply_async(args=(), kwargs={}, countdown=None, queue=None,
                            eta=None,        # absolute, timezone-AWARE datetime
                            expires=None)    # seconds, or an aware datetime
 r.id                    # task id (hex str)
-r.status()              # "pending" | "success" | "failure" | "duplicate" | "expired"
+r.status                # "pending" | "success" | "failure" | "duplicate" | "expired"
+r.status()              # the same value; the property returns a str subclass that
+                        # returns itself when called, so both spellings cost one GET
 r.get(timeout=None, poll_interval=0.05)
     # blocks until result key exists; returns result value on success;
     # raises TaskFailedError(type, message, traceback, origin) on failure (§8.1);
     # returns None with .duplicate == True semantics for duplicate (get returns None);
     # sets .expired = True and raises TaskFailedError(type="Expired") for expired;
     # raises TimeoutError if timeout expires while still pending.
+
+# After a `duplicate` resolves, §4.5's recovery path has accessors:
+r.duplicate             # True once get()/status() saw the duplicate document
+r.claimant_id           # the claiming task's id, or None for the §4.5 race
+                        # where the worker could not read the claim holder
+r.claimant()            # AsyncResult for that id, or None; its own result is
+                        # where the real outcome lives
+
+# Batch enqueue: N envelopes, one pipelined round trip, validated whole then
+# written. Deliberately NOT a transaction.
+app.enqueue_many([task, (task, args), (task, args, kwargs, options)])
 ```
 
 `eta` and `countdown` are mutually exclusive (ValueError if both). **A naive datetime is
@@ -819,11 +839,17 @@ cauli-worker --app myproj.tasks:app [--queues default,emails] [--redis-url URL]
   contract**, not merely a human readable log line:
 
   - after the `stats: ` prefix it is space separated `key=value` pairs, logfmt style;
-  - every value is a decimal integer: never a float, never quoted, never empty. `inflight_io`
-    and `inflight_cpu` are signed and printed raw, so a parser must accept a leading `-` on
-    those two: a negative reading is an accounting bug left deliberately visible rather
-    than clamped away;
-  - counters (`fetched`, `ok`, `failed`, `retried`, `dlq`, `expired`, `cpu_lost`,
+  - `host` is the only non numeric value: a hostname reduced to ASCII letters, digits, `.`,
+    `-` and `_`, with every other byte replaced by `_`, and the literal `unknown` when nothing
+    is left. It is never quoted and never empty, so it stays one logfmt token;
+  - every other value is a decimal integer: never a float, never quoted, never empty.
+    `inflight_io` and `inflight_cpu` are signed and printed raw, so a parser must accept a
+    leading `-` on those two: a negative reading is an accounting bug left deliberately
+    visible rather than clamped away;
+  - identity keys (`pid`, `host`) lead every line. They are what makes the line parseable when
+    `--procs` is above 1: each supervised process emits its own independent cumulative line at
+    the same interval, with identical key names and no other discriminator;
+  - counters (`fetched`, `ok`, `failed`, `retried`, `dlq`, `expired`, `duplicate`, `cpu_lost`,
     `sync_abandoned`, `async_rejected`) are cumulative over the worker's lifetime;
   - gauges (`inflight_io`, `inflight_cpu`, `rss_mb`, `cpu_rss_mb`, `oldest_ms`, `sync_live`,
     `cpu_backlog`, `loop_lag_ms`) are instantaneous at the tick;
@@ -835,14 +861,14 @@ cauli-worker --app myproj.tasks:app [--queues default,emails] [--redis-url URL]
   Vector, promtail and awk therefore consume it with no further work.
 
   ```
-  stats: fetched=N ok=N failed=N retried=N dlq=N expired=N cpu_lost=N inflight_io=N
-         inflight_cpu=N rss_mb=N sync_p50=N sync_p99=N async_p50=N async_p99=N cpu_p50=N
-         cpu_p99=N oldest_ms=N cpu_rss_mb=N sync_live=N sync_abandoned=N async_rejected=N
-         cpu_backlog=N loop_lag_ms=N
+  stats: pid=N host=S fetched=N ok=N failed=N retried=N dlq=N expired=N duplicate=N
+         cpu_lost=N inflight_io=N inflight_cpu=N rss_mb=N sync_p50=N sync_p99=N async_p50=N
+         async_p99=N cpu_p50=N cpu_p99=N oldest_ms=N cpu_rss_mb=N sync_live=N
+         sync_abandoned=N async_rejected=N cpu_backlog=N loop_lag_ms=N
   ```
 
   That is one physical line, wrapped here only to fit. The extra line logged once at shutdown
-  carries the first sixteen keys only, up to and including `cpu_p99`; the remaining seven are
+  carries the first nineteen keys only, up to and including `cpu_p99`; the remaining seven are
   produced by the periodic loop and are absent there.
 
   - `expired` (§9.1) counts entries discarded unrun past their deadline. They are counted in
@@ -852,12 +878,24 @@ cauli-worker --app myproj.tasks:app [--queues default,emails] [--redis-url URL]
     reason: a child taken by the OOM killer or a segfault is a pool health problem, not a task
     problem, and folded into a generic WorkerLost it left repeated child death as a scrolling
     warning with no number to alert on.
+  - `duplicate` counts envelopes suppressed by an `idempotency_key` that was already claimed.
+    Broken out of `ok` for the same reason `expired` is broken out of `dlq`: a constant or
+    badly derived key suppresses every task while `ok` keeps climbing, and folded together
+    there is no number that moves.
   - `oldest_ms` is the age of the oldest entry still sitting in any of this worker's queues,
-    from `XRANGE q - + COUNT 1` and the millisecond field of the returned stream id. Every
-    completion path XDELs its entry (§4.1), so what is left in a stream is exactly the unacked
-    work. This is the backlog's leading indicator, and it is a broker probe rather than a per
-    task sample precisely because it keeps reporting while fetching is paused, which is the
-    moment per task sampling goes blind.
+    taken as the larger of two probes: the oldest entry in the pending entries list
+    (`XPENDING q - + 1`) and the oldest entry past the group's last delivered id (`XINFO
+    GROUPS`, then an exclusive `XRANGE`), each read through the millisecond field of the stream
+    id. It is deliberately NOT `XRANGE q - + COUNT 1`. Section 4.1's XACK and XDEL pair is not
+    atomic (§4.3 explains why), so an XACK whose XDEL never landed leaves an entry in the
+    stream that no recovery path can reach; a plain `XRANGE` would read that orphan and report
+    a phantom age that grows forever and survives every restart. Both probes above skip it.
+    The orphan itself is not reaped: nothing in the worker XTRIMs a stream, so a partial write
+    leaves one entry's bytes in redis permanently. That is a slow memory leak, not a
+    correctness problem, and it is a known 1.0 gap.
+    This is the backlog's leading indicator, and it is a broker probe rather than a per task
+    sample precisely because it keeps reporting while fetching is paused, which is the moment
+    per task sampling goes blind.
   - `sync_p50` / `sync_p99` / `async_p50` / `async_p99` / `cpu_p50` / `cpu_p99` are per lane
     task latencies in milliseconds over the interval just ended, from a 24 bucket log2
     histogram per lane, linearly interpolated inside the bucket carrying the target rank.
@@ -1121,6 +1159,18 @@ existed, or by a client that did not read the same config. It is skipped when `e
 0 (absent): without that guard every such envelope would look ~55 years overdue and be
 discarded. `enqueued_at + ttl` uses saturating arithmetic so a hostile `enqueued_at` cannot
 wrap the deadline into the past.
+
+**A queue TTL is measured from enqueue, never from the due time.** Both halves above anchor on
+`enqueued_at`, so a `countdown`, an `eta` or a beat slot that lands after `enqueued_at + ttl` is
+a task that can never run: it waits out its delay in `cauli:delayed:{queue}`, is published on
+time, and is then discarded unrun at dispatch. `queue_ttl = 300` with `countdown = 600` is the
+whole shape of it, and an app-wide `"*"` entry makes it every delayed task in the application.
+A client MUST therefore refuse at enqueue when the fire time it computed is later than the
+deadline it stamped (the Python client raises `ValueError` from `make_envelope`); the worker
+has no way to tell that case apart from a genuinely stale envelope, so this check exists only
+on the client side. Note that a longer per-call `expires` does not rescue such a task, since
+the effective deadline is the EARLIER of the two: keep the queue's TTL above the longest delay
+published to it, or route delayed work to a queue with a TTL that fits.
 
 The worker reads the map through the same duck-typed §6 introspection as everything else, so an
 app object predating this feature simply reports no TTLs.
@@ -1589,6 +1639,12 @@ Two artifacts per release, published together and versioned in lockstep.
 | `cauli` | the pure-Python client, plus the `cauli-beat` entry point | `py3-none-any` |
 | `cauli-worker` | the prebuilt Rust worker binary | `cp3XX-cp3XX-manylinux_2_28_{x86_64,aarch64}` |
 
+`pip install cauli` is the whole install. The client requires `cauli-worker` behind a PEP 508
+marker naming the exact set of wheels that exist, so on a supported platform pip lands both
+halves and the user never runs a compiler, and off it the requirement disappears rather than
+taking the pure-Python client down with it. See §13.4 for the marker, and for the enqueue-only
+path that skips the binary.
+
 ### 13.1 Why the worker ships one wheel per CPython version
 
 `cauli-worker` embeds CPython (pyo3 `auto-initialize`), so the built binary carries
@@ -1635,15 +1691,60 @@ Neither package is uploaded until both hold, on every supported CPython version:
 
 ### 13.3 Version lockstep
 
-`cauli-worker` depends on `cauli==<same version>`. The two implement one wire contract, so at
-0.x a mismatched pair is a bug rather than a convenience, and a pin turns it into a pip
-resolution error instead of a protocol bug at runtime.
+The two packages pin each other exactly. `cauli-worker` depends on `cauli==<same version>`,
+and `cauli` depends on `cauli-worker==<same version>` behind the §13.4 marker. They implement
+one wire contract, so a mismatched pair is a bug rather than a convenience, and a pin turns it
+into a pip resolution error instead of a protocol bug at runtime. The cycle is deliberate, and
+pip resolves it because both pins are exact and name the same version, so exactly one solution
+exists.
 
-Four files carry the version: `worker/Cargo.toml` (which is also the worker wheel's version,
-via maturin), the `cauli==` pin in `worker/pyproject.toml`, `py/pyproject.toml`, and
-`py/cauli/__init__.py`. `scripts/check_versions.py` asserts they agree, and that they match the
-git tag when given one. It runs on every push, not only at tag time, because that failure
-otherwise surfaces at a user's `pip install`.
+Six places carry the version: `worker/Cargo.toml` (which is also the worker wheel's version,
+via maturin), the `cauli==` pin in `worker/pyproject.toml`, the `cauli-worker==` pin in
+`py/pyproject.toml`, `py/pyproject.toml`'s own `[project].version`, `py/cauli/__init__.py`,
+and the README's Status section. `scripts/check_versions.py` asserts they agree, and that they
+match the git tag when given one. It runs on every push, not only at tag time, because that
+failure otherwise surfaces at a user's `pip install`.
+
+### 13.4 One install command, and the way out of it
+
+The client's requirement on the worker is:
+
+```
+cauli-worker==<version>; sys_platform == 'linux'
+  and (platform_machine == 'x86_64' or platform_machine == 'aarch64')
+  and python_version < '3.15'
+```
+
+The marker is not caution, it is the release matrix written down. Off that set no wheel exists
+and no worker sdist is published, so an unguarded requirement would take the pure-Python client
+with it: `pip install cauli` would fail outright on a macOS laptop, on Windows, on PyPy, and
+on the first CPython newer than the matrix. Guarded, the requirement simply disappears there
+and the client installs and enqueues as before. The `python_version` bound has to be RAISED
+whenever the matrix gains a version, or that new interpreter silently gets no worker.
+
+Two platforms stay broken and the marker cannot fix them, because PEP 508 defines no marker for
+either: **musl** (Alpine) and the **free threaded** build. `sys_platform` is `linux` on musl and
+`python_version` is unchanged on a free threaded interpreter, so both satisfy the marker, no
+`musllinux` or `cp3XXt` worker wheel exists, and pip fails the whole install with
+`ResolutionImpossible` rather than dropping the requirement. The two ways out are the
+enqueue-only command below and building the worker from source. Publishing musllinux and
+`cp3XXt` wheels would close both, and until the release matrix builds and RUNS them, this is
+documented rather than pretended away.
+
+The cost of the single command is that every install on a supported platform carries the
+binary, including deployments that only enqueue. A FastAPI or Django web dyno never runs a
+worker and does not need it. That install is:
+
+```
+pip install --no-deps cauli 'redis>=5' 'msgspec>=0.18'
+```
+
+which is the client and its own two runtime dependencies, and nothing else. `pip check` then
+reports `cauli requires cauli-worker, which is not installed`; that is accurate, and a pipeline
+that gates on `pip check` has to allow it on this path. `--no-deps` is the only lever pip
+offers: an extra such as `cauli[worker]` would make the binary opt-in, and opt-in is exactly
+what the single command requirement rules out. Keep the third party names in that command in
+step with `[project].dependencies` in `py/pyproject.toml`.
 
 Releasing is pushing a `vX.Y.Z` tag. `.github/workflows/release.yml` does the rest and uploads
 via PyPI trusted publishing, so no API token is stored in the repository.

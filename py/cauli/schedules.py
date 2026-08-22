@@ -438,12 +438,36 @@ def interval(every: float) -> IntervalSchedule:
 def crontab(
     minute: Any = "*",
     hour: Any = "*",
+    *,
     day_of_month: Any = "*",
     month: Any = "*",
     day_of_week: Any = "*",
     timezone: str = "UTC",
+    month_of_year: Any = None,
 ) -> CrontabSchedule:
-    """POSIX cron-style schedule. See :class:`CrontabSchedule`."""
+    """POSIX cron-style schedule. See :class:`CrontabSchedule`.
+
+    Only ``minute`` and ``hour`` may be passed positionally, and that is
+    deliberate. Celery's ``crontab`` takes ``(minute, hour, day_of_week,
+    day_of_month, month_of_year)``; cauli's fields are in ``cron(8)`` order,
+    ``(minute, hour, day_of_month, month, day_of_week)``. Positions 3 and 4 are
+    swapped between the two, and both spellings parse cleanly, so a copied
+    ``crontab(0, 4, 1)`` would silently mean "every Monday" in one and "the 1st
+    of the month" in the other. Everything past ``hour`` must therefore be
+    named. ``month_of_year=`` is accepted only to reject it by name.
+
+    Note also that cauli ORs ``day_of_month`` and ``day_of_week`` when both are
+    restricted, as ``cron(8)`` does; Celery ANDs them. See
+    :class:`CrontabSchedule`.
+    """
+    if month_of_year is not None:
+        raise TypeError(
+            "crontab() has no 'month_of_year' argument; cauli calls that field "
+            "'month'. Note also that cauli's field order is cron(8)'s "
+            "(minute, hour, day_of_month, month, day_of_week), while Celery's "
+            "is (minute, hour, day_of_week, day_of_month, month_of_year): the "
+            "third and fourth are swapped, so pass them by name."
+        )
     return CrontabSchedule(
         minute=minute,
         hour=hour,

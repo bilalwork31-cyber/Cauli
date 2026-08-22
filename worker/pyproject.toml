@@ -58,6 +58,14 @@ Homepage = "https://github.com/bilalwork31-cyber/Cauli"
 Repository = "https://github.com/bilalwork31-cyber/Cauli"
 Issues = "https://github.com/bilalwork31-cyber/Cauli/issues"
 
+# `worker/LICENSE-MIT` and `worker/LICENSE-APACHE` are byte identical copies of
+# the two license files at the repository root. maturin only looks for license
+# files next to this pyproject.toml, and Apache-2.0 section 4(a) requires every
+# distributor to ship the license, so the wheel and sdist would otherwise claim
+# a license they do not carry. maturin picks the copies up automatically and
+# writes them into `.dist-info/licenses/`; keep them in sync with the root
+# originals (scripts/check_licenses.py enforces this).
+
 [tool.maturin]
 # A Rust BINARY that embeds Python, not an extension module. maturin puts it in
 # the wheel's scripts dir, so pip installs it onto PATH inside the venv.

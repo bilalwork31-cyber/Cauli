@@ -1,6 +1,14 @@
-
-## DECISION DOCUMENT — error taxonomy at 1.0
-### Produced on Fable. Recommendation stands, awaiting human approval. NOT implemented.
+# Decision: error taxonomy at 1.0
+> **Historical design note, not current documentation.** This is a record of how one
+> pre 1.0 decision was reached and what was known when it was reached. It is kept
+> because the reasoning is worth reading, not because it describes today's behaviour.
+> Where it disagrees with the code, with [PROTOCOL.md](../../PROTOCOL.md) or with
+> [docs/CONFIGURATION.md](../CONFIGURATION.md), those win. The status line below was
+> checked against the source, not carried over.
+>
+> **Status: shipped in 1.0.0.** `error.origin` is on the wire (PROTOCOL.md section 8) and
+> the worker minted `TimeoutError` was renamed `TimeLimitExceeded`. Everything else in the
+> taxonomy is frozen for 1.x.
 
 **Recommendation: add one additive wire field, rename one string, freeze everything else. Both before
 1.0, because the rename is only cheap now.**

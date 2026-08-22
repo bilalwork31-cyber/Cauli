@@ -5,7 +5,7 @@ use crate::broker;
 // host's own: expiry deadlines and delayed scores are compared across
 // workers, and this file writes both. See clock.rs.
 use crate::clock::now_ms;
-use crate::ctx::{Ctx, DecrGuard, Outcome};
+use crate::ctx::{Ctx, DecrGuard, InflightEntry, Outcome};
 use crate::envelope::{self, Envelope, ErrorJson};
 use crate::exec;
 use serde_json::Value;
@@ -23,6 +23,11 @@ pub fn spawn_dispatch(ctx: Arc<Ctx>, queue: String, stream_id: String, raw: Opti
         // release this slot, or `inflight_total` never reaches 0 and every
         // shutdown burns the full --drain-timeout.
         let _guard = DecrGuard(&ctx.counters.inflight_total);
+        // Held for exactly as long as this process owns the entry, so the
+        // section 4.4 recovery loop cannot reclaim (and eventually dead
+        // letter) work this very worker is still holding. Panic safe for
+        // the same reason as the counter guard above.
+        let _held = InflightEntry::track(&ctx, &queue, &stream_id);
         process(&ctx, &queue, &stream_id, raw).await;
     });
 }
@@ -55,7 +60,15 @@ fn args_kwargs_shape_ok(env: &Envelope) -> bool {
 async fn process(ctx: &Arc<Ctx>, queue: &str, sid: &str, raw: Option<String>) {
     let raw = match raw {
         Some(r) => r,
-        None => return dlq_terminal(ctx, queue, sid, "", "malformed", None).await,
+        None => {
+            // Silent before: a stream entry with no `e` field dead lettered
+            // with no log line at any level. Every terminal reason below is
+            // now visible at the DEFAULT level, because a producer/worker
+            // skew that dead letters a whole queue must not need `debug` to
+            // be seen.
+            warn!(queue, entry = %sid, "stream entry has no \"e\" field -> DLQ");
+            return dlq_terminal(ctx, queue, sid, "", "malformed", None).await;
+        }
     };
     // M2: bound parse/amplification cost before serde ever sees the payload.
     if raw.len() > ctx.args.max_envelope_bytes {
@@ -84,10 +97,31 @@ async fn process(ctx: &Arc<Ctx>, queue: &str, sid: &str, raw: Option<String>) {
             return dlq_terminal(ctx, queue, sid, &raw, "malformed", None).await;
         }
         Ok(e) if !e.id.is_empty() && !e.task.is_empty() && valid_task_id(&e.id) => e,
-        _ => return dlq_terminal(ctx, queue, sid, &raw, "malformed", None).await,
+        // Catch-all: unparseable JSON, empty id, empty task, or an id that
+        // fails the section 2 charset gate. Logged with the same bounded
+        // preview the DLQ write already computes, never the whole payload.
+        _ => {
+            warn!(
+                queue, entry = %sid,
+                preview = envelope::safe_truncate(&raw, 256),
+                "envelope unparseable or its id/task is invalid -> DLQ"
+            );
+            return dlq_terminal(ctx, queue, sid, &raw, "malformed", None).await;
+        }
     };
-    let Some(spec) = ctx.registry.get(&env.task).cloned() else {
-        debug!(task = %env.task, id = %env.id, "unregistered task -> DLQ");
+    // Borrowed, not `.cloned()`: the clone existed only to read two
+    // immutable fields and heap allocated a fresh `kind` String on every
+    // single dispatch. The borrow ends with this statement, so nothing
+    // downstream is constrained by it.
+    let Some((is_cpu, is_async)) = ctx
+        .registry
+        .get(&env.task)
+        .map(|spec| (spec.kind == "cpu", spec.is_async))
+    else {
+        // warn, not debug: this is the shape a producer/worker version skew
+        // takes, and at the default log level it used to produce no output
+        // at all while a whole queue was destroyed.
+        warn!(task = %env.task, id = %env.id, "unregistered task -> DLQ");
         return dlq_terminal(ctx, queue, sid, &raw, "unregistered", None).await;
     };
 
@@ -107,7 +141,10 @@ async fn process(ctx: &Arc<Ctx>, queue: &str, sid: &str, raw: Option<String>) {
     if let Some(deadline) = env.expiry_deadline_ms(ctx.queue_ttl_ms(queue)) {
         let now = now_ms();
         if now > deadline {
-            debug!(
+            // warn, not debug: a clock skewed client or a queue_ttl shorter
+            // than the work takes discards 100% of its own tasks here, and
+            // that used to be invisible at the default level.
+            warn!(
                 task = %env.task, id = %env.id, deadline, now,
                 late_ms = now.saturating_sub(deadline),
                 "task expired before execution -> DLQ"
@@ -160,6 +197,11 @@ async fn process(ctx: &Arc<Ctx>, queue: &str, sid: &str, raw: Option<String>) {
                 {
                     Ok(()) => {
                         ctx.counters.ok.fetch_add(1, Ordering::Relaxed);
+                        // Also counted separately: a suppressed duplicate is
+                        // not an executed task, and folding it into `ok`
+                        // alone made a badly derived idempotency_key look
+                        // like healthy throughput.
+                        ctx.counters.duplicate.fetch_add(1, Ordering::Relaxed);
                     }
                     Err(e) => {
                         error!(id = %env.id, "duplicate finish write failed: {e}");
@@ -176,9 +218,9 @@ async fn process(ctx: &Arc<Ctx>, queue: &str, sid: &str, raw: Option<String>) {
     }
 
     // Route by registry kind (registry authoritative over envelope kind).
-    let outcome = if spec.kind == "cpu" {
+    let outcome = if is_cpu {
         exec::run_cpu_task(ctx, &env).await
-    } else if spec.is_async {
+    } else if is_async {
         exec::run_async_task(ctx, &env).await
     } else {
         exec::run_sync_task(ctx, &env).await
@@ -290,11 +332,18 @@ async fn schedule_retry(
     // from valid JSON, so no NaN/Infinity survived), so re-serializing it
     // cannot fail.
     let ej = serde_json::to_string(env).expect("envelope serialize");
-    if let Err(e) = broker::finish_retry(conn, queue, sid, &ej, fire_at).await {
-        error!(id = %env.id, "retry write failed: {e}");
+    // Gated on the write, like every sibling branch in `finish`: an
+    // unconditional increment made `retried=` climb at full rate through a
+    // redis brownout in which nothing was actually scheduled.
+    match broker::finish_retry(conn, queue, sid, &ej, fire_at).await {
+        Ok(()) => {
+            debug!(id = %env.id, retries = env.retries, delay_ms = d_ms, "scheduled retry");
+            ctx.counters.retried.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(e) => {
+            error!(id = %env.id, "retry write failed: {e}");
+        }
     }
-    debug!(id = %env.id, retries = env.retries, delay_ms = d_ms, "scheduled retry");
-    ctx.counters.retried.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Final failure: DLQ `reason` ("max_retries" or "not_retryable", see

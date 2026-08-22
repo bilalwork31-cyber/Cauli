@@ -136,6 +136,24 @@ def test_unknown_timezone_rejected_with_a_useful_message():
         crontab(timezone="Mars/Olympus_Mons")
 
 
+# --------------------------------------------------- Celery signature guards
+
+
+def test_crontab_is_keyword_only_past_hour():
+    # Celery's third positional is day_of_week, cauli's is day_of_month.
+    # A copied `crontab(0, 4, 1)` must fail loudly instead of meaning
+    # something different from what it meant under Celery.
+    with pytest.raises(TypeError):
+        crontab(0, 4, 1)
+    # The two shared positions stay positional and keep working.
+    assert crontab(0, 4).to_spec() == crontab(minute=0, hour=4).to_spec()
+
+
+def test_crontab_rejects_celery_month_of_year_by_name():
+    with pytest.raises(TypeError, match="month_of_year"):
+        crontab(minute=0, hour=4, month_of_year=3)
+
+
 # ---------------------------------------------------------------- crontab
 
 

@@ -8,9 +8,9 @@ use crate::stats::Counters;
 use redis::aio::ConnectionManager;
 use serde::Deserialize;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::{watch, Semaphore};
 
 pub struct Ctx {
@@ -20,6 +20,24 @@ pub struct Ctx {
     pub redis: ConnectionManager,
     pub counters: Arc<Counters>,
     pub io_sem: Arc<Semaphore>,
+    /// Total permits `io_sem` was built with. The fetch loop needs the
+    /// CAPACITY, not just the free count, to tell "every slot is busy" from
+    /// "this deployment has fewer slots than it has queues" (see
+    /// `loops::fetch_loop`).
+    pub io_concurrency: usize,
+    /// Stream entries this process currently holds in flight, per queue.
+    /// One pre-built set per queue (queues are fixed at startup), keyed by
+    /// the parsed `(ms, seq)` halves of the redis stream id so tracking an
+    /// entry costs no allocation on the dispatch path.
+    ///
+    /// The section 4.4 recovery loop consults this before reclaiming: an
+    /// entry THIS worker is still holding must never be XCLAIMed by it,
+    /// however long it has been parked. Without it a cpu entry waiting for a
+    /// child (or any entry waiting for an execution slot) crosses the idle
+    /// threshold, gets reclaimed by its own worker, and after
+    /// `redelivery_limit` reclaims is dead lettered as
+    /// `RedeliveryLimitExceeded` having executed zero instructions.
+    pub inflight_entries: HashMap<String, Mutex<HashSet<(u64, u64)>>>,
     pub sync_pool: SyncPool,
     pub pyrt: Arc<PyRuntime>,
     /// Lazily started cpu pool: empty until the first cpu task (or startup
@@ -38,6 +56,50 @@ pub struct Ctx {
 
 /// PROTOCOL §9.2 wildcard key: the TTL used for any queue without its own entry.
 pub const QUEUE_TTL_WILDCARD: &str = "*";
+
+/// Split a redis stream id (`"<ms>-<seq>"`) into its two numeric halves.
+/// `None` for anything that is not that shape, in which case the caller
+/// falls back to not tracking the entry, i.e. to the previous behavior.
+pub fn parse_stream_id(id: &str) -> Option<(u64, u64)> {
+    let (ms, seq) = id.split_once('-')?;
+    Some((ms.parse().ok()?, seq.parse().ok()?))
+}
+
+/// Marks one stream entry as in flight in `Ctx::inflight_entries` for as
+/// long as it is held, and removes it on drop -- including a panicking
+/// unwind, exactly like `DecrGuard`. A leaked entry here would be
+/// permanently unreclaimable, so the removal must not depend on the happy
+/// path being taken.
+pub struct InflightEntry<'a> {
+    set: Option<&'a Mutex<HashSet<(u64, u64)>>>,
+    id: (u64, u64),
+}
+
+impl<'a> InflightEntry<'a> {
+    /// Records `stream_id` under `queue`. A queue this worker does not
+    /// consume, or an id that is not `<ms>-<seq>`, yields an inert guard.
+    pub fn track(ctx: &'a Ctx, queue: &str, stream_id: &str) -> Self {
+        let parsed = parse_stream_id(stream_id);
+        match (ctx.inflight_entries.get(queue), parsed) {
+            (Some(set), Some(id)) => {
+                set.lock().expect("inflight set poisoned").insert(id);
+                InflightEntry { set: Some(set), id }
+            }
+            _ => InflightEntry {
+                set: None,
+                id: (0, 0),
+            },
+        }
+    }
+}
+
+impl Drop for InflightEntry<'_> {
+    fn drop(&mut self) {
+        if let Some(set) = self.set {
+            set.lock().expect("inflight set poisoned").remove(&self.id);
+        }
+    }
+}
 
 impl Ctx {
     pub fn shutting_down(&self) -> bool {
@@ -97,6 +159,16 @@ impl Ctx {
             let pids = pool.child_pids.lock().unwrap().clone();
             crate::stats::cpu_rss_mb(&pids)
         })
+    }
+
+    /// True while this process still holds `stream_id` on `queue`: fetched
+    /// or reclaimed, and not yet finished. The section 4.4 recovery loop
+    /// uses it to refuse to reclaim its own live work.
+    pub fn holds_entry(&self, queue: &str, stream_id: &str) -> bool {
+        match (self.inflight_entries.get(queue), parse_stream_id(stream_id)) {
+            (Some(set), Some(id)) => set.lock().expect("inflight set poisoned").contains(&id),
+            _ => false,
+        }
     }
 
     /// Configured max age for `queue`, in ms: an exact match wins over the

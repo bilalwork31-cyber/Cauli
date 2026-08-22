@@ -33,7 +33,13 @@ env:
   # Oldest glibc the worker wheels target: manylinux_2_28 is RHEL 8, Debian 10
   # and Ubuntu 20.04 or newer.
   MANYLINUX: "2_28"
-  PYTHONS: '["3.10", "3.11", "3.12", "3.13", "3.14"]'
+
+# The supported CPython list is spelled out in the `worker`, `verify` and
+# `verify-bare` matrices below rather than once here, because GitHub does not
+# expose the `env` context to `jobs.<id>.strategy`: a variable here would be read
+# as a literal string and would silently produce a one entry matrix. Adding a
+# CPython version means editing all three, plus the classifiers and the
+# `python_version` bound on the `cauli-worker` pin in py/pyproject.toml.
 
 jobs:
   version:
@@ -198,6 +204,27 @@ jobs:
           client_v=$(.relvenv/bin/python -c "import cauli; print(cauli.__version__)")
           echo "worker $worker_v / client $client_v"
           test "$worker_v" = "$client_v"
+
+      # The property the whole install story rests on: a user types
+      # `pip install cauli` and gets a worker binary they can run. It is one
+      # metadata line away from silently regressing, and no other step here
+      # can catch that, because they all install the two wheels BY PATH.
+      - name: plain `pip install cauli` lands a working worker
+        run: |
+          set -euo pipefail
+          python -m venv .onecmd
+          .onecmd/bin/pip install --upgrade pip
+          # Third party dependencies first, from the index, so the resolve
+          # below can be --no-index: cauli and cauli-worker then have exactly
+          # one possible source, the artifacts we are about to publish, and
+          # cannot quietly come from an older release already on PyPI.
+          .onecmd/bin/pip install "redis>=5" "msgspec>=0.18"
+          .onecmd/bin/pip install --no-index --find-links artifacts cauli
+          .onecmd/bin/pip show cauli-worker >/dev/null
+          test -x .onecmd/bin/cauli-worker
+          # Installed is not the same as runnable. --print-plan needs no Redis
+          # and no app, so it is the cheapest proof that the binary starts.
+          .onecmd/bin/cauli-worker --print-plan
 
       # The published artifact runs the real cross-component suite: a real
       # worker binary, real cpu child processes, real Redis.

@@ -229,3 +229,100 @@ def test_status_matches_get_for_a_dict_missing_the_status_field(app, redis_clien
     with pytest.raises(TaskFailedError) as excinfo:
         ar.status()
     assert excinfo.value.type == "InvalidResult"
+
+
+def test_duplicate_exposes_the_claimant_and_its_result(app, redis_client):
+    # PROTOCOL.md section 4.5: a claim is never released, so the only way a
+    # suppressed caller can learn whether the work actually succeeded is the
+    # claimant id carried on the duplicate result.
+    ar = _ar(app)
+    claimant_id = uuid.uuid4().hex
+    _write_result(
+        redis_client,
+        ar.id,
+        {
+            "status": "duplicate",
+            "result": None,
+            "error": None,
+            "claimant_id": claimant_id,
+            "finished_at": 123,
+        },
+    )
+    _write_result(
+        redis_client,
+        claimant_id,
+        {
+            "status": "success",
+            "result": "did the work",
+            "error": None,
+            "finished_at": 1,
+        },
+    )
+
+    assert ar.claimant() is None, "nothing known before get() resolves the document"
+    assert ar.get(timeout=1) is None
+    assert ar.duplicate is True
+    assert ar.claimant_id == claimant_id
+
+    claimant = ar.claimant()
+    assert claimant is not None
+    assert claimant.id == claimant_id
+    assert claimant.get(timeout=1) == "did the work"
+
+
+def test_duplicate_with_null_claimant_id_stays_none(app, redis_client):
+    # Section 4.5 race: the claim key expired between the failed SET and the
+    # GET of its holder, so the worker writes claimant_id null. That must not
+    # turn into an AsyncResult for a task id of "None".
+    ar = _ar(app)
+    _write_result(
+        redis_client,
+        ar.id,
+        {
+            "status": "duplicate",
+            "result": None,
+            "error": None,
+            "claimant_id": None,
+            "finished_at": 123,
+        },
+    )
+    assert ar.get(timeout=1) is None
+    assert ar.claimant_id is None
+    assert ar.claimant() is None
+
+
+def test_status_reads_both_as_an_attribute_and_as_a_call(app, redis_client):
+    # `if r.status == "success":` is the Celery idiom and used to compare a
+    # bound method to a string, which is False forever and raises nothing.
+    # `r.status()` is cauli's own spelling (PROTOCOL.md section 12) and every
+    # existing call site uses it. Both have to be correct.
+    ar = _ar(app)
+    assert ar.status == "pending"
+    assert ar.status() == "pending"
+
+    _write_result(
+        redis_client,
+        ar.id,
+        {"status": "success", "result": 7, "error": None, "finished_at": 1},
+    )
+    assert ar.status == "success"
+    assert ar.status() == "success"
+    assert isinstance(ar.status, str)
+    assert f"{ar.status}" == "success"
+    assert ar.status != "failure"
+
+
+def test_calling_the_status_value_does_not_re_read_redis(app, redis_client):
+    # `r.status()` has to stay one round trip, as it was when status was a
+    # plain method: the read happens when the property is evaluated, and
+    # calling the value just hands it back.
+    ar = _ar(app)
+    _write_result(
+        redis_client,
+        ar.id,
+        {"status": "success", "result": 1, "error": None, "finished_at": 1},
+    )
+    value = ar.status
+    redis_client.delete(f"cauli:result:{ar.id}")
+    assert value() == "success"
+    assert ar.status == "pending"

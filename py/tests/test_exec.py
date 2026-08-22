@@ -311,3 +311,27 @@ def test_eof_exits_zero(child):
     rc = child.close(timeout=10)
     assert rc == 0
     child.drain_eof()
+
+
+def test_response_write_failure_is_logged(capsys):
+    """A response that cannot be written must say so on stderr.
+
+    In-process, not over the pipe: the failure window lives inside
+    `_safe_handle_and_respond`, which the socket-serving loops use. Losing a
+    response silently leaves the worker waiting out its own hard timeout with
+    nothing in the logs naming the request.
+    """
+    from cauli import _exec
+
+    class _BrokenWriter:
+        def write_response(self, payload):
+            raise BrokenPipeError("peer gone")
+
+    _exec._safe_handle_and_respond(
+        object(),
+        '{"id": "w1", "task": "nope", "args": [], "kwargs": {}}',
+        _BrokenWriter(),
+    )
+    err = capsys.readouterr().err
+    assert "response write failed for request 'w1'" in err
+    assert "BrokenPipeError" in err

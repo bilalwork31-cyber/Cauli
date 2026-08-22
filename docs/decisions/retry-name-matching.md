@@ -1,5 +1,15 @@
-# DECISION — Retry name matching, and what it uncovered
-Produced on Fable. NOT implemented.
+# Decision: Retry name matching, and what it uncovered
+> **Historical design note, not current documentation.** This is a record of how one
+> pre 1.0 decision was reached and what was known when it was reached. It is kept
+> because the reasoning is worth reading, not because it describes today's behaviour.
+> Where it disagrees with the code, with [PROTOCOL.md](../../PROTOCOL.md) or with
+> [docs/CONFIGURATION.md](../CONFIGURATION.md), those win. The status line below was
+> checked against the source, not carried over.
+>
+> **Status: shipped in 1.0.0.** Name plus countdown matching was kept, as recommended. The
+> defect it uncovered is fixed: `worker/src/shim.py` rebinds its `SoftTimeLimitExceeded`
+> from the real `cauli` module once the app is loaded, so a task's own
+> `except SoftTimeLimitExceeded` clause matches the class the worker raises.
 
 **Keep name plus countdown matching. It is the correct design, forced by two hard constraints, and
 the collision is nearly behaviour neutral. The real pre 1.0 fix in this neighbourhood is a different

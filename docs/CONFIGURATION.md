@@ -4,12 +4,16 @@ Every knob cauli has: the worker command line, the app object, the task
 decorator, per call options, environment variables, and the Django settings
 the contrib layer reads.
 
-Where a default was chosen by measurement rather than taste, the measurement
-is cited. Figures marked *(measured)* come from the 2026 benchmark campaigns
-on a six core i7-9750H under WSL2 with four cores pinned to the worker; they
-are the shape of the effect, not a promise about your machine. The raw
-campaign data has been retired from the tree ahead of a single reproducible
-benchmark.
+Where a default was chosen for a reason, the reason is stated. None of that
+reasoning is a published benchmark result: this file used to carry figures from
+a campaign whose harness is no longer in the tree, and those figures have been
+removed rather than republished without one. Reproducible numbers live in
+`bench/`, starting with `bench/CLAIMS.md` for what is actually tested and
+`bench/RESULTS.md` for what is not. Treat the guidance below as design
+rationale to confirm on your own hardware, not as a promise about it. Before
+citing a figure from `bench/` anywhere, check that the lane's task module is
+tracked: `git ls-files bench/`. A claim whose harness is not in the tree is
+not a claim this project can defend.
 
 - [Choosing a task kind](#choosing-a-task-kind)
 - [Worker command line](#worker-command-line)
@@ -42,11 +46,11 @@ The distinction that decides it is **whether the body holds the GIL**:
   written parsing): a thread pool of any width executes these one at a time.
   Use `kind="cpu"`.
 
-Measured on identical bodies: at 50 ms per task the thread pool
-reaches 59 tasks/s on GIL releasing work and 15 tasks/s on GIL holding work,
-with the per task time inflating from 62.6 ms to 413.4 ms as concurrency rises
-from 1 to 8. That inflation is the GIL serialising the bodies, and it is why
-"CPU bound" on its own is not enough information to pick a kind.
+The difference is not small. A thread pool gives real concurrency on GIL
+releasing work and none at all on GIL holding work, where per task time
+inflates roughly in step with how many bodies are queued behind the one
+holding the GIL. That inflation is the GIL serialising the bodies, and it is
+why "CPU bound" on its own is not enough information to pick a kind.
 
 Two other reasons to pick `kind="cpu"`:
 
@@ -71,15 +75,15 @@ With `-c` set, the worker derives its internals from it. Every derived value
 can still be pinned by passing its flag explicitly; an explicit flag always
 wins. Every division below is ceiling division, `⌈a / b⌉`: it rounds up, so
 `-c 65` gives 2 processes and `-c 200` gives 4, not the 1 and 3 a floor
-reading predicts. The rules, each from a measured result:
+reading predicts. The rules, and the reasoning behind each:
 
 | Derived | Formula | Why |
 |---|---|---|
-| `--procs` | min(cores, ⌈c / 64⌉) | Each process is one GIL: fanning out was +74% throughput at lower p99 (measured). Scaling by `-c` keeps a small queue worker to one quiet process on a box shared with your web app and Redis, while a large `-c` on a dedicated box uses every core. The 64 slot target is a chosen default, not yet a swept one |
+| `--procs` | min(cores, ⌈c / 64⌉) | Each process is one GIL: fanning out is the only way to run more than one GIL holding body at a time, and it lowers p99 as well as raising throughput. Scaling by `-c` keeps a small queue worker to one quiet process on a box shared with your web app and Redis, while a large `-c` on a dedicated box uses every core. The 64 slot target is a chosen default, not a swept one |
 | `--io-concurrency` | ⌈c / procs⌉ | The gate is the real bound for `async def` tasks; a slot costs about 4 KB |
-| `--io-threads` | ⌈min(c, 512) / procs⌉, at most the gate in this derivation | The sync knee is near 1000 threads per process; past it throughput and latency fall together. Staying at 1x the gate is the latency honest default: oversubscribing buys throughput by inflating task p99 (measured 2048 slots on 4 cores: a 20 ms body reached a 92 ms p99). The gate gets no special enforcement of its own: an explicit `--io-threads` is not capped by it, so `-c 50 --io-threads 999` really does give 999 threads against a gate of 50 |
+| `--io-threads` | ⌈min(c, 512) / procs⌉, at most the gate in this derivation | Thread pools stop paying somewhere around a thousand threads per process; past that, throughput and latency fall together. Staying at 1x the gate is the latency honest default: oversubscribing buys throughput by inflating task p99. The gate gets no special enforcement of its own: an explicit `--io-threads` is not capped by it, so `-c 50 --io-threads 999` really does give 999 threads against a gate of 50 |
 | `--cpu-workers` | ⌈min(cores, c) / procs⌉ | More cpu children than cores buys nothing, and more than `-c` would make `-c 8` on a cpu queue mean something other than 8 |
-| `--io-loops` | always 1 | 1 loop beat 2, 3 and 4 in every sweep: extra loops contend for one GIL |
+| `--io-loops` | always 1 | Extra loops add threads that contend for one GIL, not parallelism |
 
 Without `-c`, one process and the standalone defaults below apply, unless
 `--procs` is passed alone: it still divides `cpu_workers` across the
@@ -96,24 +100,49 @@ instead.
 | `-A`, `--app` | *required* | App location as `module:attr`. The worker's working directory is prepended to `sys.path`, so relative module paths resolve |
 | `-Q`, `--queues` | `app.default_queue` | Comma separated queue names to consume |
 | `--redis-url` | from app | Precedence: this flag > `CAULI_REDIS_URL` > `app.redis_url` |
-| `--python` | `python3` | Interpreter used to spawn cpu children |
+| `--python` | the embedded interpreter | Interpreter used to spawn cpu children. Unset, the worker asks its own embedded CPython for `sys.executable`, so a non activated venv no longer silently resolves to the system `python3` without the `cauli` package. Pass the flag to override; a warning names the fallback if neither can be resolved |
 
 ### IO execution
 
 | Flag | Default | Effect |
 |---|---|---|
 | `--io-threads` | 64, or derived from `-c` | OS threads for sync `kind="io"` tasks. **This is the scaling axis for sync work** |
-| `--io-concurrency` | 256, or derived from `-c` | Admission semaphore: maximum io tasks in flight, sync and async together |
+| `--io-concurrency` | 256, or derived from `-c` | Admission semaphore: maximum io tasks in flight, sync and async together. Above about 128 per process is untested; see the band note below |
 | `--io-loops` | 1 | Embedded asyncio event loop threads for `async def` tasks |
 
 `--io-concurrency` is a gate, not a worker count. Raising it above
 `--io-threads` does not add sync parallelism, it only lets more tasks queue
-behind the same threads. Measured: with `--io-threads 500`, gates of
-500, 2000 and 4000 all produced the same 247 to 251 tasks/s, because a two
-second task on 500 threads is 250 tasks/s whatever the gate says.
+behind the same threads. With `--io-threads 500` a two second body is capped
+near 250 tasks/s whatever the gate says, so raising the gate from 500 to 4000
+buys no sync throughput, only a longer queue in front of the same threads.
 
 For `async def` tasks the gate *is* the bound, because a slot costs a coroutine
 and a socket rather than a thread.
+
+**The default of 256 is higher than anything this project has confirmed
+works, and it is deliberate that the two do not agree.** Say so plainly rather
+than let a reader find it:
+
+- `bench/RESULTS.md` (the async lane at `--procs 6`) reports the per process
+  gate peaking near 96, then runs that finish 91% to 99% and stall above 104,
+  down to 11% of a run completed at 512. That harness is in the tree and is
+  rerunnable.
+- The stall is not attributed. The same harness opens one Redis connection per
+  concurrent caller and pins no `max_connections`, so at those settings it may
+  have run the Redis server out of client slots rather than found a limit in
+  cauli. Until it is rerun with connections pinned, neither reading is proven.
+- The default was left at 256 rather than lowered onto an unattributed number.
+  That is a judgement call, not a measurement, and it is the open item this
+  section exists to flag.
+
+What to do with that until it is settled:
+
+- Treat anything above 128 slots per process as untested rather than supported.
+- Expect a wall that looks like a hang, not a smooth decline, if you go past it.
+- Pin `--io-concurrency` yourself if you would rather not sit on an untested
+  default. Anything in the 64 to 128 band per process is inside what has run.
+- Remember each async slot can hold a database connection, so the gate feeds
+  the connection formula in the sizing section below.
 
 ### CPU execution
 
@@ -122,7 +151,7 @@ and a socket rather than a thread.
 | `--cpu-workers` | ⌈min(cores, c) / procs⌉ | Child processes for `kind="cpu"` tasks |
 | `--cpu-child-threads` | 1 | Requests pipelined per child, matched by id. Range 1 to 1024 |
 | `--cpu-prefetch` | 4 | Requests staged in a child's socket buffer beyond the one it is running. 0 disables |
-| `--cpu-max-tasks-per-child` | 0 (never) | Recycle a child after this many completed tasks. The backstop for leaky C extensions and slowly dirtied copy on write pages, like Celery's maxtasksperchild. Staged work drains first; no task is lost to a recycle |
+| `--cpu-max-tasks-per-child` | 1000 | Recycle a child after this many completed tasks; 0 disables recycling. The backstop for leaky C extensions and slowly dirtied copy on write pages, like Celery's maxtasksperchild. Staged work drains first; no task is lost to a recycle |
 | `--eager-cpu` | off | Start the cpu pool at boot instead of on the first cpu task, buying the first task a warm start |
 | `--no-fork-server` | off | One process per cpu task over stdio instead of the fork-server. Entered automatically if fork-server startup fails |
 
@@ -138,14 +167,15 @@ long ones.
 
 **`rss_mb` in the worker's stats line is the worker process only; it does not
 include cpu children.** Each forked child is a separate process with its own
-memory, never summed into that number. `--cpu-max-tasks-per-child` (default 0,
-never) is the ONLY mechanism that bounds a child's memory: cauli sets no
+memory, never summed into that number. `--cpu-max-tasks-per-child` (default 1000;
+set it to 0 to disable recycling) is the ONLY mechanism that bounds a child's
+memory: cauli sets no
 rlimit and no cgroup on it. A task with a real leak, or one that just holds a
 large result a moment too long, grows that child until the OS OOM killer takes
-it, and that death surfaces as a generic `WorkerLost` like any other. Measured:
-a child held 331.8 MB of its own while the worker's stats line read `rss_mb=35`
-throughout. If cpu tasks are memory hungry, set a recycle threshold; do not
-rely on the stats line to notice for you.
+it, and that death surfaces as a generic `WorkerLost` like any other. A child
+can grow to hundreds of megabytes while `rss_mb` never moves. If cpu tasks are
+memory hungry, set a recycle threshold; do not rely on the stats line to
+notice for you.
 
 **The cpu pool starts on the first cpu task, not at boot.** An io only
 deployment that registers cpu tasks it never calls pays nothing for them. The
@@ -158,10 +188,12 @@ the resident children.
 | Flag | Default | Effect |
 |---|---|---|
 | `--batch` | 16 | `XREADGROUP COUNT` per fetch. Must be at least 1 |
-| `--visibility-timeout` | 60 | Seconds before a dead worker's in flight tasks are reclaimed by another. Must be at least 1 |
-| `--max-envelope-bytes` | 1048576 | Oversize entries go to the DLQ as `malformed` before being parsed |
+| `--visibility-timeout` | 60 | Seconds before a dead worker's in flight tasks are reclaimed by another. Must be at least 1. This is a floor, not the whole rule: recovery waits for `max(visibility_timeout, task timeout + grace + margin)`, where the margin is sized on `--redis-timeout`, so a task never gets reclaimed while it is still legitimately running |
+| `--max-envelope-bytes` | 1048576 | Oversize entries go to the DLQ as `malformed` before being parsed. Enforced on both ends: the client refuses first, so keep this equal to the app's `max_envelope_bytes`. A client limit above the worker's produces envelopes the worker dead letters, and past 4096 bytes it cannot recover the task id, so no failure result is written and `get()` waits out its own timeout |
 | `--drain-timeout` | 30 | Seconds to finish in flight tasks on graceful shutdown |
-| `--redis-timeout` | 5 | Response and connection timeout, in seconds, for every redis round trip |
+| `--redis-timeout` | 5 | Response and connection timeout, in seconds, for every redis round trip. Forwarded to every supervised worker process |
+| `--mover-interval` | 250 | Milliseconds between delayed and retry sweeps (PROTOCOL section 4.3) |
+| `--mover-limit` | 128 | Entries the sweep moves per queue per round trip. The sweep repeats within one tick until a queue comes back short, so this bounds one `EVAL`, not the drain rate |
 
 **`--visibility-timeout` must exceed your longest task's `timeout`** (PROTOCOL
 section 4.4). The worker warns at startup when a registered task violates it.
@@ -189,6 +221,24 @@ existing safe outcome sooner, at the cost of one log line and at most one
 The Python client built by `Cauli._get_redis()` (`py/cauli/app.py`) passes the
 same 5 second default as `socket_timeout` explicitly, for the same reason:
 redis-py's own default depends on the installed version.
+
+**Do not set `--redis-timeout 1`.** The fetch loop blocks on `XREADGROUP` for
+up to 1000 ms on an empty queue, and the same deadline applies to that call, so
+the two race on scheduling jitter and every lost race tears the connection
+down. The worker now derives its block window as
+`min(1000 ms, --redis-timeout / 2)` with a 50 ms floor and logs the shortened
+window at `info`, so a value of 1 costs you a 500 ms poll rather than a
+reconnect storm. It is still the wrong lever: raise `--redis-timeout` to match
+your redis tail latency instead of lowering it to force faster polling.
+
+**The delayed and retry sweep is no longer rate capped.** Before this release
+the sweep moved at most `--mover-limit` entries per queue per tick with no
+retry, which fixed the drain rate at 512 per second per queue per process
+whatever the flags said. Every retry, `countdown` and `eta` passes through that
+path, so a high retry rate grew `cauli:delayed:{queue}` without bound and
+nothing in the stats line watched it. The sweep now repeats within a tick until
+a queue returns a short page, up to 32 rounds. No published figure exists for
+the ceiling that leaves; `bench/` has no retry rate lane yet.
 
 ### Observability
 
@@ -223,12 +273,14 @@ app = Cauli(redis_url="redis://localhost:6379/0")
 
 | Option | Default | Effect |
 |---|---|---|
-| `redis_url` | `redis://localhost:6379/0` | Broker and result store. Falls back to `CAULI_REDIS_URL` |
+| `redis_url` | `redis://localhost:6379/0` | Broker and result store. Falls back to `CAULI_REDIS_URL`. `rediss://` is supported by both halves: the worker links rustls and trusts the platform certificate store, so Upstash, Azure Cache and ElastiCache with encryption in transit connect without a build flag |
 | `default_queue` | `"default"` | Queue for tasks and calls that do not name one |
 | `result_ttl` | 3600 | Seconds a result key survives |
 | `idemp_ttl` | 86400 | Seconds an idempotency key is remembered |
 | `task_routes` | `None` | `{glob: destination}`, `(pattern, destination)` pairs, or callables |
-| `queue_ttl` | `None` | Seconds, or `{queue: seconds}` with `"*"` as fallback. A task picked up later is discarded |
+| `queue_ttl` | `None` | Seconds, or `{queue: seconds}` with `"*"` as fallback. A task picked up later is discarded. Measured from enqueue, never from due time: a `countdown` or `eta` past the TTL is refused at enqueue rather than discarded unrun later |
+| `max_envelope_bytes` | 1048576 | Largest encoded envelope `.delay()`, `.apply_async()` and the batch calls will publish. Over it they raise `ValueError` naming the task, the measured size and the limit, and write nothing. Keep it equal to the worker's `--max-envelope-bytes`. `cauli-beat` does not read it |
+| `redis_client` | `None` | A ready `redis.Redis`, or a zero argument factory returning one. Overrides `redis_url` for the Python client and `cauli-beat`. This is the Sentinel injection point: `Cauli(redis_client=lambda: sentinel.master_for("mymaster"))`. The Rust worker does not read it and connects by URL |
 
 `task_routes` overrides a task's own decorator `queue`, which is the point: an
 operator re-routes without editing task code. It never overrides a per call
@@ -248,7 +300,7 @@ def crunch(data): ...
 | `queue` | app default | Queue this task publishes to |
 | `max_retries` | 3 | Retries before the DLQ |
 | `timeout` | 300.0 | Hard timeout in seconds |
-| `soft_timeout` | `None` | Seconds before `SoftTimeLimitExceeded` is raised inside the task, so it can clean up |
+| `soft_timeout` | `None` | Seconds before the task is asked to stop early, so it can clean up. The hard `timeout` stays the backstop behind it. **The two io lanes signal it differently**: a `def` task receives `SoftTimeLimitExceeded` raised into its thread, so `except SoftTimeLimitExceeded` works; an `async def` task is cancelled at the soft mark, so it observes `asyncio.CancelledError` and its `finally` blocks run, while an `except SoftTimeLimitExceeded` inside the body never fires. The failure cauli reports is `SoftTimeLimitExceeded` on both, so callers, the DLQ and the result document agree. Ignored unless `0 < soft_timeout < timeout` |
 | `store_result` | `True` | Write `cauli:result:{id}`. `False` skips building the result entirely |
 | `backoff_base` | 0.5 | First retry delay, seconds |
 | `backoff_factor` | 2.0 | Multiplier per retry |
@@ -284,20 +336,60 @@ task.apply_async(args=(), kwargs=None, countdown=None, eta=None,
 | `eta` | Absolute datetime. **Must be timezone aware**; a naive one raises rather than being guessed at |
 | `expires` | Seconds, or an absolute aware datetime. Picked up later, it is discarded with result status `expired` |
 | `queue` | Overrides routing rules, the task's queue and the app default |
-| `idempotency_key` | Deduplicates execution for `idemp_ttl` seconds |
+| `idempotency_key` | Deduplicates execution for `idemp_ttl` seconds. It narrows the duplicate window, it does not close it: the task body still has to be safe to repeat. See PROTOCOL.md section 4, "Delivery guarantee" |
 
 `countdown` and `eta` are mutually exclusive. An `eta` in the past is not an
 error, it means "due now".
 
+### Argument types
+
+Arguments and keyword arguments are encoded as JSON. The accepted set is
+`str`, `int`, `float`, `bool`, `None`, `list`, `tuple`, and `dict` with `str`
+keys. Anything else raises `TypeError` at the call site, naming the path to
+the offending value, for example `args[1]['meta']`. There is no `serializer=`
+option and no pickle path. Note that a `tuple` encodes as a JSON array and
+decodes back as a `list`, so a round trip is not type preserving. The usual
+first casualties porting from Celery are `UUID`, `datetime`, `Decimal` and
+model instances.
+
+### Batching
+
+```python
+app.enqueue_many([
+    send_email,                                    # no arguments
+    (send_email, ("a@b.com",)),                    # args
+    (crunch, ([1, 2],), {}, {"queue": "bulk"}),    # args, kwargs, options
+])
+await app.aenqueue_many([...])                     # on AsyncCauli
+```
+
+N envelopes in one pipelined round trip instead of N. `options` accepts
+exactly the `apply_async` keywords and rejects anything else by name. The
+whole batch is validated and encoded before the first write, so one bad or
+oversize call aborts the batch with nothing published. The pipeline is not a
+transaction: a Redis failure part way through can leave some entries written.
+
+### On commit, for Django
+
 Django users also get `delay_on_commit` and `apply_async_on_commit`, which
 defer publishing until the current transaction commits, so a task never
-observes a row that got rolled back.
+observes a row that got rolled back. Validation is not deferred with it: the
+signature check and the JSON encode dry run run at the call site, inside your
+`atomic()` block, so a bad argument rolls the transaction back instead of
+raising at COMMIT with the row already written.
+
+**Nothing is enqueued under `django.test.TestCase`.** That class wraps every
+test in an atomic block it always rolls back, so the on commit callback never
+runs. Wrap the assertion in `self.captureOnCommitCallbacks(execute=True)`, or
+subclass `TransactionTestCase`. With pytest-django, the `db` fixture behaves
+like `TestCase` and `transactional_db` behaves like `TransactionTestCase`.
 
 ## Environment variables
 
 | Variable | Read by | Effect |
 |---|---|---|
-| `CAULI_REDIS_URL` | client and worker | Broker URL when not passed explicitly |
+| `CAULI_REDIS_URL` | client, `cauli-beat` and worker | Broker URL. **Precedence differs by consumer.** For `Cauli(redis_url=...)` an explicit argument wins over this variable. For `cauli-beat` and the worker this variable overwrites the URL the app declared in code, and only `--redis-url` beats it. A stale value in a beat or worker container therefore silently redirects that process while the web app keeps enqueueing elsewhere. The worker also reads it in preference to argv so a password never reaches `/proc/<pid>/cmdline`, and the supervisor passes it to its children the same way |
+| `CAULI_ALLOW_REDIS_CLUSTER` | worker | Set to `1` to start against a Redis running in cluster mode instead of exiting 1. Off by default: the worker sends `INFO cluster` before it touches a consumer group and refuses when the reply says `cluster_enabled:1`, because `cauli:q:{queue}` and `cauli:delayed:{queue}` never share a hash slot, so a delayed or retried task leaves the stream without ever reaching the delayed set. That is silent loss, not a visible error. A Redis that will not answer the probe at all starts normally |
 | `CAULI_LOOP` | worker | Event loop policy for the embedded asyncio loops. Unset: uvloop when importable, else stock asyncio; the startup line reports which (`impl=uvloop`). `asyncio` forces the stock loop; `uvloop` makes uvloop mandatory and fails startup without it. Force a mode when you must know which loop you measured: under a venv overlay the embedded interpreter also sees system site-packages, so uvloop can appear without being in your requirements |
 | `RUST_LOG` | worker | Overrides `--log-level`. A bare level such as `RUST_LOG=debug` works everywhere. A per target directive has to name the right target, and that differs between builds: the wheel ships `cauli_worker_bin`, while a local `cargo build` produces `cauli_worker`. So use `RUST_LOG=cauli_worker_bin=debug` against an installed worker and `RUST_LOG=cauli_worker=debug` against one you built yourself. Both binaries are the same `src/main.rs`; the two names exist so that `cargo build` keeps producing `cauli-worker` for the integration suite while the wheel ships its console script wrapper under that name |
 | `VIRTUAL_ENV` | worker | The embedded interpreter calls `site.addsitedir` on this venv's site-packages. **Required when running the worker against a virtualenv**, because editable installs are invisible to a `PYTHONPATH` only interpreter |
@@ -350,38 +442,43 @@ pooler recovery.
 Start with `-c` alone. Change one axis at a time and measure, because the
 right value depends on your task body more than on cauli.
 
-**Processes first.** `--procs` is the largest axis the campaign found: on 4
-pinned cores, 1 process to 4 was +74% throughput with lower p99, because each
-process brings its own GIL *(measured)*. `-c` scales it automatically, one
-process per ~64 slots up to the cores, so a busy dedicated box fans out and a
-small colocated worker stays out of your web app's way. The supervisor
+**Processes first.** `--procs` is the largest axis cauli has, because each
+process brings its own GIL and one process runs a single GIL holding body at a
+time however wide its pools are. `-c` scales it automatically, one process per
+~64 slots up to the cores, so a busy dedicated box fans out and a small
+colocated worker stays out of your web app's way. The supervisor
 restarts a dead process after 1 s and forwards SIGTERM to all of them, so
 systemd and docker manage one pid as before. Each process that receives cpu
 tasks starts its own cpu pool on the first one; `--cpu-workers` is divided
 across procs so the child total stays at the core count.
 
-**Sync io tasks.** `--io-threads` is the axis. Measured *(measured)* on a two
-second task with four cores: 500 threads gave 251 tasks/s, 1000 gave 495
-tasks/s, and 2000 fell back to 351 tasks/s while the task body inflated from
-2.00 s to 3.82 s. That inflation is the signature of oversubscription, and it
-is the same shape Celery's gevent pool shows at the same point. Past the knee
-you lose throughput *and* latency together.
+**Sync io tasks.** `--io-threads` is the axis. Widen it while throughput still
+rises, and stop when the task body starts inflating: a body that takes longer
+under a wider pool than it did under a narrow one is the signature of
+oversubscription, the same shape Celery's gevent pool shows at the same point.
+Past that knee you lose throughput *and* latency together, so the last useful
+value is the one just before the body time moves.
 
 Do not simply copy the `--io-concurrency 500` from the README quickstart onto
-sync tasks. Measured cost of running wider than the optimum *(measured)*: 9%
-on an HTTP read workload, 12% on a Django ORM workload.
+sync tasks. Running wider than the optimum is not free: past the knee you pay
+in both throughput and per task latency, so find the knee on your own workload
+rather than starting above it.
 
-**Async io tasks.** `--io-concurrency` is the axis and slots are cheap, about
-4 KB each. Leave `--io-loops` at 1 unless you can show otherwise: measured
-*(measured)*, 1 loop reached 1351 tasks/s against 1057, 957 and 969 for 2, 3 and
-4 loops. Extra loops add threads contending for one GIL, not parallelism.
+**Async io tasks.** `--io-concurrency` is the axis and a slot itself is cheap,
+about 4 KB, but see the band note above before you climb past 128 per process:
+the memory is not what runs out first. The connections each slot can hold are,
+and above 128 you are past everything this project has run. Leave `--io-loops` at 1 unless you can show otherwise on your own
+workload: extra loops add threads that contend for one GIL, not parallelism.
 
 **CPU tasks.** `--cpu-workers` at the core count is the right starting point.
-Sweep `--cpu-prefetch` by task size: measured *(measured)*, 50 ms tasks were
-fastest at `--cpu-prefetch 0` (60.5 against 56.0 tasks/s at the default 4),
-while sub millisecond tasks want it deep.
+Sweep `--cpu-prefetch` by task size. Deep prefetch pays for sub millisecond
+tasks, where the round trip dominates the body. It stops paying once the body
+is long enough to hide the fetch, and `--cpu-prefetch 0` can then be faster,
+because a prefetched entry waits in one child's queue instead of on a free one.
 
-**When none of it helps.** cauli's own dispatch measured 0.1% of worker CPU on
-the sync path and 5.8% on the async path *(measured)*. If a workload is slow and
-the flags do not move it, the cost is in the task body, the database or the
-service being called, and no worker setting will reach it.
+**When none of it helps.** cauli's own dispatch is a thin layer: a Redis read,
+an envelope decode and a handoff into a pool. Nothing in that path is designed
+to be the bottleneck, but no figure for its share of worker CPU is published
+here, because none has been reproduced by a harness in this tree. If a workload
+is slow and the flags do not move it, look in the task body, the database or
+the service being called; a worker setting is unlikely to reach it.

@@ -20,8 +20,20 @@ _u/
 itest/worker.log
 *.log
 
-# Session working notes, never tracked
+# Internal working notes and audit records. Kept on disk, never published:
+# they name unpushed branches, an in progress review process and interim
+# verdicts that would read as the project's current position.
 HANDOFF.md
+AUDIT.md
+FIXES.md
+RESUME.md
+docs/AUDIT_LOG.md
+docs/AUDIT_LOOP_PROMPT.md
+docs/RELEASE_AUDIT.md
+# Internal research note: names a personal WSL path, a machine specific
+# Postgres port, scripts that live outside this repository, and figures from
+# bench2/ and bench3/, neither of which is in the tree.
+docs/RESEARCH-rust-pump-threading-local.md
 
 # Transient result file campaign.py overwrites each run
 bench/campaign_result.json

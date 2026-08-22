@@ -846,7 +846,21 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:
         log.error("failed to load app %r: %s", args.app, exc)
         return 1
-    if args.redis_url:
+    # An app built with `redis_client=` (a Sentinel master_for factory, a
+    # custom pool) connects through that client, not through `redis_url`, so
+    # rewriting the URL here would change nothing while looking like it had.
+    # An explicit --redis-url is then a contradiction the operator has to
+    # resolve; the ambient env var is not, and simply loses.
+    if getattr(app, "redis_client", None) is not None:
+        if args.redis_url:
+            log.error(
+                "bad configuration: --redis-url cannot override the app's "
+                "injected redis_client=, which is what beat connects through. "
+                "Drop one of the two."
+            )
+            return 1
+        log.info("beat: connecting through the app's injected redis client")
+    elif args.redis_url:
         app.redis_url = args.redis_url
         app._redis = None
     elif os.environ.get("CAULI_REDIS_URL"):

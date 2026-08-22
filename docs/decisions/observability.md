@@ -1,5 +1,16 @@
-# DECISION — observability surface at 1.0
-Produced on Fable. Recommendation stands, awaiting human approval. NOT implemented.
+# Decision: observability surface at 1.0
+> **Historical design note, not current documentation.** This is a record of how one
+> pre 1.0 decision was reached and what was known when it was reached. It is kept
+> because the reasoning is worth reading, not because it describes today's behaviour.
+> Where it disagrees with the code, with [PROTOCOL.md](../../PROTOCOL.md) or with
+> [docs/CONFIGURATION.md](../CONFIGURATION.md), those win. The status line below was
+> checked against the source, not carried over.
+>
+> **Status: shipped in 1.0.0.** The stats line gained per lane latency percentiles,
+> `oldest_ms`, `cpu_rss_mb`, `sync_live`, `sync_abandoned`, `async_rejected`,
+> `cpu_backlog` and `loop_lag_ms`, then `pid`, `host` and `duplicate` in the release audit
+> pass. `pending_async` was removed. cpu child recycling now defaults to 1000 tasks.
+> The rejections still stand: no metrics endpoint, no JSON logging, no health endpoint.
 
 **Keep the single stats line and make it a documented logfmt contract. Add 9 fields, remove 1, and
 flip the cpu child recycle default. Zero new dependencies and zero new flags.**

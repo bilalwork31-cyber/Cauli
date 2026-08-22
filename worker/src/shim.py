@@ -5,14 +5,21 @@ complexity so the pyo3 surface stays "call function, pass strings, get strings".
 
 Contract with Rust:
   load_app(app_spec, extra_paths_json) -> app config JSON (startup only)
-  run_sync(name, args, kwargs, soft_timeout_ms) -> outcome dict
+  run_sync(name, args, kwargs, soft_timeout_ms, meta) -> outcome dict
   start_loops(n)                      -> spawn N daemon threads running asyncio loops
   set_callback(cb)                    -> register Rust completion callback cb(token, outcome)
-  submit_async(token, name, args, kwargs, timeout_s) -> schedules coroutine;
-      completion is push-style via the registered callback (no polling).
+  submit_async(token, name, args, kwargs, timeout_s, soft_timeout_s, meta)
+      -> schedules coroutine; completion is push-style via the registered
+      callback (no polling).
   heartbeat()                         -> per loop (lag_ms, pending, completed),
       stamping each loop through call_soon_threadsafe on the way (wedge
       detection and the stats line's loop_lag_ms; worker/src/loops.rs).
+
+`meta` on both execution entry points is the envelope tuple
+`(id, retries, max_retries, queue)` that backs `cauli.current_task()`, or
+None when the caller does not report it (older worker, unit test). It is one
+tuple rather than four scalars so the per-task pyo3 call does not grow four
+argument slots on the hottest path in the process; see `_enter_context`.
 
 Task arguments and outcomes cross as REAL PYTHON OBJECTS, not JSON strings.
 Rust converts in both directions (worker/src/pyjson.rs). This module therefore
@@ -58,6 +65,46 @@ except Exception:
         cauli.SoftTimeLimitExceeded (audit L5): a task's `except Exception`
         must catch this in the fallback case too.
         """
+
+
+try:  # pragma: no cover - only when the real cauli package is importable
+    from cauli._context import TaskContext as _TaskContext  # type: ignore
+    from cauli._context import reset_current_task as _reset_ctx  # type: ignore
+    from cauli._context import set_current_task as _set_ctx  # type: ignore
+except Exception:
+    # No importable cauli package in this interpreter (the shim is loaded
+    # standalone by the Rust unit tests). Then `cauli.current_task()` does not
+    # exist for the task to call either, so both io lanes simply skip the
+    # context rather than carrying a second copy of the ContextVar.
+    _TaskContext = None
+    _set_ctx = None
+    _reset_ctx = None
+
+
+def _enter_context(name, meta):
+    """Install `cauli.current_task()` for this attempt; returns a reset token.
+
+    `meta` is the `(id, retries, max_retries, queue)` tuple Rust reads off the
+    envelope (worker/src/pyrt.rs). None means the caller did not report it, in
+    which case nothing is installed and `current_task()` keeps returning None
+    inside the task instead of handing it an invented id -- the behaviour
+    py/cauli/_context.py documents for a worker that does not plumb this.
+    """
+    if meta is None or _TaskContext is None:
+        return None
+    task_id, retries, max_retries, queue = meta
+    return _set_ctx(_TaskContext(task_id, name, retries, max_retries, queue))
+
+
+def _leave_context(token):
+    """Undo `_enter_context`. A no-op when no context was installed.
+
+    Always paired in a `finally`: the sync lane's pool threads are reused, so
+    a leaked context would let the NEXT task on that thread read the previous
+    task's id.
+    """
+    if token is not None:
+        _reset_ctx(token)
 
 
 _registry = {}  # task name -> duck-typed TaskDef object
@@ -222,6 +269,27 @@ def load_app(app_spec, extra_paths_json):
     if real_cauli is not None and hasattr(real_cauli, "SoftTimeLimitExceeded"):
         SoftTimeLimitExceeded = real_cauli.SoftTimeLimitExceeded
 
+    # Same late-import story for the task context (py/cauli/_context.py): the
+    # module-level import above ran before sys.path existed, so without this
+    # rebind `cauli.current_task()` would return None inside every io task
+    # even though the app module has since imported the real cauli. The three
+    # names are bound together or not at all -- a half-bound set would set a
+    # context it cannot reset, and a leaked context on a reused sync pool
+    # thread shows the NEXT task the previous task's id.
+    global _TaskContext, _set_ctx, _reset_ctx
+    real_ctx = sys.modules.get("cauli._context")
+    if real_ctx is not None:
+        try:
+            ctx_cls = real_ctx.TaskContext
+            setter = real_ctx.set_current_task
+            resetter = real_ctx.reset_current_task
+        except AttributeError:
+            # A cauli too old to carry the context API. Leave the io lanes
+            # skipping the context entirely, which is what current_task()
+            # documents for a worker that does not report it.
+            ctx_cls = setter = resetter = None
+        _TaskContext, _set_ctx, _reset_ctx = ctx_cls, setter, resetter
+
     # Lifecycle hooks (PROTOCOL §4.8), by getattr like everything else here:
     # keep the app's list objects so post-startup registrations are seen.
     global _before_hooks, _after_hooks
@@ -357,7 +425,7 @@ def _inject_soft(tid, gen):
         _set_async_exc(ctypes.c_ulong(tid), ctypes.py_object(SoftTimeLimitExceeded))
 
 
-def run_sync(name, args, kwargs, soft_timeout_ms):
+def run_sync(name, args, kwargs, soft_timeout_ms, meta=None):
     """Run one sync task. `args`/`kwargs` arrive as real Python objects and the
     outcome dict is returned as a real Python object.
 
@@ -366,9 +434,12 @@ def run_sync(name, args, kwargs, soft_timeout_ms):
     that all in-process tasks share -- the two `json.loads` calls and the
     validate-plus-encode that used to live here were charged directly against
     total io throughput.
+
+    `meta` is the `(id, retries, max_retries, queue)` envelope tuple backing
+    `cauli.current_task()`, or None (see `_enter_context`).
     """
     try:
-        return _run_sync_inner(name, args, kwargs, soft_timeout_ms)
+        return _run_sync_inner(name, args, kwargs, soft_timeout_ms, meta)
     except BaseException as e:  # late soft-timeout injection race, anything else
         try:
             return _finish_exc(e)
@@ -385,7 +456,7 @@ def run_sync(name, args, kwargs, soft_timeout_ms):
             }
 
 
-def _run_sync_inner(name, args, kwargs, soft_timeout_ms):
+def _run_sync_inner(name, args, kwargs, soft_timeout_ms, meta=None):
     td = _registry.get(name)
     if td is None:
         return {
@@ -400,33 +471,40 @@ def _run_sync_inner(name, args, kwargs, soft_timeout_ms):
         }
     fn = getattr(td, "fn")
 
-    # Before hooks (PROTOCOL §4.8) run on THIS pool thread before the soft
-    # timeout is armed: hook time is not charged against the soft budget and
-    # an injection cannot land inside a hook. After hooks run after the
-    # disarm below, on every outcome path.
-    _run_hooks(_before_hooks, "before_task")
-    tid = threading.get_ident()
-    gen = _thread_gen.get(tid, 0)
-    if soft_timeout_ms is not None and soft_timeout_ms > 0:
-        _schedule_soft_timeout(tid, gen, soft_timeout_ms)
+    # `cauli.current_task()` is installed around the hooks as well as the task
+    # body: a before/after hook is the natural place to open a per-task log
+    # scope, and it must see the same id the body will.
+    ctx_token = _enter_context(name, meta)
     try:
-        rv = fn(*args, **kwargs)
-        out = _finish_value(rv)
-    except BaseException as e:
-        out = _finish_exc(e)
+        # Before hooks (PROTOCOL §4.8) run on THIS pool thread before the soft
+        # timeout is armed: hook time is not charged against the soft budget
+        # and an injection cannot land inside a hook. After hooks run after
+        # the disarm below, on every outcome path.
+        _run_hooks(_before_hooks, "before_task")
+        tid = threading.get_ident()
+        gen = _thread_gen.get(tid, 0)
+        if soft_timeout_ms is not None and soft_timeout_ms > 0:
+            _schedule_soft_timeout(tid, gen, soft_timeout_ms)
+        try:
+            rv = fn(*args, **kwargs)
+            out = _finish_value(rv)
+        except BaseException as e:
+            out = _finish_exc(e)
+        finally:
+            # Bump the generation (M3): fences off a watchdog deadline for THIS
+            # invocation (already scheduled above, if any) so it cannot land
+            # inside whatever task this thread picks up next. The residual
+            # window where the deadline fires after fn() returns but before
+            # this finally block runs -- flipping a successful execution into a
+            # SoftTimeLimitExceeded failure -- is inherent to
+            # PyThreadState_SetAsyncExc and not fixed by the generation counter
+            # (it is the SAME generation); documented in PROTOCOL.md §4.6.
+            with _gen_lock:
+                _thread_gen[tid] = gen + 1
+            _set_async_exc(ctypes.c_ulong(tid), None)
+            _run_hooks(_after_hooks, "after_task")
     finally:
-        # Bump the generation (M3): fences off a watchdog deadline for THIS
-        # invocation (already scheduled above, if any) so it cannot land
-        # inside whatever task this thread picks up next. The residual window
-        # where the deadline fires after fn() returns but before this finally
-        # block runs -- flipping a successful execution into a
-        # SoftTimeLimitExceeded failure -- is inherent to
-        # PyThreadState_SetAsyncExc and not fixed by the generation counter
-        # (it is the SAME generation); documented in PROTOCOL.md §4.6.
-        with _gen_lock:
-            _thread_gen[tid] = gen + 1
-        _set_async_exc(ctypes.c_ulong(tid), None)
-        _run_hooks(_after_hooks, "after_task")
+        _leave_context(ctx_token)
     return out
 
 
@@ -562,15 +640,23 @@ def _drain(idx, loop):
     with _pending_locks[idx]:
         batch = queue[:]
         del queue[:]
-    for token, name, args, kwargs, timeout_s in batch:
+    for token, name, args, kwargs, timeout_s, soft_timeout_s, meta in batch:
         # _arun is defensive (it converts every exception into an outcome and
         # always invokes the callback), so a bare Task needs no result handle.
-        loop.create_task(_arun(idx, token, name, args, kwargs, timeout_s))
+        loop.create_task(
+            _arun(idx, token, name, args, kwargs, timeout_s, soft_timeout_s, meta)
+        )
 
 
-def submit_async(token, name, args, kwargs, timeout_s):
+def submit_async(token, name, args, kwargs, timeout_s, soft_timeout_s=None, meta=None):
     """Schedule one async task. `args`/`kwargs` are already Python objects
     (converted in Rust); nothing on this path touches JSON.
+
+    `timeout_s` is the hard deadline and `soft_timeout_s` (or None) the soft
+    one; they travel separately so `_arun` can enforce the pair rather than
+    collapsing them to their minimum (see `_await_with_soft_limit`). `meta` is
+    the `(id, retries, max_retries, queue)` envelope tuple backing
+    `cauli.current_task()`, or None (see `_enter_context`).
 
     Submissions are queued per loop and the loop is woken only when its queue
     was empty. asyncio.run_coroutine_threadsafe wakes the loop thread for
@@ -610,14 +696,62 @@ def submit_async(token, name, args, kwargs, timeout_s):
                 "rejecting so the task can be retried instead of queued "
                 "forever" % (idx, _PENDING_CAP)
             )
-        _pending[idx].append((token, name, args, kwargs, timeout_s))
+        _pending[idx].append(
+            (token, name, args, kwargs, timeout_s, soft_timeout_s, meta)
+        )
         _hb_sub[idx] += 1
         wake = len(_pending[idx]) == 1
     if wake:
         loop.call_soon_threadsafe(_drain, idx, loop)
 
 
-async def _arun(idx, token, name, args, kwargs, timeout_s):
+async def _await_with_soft_limit(coro, soft_s, hard_s):
+    """Run one async task body under the §4.6 soft-then-hard deadline pair.
+
+    The soft mark raises `cauli.SoftTimeLimitExceeded` out of this coroutine,
+    exactly as the sync and cpu lanes do, and the hard deadline stays the
+    backstop behind it. What this replaced was a single
+    `asyncio.wait_for(coro, min(soft, hard))`, which meant an `async def`
+    task never saw `SoftTimeLimitExceeded` at all: the soft limit silently
+    became the whole budget and was reported as `TimeLimitExceeded`.
+
+    Lane difference worth knowing, and the reason this is not the sync lane's
+    mechanism: asyncio has no public way to throw an arbitrary exception into
+    a running coroutine at its await point (`PyThreadState_SetAsyncExc` has
+    no asyncio equivalent, and reaching into `Task._fut_waiter` to poison the
+    future a task is parked on breaks the callback that owns it). The stop
+    signal is therefore a `Task.cancel()`, so an async task body observes the
+    soft deadline as `asyncio.CancelledError` and its `finally` blocks run,
+    while an `except SoftTimeLimitExceeded` INSIDE the body does not fire.
+    The exception the worker reports for the task is `SoftTimeLimitExceeded`
+    either way, so callers, the DLQ and the result document all agree with
+    the other two lanes.
+
+    A body that swallows the cancellation and returns normally still returns
+    its value; a body that ignores it and burns the rest of the hard budget
+    times out as `TimeLimitExceeded`, which is what the hard limit means.
+    """
+    task = asyncio.ensure_future(coro)
+    done, _ = await asyncio.wait((task,), timeout=soft_s)
+    if done:
+        return task.result()
+    task.cancel()
+    remaining = hard_s - soft_s
+    done, _ = await asyncio.wait((task,), timeout=remaining if remaining > 0 else 0)
+    if not done:
+        # Cancellation ignored and the hard budget is gone: that is the hard
+        # limit firing, not the soft one. Raised as the same TimeoutError
+        # `asyncio.wait_for` would have raised so _arun maps it identically.
+        raise asyncio.TimeoutError()
+    if task.cancelled():
+        raise SoftTimeLimitExceeded("soft time limit of %.3fs exceeded" % (soft_s,))
+    return task.result()
+
+
+async def _arun(
+    idx, token, name, args, kwargs, timeout_s, soft_timeout_s=None, meta=None
+):
+    ctx_token = None
     try:
         td = _registry.get(name)
         if td is None:
@@ -633,6 +767,14 @@ async def _arun(idx, token, name, args, kwargs, timeout_s):
             }
         else:
             fn = getattr(td, "fn")
+            # `cauli.current_task()` for this coroutine, installed before the
+            # hooks exactly as the sync lane does. A ContextVar set here is
+            # visible to the task body (`asyncio.wait_for` and
+            # `_await_with_soft_limit` both wrap the body in a Task, which
+            # copies the context at creation time) and, because each _arun is
+            # itself a Task with its own context copy, invisible to every
+            # other coroutine sharing this loop thread.
+            ctx_token = _enter_context(name, meta)
             # Before/after hooks (PROTOCOL §4.8) on the loop thread, outside
             # the wait_for window (hook time is not charged against the task
             # timeout). Awaitable-returning hooks are awaited.
@@ -642,7 +784,12 @@ async def _arun(idx, token, name, args, kwargs, timeout_s):
             if _before_hooks:
                 await _run_hooks_async(_before_hooks, "before_task")
             try:
-                rv = await asyncio.wait_for(fn(*args, **kwargs), timeout_s)
+                if soft_timeout_s is None:
+                    rv = await asyncio.wait_for(fn(*args, **kwargs), timeout_s)
+                else:
+                    rv = await _await_with_soft_limit(
+                        fn(*args, **kwargs), soft_timeout_s, timeout_s
+                    )
                 out = _finish_value(rv)
             except (asyncio.TimeoutError, TimeoutError):
                 # The worker's own limit firing, so TimeLimitExceeded, matching
@@ -670,6 +817,8 @@ async def _arun(idx, token, name, args, kwargs, timeout_s):
         # inside, and hooks swallow theirs, so anything reaching here came
         # out of the shim's dispatch machinery.
         out = {"ok": False, "retryable": True, "error": _error_dict(e, "worker")}
+    finally:
+        _leave_context(ctx_token)
 
     # This loop finished something. The wedge watchdog reads this counter as
     # the corroborating signal its stale stamp needs: a loop that is merely

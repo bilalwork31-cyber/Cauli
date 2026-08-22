@@ -33,10 +33,36 @@ dependencies = [
     # dict-key coercion and exception types), and a fallback lets the slow path
     # survive unnoticed in production. See py/cauli/_codec.py.
     "msgspec>=0.18",
-    # zoneinfo (stdlib) needs a system tz database; Windows ships none, and
-    # cauli.schedules refuses to guess a timezone. The client library is
-    # cross platform, so the fallback data has to be a real dependency there.
-    "tzdata; sys_platform == 'win32'",
+    # zoneinfo (stdlib) reads a system tz database, and cauli.schedules refuses
+    # to guess a timezone: a CrontabSchedule raises at app import when the name
+    # cannot be resolved. Windows ships no database at all, and neither do the
+    # container bases people actually deploy on -- Alpine and distroless carry
+    # no /usr/share/zoneinfo unless you add tzdata yourself. A sys_platform
+    # marker drops the wheel on exactly those Linux images, so there is no
+    # marker here: ~450 KB of data beats an import time crash on a correct
+    # timezone name.
+    "tzdata",
+    # `pip install cauli` has to leave the user with a worker they can RUN, so
+    # the client pulls the prebuilt binary rather than leaving it a second step
+    # people skip and then file a bug about. The marker is not caution, it is
+    # the exact set of wheels that exist: Linux only (the worker arms
+    # PR_SET_PDEATHSIG and binds a UnixListener), x86_64 and aarch64 only, and
+    # CPython 3.10 through 3.14, which is the release matrix. Off that set the
+    # marker DROPS the requirement instead of failing the install, so the
+    # client still installs on a macOS laptop, on Windows, on PyPy and on a
+    # CPython newer than the matrix: enqueue keeps working, only the worker is
+    # absent. Raise the python_version bound when the matrix gains a version.
+    #
+    # Two gaps the marker CANNOT close, because PEP 508 has no marker for
+    # either: musl (Alpine) and the free threaded build. Both look like
+    # supported platforms to the marker, no compatible wheel exists, and pip
+    # therefore fails the whole install rather than dropping the requirement.
+    # Use the enqueue only command below there, or build the worker from
+    # source. See PROTOCOL.md section 13.4.
+    #
+    # Enqueue-only deployments (a FastAPI or Django web dyno never runs the
+    # worker) can skip the binary; the recipe is PROTOCOL.md section 13.4.
+    "cauli-worker==1.0.0; sys_platform == 'linux' and platform_python_implementation == 'CPython' and (platform_machine == 'x86_64' or platform_machine == 'aarch64') and python_version < '3.15'",
 ]
 
 [project.scripts]
@@ -66,6 +92,12 @@ speed = []
 
 [tool.setuptools]
 packages = ["cauli", "cauli.contrib"]
+# The project is dual licensed and both license texts live at the repository
+# root, one level above this build directory. setuptools refuses to glob
+# outside the project directory, so `py/LICENSE-*` are byte identical copies of
+# the root originals, listed here so the wheel and sdist carry them in
+# .dist-info (Apache-2.0 section 4(a) requires shipping the license).
+license-files = ["LICENSE-MIT", "LICENSE-APACHE"]
 
 [tool.setuptools.package-data]
 cauli = ["py.typed"]

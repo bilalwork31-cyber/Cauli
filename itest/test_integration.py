@@ -290,14 +290,23 @@ def test_expired_task_is_discarded_without_running(stack):
     The marker file is the proof that the task body never ran -- a result key
     saying "expired" would be satisfied by a task that ran and then got
     relabelled.
+
+    The envelope is already past its deadline at enqueue, which section 3 says
+    is published anyway rather than refused, so that expiry keeps a single
+    enforcement point. Pairing a countdown with a shorter expires would never
+    reach the worker at all: the client refuses that combination at the call
+    site (section 9.2).
     """
+    from datetime import datetime, timedelta, timezone
+
     from cauli import TaskFailedError
 
     r, _ = stack
     m = _app()
     path = f"/tmp/cauli-itest-expired-{uuid.uuid4().hex}"
-    # Delayed past its own expiry: due at +1.5s, dead at +0.4s.
-    res = m.marker.apply_async(args=(path,), countdown=1.5, expires=0.4)
+    res = m.marker.apply_async(
+        args=(path,), expires=datetime.now(timezone.utc) - timedelta(seconds=1)
+    )
 
     with pytest.raises(TaskFailedError) as ei:
         res.get(timeout=20)

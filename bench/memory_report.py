@@ -7,6 +7,13 @@ memory cost" number for a many-small-processes stack like Celery, and costs
 nothing to also apply to cauli for consistency (cauli's --procs are spawned
 fresh, not forked, so cauli's PSS and RSS are already close).
 
+Matches on exact comm name (pgrep -x), not -f: -f matches full command
+lines, which self-matches any wrapper shell whose own script text contains
+the pattern (e.g. a driver script literally containing the word "celery"
+in the command it ran to get here) -- phantom-counts that shell as a
+worker process. -x requires both processes here (celery, cauli-worker) use
+clean, dedicated comm names, confirmed via `ps -eo pid,comm`.
+
 Usage: memory_report.py <pgrep_pattern>
 """
 
@@ -27,7 +34,7 @@ def pss_kb(pid):
 
 def main():
     pattern = sys.argv[1]
-    out = subprocess.run(["pgrep", "-f", pattern], capture_output=True, text=True)
+    out = subprocess.run(["pgrep", "-x", pattern], capture_output=True, text=True)
     pids = [int(p) for p in out.stdout.split()]
     if not pids:
         print(f"no processes matched {pattern!r}", file=sys.stderr)

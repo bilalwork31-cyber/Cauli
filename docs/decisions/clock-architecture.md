@@ -1,5 +1,14 @@
-# DECISION — time and clock architecture at 1.0
-Produced on Fable. Recommendation stands, awaiting human approval. NOT implemented.
+# Decision: time and clock architecture at 1.0
+> **Historical design note, not current documentation.** This is a record of how one
+> pre 1.0 decision was reached and what was known when it was reached. It is kept
+> because the reasoning is worth reading, not because it describes today's behaviour.
+> Where it disagrees with the code, with [PROTOCOL.md](../../PROTOCOL.md) or with
+> [docs/CONFIGURATION.md](../CONFIGURATION.md), those win. The status line below was
+> checked against the source, not carried over.
+>
+> **Status: shipped in 1.0.0.** `worker/src/clock.rs` anchors on Redis `TIME`, re anchors
+> on a periodic sample and warns at boot about a skew worth naming. The Python client is
+> still on its own clock, which CHANGELOG's known limitations now says plainly.
 
 **Ship 1.0 with a Redis anchored SAMPLED clock in the worker. Do not route per call through Redis
 `TIME`.** The mixed clock shared timeline is a genuine 1.0 defect, but the correct fix is small.

@@ -1,5 +1,16 @@
-# DECISION — packaging, distribution and the first fifteen minutes
-Produced on Fable. NOT implemented. This surface the audit never touched at all.
+# Decision: packaging, distribution and the first fifteen minutes
+> **Historical design note, not current documentation.** This is a record of how one
+> pre 1.0 decision was reached and what was known when it was reached. It is kept
+> because the reasoning is worth reading, not because it describes today's behaviour.
+> Where it disagrees with the code, with [PROTOCOL.md](../../PROTOCOL.md) or with
+> [docs/CONFIGURATION.md](../CONFIGURATION.md), those win. The status line below was
+> checked against the source, not carried over.
+>
+> **Status: shipped in 1.0.0.** Wheels are built for CPython 3.10 through 3.14, and the
+> `cauli-worker` console script points the dynamic loader at the running interpreter's own
+> library directory before it execs the binary, which is what makes conda, uv managed
+> interpreters and minimal containers work. Claiming the PyPI names happens outside this
+> tree and is not something the repository can show.
 
 **The release pipeline is genuinely well built. Three traps sit in a stranger's first fifteen minutes,
 and two of them block 1.0.**

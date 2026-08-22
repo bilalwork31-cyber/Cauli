@@ -73,6 +73,34 @@ pub struct PyRuntime {
     async_rejected: AtomicU64,
 }
 
+/// The envelope facts a running task can read back about itself through
+/// `cauli.current_task()` (py/cauli/_context.py). Crosses into the shim as a
+/// single `(id, retries, max_retries, queue)` tuple: one tuple rather than
+/// four extra argument slots on the two hottest pyo3 calls in the process.
+///
+/// `id` is the envelope id the enqueuing side holds as `AsyncResult.id`, not
+/// the cpu lane's suffixed wire id.
+#[derive(Clone)]
+pub struct TaskMeta {
+    pub id: String,
+    pub retries: u32,
+    pub max_retries: u32,
+    pub queue: String,
+}
+
+impl TaskMeta {
+    fn to_py<'py>(&self, py: Python<'py>) -> Bound<'py, PyTuple> {
+        (
+            self.id.as_str(),
+            self.retries,
+            self.max_retries,
+            self.queue.as_str(),
+        )
+            .into_pyobject(py)
+            .expect("a tuple of str/u32 cannot fail to convert")
+    }
+}
+
 /// One queued async submission. Owns its data: the envelope's args/kwargs are
 /// cloned at queue time exactly as the old spawn_blocking closure cloned them.
 struct SubmitJob {
@@ -80,7 +108,17 @@ struct SubmitJob {
     name: String,
     args: Value,
     kwargs: Value,
+    /// Hard deadline (envelope `timeout_ms`), seconds.
     timeout_s: f64,
+    /// Soft deadline, seconds, when one is set and lands strictly before the
+    /// hard one (`envelope::async_timeouts_s`). `None` means no soft limit.
+    /// The two travel separately so the shim can raise
+    /// `SoftTimeLimitExceeded` at the soft mark and still keep the hard
+    /// deadline as the backstop, instead of collapsing them to their minimum.
+    soft_timeout_s: Option<f64>,
+    /// Backs `cauli.current_task()` inside the coroutine. `None` only from
+    /// call sites with no envelope behind them (unit tests).
+    meta: Option<TaskMeta>,
 }
 
 /// Normalize the shim's outcome dict (a real Python object, not JSON text)
@@ -210,6 +248,31 @@ fn pyerr_string(py: Python<'_>, e: &PyErr) -> String {
 /// backstop timeout with nothing logged anywhere, which is the failure this
 /// guard exists to convert into an immediate startup error.
 static RUNTIME_BUILT: AtomicBool = AtomicBool::new(false);
+
+/// `sys.executable` of the interpreter this worker already embeds, or None
+/// when the embedding gives no path (a statically linked or frozen build).
+///
+/// This is the right default for `--python`, which spawns cpu children. The
+/// old default was the bare string `"python3"`, resolved through `PATH` by
+/// `Command::new`: a systemd `ExecStart=/opt/app/venv/bin/cauli-worker` or a
+/// Docker `CMD` never activates the venv, so it found the base interpreter
+/// with no `cauli` package in it. The fork server then failed, the stdio
+/// fallback respawn looped, the cpu backlog filled, and the fetch loop's
+/// backlog gate stopped fetching io work too — one misrouted interpreter
+/// taking the whole worker offline at warn level. The embedded interpreter
+/// is by construction the one that successfully imported the app.
+pub fn interpreter_executable() -> Option<String> {
+    Python::attach(|py| {
+        let exe: String = py
+            .import("sys")
+            .ok()?
+            .getattr("executable")
+            .ok()?
+            .extract()
+            .ok()?;
+        (!exe.is_empty()).then_some(exe)
+    })
+}
 
 impl PyRuntime {
     /// Initialize the interpreter, import the shim, load the app, register the
@@ -368,6 +431,7 @@ impl PyRuntime {
         args: &Value,
         kwargs: &Value,
         soft_timeout_ms: Option<u64>,
+        meta: Option<&TaskMeta>,
     ) -> Outcome {
         Python::attach(|py| {
             let call = (|| -> PyResult<Outcome> {
@@ -379,11 +443,13 @@ impl PyRuntime {
                     Ok(v) => v,
                     Err(e) => return Ok(depth_failure_outcome(py, &e)),
                 };
-                let out =
-                    self.shim
-                        .bind(py)
-                        .getattr("run_sync")?
-                        .call1((name, a, k, soft_timeout_ms))?;
+                let out = self.shim.bind(py).getattr("run_sync")?.call1((
+                    name,
+                    a,
+                    k,
+                    soft_timeout_ms,
+                    meta.map(|m| m.to_py(py)),
+                ))?;
                 Ok(outcome_from_py(&out))
             })();
             call.unwrap_or_else(|e| Outcome::Failure {
@@ -407,6 +473,8 @@ impl PyRuntime {
         args: &Value,
         kwargs: &Value,
         timeout_s: f64,
+        soft_timeout_s: Option<f64>,
+        meta: Option<TaskMeta>,
     ) -> (u64, oneshot::Receiver<Outcome>) {
         let token = self.next_token.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
@@ -421,6 +489,8 @@ impl PyRuntime {
             args: args.clone(),
             kwargs: kwargs.clone(),
             timeout_s,
+            soft_timeout_s,
+            meta,
         };
         if self.submit_tx.send(job).is_err() {
             // Submitter thread gone: only reachable during teardown.
@@ -474,7 +544,15 @@ impl PyRuntime {
                         continue;
                     }
                 };
-                if let Err(e) = submit.call1((job.token, job.name.as_str(), a, k, job.timeout_s)) {
+                if let Err(e) = submit.call1((
+                    job.token,
+                    job.name.as_str(),
+                    a,
+                    k,
+                    job.timeout_s,
+                    job.soft_timeout_s,
+                    job.meta.as_ref().map(|m| m.to_py(py)),
+                )) {
                     if queue_full_ty
                         .as_ref()
                         .is_some_and(|ty| e.is_instance(py, ty))
@@ -592,6 +670,23 @@ pub struct SyncJob {
     pub args: Value,
     pub kwargs: Value,
     pub soft_timeout_ms: Option<u64>,
+    /// Backs `cauli.current_task()` inside the task body. `None` only from
+    /// call sites with no envelope behind them (unit tests). Boxed so this
+    /// job (which is handed back by value when the bounded queue is full)
+    /// stays small enough for `clippy::result_large_err`.
+    pub meta: Option<Box<TaskMeta>>,
+    /// Fired by the pool thread at the instant it commits to running this
+    /// job, before the first Python instruction.
+    ///
+    /// The dispatcher starts the job's `timeout_ms` clock from this signal
+    /// rather than from submit time. The pool queue and the io admission
+    /// gate are sized independently (`--io-threads` against
+    /// `--io-concurrency`, 64 against 256 on the standalone defaults), so up
+    /// to `io_concurrency - io_threads` jobs can sit in the channel with no
+    /// thread behind them. Charging that wait to the task both stole time
+    /// from the task itself and made a job that never left the queue report
+    /// as an abandoned wedged thread.
+    pub started: oneshot::Sender<()>,
     pub resp: oneshot::Sender<Outcome>,
 }
 
@@ -699,11 +794,19 @@ impl SyncPool {
                     if job.name == TEST_HOOK_PANIC_JOB {
                         panic!("test-hooks: deliberate sync pool worker panic");
                     }
+                    // Committing to run: from here the dispatcher charges the
+                    // job's own timeout_ms. An Err means it stopped waiting
+                    // between the is_closed check above and now, so skip
+                    // rather than run a zombie.
+                    if job.started.send(()).is_err() {
+                        continue;
+                    }
                     let out = rt.run_sync_blocking(
                         &job.name,
                         &job.args,
                         &job.kwargs,
                         job.soft_timeout_ms,
+                        job.meta.as_deref(),
                     );
                     let _ = job.resp.send(out);
                 }
@@ -713,11 +816,16 @@ impl SyncPool {
 
     /// Enqueue a job. `Err` means the bounded queue is full (every thread is
     /// wedged and the backlog is already at capacity); the caller should fail
-    /// the task rather than block the async runtime.
-    pub fn submit(&self, job: SyncJob) -> Result<(), SyncJob> {
-        self.tx.try_send(job).map_err(|e| match e {
-            crossbeam_channel::TrySendError::Full(j) => j,
-            crossbeam_channel::TrySendError::Disconnected(j) => j,
+    /// the task rather than block the async runtime. The rejected job comes
+    /// back boxed: it is a wide value and this is the cold path, so the one
+    /// allocation buys every `Result<(), _>` on this path a pointer-sized
+    /// error variant (`clippy::result_large_err`).
+    pub fn submit(&self, job: SyncJob) -> Result<(), Box<SyncJob>> {
+        self.tx.try_send(job).map_err(|e| {
+            Box::new(match e {
+                crossbeam_channel::TrySendError::Full(j) => j,
+                crossbeam_channel::TrySendError::Disconnected(j) => j,
+            })
         })
     }
 
@@ -948,11 +1056,14 @@ app = _App()
         assert_eq!(pool.live_threads.load(Ordering::Relaxed), 1);
 
         let (resp_tx, resp_rx) = oneshot::channel();
+        let (started_tx, _started_rx) = oneshot::channel();
         pool.submit(SyncJob {
             name: TEST_HOOK_PANIC_JOB.to_string(),
             args: Value::Null,
             kwargs: Value::Null,
             soft_timeout_ms: None,
+            meta: None,
+            started: started_tx,
             resp: resp_tx,
         })
         .ok()
@@ -999,7 +1110,7 @@ app = _App()
         for _ in 0..(crate::pyjson::MAX_DEPTH + 2) {
             deep = serde_json::json!([deep]);
         }
-        match rt.run_sync_blocking("does.not.matter", &deep, &serde_json::json!({}), None) {
+        match rt.run_sync_blocking("does.not.matter", &deep, &serde_json::json!({}), None, None) {
             Outcome::Failure { err, retryable } => {
                 assert!(
                     !retryable,
@@ -1027,7 +1138,14 @@ app = _App()
         for _ in 0..(crate::pyjson::MAX_DEPTH + 2) {
             deep = serde_json::json!([deep]);
         }
-        let (_token, rx) = rt.queue_submit("does.not.matter", &deep, &serde_json::json!({}), 5.0);
+        let (_token, rx) = rt.queue_submit(
+            "does.not.matter",
+            &deep,
+            &serde_json::json!({}),
+            5.0,
+            None,
+            None,
+        );
         // blocking_recv rather than #[tokio::test] and `.await`: the guard
         // above has to span both the submit and the completion, and a std
         // MutexGuard has no business crossing an await point.
@@ -1069,6 +1187,7 @@ app = _App()
             &serde_json::json!([]),
             &serde_json::json!({}),
             None,
+            None,
         ) {
             Outcome::Failure { err, retryable } => {
                 assert_eq!(err.type_, "UnregisteredTask");
@@ -1100,6 +1219,8 @@ app = _App()
             &serde_json::json!([]),
             &serde_json::json!({}),
             5.0,
+            None,
+            None,
         );
         // blocking_recv rather than #[tokio::test] and `.await`: the guard
         // above has to span both the submit and the completion, and a std
@@ -1261,5 +1382,149 @@ app = _App()
             // for every test that runs after this one in the same process.
             let _ = sys_modules.del_item("cauli");
         });
+    }
+    /// `Outcome` has no `Debug`; this names the variant for a failed
+    /// assertion without widening the public type just for tests.
+    fn outcome_name(o: &Outcome) -> &'static str {
+        match o {
+            Outcome::Success(_) => "Success",
+            Outcome::Failure { .. } => "Failure",
+            Outcome::ForceRetry { .. } => "ForceRetry",
+        }
+    }
+
+    /// An app with three `async def` bodies that react differently to being
+    /// stopped at the soft mark. `_Task` is the duck-typed shape `load_app`
+    /// reads (`fn`, `kind`, `is_async`).
+    const SOFT_TIMEOUT_APP_SRC: &str = r#"
+import asyncio
+
+
+class _Task:
+    def __init__(self, fn):
+        self.fn = fn
+        self.kind = "io"
+        self.is_async = True
+
+
+async def propagates(hold_s):
+    await asyncio.sleep(hold_s)
+    return "finished"
+
+
+async def cleans_up(hold_s):
+    try:
+        await asyncio.sleep(hold_s)
+    except asyncio.CancelledError:
+        return "cleaned up"
+    return "finished"
+
+
+async def stubborn(hold_s):
+    try:
+        await asyncio.sleep(hold_s)
+    except asyncio.CancelledError:
+        await asyncio.sleep(hold_s)
+    return "finished"
+
+
+class _App:
+    redis_url = "redis://localhost:6379/0"
+    default_queue = "default"
+    result_ttl = 3600
+    idemp_ttl = 86400
+    queue_ttl = {}
+    _tasks = {
+        "propagates": _Task(propagates),
+        "cleans_up": _Task(cleans_up),
+        "stubborn": _Task(stubborn),
+    }
+
+
+app = _App()
+"#;
+
+    /// BLOCKER regression: the async lane used to hand the shim a single
+    /// `min(soft, hard)` deadline, so an `async def` task never raised
+    /// `SoftTimeLimitExceeded` and its soft limit silently became the whole
+    /// budget, reported as `TimeLimitExceeded`. All five behaviours are
+    /// checked against ONE runtime because only one `PyRuntime` may exist
+    /// per process.
+    #[test]
+    fn async_soft_timeout_fires_before_the_hard_deadline() {
+        let _shim_state = shim_state_guard();
+        let app_spec = Python::attach(|py| {
+            install_fake_app_module(py, "cauli_test_soft_timeout_app", SOFT_TIMEOUT_APP_SRC)
+        });
+        let (rt, _cfg) = PyRuntime::init(&app_spec, 1).expect("valid app must init cleanly");
+
+        let submit = |task: &str, hold_s: f64, hard_s: f64, soft_s: Option<f64>| {
+            let (_token, rx) = rt.queue_submit(
+                task,
+                &serde_json::json!([hold_s]),
+                &serde_json::json!({}),
+                hard_s,
+                soft_s,
+                None,
+            );
+            rx.blocking_recv().expect("submitter thread must respond")
+        };
+
+        // 1. Soft fires and the body does not handle it: the reported error
+        //    is SoftTimeLimitExceeded, not TimeLimitExceeded, and it arrives
+        //    at the soft mark rather than at the hard one.
+        let started = std::time::Instant::now();
+        match submit("propagates", 10.0, 5.0, Some(0.2)) {
+            Outcome::Failure { err, retryable } => {
+                assert_eq!(err.type_, "SoftTimeLimitExceeded", "{err:?}");
+                assert!(retryable);
+            }
+            other => panic!(
+                "expected a soft timeout failure, got {}",
+                outcome_name(&other)
+            ),
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(4),
+            "the soft deadline must fire at soft, not at hard"
+        );
+
+        // 2. The body's own cleanup path runs and its return value stands.
+        match submit("cleans_up", 10.0, 5.0, Some(0.2)) {
+            Outcome::Success(v) => assert_eq!(v, serde_json::json!("cleaned up")),
+            other => panic!(
+                "expected the cleanup return value, got {}",
+                outcome_name(&other)
+            ),
+        }
+
+        // 3. The HARD budget survives the soft mark. This body ignores the
+        //    stop and keeps working past `soft`; under the collapsed
+        //    `min(soft, hard)` it timed out at 0.2s.
+        match submit("stubborn", 0.3, 5.0, Some(0.2)) {
+            Outcome::Success(v) => assert_eq!(v, serde_json::json!("finished")),
+            other => panic!(
+                "expected the hard budget to apply, got {}",
+                outcome_name(&other)
+            ),
+        }
+
+        // 4. ...and the hard deadline is still a real backstop behind it.
+        match submit("stubborn", 2.0, 1.0, Some(0.2)) {
+            Outcome::Failure { err, retryable } => {
+                assert_eq!(err.type_, "TimeLimitExceeded", "{err:?}");
+                assert!(retryable);
+            }
+            other => panic!("expected a hard timeout, got {}", outcome_name(&other)),
+        }
+
+        // 5. No soft limit set: unchanged single-deadline behaviour.
+        match submit("propagates", 0.05, 5.0, None) {
+            Outcome::Success(v) => assert_eq!(v, serde_json::json!("finished")),
+            other => panic!(
+                "expected success with no soft limit, got {}",
+                outcome_name(&other)
+            ),
+        }
     }
 }
