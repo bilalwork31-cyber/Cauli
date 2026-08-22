@@ -7,10 +7,14 @@ import) and never in a test run that already has the package present.
 
 from __future__ import annotations
 
-import tomllib
 from pathlib import Path
 
 import pytest
+
+# tomllib is stdlib only from 3.11. On 3.10 this module skips rather than
+# carrying a tomli dependency for one interpreter: pyproject metadata is
+# interpreter independent, so the 3.11 through 3.14 legs already assert it.
+tomllib = pytest.importorskip("tomllib")
 
 PYPROJECT = Path(__file__).resolve().parent.parent / "pyproject.toml"
 
