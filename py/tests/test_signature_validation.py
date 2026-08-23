@@ -91,15 +91,21 @@ def test_signature_check_falls_through_when_uninspectable(
     app, redis_client, monkeypatch
 ):
     """A callable inspect.signature() cannot introspect must not block a
-    legitimate call it has no safe way to verify."""
+    legitimate call it has no safe way to verify.
 
-    @app.task()
-    def add(a, b):
-        return a + b
+    The introspection happens once, when the task is declared, rather than on
+    every enqueue, so the patch has to be in place before the decorator runs.
+    """
 
     def _uninspectable(_fn):
         raise ValueError("no signature found")
 
     monkeypatch.setattr(task_module.inspect, "signature", _uninspectable)
+
+    @app.task()
+    def add(a, b):
+        return a + b
+
+    assert add._signature is None
     add.delay(a=1, bee=2)  # cannot be checked, so this must NOT raise
     assert redis_client.xlen("cauli:q:default") == 1

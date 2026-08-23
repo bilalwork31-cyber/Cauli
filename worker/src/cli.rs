@@ -111,13 +111,18 @@ pub struct Args {
     pub cpu_prefetch: usize,
 
     /// Recycle a cpu child after it completes this many tasks. THE DEFAULT
-    /// IS 1000: children are recycled unless you say otherwise. Pass 0 to opt
+    /// IS 10000: children are recycled unless you say otherwise. Pass 0 to opt
     /// out and let a child live for the whole worker lifetime. This is the
     /// backstop for leaky C extensions and slowly dirtied copy on write
     /// pages, like Celery's maxtasksperchild, and nothing else in the worker
     /// bounds cpu child memory. Staged prefetch work always drains before the
-    /// recycle fires, so no task is lost to it
-    #[arg(long, default_value_t = 1000, help_heading = ADVANCED)]
+    /// recycle fires, so no task is lost to it.
+    ///
+    /// It is a leak backstop, not a copy on write one: measured child private
+    /// RSS plateaus at 2416kB by 5000 tasks and moves 4kB more out to 20000,
+    /// so the old default of 1000 was re-forking mid ramp for no memory
+    /// benefit while throwing away a warm child
+    #[arg(long, default_value_t = 10000, help_heading = ADVANCED)]
     pub cpu_max_tasks_per_child: usize,
 
     /// Start the cpu pool at boot instead of on the first cpu task. Costs
@@ -185,8 +190,12 @@ pub struct Args {
     #[arg(long, default_value_t = 5, help_heading = ADVANCED)]
     pub redis_timeout: u64,
 
-    /// Delayed and retry sweep interval in milliseconds (PROTOCOL §4.3)
-    #[arg(long, default_value_t = 250, help_heading = ADVANCED)]
+    /// Delayed and retry sweep interval in milliseconds (PROTOCOL §4.3).
+    /// Every countdown, eta, retry and beat firing waits out at most one of
+    /// these before it can run, so the tick is a floor on retry latency: at
+    /// 250ms it added up to 250ms to a default first retry of 250-500ms, a
+    /// +50% error on the backoff curve the user asked for
+    #[arg(long, default_value_t = 50, help_heading = ADVANCED)]
     pub mover_interval: u64,
 
     /// Entries the delayed/retry sweep moves per queue per EVAL. The sweep
@@ -222,6 +231,17 @@ const SLOTS_PER_PROC: usize = 64;
 /// Derivation rules (thresholds measured, bench2/bench3; docs/CONFIGURATION.md):
 /// - procs: explicit, else min(cores, c/SLOTS_PER_PROC) with -c, else 1
 ///   (standalone behavior unchanged).
+///
+/// Every per-process division below FLOORS. `-c` is a ceiling on what the
+/// whole worker will hold, not a per-process target: each supervised child
+/// receives the same resolved flags, so a remainder cannot be handed to one
+/// child alone, and rounding each child up overshot the number the operator
+/// asked for -- `-c 65` derived 2 x 33 = 66, `-c 512` derived 6 x 86 = 516.
+/// Overshoot is the dangerous direction: `-c` is what an operator sizes a
+/// database connection pool against, so exceeding it can breach a limit that
+/// lives outside this process. Undershooting by less than one slot per
+/// process only leaves a little capacity on the table.
+///
 /// - io_concurrency: explicit, else c/procs with -c, else 256. The gate is
 ///   the bound for async tasks (a slot costs ~4 KB). The standalone 256 sits
 ///   above every band this repo has measured; the flag's own help carries the
@@ -235,7 +255,11 @@ const SLOTS_PER_PROC: usize = 64;
 ///   an explicit choice, not a default).
 /// - cpu_workers: explicit, else cores/procs but never more than -c's share:
 ///   more children than cores buys nothing, and more than c would make
-///   `-c 8` on a pdf-convert queue mean something other than 8.
+///   `-c 8` on a pdf-convert queue mean something other than 8. Floored for
+///   the same reason as the io lanes, and here the old div_ceil broke the
+///   stated rule outright: at `-c 200` on 6 cores it derived 4 procs x 2
+///   children = 8 children for 6 cores, the exact oversubscription the rule
+///   exists to prevent.
 pub fn resolve(args: &Args, cores: usize) -> Resolved {
     let cores = cores.max(1);
     let procs = args
@@ -248,13 +272,10 @@ pub fn resolve(args: &Args, cores: usize) -> Resolved {
     let (io_threads, io_concurrency) = match args.concurrency {
         Some(c) => {
             let c = c.max(1);
-            let gate = args
-                .io_concurrency
-                .unwrap_or_else(|| c.div_ceil(procs))
-                .max(1);
+            let gate = args.io_concurrency.unwrap_or(c / procs).max(1);
             let threads = args
                 .io_threads
-                .unwrap_or_else(|| c.min(512).div_ceil(procs).min(gate))
+                .unwrap_or_else(|| (c.min(512) / procs).min(gate))
                 .max(1);
             (threads, gate)
         }
@@ -266,9 +287,9 @@ pub fn resolve(args: &Args, cores: usize) -> Resolved {
     let cpu_workers = args
         .cpu_workers
         .unwrap_or_else(|| {
-            let per_proc = cores.div_ceil(procs);
+            let per_proc = cores / procs;
             match args.concurrency {
-                Some(c) => per_proc.min(c.max(1).div_ceil(procs)),
+                Some(c) => per_proc.min(c.max(1) / procs),
                 None => per_proc,
             }
         })
@@ -322,7 +343,7 @@ mod tests {
         assert_eq!(a.io_concurrency, None);
         assert_eq!(a.cpu_workers, None);
         assert_eq!(a.cpu_child_threads, 1);
-        assert_eq!(a.cpu_max_tasks_per_child, 1000);
+        assert_eq!(a.cpu_max_tasks_per_child, 10000);
         assert!(!a.eager_cpu);
         assert!(!a.print_plan);
         assert!(!a.no_fork_server);
@@ -331,7 +352,7 @@ mod tests {
         assert_eq!(a.max_envelope_bytes, 1_048_576);
         assert_eq!(a.drain_timeout, 30);
         assert_eq!(a.python, None);
-        assert_eq!(a.mover_interval, 250);
+        assert_eq!(a.mover_interval, 50);
         assert_eq!(a.mover_limit, 128);
         assert_eq!(a.stats_interval, 10);
         assert_eq!(a.log_level, "info");
@@ -341,8 +362,8 @@ mod tests {
     /// Behaviour change: cpu children recycle by default now. 0 has to stay
     /// accepted, because it is the documented way to opt back out.
     #[test]
-    fn cpu_recycle_defaults_to_1000_with_zero_as_the_opt_out() {
-        assert_eq!(parse(&[]).cpu_max_tasks_per_child, 1_000);
+    fn cpu_recycle_defaults_to_10000_with_zero_as_the_opt_out() {
+        assert_eq!(parse(&[]).cpu_max_tasks_per_child, 10_000);
         assert_eq!(
             parse(&["--cpu-max-tasks-per-child", "0"]).cpu_max_tasks_per_child,
             0
@@ -484,8 +505,8 @@ mod tests {
     fn resolve_large_c_uses_every_core() {
         let r = resolve(&parse(&["-c", "4000"]), 6);
         assert_eq!(r.procs, 6);
-        assert_eq!(r.io_concurrency, 667);
-        assert_eq!(r.io_threads, 86); // 512/6, not 667: sync knee guard
+        assert_eq!(r.io_concurrency, 666); // 6 x 666 = 3996, never above 4000
+        assert_eq!(r.io_threads, 85); // 512/6, not 666: sync knee guard
         assert_eq!(r.cpu_workers, 1);
     }
 
@@ -497,10 +518,42 @@ mod tests {
             Resolved {
                 procs: 16, // 1000 / SLOTS_PER_PROC, under the 32 cores
                 io_threads: 32,
-                io_concurrency: 63,
+                io_concurrency: 62, // 16 x 62 = 992; ceiling gave 1008 > 1000
                 cpu_workers: 2,
             }
         );
+    }
+
+    /// The two invariants the per-process rounding exists to hold, swept
+    /// rather than sampled. Both were violated by the old div_ceil rounding
+    /// at points no single-value test happened to cover: `-c 65` on 6 cores
+    /// derived 2 x 33 = 66 slots for a 65 slot budget, and `-c 200` derived
+    /// 4 procs x 2 = 8 cpu children onto 6 cores.
+    #[test]
+    fn resolved_totals_never_exceed_c_or_the_cores() {
+        for cores in [1usize, 2, 4, 6, 8, 16, 32, 64] {
+            for c in [
+                1usize, 2, 3, 5, 7, 8, 15, 16, 31, 32, 63, 64, 65, 100, 128, 129, 200, 255, 256,
+                500, 512, 513, 1000, 1024, 4000, 10_000,
+            ] {
+                let r = resolve(&parse(&["-c", &c.to_string()]), cores);
+                let slots = r.io_concurrency * r.procs;
+                assert!(
+                    slots <= c.max(r.procs),
+                    "-c {c} on {cores} cores derived {} procs x {} slots = {slots}",
+                    r.procs,
+                    r.io_concurrency
+                );
+                let children = r.cpu_workers * r.procs;
+                assert!(
+                    children <= cores.max(r.procs),
+                    "-c {c} on {cores} cores derived {} procs x {} cpu children \
+                     = {children}",
+                    r.procs,
+                    r.cpu_workers
+                );
+            }
+        }
     }
 
     #[test]

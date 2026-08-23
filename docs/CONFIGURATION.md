@@ -151,7 +151,7 @@ What to do with that until it is settled:
 | `--cpu-workers` | ⌈min(cores, c) / procs⌉ | Child processes for `kind="cpu"` tasks |
 | `--cpu-child-threads` | 1 | Requests pipelined per child, matched by id. Range 1 to 1024 |
 | `--cpu-prefetch` | 4 | Requests staged in a child's socket buffer beyond the one it is running. 0 disables |
-| `--cpu-max-tasks-per-child` | 1000 | Recycle a child after this many completed tasks; 0 disables recycling. The backstop for leaky C extensions and slowly dirtied copy on write pages, like Celery's maxtasksperchild. Staged work drains first; no task is lost to a recycle |
+| `--cpu-max-tasks-per-child` | 10000 | Recycle a child after this many completed tasks; 0 disables recycling. The backstop for leaky C extensions and slowly dirtied copy on write pages, like Celery's maxtasksperchild. Staged work drains first; no task is lost to a recycle |
 | `--eager-cpu` | off | Start the cpu pool at boot instead of on the first cpu task, buying the first task a warm start |
 | `--no-fork-server` | off | One process per cpu task over stdio instead of the fork-server. Entered automatically if fork-server startup fails |
 
@@ -167,7 +167,7 @@ long ones.
 
 **`rss_mb` in the worker's stats line is the worker process only; it does not
 include cpu children.** Each forked child is a separate process with its own
-memory, never summed into that number. `--cpu-max-tasks-per-child` (default 1000;
+memory, never summed into that number. `--cpu-max-tasks-per-child` (default 10000;
 set it to 0 to disable recycling) is the ONLY mechanism that bounds a child's
 memory: cauli sets no
 rlimit and no cgroup on it. A task with a real leak, or one that just holds a
@@ -192,7 +192,7 @@ the resident children.
 | `--max-envelope-bytes` | 1048576 | Oversize entries go to the DLQ as `malformed` before being parsed. Enforced on both ends: the client refuses first, so keep this equal to the app's `max_envelope_bytes`. A client limit above the worker's produces envelopes the worker dead letters, and past 4096 bytes it cannot recover the task id, so no failure result is written and `get()` waits out its own timeout |
 | `--drain-timeout` | 30 | Seconds to finish in flight tasks on graceful shutdown |
 | `--redis-timeout` | 5 | Response and connection timeout, in seconds, for every redis round trip. Forwarded to every supervised worker process |
-| `--mover-interval` | 250 | Milliseconds between delayed and retry sweeps (PROTOCOL section 4.3) |
+| `--mover-interval` | 50 | Milliseconds between delayed and retry sweeps (PROTOCOL section 4.3). A floor on retry latency: every countdown, eta, retry and beat firing waits out at most one tick before it can run |
 | `--mover-limit` | 128 | Entries the sweep moves per queue per round trip. The sweep repeats within one tick until a queue comes back short, so this bounds one `EVAL`, not the drain rate |
 
 **`--visibility-timeout` must exceed your longest task's `timeout`** (PROTOCOL

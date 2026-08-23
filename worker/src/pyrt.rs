@@ -387,16 +387,30 @@ impl PyRuntime {
         // (exec::run_async_task) caps queued jobs at --io-concurrency.
         //
         // Thread-state note (see the sync-pool landmine below): this thread
-        // uses a plain Python::attach per batch, NOT a pinned thread state.
-        // That is deliberate and safe HERE because nothing on this path
-        // relies on threading.local surviving between batches -- the shim's
-        // submit_async touches module globals only. The pinning requirement
-        // applies to threads that EXECUTE task bodies, which cache things
-        // like Django connections in thread locals. This thread never does.
+        // pins ONE persistent CPython thread state, the same way the sync pool
+        // does, but for a different reason. The sync pool pins so that
+        // threading.local survives between tasks; nothing on THIS path relies
+        // on that, since the shim's submit_async touches module globals only.
+        // Here the reason is pure cost: an unpinned Python::attach on a
+        // non-Python thread creates and then DESTROYS a whole thread state per
+        // batch, and batches average 1.4 to 9 jobs in practice rather than the
+        // DRAIN_MAX ceiling of 128, so that per-batch teardown measured at ~7%
+        // of async lane CPU. Correctness is identical either way.
         let rt_submit = Arc::clone(&rt);
         std::thread::Builder::new()
             .name("cauli-async-submit".into())
             .spawn(move || {
+                // SAFETY: the interpreter is initialized (PyRuntime::init runs
+                // to the point of loading the shim before this thread is
+                // spawned), and the Ensure is paired with an immediate
+                // SaveThread so the GIL is not held around the blocking recv
+                // below. The state is never Released, so CPython keeps it
+                // registered in gilstate TSS for this thread's whole lifetime
+                // and every later attach finds and reuses it.
+                unsafe {
+                    pyo3::ffi::PyGILState_Ensure();
+                    pyo3::ffi::PyEval_SaveThread();
+                }
                 const DRAIN_MAX: usize = 128;
                 let mut batch: Vec<SubmitJob> = Vec::with_capacity(DRAIN_MAX);
                 while let Ok(first) = submit_rx.recv() {

@@ -830,7 +830,7 @@ cauli-worker --app myproj.tasks:app [--queues default,emails] [--redis-url URL]
 - `--max-envelope-bytes` (default 1 MiB): see §2.
 - `--cpu-child-threads` (default 1): per-child request concurrency, `--no-fork-server`:
   force the stdio child mode — both per §5.1.
-- `--cpu-max-tasks-per-child` (default 1000): recycle a cpu child once it has completed this
+- `--cpu-max-tasks-per-child` (default 10000): recycle a cpu child once it has completed this
   many tasks. Children DO recycle by default; `0` opts out and lets a child live for the
   worker's whole lifetime. Nothing else in the worker bounds cpu child memory, and under the
   fork server a recycle is a fork of the already preloaded parent with no re import (§5.1).

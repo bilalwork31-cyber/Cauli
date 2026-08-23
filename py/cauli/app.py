@@ -13,7 +13,6 @@ import os
 import re
 import threading
 import time
-import uuid
 from datetime import datetime
 from typing import Any, Callable, Iterable, overload
 
@@ -690,7 +689,12 @@ class Cauli:
 
         envelope: dict[str, Any] = {
             "v": 1,
-            "id": task_id or uuid.uuid4().hex,
+            # os.urandom, not uuid4: the wire format is 32 hex characters
+            # either way (PROTOCOL section 2) and nothing on either side ever
+            # parses this back into a UUID, so the version/variant bits bought
+            # nothing. uuid4().hex was 2429ns and 17.5% of a .delay(); this is
+            # 927ns, with 128 bits of entropy instead of 122.
+            "id": task_id or os.urandom(16).hex(),
             "task": task_name,
             "args": args,
             "kwargs": kwargs,

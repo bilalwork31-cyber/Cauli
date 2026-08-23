@@ -21,6 +21,7 @@ mod ctx;
 mod dispatch;
 mod envelope;
 mod exec;
+mod logsink;
 mod loops;
 mod pyjson;
 mod pyrt;
@@ -162,7 +163,15 @@ fn real_main() -> i32 {
     };
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&args.log_level));
-    tracing_subscriber::fmt().with_env_filter(filter).init();
+    // Through logsink, not straight to stdout: every tokio runtime worker
+    // reaches a per-envelope warn!/error! site, so a stalled log reader used
+    // to fill the pipe and park them inside write(2) one by one -- the whole
+    // runtime frozen, with no error and nothing for the wedge watchdog to
+    // see. See src/logsink.rs.
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(logsink::LogSink::start())
+        .init();
 
     // Pure-argument validation runs before the embedded interpreter comes up:
     // a bad value must fail once, loudly — not crash-loop N supervised
@@ -337,10 +346,24 @@ fn real_main() -> i32 {
         );
     }
 
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime");
+    // One tokio pool exists per WORKER PROCESS and the supervisor runs
+    // `procs` of them on the same box, so the default (one worker thread per
+    // core) had every process claim a whole box: 6 procs on 6 cores meant 36
+    // runtime threads competing for 6 cores. None of them ever executes
+    // Python -- task bodies run on the sync pool threads, the asyncio loop
+    // threads, or in cpu children, and these only drive redis io and the
+    // dispatch futures -- so the extra threads bought nothing and cost
+    // scheduler churn. Give each process its share of the box instead.
+    //
+    // TOKIO_WORKER_THREADS stays authoritative: it is tokio's own documented
+    // escape hatch, and calling .worker_threads() unconditionally would
+    // silently disable it.
+    let mut rt_builder = tokio::runtime::Builder::new_multi_thread();
+    rt_builder.enable_all();
+    if std::env::var_os("TOKIO_WORKER_THREADS").is_none() {
+        rt_builder.worker_threads((cores / resolved.procs).max(1));
+    }
+    let rt = rt_builder.build().expect("tokio runtime");
     rt.block_on(run_worker(args, resolved, pyrt, appcfg, redis_url, queues))
 }
 
@@ -682,6 +705,10 @@ fn print_plan(args: &cli::Args, r: &cli::Resolved, cores: usize) {
     println!("    sync io threads     {}", r.io_threads);
     println!("    asyncio loops       {}", args.io_loops);
     println!(
+        "    tokio runtime threads {}  (redis io and dispatch; never run Python)",
+        (cores / r.procs).max(1)
+    );
+    println!(
         "    cpu children        {}  ({}; only if the app registers kind=\"cpu\" tasks)",
         r.cpu_workers,
         if args.eager_cpu {
@@ -691,9 +718,11 @@ fn print_plan(args: &cli::Args, r: &cli::Resolved, cores: usize) {
         }
     );
     println!(
-        "  totals: {} io tasks in flight, {} sync threads, up to {} cpu children",
+        "  totals: {} io tasks in flight, {} sync threads, {} tokio threads, \
+up to {} cpu children",
         plan_total(r.io_concurrency, r.procs),
         plan_total(r.io_threads, r.procs),
+        plan_total((cores / r.procs).max(1), r.procs),
         plan_total(r.cpu_workers, r.procs)
     );
     println!("  override any value with its flag; see --help and docs/CONFIGURATION.md");

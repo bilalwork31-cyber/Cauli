@@ -229,8 +229,8 @@ async def _run_async_task(
 ) -> Any:
     """Run one ``async def`` cpu task with its hooks INSIDE the event loop.
 
-    An async task's body runs under ``asyncio.run``, so its before/after
-    hooks have to run there too: a hook that branches on
+    An async task's body runs on an event loop, so its before/after hooks
+    have to run there too: a hook that branches on
     ``asyncio.get_running_loop()`` (the Django contrib's does) would
     otherwise take its sync branch on this thread while the body's
     thread-sensitive ORM work executes on asgiref's executor thread, and
@@ -241,8 +241,9 @@ async def _run_async_task(
     The soft timeout is armed after the before hooks and disarmed before the
     after hooks, exactly as on the sync path: hook time is not charged
     against the task's soft budget and an injection cannot land in a hook.
-    ``asyncio.run`` executes on the calling thread, so both the SIGALRM and
-    the watchdog scheme still target the right thread.
+    The loop this runs on is the calling thread's own persistent loop (see
+    ``_thread_event_loop``), so both the SIGALRM and the watchdog scheme still
+    target the right thread.
     """
     await _run_hooks_async(getattr(app, "_before_task_hooks", ()), "before_task")
     try:
@@ -259,6 +260,59 @@ async def _run_async_task(
                 watchdog.disarm()
     finally:
         await _run_hooks_async(getattr(app, "_after_task_hooks", ()), "after_task")
+
+
+_loops = threading.local()
+
+
+def _thread_event_loop() -> asyncio.AbstractEventLoop:
+    """The persistent event loop belonging to THIS execution thread.
+
+    Replaces a per-request ``asyncio.run``. Standing a loop up and tearing it
+    down again costs 122.7us against 10.1us to drive a coroutine on a loop
+    that already exists: more, per task, than the entire unix socket round
+    trip that delivered the request. The io async lane already works this way
+    (worker/src/shim.py keeps its loops for the process lifetime), so this
+    also makes the two async lanes agree.
+
+    One loop per thread, not one per child: ``run_until_complete`` runs on the
+    calling thread, and both soft timeout schemes (SIGALRM in single mode, the
+    watchdog's ``PyThreadState_SetAsyncExc`` in threaded mode) target that
+    same thread. ``asyncio.set_event_loop`` is part of the contract, not
+    decoration -- ``asgiref`` and Django read the thread's current loop.
+
+    The pid guard is for the fork server: a ``threading.local`` survives
+    ``fork()`` on the forking thread, so without it a child could inherit and
+    reuse the parent's loop, whose epoll fd the parent still holds.
+    """
+    loop = getattr(_loops, "loop", None)
+    if loop is None or loop.is_closed() or getattr(_loops, "pid", None) != os.getpid():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        _loops.loop = loop
+        _loops.pid = os.getpid()
+    return loop
+
+
+def _cancel_orphans(loop: asyncio.AbstractEventLoop) -> None:
+    """Cancel whatever the task body left running, as ``asyncio.run`` did.
+
+    ``asyncio.run`` cancelled every still-pending task before closing its
+    loop, so a body that fired off ``asyncio.create_task(...)`` and returned
+    without awaiting it could never outlive its own request. This loop
+    survives between requests, so without this an orphan would keep running
+    inside the NEXT task on this thread, holding whatever it captured -- a
+    database connection included.
+
+    Between requests the loop is idle, so on every well behaved task this is
+    one scan of an empty set.
+    """
+    pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
+    if not pending:
+        return
+    for t in pending:
+        t.cancel()
+    loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
 
 
 def _execute(
@@ -328,17 +382,21 @@ def _execute(
             run_hooks(getattr(app, "_before_task_hooks", ()), "before_task")
         try:
             if is_async:
-                result = asyncio.run(
-                    _run_async_task(
-                        app,
-                        task,
-                        args,
-                        kwargs,
-                        soft_timeout_ms,
-                        watchdog if use_watchdog else None,
-                        use_alarm,
+                loop = _thread_event_loop()
+                try:
+                    result = loop.run_until_complete(
+                        _run_async_task(
+                            app,
+                            task,
+                            args,
+                            kwargs,
+                            soft_timeout_ms,
+                            watchdog if use_watchdog else None,
+                            use_alarm,
+                        )
                     )
-                )
+                finally:
+                    _cancel_orphans(loop)
             else:
                 if use_alarm:
                     signal.setitimer(

@@ -142,3 +142,36 @@ def noisy():
 async def aadd(a, b):
     await asyncio.sleep(0)
     return a + b
+
+
+@app.task(name="aloop_id", kind="cpu")
+async def aloop_id():
+    """Identity of the loop this request ran on.
+
+    Two requests returning the same id is the whole point of the persistent
+    per-thread loop in cauli._exec: asyncio.run built and destroyed one per
+    request, which cost more than the socket round trip that delivered it.
+    """
+    return id(asyncio.get_running_loop())
+
+
+_leaked = {"ran": False}
+
+
+async def _orphan():
+    await asyncio.sleep(0.05)
+    _leaked["ran"] = True
+
+
+@app.task(name="aleak", kind="cpu")
+async def aleak():
+    """Fire off a task and return without awaiting it, the classic leak."""
+    asyncio.create_task(_orphan())
+    return "spawned"
+
+
+@app.task(name="aleak_check", kind="cpu")
+async def aleak_check():
+    """Long enough for a surviving orphan to have fired."""
+    await asyncio.sleep(0.2)
+    return _leaked["ran"]

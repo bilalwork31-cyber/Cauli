@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 import json
 import threading
 import time
@@ -326,3 +327,47 @@ def test_calling_the_status_value_does_not_re_read_redis(app, redis_client):
     redis_client.delete(f"cauli:result:{ar.id}")
     assert value() == "success"
     assert ar.status == "pending"
+
+
+def test_result_poll_ramps_from_one_millisecond_up_to_the_interval(app):
+    """A fixed 50ms poll charged every awaited task 25ms on average just to be
+    noticed. The wait starts at 1ms and doubles, capped by poll_interval."""
+    ar = _ar(app)
+    delays = list(itertools.islice(ar._poll_delays(0.05), 18))
+    assert delays[:10] == [0.001] * 10
+    assert delays[10:16] == [0.002, 0.004, 0.008, 0.016, 0.032, 0.05]
+    assert delays[16:] == [0.05, 0.05]
+    # Cumulative wake times: a result landing anywhere in the first 24ms is
+    # collected inside 24ms, against a flat 50ms poll that could not see it
+    # before 50ms whatever it did.
+    assert sum(delays[:13]) <= 0.024
+
+
+def test_result_poll_interval_is_still_a_hard_ceiling(app):
+    """poll_interval keeps its meaning: nothing polls faster than an explicit
+    value, and a value below the 1ms floor is used as given."""
+    ar = _ar(app)
+    assert all(d <= 0.2 for d in itertools.islice(ar._poll_delays(0.2), 20))
+    assert list(itertools.islice(ar._poll_delays(0.0005), 3)) == [
+        0.0005,
+        0.0005,
+        0.0005,
+    ]
+
+
+def test_get_returns_as_soon_as_the_result_lands(app, redis_client):
+    """End to end: a result written 20ms after get() starts must be picked up
+    well inside the old 50ms tick."""
+    ar = _ar(app)
+
+    def _late_write():
+        time.sleep(0.02)
+        _write_result(redis_client, ar.id, {"status": "success", "result": 7})
+
+    t = threading.Thread(target=_late_write)
+    started = time.monotonic()
+    t.start()
+    assert ar.get(timeout=5) == 7
+    elapsed = time.monotonic() - started
+    t.join()
+    assert elapsed < 0.035, f"took {elapsed * 1000:.1f}ms, ramp is not engaging"

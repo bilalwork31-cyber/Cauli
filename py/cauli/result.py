@@ -7,13 +7,27 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Iterator
 
 from cauli import _codec
 from cauli.exceptions import TaskFailedError
 
 if TYPE_CHECKING:
     from cauli.app import Cauli
+
+# Where a result wait starts before it backs off toward its poll_interval.
+# 1ms is below any round trip this client can make to Redis, so the floor is
+# set by the network rather than by this number.
+_POLL_FLOOR = 0.001
+
+# Polls held at the floor before the ramp starts doubling. Pure doubling from
+# 1ms reaches 50ms after only 6 sleeps but has already spent 63ms getting
+# there, so it barely beat the flat 50ms poll for the mid range results it was
+# meant to rescue. Ten flat polls cover the first 10ms one millisecond at a
+# time, and the doubling then takes over: cumulative wake times run 1..10, 12,
+# 16, 24, 40, 72, 122ms. Thirteen extra reads, and only from a client that is
+# blocked waiting anyway.
+_POLL_FLAT = 10
 
 
 class _Status(str):
@@ -145,6 +159,28 @@ class AsyncResult:
             )
         return _Status(doc["status"])
 
+    @staticmethod
+    def _poll_delays(ceiling: float) -> Iterator[float]:
+        """Successive sleeps for a result wait: 1ms, doubling up to ``ceiling``.
+
+        A fixed 50ms poll costs a task 25ms of latency on average purely
+        waiting to be noticed, which for a 5ms task is 6x its own runtime. Most
+        results land in the first few milliseconds, so the wait spends its
+        first ten polls at the 1ms floor and only then doubles away: the extra
+        Redis reads are thirteen in the first tenth of a second and nothing
+        after that, and they come from a client that is already blocked.
+
+        ``poll_interval`` keeps its meaning as the ceiling, so an explicit
+        value still bounds how often this talks to Redis, and a value below
+        1ms is simply used as-is.
+        """
+        delay = min(_POLL_FLOOR, ceiling)
+        for _ in range(_POLL_FLAT):
+            yield delay
+        while True:
+            delay = min(delay * 2, ceiling)
+            yield delay
+
     def get(self, timeout: float | None = None, poll_interval: float = 0.05) -> Any:
         """Block until the result key exists, then resolve it.
 
@@ -166,8 +202,10 @@ class AsyncResult:
           :class:`TaskFailedError` with ``type == "InvalidResult"`` (see
           :meth:`_decode`).
 
-        This is poll-based (default ``poll_interval`` 0.05s), not push/blocking
-        redis-side. Without ``timeout``, ``get()`` can block forever by design:
+        This is poll-based, not push/blocking redis-side: the wait starts at
+        a 1ms poll and doubles up to ``poll_interval`` (default 0.05s), so a
+        fast task is collected almost as soon as it finishes while a long wait
+        settles back to one read every 50ms. Without ``timeout``, ``get()`` can block forever by design:
         a task enqueued with ``store_result=False`` never gets a result key at
         all, and neither does one dead lettered as malformed, unregistered, or
         over its redelivery limit, but only when the task id itself could not
@@ -178,33 +216,36 @@ class AsyncResult:
         anything but throwaway scripts.
         """
         deadline = None if timeout is None else time.monotonic() + timeout
+        delays = self._poll_delays(poll_interval)
         while True:
             doc = self._load()
             if doc is not None:
                 return self._resolve(doc)
             if deadline is not None and time.monotonic() >= deadline:
                 raise self._timeout_error(timeout)
-            time.sleep(poll_interval)
+            time.sleep(next(delays))
 
     async def aget(
         self, timeout: float | None = None, poll_interval: float = 0.05
     ) -> Any:
         """:meth:`get` without blocking the event loop. Requires an ``AsyncCauli``.
 
-        Identical outcomes and identical exceptions -- the same ``_resolve``
-        decides both -- but the poll sleeps on the loop and the Redis read goes
-        through ``redis.asyncio``. Awaiting the blocking ``get()`` inside a
+        Identical outcomes, identical exceptions and the identical backoff
+        ramp -- the same ``_resolve`` and ``_poll_delays`` drive both -- but the
+        poll sleeps on the loop and the Redis read goes through
+        ``redis.asyncio``. Awaiting the blocking ``get()`` inside a
         coroutine would park the whole loop thread for the entire wait, which
         for a task that never produces a result key is forever.
         """
         deadline = None if timeout is None else time.monotonic() + timeout
+        delays = self._poll_delays(poll_interval)
         while True:
             doc = await self._aload()
             if doc is not None:
                 return self._resolve(doc)
             if deadline is not None and time.monotonic() >= deadline:
                 raise self._timeout_error(timeout)
-            await asyncio.sleep(poll_interval)
+            await asyncio.sleep(next(delays))
 
     def _resolve(self, doc: dict[str, Any]) -> Any:
         """Turn a present result document into a return value or an exception."""

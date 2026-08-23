@@ -276,6 +276,56 @@ def test_async_task_runs_via_asyncio(child):
     assert resp == {"id": "a1", "ok": True, "result": 7}
 
 
+def test_async_tasks_share_one_persistent_loop(child):
+    """asyncio.run built a fresh loop per request; the child keeps one per
+    thread. Same loop identity across requests is the observable difference."""
+    first = child.request(
+        {
+            "id": "l1",
+            "task": "aloop_id",
+            "args": [],
+            "kwargs": {},
+            "soft_timeout_ms": None,
+        }
+    )
+    second = child.request(
+        {
+            "id": "l2",
+            "task": "aloop_id",
+            "args": [],
+            "kwargs": {},
+            "soft_timeout_ms": None,
+        }
+    )
+    assert first["ok"] and second["ok"]
+    assert first["result"] == second["result"]
+
+
+def test_a_leaked_task_cannot_outlive_its_own_request(child):
+    """A body that create_task()s and returns without awaiting must not leave
+    that task running inside the NEXT request on the same thread.
+
+    asyncio.run cancelled every pending task before closing its loop. The
+    persistent loop has to reproduce that itself, or an orphan keeps running
+    while holding whatever it captured, a database connection included.
+    """
+    spawned = child.request(
+        {"id": "k1", "task": "aleak", "args": [], "kwargs": {}, "soft_timeout_ms": None}
+    )
+    assert spawned == {"id": "k1", "ok": True, "result": "spawned"}
+
+    checked = child.request(
+        {
+            "id": "k2",
+            "task": "aleak_check",
+            "args": [],
+            "kwargs": {},
+            "soft_timeout_ms": None,
+        }
+    )
+    assert checked == {"id": "k2", "ok": True, "result": False}
+
+
 def test_task_prints_do_not_corrupt_protocol(child):
     resp = child.request(
         {"id": "n1", "task": "noisy", "args": [], "kwargs": {}, "soft_timeout_ms": None}

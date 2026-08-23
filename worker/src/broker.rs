@@ -117,13 +117,18 @@ fn sha256(data: &[u8]) -> [u8; 32] {
 /// reach of a busy deployment. 128 bits keeps both out of reach while the
 /// key stays a fixed 32 hex chars.
 fn idemp_digest_hex(s: &str) -> String {
-    use std::fmt::Write as _;
+    // Nibble table, not `write!(out, "{b:02x}")`. The formatting machinery cost
+    // 391.7ns for these 16 bytes against 31.4ns for the table, i.e. core::fmt
+    // was more expensive than the SHA-256 it formats (376ns for a 36 byte key).
+    // Byte for byte identical output; this is purely how the digest is spelled.
+    const HEX: &[u8; 16] = b"0123456789abcdef";
     let d = sha256(s.as_bytes());
-    let mut out = String::with_capacity(32);
+    let mut out = Vec::with_capacity(32);
     for b in &d[..16] {
-        let _ = write!(out, "{b:02x}"); // writing to a String cannot fail
+        out.push(HEX[(b >> 4) as usize]);
+        out.push(HEX[(b & 0x0f) as usize]);
     }
-    out
+    String::from_utf8(out).expect("hex table is ASCII")
 }
 
 pub fn idemp_key(key: &str) -> String {
@@ -605,6 +610,29 @@ pub async fn xclaim_entries(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The wire value itself, against digests computed by an independent
+    /// implementation (`hashlib.sha256(k).hexdigest()[:32]`). The
+    /// deterministic/bounded test below only compares keys to other keys, so
+    /// it passes just as happily against a wrong digest or a wrong hex
+    /// encoder, and both of those are silent BREAKING changes: keys written
+    /// by an older worker stop matching and an idempotent task runs twice.
+    #[test]
+    fn idemp_digest_matches_reference_sha256() {
+        assert_eq!(
+            idemp_digest_hex("order-42"),
+            "3bf8b157c4238eefe5ae4a66eca81c6b"
+        );
+        assert_eq!(
+            idemp_digest_hex("order-43"),
+            "7cb94acade5a102a33b58fe6f51ea4c4"
+        );
+        assert_eq!(idemp_digest_hex(""), "e3b0c44298fc1c149afbf4c8996fb924");
+        assert_eq!(
+            idemp_key("order-42"),
+            "cauli:idemp:3bf8b157c4238eefe5ae4a66eca81c6b"
+        );
+    }
 
     #[test]
     fn idemp_key_is_deterministic_and_bounded() {
