@@ -63,6 +63,48 @@ jumps). Mentioned because a benchmark that silently drops or clips negative
 outliers instead of finding their cause is exactly the kind of thing that
 should not be trusted.
 
+**Comparisons are PAIRED and interleaved, added 2026-08-24.** Running all reps
+of A and then all reps of B is not safe on this box. Measured directly: one
+binary, one config, one session drifted from 19,532 to 12,540 tasks per second
+while staying stable to 4% inside any five minute block. A block design hands
+that drift to whichever side runs second and reports it as a difference between
+frameworks. So the two sides of a comparison now run back to back, minutes
+apart, with the order flipped every pair, and the reported figure is the mean of
+per pair ratios with a 95% interval rather than a ratio of means. A row whose
+interval spans 1.0 is reported as indistinguishable from noise, not as a win.
+`campaign_paired.py` implements this; `campaign.py` remains for single lane
+runs.
+
+**Both sides must sit on the same filesystem.** An early paired run kept the
+baseline tree on ext4 and the comparison tree on a `/mnt` 9p mount. The import
+path difference alone produced a 12% swing and tripled the pair to pair
+variance. Filesystem is part of the configuration.
+
+**Every worker process must be dead before the next run starts.** Celery
+answers `SIGTERM` with a warm shutdown that waits on prefetched tasks and can
+simply never finish; one such pool ran for 2.4 hours and competed for cores
+with every measurement taken after it. `ceiling.py` now enumerates surviving
+worker processes both before and after each run and reports any it has to kill.
+
+**Where the CPU went is part of the result.** `ceiling.py` samples per process
+CPU for the worker, Postgres and Redis over the same window the throughput
+slope is taken from, and labels each row `framework-bound`, `redis-bound`,
+`postgres-bound` or `box-bound`. On a 6 vCPU machine shared with the broker,
+the database and the harness, `box-bound` is the common and honest answer, and
+a "ceiling" measured on a saturated box is a property of the box. Saying so is
+the difference between a ceiling and a number.
+
+**Instrument bugs found and fixed while producing this document**, listed
+because each one produced a plausible wrong answer before it was caught: a
+block design on a drifting box (fake 12% regression), a cross filesystem
+comparison (same fake regression, different cause), a runner that did not set
+`PYTHONPATH` for the embedded interpreter (cauli measured at 0 tasks/s), and
+leaked Celery pools (silently contaminated every later row). All four came from
+reimplementing something `run.sh` or `monitor.py` already did correctly. The
+harness now cross checks itself: Celery prefork measured 826/s against this
+document's previously published 850.6/s, within 3%, and that agreement is what
+makes the rest of the table credible.
+
 ## Claim 1: memory per unit of concurrency
 
 RSS is NOT the right metric for Celery here and using it would have quietly
@@ -531,35 +573,61 @@ more than any single number in it:**
 
 ### SQLAlchemy async ORM, the FastAPI-shaped comparison
 
+**CORRECTED 2026-08-24. This section previously reported that taskiq beat
+cauli 733.6/s to 378.6/s, and explained the gap with SQLAlchemy's greenlet
+based async engine. Both the number and the explanation were wrong. The
+original text is preserved in git history.**
+
+What was wrong, in order of size:
+
+1. **`sqla_models.make_engine` built the pool as `pool_size=2,
+   max_overflow=pool_max - 2`.** That reads like "up to `pool_max`
+   connections" and is not. SQLAlchemy pools exactly `pool_size` connections
+   and CLOSES every overflow connection when it is returned, so above two
+   concurrent tasks nearly every insert paid a fresh TCP connect and SCRAM
+   handshake. The raw psycopg lanes it was being compared against use
+   `AsyncConnectionPool(min_size=2, max_size=pool_max)`, where `min_size` is
+   an idle floor rather than a cap. The two parameters were translated by
+   name, and they do not correspond.
+2. **The configs were not matched, though the write up said they were.**
+   cauli ran 4 processes against taskiq's 8.
+3. **The pool sweep that ruled out connection availability could not have
+   detected it.** Sweeping "pool size 2 through 100" varied `max_overflow`
+   while `pool_size` stayed the literal `2`, so every point in the sweep had
+   the same two pooled connections. A flat line was read as evidence that
+   connections were not the bottleneck; it was evidence that the sweep was
+   not changing the thing it named.
+
+The tell was that cauli, taskiq and a framework free probe all landed within a
+few percent of the same number. Three systems agreeing that closely are
+usually all waiting on a fourth.
+
+Corrected measurement, both frameworks on 8 processes, 40 concurrent tasks per
+process and a 40 connection pool per process (320 total against Postgres's 400
+limit), paired and interleaved with the order alternating every pair:
+
 | Lane | Config | Throughput |
 |---|---|---:|
 | cauli, raw psycopg3-async, direct Postgres | `--procs 4 --io-concurrency 500` | 3,783.7/s |
-| cauli, raw psycopg3-async, **via pgbouncer** | same config | **4,577.5/s — pgbouncer wins here too** |
-| cauli, SQLAlchemy async ORM, direct Postgres | `--procs 4 --io-concurrency 24` | 378.6/s |
-| taskiq, SQLAlchemy async ORM | `--workers 8 --max-async-tasks 20 --max-prefetch 20` | 733.6/s (**taskiq wins this one**) |
+| cauli, raw psycopg3-async, **via pgbouncer** | same config | **4,577.5/s** |
+| **cauli, SQLAlchemy async ORM** | `--procs 8 --io-concurrency 40` | **1,627/s** |
+| taskiq, SQLAlchemy async ORM | `--workers 8 --max-async-tasks 40` | 1,425/s |
 
-**Stated plainly, not smoothed over: taskiq beats cauli on this lane.**
-Root-caused rather than left as an unexplained number: the gap is not
-ORM overhead. Isolated by re-running the identical insert through
-SQLAlchemy's **Core** API (raw SQL, no `Session`, no identity map, no
-unit-of-work) at the same concurrency — it measured within noise of the
-full ORM (~208/s Core vs ~219-253/s ORM, both sequential and concurrent
-via `asyncio.gather`, pool size swept 2 through 100 core connections with
-no effect). That rules out the ORM layer entirely. What's left is
-SQLAlchemy's async **engine** itself: its asyncio support is built on a
-`greenlet`-based bridge over what is fundamentally synchronous internals,
-and under concurrent load in this environment it does not scale with
-added concurrency the way the raw driver does — throughput stayed flat
-regardless of pool size or `asyncio.gather` batch size, which a real
-connection-availability bottleneck would not produce. This is a
-characteristic of SQLAlchemy's async engine in this environment, not of
-cauli, not of this suite's task code, and not an artifact of a
-transaction-mode difference (an earlier version of this section
-attributed the gap to autocommit-vs-explicit-transaction round trips;
-that was wrong — Core bypasses the ORM's transaction handling entirely
-and shows the same number, so transaction mode isn't the cause either).
-Reported as measured: cauli loses this comparison, for a reason external
-to cauli, and that's still the honest number to publish.
+Ratio of per pair ratios: **1.145, 95% CI 1.078 to 1.211, cauli ahead in 6 of
+6 pairs.** cauli wins this lane by 14.5%.
+
+Both frameworks moved by roughly 2x once the pool was fixed, which is the
+signature of a harness bottleneck being lifted rather than either framework
+changing. Neither number says anything about the previous ones except that
+they measured connection churn.
+
+Two lessons this cost, recorded so the next person does not repay them:
+
+- A sweep that produces a flat line is a claim about the sweep before it is a
+  claim about the system. Verify the swept parameter actually changes what it
+  names.
+- When several independent systems report the same throughput, suspect a
+  shared bottleneck outside all of them rather than a coincidence.
 
 ### Operational finding, summarized: Django needs a pooler in front of Postgres, regardless of task queue
 
@@ -613,6 +681,103 @@ pgbouncer next.
 **Reproducing this section requires pgbouncer** (`pool_mode = transaction`,
 pointed at the same `bench` Postgres role/db) in addition to the base
 `setup.sh` environment — see `bench/README.md` for the config used here.
+
+## Ceiling sweeps with CPU attribution (2026-08-24)
+
+Everything above this section was measured with a block design and is retained
+as recorded. This section is a re-measurement with the paired protocol, the
+orphan checks, and per process CPU sampling described in Method. Where the two
+disagree, prefer this one, and prefer the ratios over the absolutes: the box
+drifts ~35% across a session, so a ratio measured inside one session is worth
+more than an absolute measured in another.
+
+The question these sweeps answer is not "how fast" but "what stopped it".
+Every row carries the CPU cores consumed by the worker, Postgres and Redis over
+the same window the throughput slope came from.
+
+### Harness cross check
+
+Celery prefork measured **826/s** here against the **850.6/s** this document
+published from an independent earlier run: agreement within 3%. That is the
+anchor that makes the rest of the table trustworthy, and it is the reason
+these numbers are published while four earlier attempts were discarded.
+
+### Dispatch, no database, no ORM, no web framework
+
+Task body is one `redis.incr`. Single runs, so read the ratios, not the peaks.
+
+| Config | tasks/s | worker cores | redis cores | Limit |
+|---|---:|---:|---:|---|
+| cauli async `--procs 6 --io-concurrency 96` | 27,060 | 4.71 | 0.60 | box (5.3/6) |
+| cauli async `--procs 4` | 20,582 | 4.61 | 0.63 | box (5.2/6) |
+| cauli async `--procs 8` | 20,012 | 4.64 | 0.59 | box (5.2/6) |
+| cauli async `--procs 2` | 17,994 | 3.05 | 0.56 | **framework** |
+| cauli sync `--procs 12 --io-threads 80` | 19,299 | 4.80 | 0.53 | box (5.3/6) |
+| cauli sync `--procs 6 --io-threads 80` | 17,656 | 4.93 | 0.52 | box (5.4/6) |
+| taskiq `--workers 6 --max-async-tasks 100` | 7,812 | 4.54 | 0.40 | **framework** |
+| taskiq `--workers 8` | 7,694 | 4.95 | 0.38 | box (5.3/6) |
+| celery prefork `-c 4 --prefetch 1` | 826 | 1.13 | 0.17 | **framework** |
+| celery prefork `-c 8 --prefetch 4` | 816 | 1.11 | 0.17 | **framework** |
+
+**Redis is not the constraint for anyone**: 0.63 cores at the highest point,
+about 10% of the box. Nobody in this table is broker bound.
+
+**Celery is framework bound at 1.13 cores** and leaves four of six cores idle.
+It cannot convert more hardware into more throughput on this workload. That,
+rather than the raw ratio, is the structural difference worth understanding:
+cauli saturates the machine, Celery saturates itself.
+
+**cauli's own ceiling is not visible on this box.** Every cauli row except
+`--procs 2` is box bound at 4.6 to 4.9 cores while sharing six cores with
+Redis, the driver and the monitor. A ceiling measured on a saturated box is a
+property of the box, so the honest statement is "at least 27,060/s while using
+4.71 cores", not "cauli's maximum is 27,060/s".
+
+Ratios at best observed config: cauli async is **3.5x taskiq** and **32.8x
+Celery prefork**.
+
+### Django ORM, sync tasks
+
+One Django ORM `objects.create()` per task. Postgres made cheap first
+(UNLOGGED, `synchronous_commit=off`) so the row measures the framework.
+
+| Config | tasks/s | worker cores | pg cores | Limit |
+|---|---:|---:|---:|---|
+| **cauli sync `--procs 6 --io-threads 24`** | **4,256** | 3.92 | 0.76 | framework |
+| cauli sync `--procs 8 --io-threads 32` | 3,246 | 3.93 | 0.69 | framework |
+| cauli sync `--procs 4 --io-threads 16` | 2,870 | 3.69 | 0.66 | framework |
+| **celery prefork `-c 16`** | **247** | 3.24 | 0.16 | framework |
+| celery prefork `-c 32` | 231 | 3.30 | 0.16 | framework |
+
+**Both sides are framework bound with Postgres under one core**, which is the
+condition this sweep exists to create. cauli is **17.2x** Celery prefork here.
+
+The column that explains it is worker cores: Celery spends 3.24 cores to
+produce 247 tasks/s, cauli spends 3.92 to produce 4,256. Nearly the same CPU,
+seventeen times the output.
+
+No connection exhaustion appeared at this sizing (6 x 24 = 144 connections
+against a 400 limit). The pgbouncer finding elsewhere in this document stands,
+but it was hit at `--procs 12 --io-threads 80`, which asks for 960.
+
+### SQLAlchemy async ORM, async tasks (the FastAPI shape)
+
+| Config | tasks/s | worker cores | pg cores | Limit |
+|---|---:|---:|---:|---|
+| cauli async `--procs 6 --io-concurrency 40` | 2,268 | 4.86 | 0.69 | box (5.7/6) |
+| cauli async `--procs 8` | 2,099 | 4.88 | 0.66 | box (5.7/6) |
+| **cauli async `--procs 4 --io-concurrency 32`** | **2,032** | **3.88** | 0.59 | **framework** |
+| taskiq `--workers 8 --max-async-tasks 40` | 1,958 | 5.08 | 0.58 | box (5.8/6) |
+| taskiq `--workers 6` | 1,956 | 5.10 | 0.58 | box (5.8/6) |
+| **taskiq `--workers 4 --max-async-tasks 32`** | **1,736** | **3.88** | 0.45 | **framework** |
+
+The two bolded rows are the cleanest comparison in this document: both
+framework bound, both consuming **exactly 3.88 cores**, cauli **1.17x** ahead.
+
+That figure was produced by a different method than the paired campaign in
+Claim 5, which measured **1.145 (95% CI 1.078 to 1.211, 6 of 6 pairs)**. Two
+independent methods landing within 3% of each other is the strongest evidence
+in this file.
 
 ## Backlog drain (1M tasks)
 
