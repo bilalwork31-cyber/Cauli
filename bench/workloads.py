@@ -22,7 +22,14 @@ def cpu_burn(ms):
 PG_DSN = os.environ.get("BENCH_PG_DSN", "postgresql://bench:bench@127.0.0.1:5432/bench")
 PG_INSERT_SQL = "INSERT INTO bench_io (payload) VALUES (%s)"
 PG_PAYLOAD = "x" * 200
-PG_POOL_MAX = 100
+# Per WORKER PROCESS, not per fleet. Every lane here builds its pool inside
+# each process, so the real connection count is `procs x PG_POOL_MAX` and it is
+# Postgres's max_connections (400 on the bench box, 3 reserved) that binds.
+# cauli's own contrib/sqlalchemy.py states the same rule for user code. It is
+# env overridable so a lane running many processes can size its share down
+# without changing the single process lanes, which is what the SQLAlchemy
+# comparison needs: 8 processes x 100 would ask for 800.
+PG_POOL_MAX = int(os.environ.get("BENCH_PG_POOL_MAX", "100"))
 
 # Adversarial mixed workload (CLAIMS.md #4): a calibrated busy-loop stands in
 # for "parse a 500KB JSON body after an await" -- same GIL-holding effect,
