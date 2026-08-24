@@ -436,6 +436,12 @@ Report bugs and ask questions at
 See [CONTRIBUTING.md](CONTRIBUTING.md) to build from source, and
 [SECURITY.md](SECURITY.md) to report a vulnerability.
 
+## Status
+
+cauli 1.0.0, the first public release. 1.0 means the wire format in
+[PROTOCOL.md](PROTOCOL.md) and the stats line key set are frozen for the 1.x
+series. It does not mean a decade of production mileage.
+
 ## License
 
 Dual licensed under MIT or Apache 2.0, at your option.
