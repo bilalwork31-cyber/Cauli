@@ -319,53 +319,92 @@ frameworks roughly doubled once it was fixed. The full retraction is in
 
 ### Memory per unit of concurrency
 
-PSS, not RSS, summed across every worker process. *Carried over from the
-earlier measurement round, not re-measured with the paired method.*
+N tasks that `sleep(3600)`, all held in flight at once, PSS summed across the
+whole worker process group. Re-measured 2026-08-24 on 10 vCPU.
 
-| Tasks in flight | cauli async | Celery prefork | Celery gevent |
+| Tasks in flight | cauli, `--procs` auto | cauli, `--procs 6` | Celery gevent |
 |---:|---:|---:|---:|
-| 100 | 58.8 MiB | 2,036.7 MiB | **46.7 MiB** |
-| 1,000 | 156.9 MiB | not attempted | **68.2 MiB** |
-| 10,000 | **215.7 MiB** | not attempted | 282.9 MiB |
+| 100 | 59.7 MiB | — | **49.2 MiB** |
+| 1,000 | 245.6 MiB | — | **70.8 MiB** |
+| 5,000 | 277.4 MiB | — | **166.9 MiB** |
+| 10,000 | 317.1 MiB | **227.1 MiB** | 285.4 MiB |
 
-**cauli loses this below roughly 4,500 to 6,000 tasks in flight.** Celery with
-`-P gevent` is one process with N greenlets and is cheaper until the crossover.
-cauli's floor is higher because it always runs a supervisor plus a worker
-process embedding CPython. It wins past the crossover because its marginal cost
-is about 6.6 KiB per held task against 19 to 30 KiB.
+**The number that decides this table is `--procs`, not the task count.** Each
+worker process embeds its own CPython and costs about **22.6 MiB** before it
+holds a single task; a held task itself costs about 6.6 KiB. Celery gevent is
+one process with N greenlets, so it pays that floor once no matter how you
+tune it.
+
+At 10,000 in flight, cauli at `--procs 6` uses 227.1 MiB and **beats** gevent's
+285.4; the same cauli at `--procs 10` uses 317.4 MiB and **loses** to it. Same
+code, same workload, same box. `-c` derives `procs` from the core count because
+that is what maximises throughput, which is the wrong objective if what you are
+short of is memory.
+
+**So: if you are optimising for memory at high concurrency, set `--procs`
+explicitly and keep it low.** The auto-derivation will not do it for you.
 
 ### CPU bound work
 
-`kind="cpu"` against four alternatives, all at 6 processes. *Carried over, not
-re-measured.*
+`kind="cpu"` against Celery prefork, both at 6 worker processes, both pinned to
+the same 8 CPUs. Paired and interleaved, 3 pairs per size, reported as the mean
+of per-pair ratios with a 95% interval.
 
-| Task size | cauli | Celery | taskiq | Dramatiq |
-|---:|---:|---:|---:|---:|
-| 0.5ms | **2,664.8/s** | 778.4/s | 810.5/s | 1,539.5/s |
-| 2ms | **1,776.6/s** | 693.2/s | 763.2/s | 1,188.7/s |
-| 10ms | 516.5/s | 413.0/s | 515.6/s | 473.3/s |
-| 50ms | 115.3/s | 110.8/s | 117.6/s | 117.3/s |
+| Task size | cauli | Celery prefork | Ratio | 95% CI |
+|---:|---:|---:|---:|---|
+| 0.5ms | **3,770.6/s** | 875.9/s | **4.31x** | 3.76 - 4.86 |
+| 2ms | **2,580.9/s** | 871.8/s | **2.96x** | 2.87 - 3.05 |
+| 10ms | 580.6/s | 546.5/s | 1.06x | 1.06 - 1.07 |
+| 50ms | 118.9/s | 117.6/s | 1.01x | 1.01 - 1.01 |
 
-Dispatch overhead is a shrinking fraction of total time as the task grows.
-**At 50ms all four are within noise.** At 10ms taskiq ties cauli. Only at small
-task sizes does the lead matter.
+This is physics, and the shape is the point rather than any single number.
+Dispatch overhead is a fixed cost per task, so it dominates a 0.5ms task and
+disappears into a 50ms one. **At 50ms the two are 1% apart.** That 1% is
+statistically real here (the interval excludes 1.0) and operationally
+irrelevant: if your tasks are 50ms or longer, no task queue is going to save
+you meaningful CPU, and you should choose one on other grounds.
 
 ### Correctness under a hard crash
 
-`kill -9` at 160 of 500 uniquely tagged tasks, restart, count what comes out.
-*Carried over. These are counts rather than rates, so box drift cannot move
-them.*
+`kill -9` the worker at 160 of 500 uniquely tagged tasks, restart it, count
+what comes out. Counts, not rates, so nothing here depends on how busy the box
+was. Re-measured 2026-08-24.
 
-| Framework | Lost | Duplicates | Recovery |
+| Lane | Lost permanently | Duplicates | Recovery |
 |---|---:|---:|---:|
-| cauli | **0** | 0 | 34.0s |
-| Celery, `acks_late`, `visibility_timeout=5` | 0 | 0 | 103.2s |
-| Celery, plain default | 80 of 500 | 0 | never recovered |
-| Dramatiq, default | 85 of 500 | 0 | timed out |
-| arq, default | 400 of 500 | 0 | timed out |
+| **cauli** | **0** | **0** | **10.8s** |
+| Celery, `acks_late=True`, `visibility_timeout=5` | 0 | 0 | 91.3s (**8.5x slower**) |
+| Celery, plain default | **`concurrency x (prefetch + 1)`, permanent** | 0 | never recovers |
 
-Dramatiq and arq ran at their default reliability configuration and were not
-given the tuned second pass Celery got.
+**Celery's default loss is not a number, it is a formula**, and it was verified
+against three configurations, predicting each exactly:
+
+| Celery default config | Predicted | Measured |
+|---|---:|---:|
+| `-c 4 --prefetch-multiplier=1` | 8 | **8** |
+| `-c 4 --prefetch-multiplier=4` | 20 | **20** |
+| `-c 16 --prefetch-multiplier=4` | 80 | **80** |
+
+It loses exactly what the worker had prefetched into memory, with no path back.
+The uncomfortable part is that prefetch is Celery's main throughput knob: **the
+harder you tune Celery for speed, the more it loses when a box dies.** cauli
+loses none at any concurrency, because recovery is driven by the consumer
+group's pending list in Redis rather than by whatever happened to be inside a
+worker process.
+
+Celery's `acks_late` path is eventually correct and 8.5x slower to recover, for
+a reason in kombu rather than in this harness:
+`kombu.transport.redis.QoS.restore_visible` restores at most 10 stale messages
+per scan, and the scan fires on 1 invocation in 10.
+
+cauli's own recovery improved from a previously published 34.0s to 10.8s in
+this cycle, from the `--mover-interval` default moving 250ms to 50ms.
+
+**On batched acks:** completions are now flushed in batches (PROTOCOL 4.1), so
+a crash can in principle redeliver up to one unflushed buffer per queue and
+re-execute those tasks. Measured here at this configuration: **0 duplicates**,
+twice. The bound still holds and a crash at much higher throughput would
+exercise it harder, so this is reported as measured rather than as a guarantee.
 
 ### Where cauli loses
 
@@ -373,8 +412,8 @@ A table that only shows wins is rigged.
 
 | Result | Number |
 |---|---|
-| **Memory below the crossover** | Celery gevent and threads are cheaper up to roughly 4,500 to 6,000 tasks in flight. |
-| **CPU bound parity at 50ms** | All frameworks within noise. taskiq ties at 10ms. |
+| **Memory, unless you pin `--procs`** | Celery gevent is cheaper at every concurrency measured when cauli runs its auto-derived process count. cauli wins at 10,000 in flight only with `--procs 6` (227.1 MiB against 285.4). Each cauli process costs ~22.6 MiB before it holds anything. |
+| **CPU bound parity at 50ms** | cauli and Celery are 1% apart at 50ms and 6% at 10ms. The lead only exists for short tasks. |
 | **The wrong config stalls under a CPU burst** | A 50ms burst every 3 seconds pushes the naive async lane to 18x baseline p99. Routing it to `kind="cpu"` brings that to 4.0x, ahead of arq at 4.4x and Celery prefork at 14.5x, but the naive number is what you get if you do not route CPU work. |
 | **Throughput falls off a cliff** | Above 104 slots per process, a run reaches 91 to 99% and then hangs instead of slowing down. |
 | **Django needs pgbouncer at high concurrency** | At `--procs 12 --io-threads 80` the Django lane asks Postgres for 960 connections and exhausts `max_connections`. Django has no connection pool, and the same wall hits Celery with enough prefork workers. |

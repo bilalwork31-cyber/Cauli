@@ -779,6 +779,106 @@ Claim 5, which measured **1.145 (95% CI 1.078 to 1.211, 6 of 6 pairs)**. Two
 independent methods landing within 3% of each other is the strongest evidence
 in this file.
 
+## Claims 1, 3 and 4 re-measured (2026-08-24)
+
+The three tables above were produced with a block design before the paired
+protocol existed. All three are re-measured here on 10 vCPU, and all three
+changed. Where they disagree with the older sections, prefer these.
+
+Three independent cross checks say the harness is sound: Celery prefork
+measured 826/s against this document's previously published 850.6/s; Celery
+gevent's memory reproduced within 2 to 5% at four separate concurrencies; and
+cauli at `--procs 6` holding 10,000 tasks measured 227.1 MiB against a
+published 215.7. Agreement on three unrelated measurements is what makes the
+disagreements below worth acting on.
+
+### Claim 1 re-measured: memory is decided by `--procs`, not by task count
+
+N tasks that `sleep(3600)` held simultaneously, PSS summed across the process
+group. Celery prefork is not re-run: one OS process per slot means 1,000
+interpreters, and its 2,036.7 MiB at 100 slots is not in dispute.
+
+| Tasks in flight | cauli, `--procs` auto | cauli, `--procs 6` | Celery gevent |
+|---:|---:|---:|---:|
+| 100 | 59.7 MiB (3 procs) | — | 49.2 MiB |
+| 1,000 | 245.6 MiB (11 procs) | — | 70.8 MiB |
+| 5,000 | 277.4 MiB (11 procs) | — | 166.9 MiB |
+| 10,000 | 317.1 MiB (11 procs) | **227.1 MiB (7 procs)** | 285.4 MiB |
+
+The older table reported cauli winning past roughly 4,500 to 6,000 in flight.
+That was true at the 6 vCPU it was measured on and is not a property of cauli:
+`-c` derives `procs` from the core count, so the same `-c 10000` that produced
+6 worker processes there produces 10 here, and each one embeds its own CPython.
+
+Decomposed: **~22.6 MiB per worker process** ((317.4 - 227.1) / 4 extra
+processes, measured directly at 10,000 held with `--procs` pinned to 6 and to
+10), plus ~6.6 KiB per held task. Celery gevent is a single process, so it pays
+the interpreter floor exactly once regardless of concurrency, and that is the
+whole shape of this comparison.
+
+Operational consequence, which the old table did not state: **pin `--procs`
+when memory is the binding constraint.** The auto-derivation optimises for
+throughput.
+
+### Claim 3 re-measured: CPU bound, paired
+
+Both stacks at 6 worker processes, both pinned to CPU 2-9, Celery at prefetch 1
+(the analogue of cauli's cpu prefetch, per the fairness rule in Method). Three
+pairs per size, interleaved, order alternating.
+
+| Task size | cauli | Celery prefork | Ratio | 95% CI |
+|---:|---:|---:|---:|---|
+| 0.5ms | 3,770.6/s | 875.9/s | 4.31x | 3.76 - 4.86 |
+| 2ms | 2,580.9/s | 871.8/s | 2.96x | 2.87 - 3.05 |
+| 10ms | 580.6/s | 546.5/s | 1.06x | 1.06 - 1.07 |
+| 50ms | 118.9/s | 117.6/s | 1.01x | 1.01 - 1.01 |
+
+Same shape as the block-design table, higher absolutes on both sides from the
+extra cores. One refinement worth recording: the old table called 50ms "within
+noise". Paired, the 1% gap is statistically detectable (the interval excludes
+1.0) and operationally meaningless. Both statements can be true, and the
+precise one is better.
+
+### Claim 4 re-measured: crash correctness, and Celery's loss is a formula
+
+500 uniquely tagged tasks, `kill -9` at 160 executed, fresh worker, count what
+comes out. cauli at `--procs 2 --io-threads 8`; Celery at `-c 4 -P prefork
+--prefetch-multiplier=1` unless stated.
+
+| Lane | Lost permanently | Duplicates | Recovery |
+|---|---:|---:|---:|
+| cauli | 0 | 0 | 10.8s (reproduced: 10.77, 10.78) |
+| Celery, `acks_late=True`, `visibility_timeout=5` | 0 | 0 | 91.3s |
+| Celery, plain default | 8 at this config, see below | 0 | never |
+
+The old table reported 80 of 500 for the default lane. Both numbers are right,
+and the reason is that **the loss is deterministic, not sampled**: a crashed
+Celery default worker loses exactly what it had prefetched into memory.
+
+| Celery default config | `concurrency x (prefetch + 1)` | Measured lost |
+|---|---:|---:|
+| `-c 4 --prefetch-multiplier=1` | 8 | 8 |
+| `-c 4 --prefetch-multiplier=4` | 20 | 20 |
+| `-c 16 --prefetch-multiplier=4` | 80 | 80 |
+
+Predicted exactly at all three points, and it reconciles the 80: that row was
+measured at a higher concurrency. Publishing the formula rather than one draw
+is strictly better, and it exposes the part that matters: prefetch is Celery's
+primary throughput knob, so **tuning Celery faster increases what it loses on
+a crash, linearly.**
+
+cauli's recovery improved from 34.0s to 10.8s in this cycle, from
+`--mover-interval` moving 250ms to 50ms; the reclaim path waits on that tick.
+The `acks_late` gap widened from a published 3x to 8.5x for the same reason,
+against an unchanged kombu throttle (`QoS.restore_visible` restores at most 10
+stale messages per scan, scanning on 1 invocation in 10).
+
+**Batched acks (PROTOCOL 4.1) cost nothing here.** A crash can in principle
+redeliver up to one unflushed buffer per queue; measured at this configuration
+it produced 0 duplicates in both runs. At `--io-threads 8` the 2ms timer flushes
+almost immediately, so the buffer is rarely deep when the kill lands. A crash at
+30,000 tasks/s would exercise the bound far harder, and that is not measured.
+
 ## Backlog drain (1M tasks)
 
 Preload 1,000,000 no-op tasks with no worker running, then start it: this is
