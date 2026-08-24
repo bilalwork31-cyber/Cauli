@@ -153,6 +153,25 @@ def bench_env(env_extra):
 _WORKER_PATTERNS = ("cauli-worker", "cauli._exec", "celery", "taskiq", "dramatiq")
 
 
+def _ancestors():
+    """This process and everything that launched it.
+
+    A shell that starts the worker has the worker's path in its own command
+    line, so any cmdline-substring match finds the launcher too. Killing that
+    kills the run. Exclude the whole ancestor chain instead of trying to write
+    a cleverer pattern.
+    """
+    out, pid = set(), os.getpid()
+    while pid and pid not in out:
+        out.add(pid)
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                pid = int(f.read().rsplit(") ", 1)[1].split()[1])
+        except (OSError, IndexError, ValueError):
+            break
+    return out
+
+
 def _survivors():
     """Worker processes still alive that should not be.
 
@@ -162,19 +181,39 @@ def _survivors():
     every measurement that followed. Killing the process group is not enough,
     so every run ends by checking that nothing survived and reporting it when
     something does. A silent leak here contaminates every later row.
+
+    Matching is on the EXECUTABLE NAME (/proc/pid/comm), not the command line.
+    comm is the program actually running, so a wrapper script that merely
+    mentions the worker's path cannot match, while `pkill -f` style matching
+    reliably found the launcher and killed the benchmark instead of the leak.
     """
+    names = {"cauli-worker", "celery", "dramatiq"}
+    mine = _ancestors()
     out = []
     for entry in os.listdir("/proc"):
         if not entry.isdigit():
             continue
+        pid = int(entry)
+        if pid in mine:
+            continue
         try:
-            with open(f"/proc/{entry}/cmdline", "rb") as f:
-                cmd = f.read().replace(b"\0", b" ").decode("utf8", "replace")
+            with open(f"/proc/{entry}/comm") as f:
+                comm = f.read().strip()
         except OSError:
             continue
-        low = cmd.lower()
-        if any(pat in low for pat in _WORKER_PATTERNS) and "ceiling.py" not in low:
-            out.append(int(entry))
+        if comm in names:
+            out.append(pid)
+            continue
+        # taskiq and cauli's cpu children run under a plain python comm, so
+        # they need the command line -- safe now that ancestors are excluded.
+        if comm.startswith("python"):
+            try:
+                with open(f"/proc/{entry}/cmdline", "rb") as f:
+                    cl = f.read().replace(b"\0", b" ").decode("utf8", "replace")
+            except OSError:
+                continue
+            if "taskiq worker" in cl or "cauli._exec" in cl:
+                out.append(pid)
     return out
 
 

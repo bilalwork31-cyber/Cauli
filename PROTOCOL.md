@@ -62,7 +62,7 @@ Unknown fields must be preserved on re-enqueue (retries) if practical, otherwise
 ```json
 {
   "v": 1,
-  "id": "32 char lowercase hex (uuid4().hex)",
+  "id": "32 char lowercase hex (128 random bits; the client uses os.urandom)",
   "task": "registered task name, e.g. myapp.tasks.send_email",
   "args": [],
   "kwargs": {},
@@ -261,7 +261,7 @@ background. Reads in between extrapolate from the monotonic clock, so a local NT
 score, no deadline and no stamp. Reading `TIME` per call instead would put two SERIAL round trips
 on every task, at the expiry check and at the finish stamp, and roughly double broker command load,
 which is not a price a timestamp is worth; drift between samples is about 3ms per minute against a
-mover that ticks every 250ms. A worker that cannot read `TIME` at all, which some managed
+mover that ticks every 50ms (`--mover-interval`). A worker that cannot read `TIME` at all, which some managed
 deployments deny by ACL, keeps extrapolating from its last anchor and warns; it does not refuse to
 start, and its exposure is the local clock behaviour described above.
 

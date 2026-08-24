@@ -3,6 +3,82 @@
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Changed
+
+- **Completions are batched.** The worker buffers completions per queue and
+  flushes them as one pipeline: each completion's own writes, then one
+  multi-id `XACK`, then one multi-id `XDEL`. A flush fires at `--ack-batch`
+  completions (default 64) or `--ack-flush-ms` milliseconds (default 2),
+  whichever comes first. Redis executes commands on one thread, and per task
+  round trips were the measured ceiling of the whole system: the same command
+  mix costs 98.1us of redis CPU per task at one round trip each against 9.1us
+  at 64 per round trip. Redis dropped from 0.76 to 0.68 cores at peak while
+  throughput rose 5.2% (95% CI 1.024 to 1.079); the point is not the 5.2% but
+  that redis is no longer the bound, so more worker cores now buy throughput.
+  **A crash, not a graceful stop, can now lose up to one unflushed buffer per
+  queue to redelivery** (at most `--ack-batch` entries, at most
+  `--ack-flush-ms` old). The idempotency guard absorbs it. Nothing else
+  narrows. `XLEN cauli:q:{queue}` now includes up to one flush window of
+  completed entries and is not backlog; §7's `oldest_ms` is.
+- `--cpu-max-tasks-per-child` now defaults to **10000**, was 1000. Measured
+  child private RSS plateaus at 2416kB by 5000 tasks and moves 4kB more out to
+  20000, so the old default re-forked mid ramp for no memory benefit.
+- `--mover-interval` now defaults to **50ms**, was 250ms. Every countdown,
+  eta, retry and beat firing waits out at most one tick, so at 250ms it added
+  up to 250ms to a default first retry of 250 to 500ms.
+- `-c` derivation now **floors** every per process division instead of
+  rounding up. `-c` is a ceiling on the whole worker, and each supervised
+  child receives the same resolved flags, so rounding each child up overshot:
+  `-c 65` derived 2 x 33 = 66 slots and `-c 512` derived 6 x 86 = 516.
+  Overshoot is the dangerous direction, since `-c` is what an operator sizes a
+  database connection pool against.
+- cpu children can no longer exceed the core count. The rule was already
+  documented; `div_ceil` broke it, deriving 8 children for 6 cores at `-c 200`.
+- The tokio runtime is sized per worker process rather than taking a whole box
+  each. Six processes on six cores meant 36 runtime threads, none of which ever
+  executes Python. `TOKIO_WORKER_THREADS` still wins.
+- `AsyncResult.get()` and `aget()` poll at 1ms for their first ten reads before
+  doubling to `poll_interval`. A flat 50ms poll charged every awaited task 25ms
+  on average just to be noticed. `poll_interval` keeps its meaning as the
+  ceiling.
+- Task ids are generated with `os.urandom(16).hex()` rather than
+  `uuid.uuid4().hex`. Same 32 hex characters on the wire, 128 bits of entropy
+  instead of 122, and nothing ever parsed it back as a UUID.
+
+### Added
+
+- `--ack-batch` and `--ack-flush-ms` (64 / 2), under Advanced tuning, shown in
+  `--print-plan` and forwarded to every supervised worker process.
+- A trim backstop (`XTRIM MINID` at the provably acked boundary) that reclaims
+  entries orphaned by a torn flush, and by pre 1.0 per entry writes.
+
+### Fixed
+
+- **Logging could freeze the whole runtime.** Every tokio worker reaches a per
+  envelope `warn!`/`error!` site, so a stalled log reader filled the 64KiB pipe
+  and parked them one by one inside `write(2)`, with no error and nothing for
+  the wedge watchdog to see. Logs now go through a bounded non blocking sink
+  that drops and counts rather than blocking.
+- `gc.freeze()` now runs in the embedded interpreter after the app import. The
+  cpu fork parent already did this; the io lane never did, so the whole app
+  image sat in gen2 and every gen2 collection rescanned it while holding the
+  GIL that all in process tasks share. Measured on a 300k object image: 9.28ms
+  to 0.14ms.
+- Async `kind="cpu"` tasks run on a persistent per thread event loop instead of
+  `asyncio.run` per request, which cost 114.2us against 9.7us. Tasks left
+  running by a body that never awaited them are still cancelled at the end of
+  the request, so an orphan cannot outlive its own request.
+- `inspect.signature()` is bound once when a task is declared rather than
+  rebuilt on every `.delay()`, where it was 66% of the call.
+- The soft timeout disarm is skipped when nothing was armed, saving 893ns of
+  GIL held time on every task that declares no `soft_timeout`.
+- The idempotency digest hex encoder uses a nibble table rather than
+  `write!("{b:02x}")`, which cost more than the SHA-256 it was formatting.
+- `--print-plan` reports the tokio runtime threads it was omitting from its own
+  totals.
+
 ## 1.0.0 (2026-08-17)
 
 First release. Version 0.1.0 was never published, so everything below is

@@ -16,8 +16,25 @@ a bare no-op. Start here:
 
 ```bash
 ./setup.sh          # builds cauli-worker fresh, pinned venv, dedicated redis/pg
-python3 campaign.py --reps 3
+python3 campaign_paired.py --suite dispatch --pairs 8
 ```
+
+**Use `campaign_paired.py`, not `campaign.py`, for anything you intend to
+publish.** A block design (all reps of A, then all reps of B) is not safe on a
+shared box. Measured here: one binary and one config drifted from 19,532 to
+12,540 tasks per second across a single session while staying stable to 4%
+inside any five minute block. A block design hands that drift to whichever side
+runs second and reports it as a difference between frameworks; it produced a
+false 12% regression before it was caught. `campaign_paired.py` interleaves the
+two sides, alternates their order every pair, and reports the mean of per pair
+ratios with a 95% interval, calling a row noise when the interval spans 1.0.
+
+Two more rules the harness now encodes, both learned from a wrong published
+number: **both sides must sit on the same filesystem** (an ext4 baseline against
+a `/mnt` 9p subject swings 12% on the import path alone), and **every worker
+process must be dead before the next run starts** (Celery answers `SIGTERM`
+with a warm shutdown that can never finish; one leaked pool ran for 2.4 hours
+and competed with every measurement after it).
 
 Requires Linux (cauli-worker's constraint, not this harness's), Redis,
 PostgreSQL, and Rust/Cargo. `setup.sh` never touches a Redis or Postgres
@@ -59,7 +76,9 @@ applied in `tasks_cauli_sync_pg.py` / `tasks_cauli_async_pg.py`.
 | `enqueue.py` | Preloads N tasks for a lane with no worker running (drain-rate setup) |
 | `monitor.py` | Polls a completion counter, computes the mid-80%-slope drain rate |
 | `run.sh` | Orchestrates one measurement: flush, enqueue, start worker, monitor, clean up |
-| `campaign.py` | Runs the pinned final configs from RESULTS.md, N reps, prints a summary table |
+| `campaign.py` | Runs the pinned final configs from RESULTS.md, N reps, block design. Fine for a single lane; do NOT use it to compare two things |
+| `campaign_paired.py` | The comparison runner: interleaved, order alternating, reports ratios with a 95% interval. Use this one |
+| `ceiling.py` | Sweeps a framework to its own peak and says WHAT STOPPED IT, sampling per process CPU for the worker, Postgres and Redis over the same window the slope comes from, and labelling each row framework-bound, redis-bound, postgres-bound or box-bound |
 | `latency_producer.py` / `latency_report.py` | Open-loop load generation + HdrHistogram percentiles |
 | `mixed_driver.py` / `mixed_report.py` | Adversarial I/O + CPU-burst workload and its analysis |
 | `chaos_driver.py` | `kill -9` mid-run, measure data loss / duplicates / recovery time |

@@ -146,7 +146,8 @@ against Redis Streams per PROTOCOL.md. Module map:
   broker, which is what lets a future SQS/RabbitMQ backend inherit it for free.
   Before the idempotency claim, so an expired task cannot burn the key and lock
   out a later valid task carrying the same one.
-  Outcome: DLQ (`reason="expired"`) + a `"expired"` result key + XACK/XDEL, and
+  Outcome: DLQ (`reason="expired"`) + a `"expired"` result key + the batched
+  ack/delete, and
   the broken-out `expired` stats counter.
 - **Queue TTL (§9.2)** arrives as `app.queue_ttl` through the same duck-typed
   shim `load_app` config as everything else (`{queue: seconds}`, `"*"` =
@@ -190,17 +191,37 @@ make progress (hard-timeout SIGKILL bounds every slot), so overflow clears in
 bounded time. This satisfies "bound cpu backlog to 2*cpu_workers" without
 letting it wedge io fetching forever.
 
-## Completion writes (all pipelined, §4.1/§4.2)
+## Completion writes (buffered and flushed as one pipeline, §4.1/§4.2)
 
-- success: `SET result EX ttl` (if store_result) + XACK + XDEL
-- retry: retries+=1, `ZADD delayed (now+d)` (unknown envelope fields preserved)
-  + XACK + XDEL, d per §4.2 (jitter = uniform(0.5d, d) after the max clamp);
+Completions do NOT each issue their own ack. They are buffered per queue and
+flushed together: every buffered completion's own writes first, then ONE
+multi-id `XACK`, then ONE multi-id `XDEL` naming the same ids. A flush fires at
+`--ack-batch` completions (default 64) or `--ack-flush-ms` (default 2) since the
+oldest buffered one. Per-task round trips, not per-task commands, were the
+measured throughput ceiling of the whole system: the same command mix costs
+98.1us of redis main-thread CPU per task at one round trip each and 9.1us at 64
+per round trip.
+
+The wire order is contractual. Reversing `XACK` and `XDEL` would delete entries
+still in the PEL, which §4.4 could then never peek, claim or ack again.
+
+Each line below lists only a completion's OWN writes; the ack and delete are
+always the shared batch above.
+
+- success: `SET result EX ttl` (if store_result)
+- retry: retries+=1, `ZADD delayed (now+d)` (unknown envelope fields preserved),
+  d per §4.2 (jitter = uniform(0.5d, d) after the max clamp);
   `cauli.Retry.countdown` overrides d
-- final failure: `XADD dlq (e, reason="max_retries", error)` + result + XACK+XDEL
+- final failure: `XADD dlq (e, reason="max_retries", error)` + result
 - malformed / unregistered / redelivery_limit: DLQ (error field empty) + result
-  (when the id is recoverable) + XACK+XDEL
+  (when the id is recoverable)
 - expired (§9.1): `XADD dlq (e, reason="expired")` + an `"expired"` result
-  (when store_result) + XACK+XDEL; no retry, no lifecycle hooks
+  (when store_result); no retry, no lifecycle hooks
+
+A completion is not reported to the counters below, or to the §4.7 drain, until
+its flush has been answered by redis, so a graceful shutdown cannot finish with
+acks still buffered. A crash can lose at most one unflushed buffer per queue to
+redelivery, which the idempotency guard absorbs.
 
 Counters: ok counts successes and duplicates; failed counts final failures;
 retried counts scheduled retries; dlq counts every DLQ write; expired counts
