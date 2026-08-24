@@ -28,7 +28,7 @@ All keys use prefix `cauli:`. `{queue}` is a queue name matching `[a-zA-Z0-9_.-]
 
 | Key | Type | Purpose |
 |---|---|---|
-| `cauli:q:{queue}` | Stream | Ready tasks. Each entry has exactly one field `e` whose value is the envelope JSON (UTF-8). |
+| `cauli:q:{queue}` | Stream | Ready tasks. Each entry has exactly one field `e` whose value is the envelope JSON (UTF-8). Completed entries are removed by the completion flush's batched `XDEL` (§4.1); the stream briefly holds up to one flush window (≤ `--ack-batch` entries / ≤ `--ack-flush-ms`) of completed-but-unflushed entries, plus any torn-flush orphans until the trim backstop reclaims them, so `XLEN` here can slightly exceed backlog. |
 | `cauli:delayed:{queue}` | ZSET | Delayed/retrying tasks. member = envelope JSON string, score = fire_at epoch ms. |
 | `cauli:dlq:{queue}` | Stream | Dead letters. Fields: `e` = envelope JSON, `reason` = string, `error` = error JSON (see §8) or empty string. Capped at 1000 entries (approximate XADD MAXLEN); see below. |
 | `cauli:result:{task_id}` | String | Result JSON (see §8), `SET ... EX result_ttl`. |
@@ -313,17 +313,72 @@ anything: `COUNT` applies per stream, so every listed queue contributes to every
 ### 4.1 Completion
 
 - Success: if `store_result`: `SET cauli:result:{id} {result json} EX result_ttl`.
-  Then `XACK cauli:q:{queue} cauli {stream_id}` and `XDEL cauli:q:{queue} {stream_id}`.
+  Then `XACK cauli:q:{queue} cauli {stream_id}` and `XDEL cauli:q:{queue} {stream_id}` — both
+  batched into the completion flush, see below.
 - Failure (Python exception, timeout, worker-side error): see retry policy.
 
-All completion writes in this section (and §4.2, §4.4, §4.5) are issued as a single redis
-`pipe()`, but WITHOUT `MULTI`/`EXEC` — they are pipelined, not atomic. This is deliberate:
-wrapping multi-key pipelines (result key + stream + delayed zset + DLQ stream, potentially on
-different hash slots) in a real transaction would break Redis Cluster, where all keys in a
-`MULTI` must map to the same slot. A connection drop mid-pipeline can therefore apply some
-commands and not others (e.g. a retry `ZADD` without the matching `XACK`) — under at-least-once
-delivery this just means the original entry is later recovered and re-executed via §4.4, which
-is within the documented semantics, not a new failure mode.
+**Batched completion writes.** The worker buffers completions per queue and flushes them as
+ONE pipeline: every buffered completion's own writes first (result `SET`, retry `ZADD`, DLQ
+`XADD`), then a single multi-id `XACK` naming every buffered entry, then a single multi-id
+`XDEL` naming the same entries. A flush fires at whichever comes first: `--ack-batch`
+completions (default 64) or `--ack-flush-ms` (default 2) milliseconds since the oldest buffered
+one. Rationale: redis executes commands on one thread, and per-task completion round trips were
+the measured throughput ceiling of the whole system; batching the completion writes cuts redis
+CPU per task several-fold, at two commands per FLUSH instead of four per TASK. The `XDEL` is
+deliberately still here, per flush: an earlier revision removed it and left stream removal to
+the trim below, whose boundary is the group's oldest PENDING id — one slow task then retained
+every completed entry behind it (throughput x that task's duration; at 30k/s under the default
+300s `timeout_ms`, nine million entries). Completed entries are freed at their own flush,
+regardless of what else is running. Properties of the flush that are contractual, not
+incidental:
+
+- **Order.** A completion's own writes are always queued BEFORE the batch `XACK`, and the
+  batch `XDEL` comes AFTER the `XACK`. Torn before the ack: writes without the ack — the entry
+  is redelivered per §4.4 and resolves as a §4.5 duplicate; the ack can never land without the
+  writes, which would silently drop a retry or a dead letter. Torn between ack and delete:
+  acked-but-undeleted entries, reclaimed by the trim backstop below. The reverse order would
+  delete entries still in the PEL, which §4.4 could then never peek, claim or ack — pinned in
+  `XPENDING` forever. No `MULTI` guards the pair anymore: the trim backstop is what turned the
+  old stranding hazard into bounded residue.
+- **Durability of the report.** A completion is not reported (counters, §4.7 drain) until its
+  flush has been answered by redis. The buffer widens the CRASH duplicate window — a worker
+  killed mid-window loses at most one unflushed buffer per queue (≤ `--ack-batch` entries,
+  ≤ `--ack-flush-ms` old) to redelivery — but never weakens what an acked completion means.
+
+The pipeline carries no `MULTI`/`EXEC`, deliberately: the keys involved (result key, stream,
+delayed zset, DLQ stream) can map to different hash slots, and atomicity across them was never
+promised — a torn flush resolves toward re-execution under at-least-once, which is within the
+documented semantics.
+
+**The trim backstop.** A flush torn between its `XACK` and its `XDEL` leaves acked-undeleted
+orphans (as could a pre-1.0 worker's torn per-entry pair, permanently). A worker loop (every
+100ms per queue) reclaims them: it computes the boundary below which every entry is provably
+acked — the group's oldest pending id, or, with an empty PEL, one sequence past its
+`last-delivered-id`, reading `XINFO GROUPS` BEFORE `XPENDING` so a concurrent delivery can
+never slip under the boundary — and issues `XTRIM cauli:q:{queue} MINID {boundary}`. `MINID`
+removes ids strictly below the boundary, so a pending or undelivered entry is never removed,
+from any worker, including with several workers trimming concurrently. Because that boundary is
+the oldest PENDING id, an orphan behind a long-running task waits for that task before it is
+reclaimed — acceptable for rare, tear-sized orphans, and the reason the trim must never be the
+primary removal path.
+
+**The honest retention bound.** A completed entry normally leaves the stream at its own flush:
+within one flush window (≤ `--ack-batch` entries or ≤ `--ack-flush-ms`, whichever bound
+bites). Only torn-flush orphans outlive that, and they persist until the trim boundary passes
+them — at most one flush of entries per tear, held for up to the duration of the oldest
+in-flight task, then one trim tick. Steady-state `XLEN cauli:q:{queue}` is therefore backlog
+plus at most roughly one flush window of completed entries. Backlog itself is what §7's
+`oldest_ms` reads: the oldest pending entry and the oldest undelivered entry, neither of which
+the flush's `XDEL` or the trim can touch.
+
+**1.x compatibility.** This change is inside the frozen envelope: the key set, key types,
+envelope JSON, result JSON and consumer group layout are byte-for-byte unchanged, and old and
+new workers interoperate on the same queues (an old worker's per-entry `XACK`+`XDEL` and a new
+worker's batched `XACK`+trim are both valid transitions of the same state machine — the trim
+boundary is computed from the group's own state, so it is safe under mixed fleets). What moved
+is behavior already declared loose: the duplicate window (§4's "duplicates are always
+possible") gains a bounded crash case, and `XLEN cauli:q:{queue}` can briefly exceed backlog by
+up to one flush window, which was never a documented reading.
 
 ### 4.2 Retry policy
 
@@ -334,12 +389,13 @@ On failure with `retries < max_retries`:
    `d_ms = min(backoff_max_ms, backoff_base_ms * backoff_factor^(attempt-1))`.
    If `jitter`: `d_ms = uniform(0.5 * d_ms, d_ms)`.
 3. `ZADD cauli:delayed:{queue} (now + d_ms) new_envelope_json`.
-4. XACK + XDEL the delivered entry. Do NOT write a result key (task is still pending).
+4. XACK + XDEL the delivered entry (batched, §4.1; the ZADD rides the same flush pipeline,
+   queued before the ack). Do NOT write a result key (task is still pending).
 
 On failure with `retries >= max_retries` (final):
 1. `XADD cauli:dlq:{queue} * e envelope_json reason "max_retries" error {error json}`.
 2. If `store_result`: `SET cauli:result:{id} {failure result json} EX result_ttl`.
-3. XACK + XDEL.
+3. XACK (batched, §4.1).
 
 On a failure marked `retryable: false` (a deterministic failure that would fail the same way
 on every attempt, e.g. `SerializationError`), the same three steps run immediately, on the
@@ -425,7 +481,8 @@ Every `visibility_timeout / 2` (visibility_timeout default 60s, CLI flag), per q
    if any registered task's `timeout_ms >= visibility_timeout * 1000`.
 3. Otherwise (idle >= required_idle_ms): if `delivery_count > redelivery_limit` (default
    `max(3, max_retries+1)`, computed per envelope after claim; use 3 if envelope unreadable):
-   claim it (`XCLAIM ... JUSTID` acceptable), DLQ with reason `"redelivery_limit"`, XACK+XDEL. A
+   claim it (`XCLAIM ... JUSTID` acceptable), DLQ with reason `"redelivery_limit"`, XACK
+   (batched, §4.1). A
    result key is written too when the id is recoverable (§8).
 4. Else `XCLAIM cauli:q:{queue} cauli {consumer} {visibility_timeout_ms} {id}` and execute it
    normally (same code path as a fresh delivery; do not increment `retries` for a claim).
@@ -463,7 +520,7 @@ At execution start, if `idempotency_key` is not null (`{h}` = the hashed key per
   (**"mine again"**, see below) → `PEXPIRE` the key back to that same TTL and execute normally.
 - If the existing value is a DIFFERENT task id → do NOT execute. If `store_result`: write
   result JSON with status `"duplicate"` (result null) carrying `claimant_id`, the id of the task
-  that holds the key. XACK + XDEL. This is dedup within the claim's TTL, best effort by design
+  that holds the key. XACK (batched, §4.1). This is dedup within the claim's TTL, best effort by design
   (the broker is at least once).
 
 **The TTL is derived from the execution, not taken as configured.** `idemp_ttl` is one global
@@ -536,10 +593,12 @@ would be strictly worse than running it; the worker logs a warning and proceeds.
 
 ### 4.7 Graceful shutdown
 
-On SIGTERM or SIGINT: stop fetching new work; keep the delayed mover and acks running; wait
-up to `--drain-timeout` (default 30s) for in flight tasks; then exit 0. Unfinished tasks stay
-pending in the consumer group and are recovered via §4.4 by the next worker. Second signal:
-exit immediately (code 130).
+On SIGTERM or SIGINT: stop fetching new work; keep the delayed mover, the §4.1 ack flushers
+and the trim running; wait up to `--drain-timeout` (default 30s) for in flight tasks; then exit
+0. A task counts as in flight until its completion flush is answered (§4.1), so a clean drain
+never leaves buffered acks behind: the flush window (`--ack-flush-ms`, default 2ms) bounds how
+long the last buffer can wait. Unfinished tasks stay pending in the consumer group and are
+recovered via §4.4 by the next worker. Second signal: exit immediately (code 130).
 
 ### 4.8 Task lifecycle hooks
 
@@ -886,13 +945,13 @@ cauli-worker --app myproj.tasks:app [--queues default,emails] [--redis-url URL]
     taken as the larger of two probes: the oldest entry in the pending entries list
     (`XPENDING q - + 1`) and the oldest entry past the group's last delivered id (`XINFO
     GROUPS`, then an exclusive `XRANGE`), each read through the millisecond field of the stream
-    id. It is deliberately NOT `XRANGE q - + COUNT 1`. Section 4.1's XACK and XDEL pair is not
-    atomic (§4.3 explains why), so an XACK whose XDEL never landed leaves an entry in the
-    stream that no recovery path can reach; a plain `XRANGE` would read that orphan and report
-    a phantom age that grows forever and survives every restart. Both probes above skip it.
-    The orphan itself is not reaped: nothing in the worker XTRIMs a stream, so a partial write
-    leaves one entry's bytes in redis permanently. That is a slow memory leak, not a
-    correctness problem, and it is a known 1.0 gap.
+    id. It is deliberately NOT `XRANGE q - + COUNT 1`. Under §4.1's batched completion the
+    stream legitimately holds acked entries for up to one trim tick, so the raw stream head is
+    not backlog by design; a plain `XRANGE` would report a phantom age for entries that are
+    already done. Both probes above read only real outstanding work, and the §4.1 trim is what
+    reaps the acked entries (including any acked-but-undeleted orphan an older worker's torn
+    completion write left behind — the former "slow memory leak, known 1.0 gap" is gone: the
+    trim cleans it within a tick).
     This is the backlog's leading indicator, and it is a broker probe rather than a per task
     sample precisely because it keeps reporting while fetching is paused, which is the moment
     per task sampling goes blind.
@@ -1133,7 +1192,7 @@ lock out a later, still-valid task carrying the same one.
 2. If `store_result`: a result key with status `"expired"` (§8), so a caller blocked in
    `get()` is told what happened instead of waiting out its timeout.
 
-Then XACK + XDEL. No retry (a retry would expire identically), and no lifecycle hooks run
+Then XACK (batched, §4.1). No retry (a retry would expire identically), and no lifecycle hooks run
 (§4.8: hooks run only for entries that execute). The `expired` counter in the stats line
 (§7) is broken out from `dlq` because "work is being thrown away because the queue cannot keep
 up" is a different operational signal from "work is failing".

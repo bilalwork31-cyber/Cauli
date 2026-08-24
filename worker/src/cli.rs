@@ -206,6 +206,24 @@ pub struct Args {
     /// throughput, with every retry, countdown and eta passing through it.
     #[arg(long, default_value_t = 128, help_heading = ADVANCED)]
     pub mover_limit: usize,
+
+    /// Completions buffered per queue before they are flushed as ONE
+    /// pipeline with ONE multi-id XACK and ONE multi-id XDEL (PROTOCOL
+    /// §4.1). Batching acks is what keeps redis's single command-execution
+    /// thread from being the throughput ceiling; 64 was measured as past
+    /// the knee of that curve. Values below 1 are treated as 1 (no
+    /// batching).
+    #[arg(long, default_value_t = 64, help_heading = ADVANCED)]
+    pub ack_batch: usize,
+
+    /// Max milliseconds a completed task's ack may wait in the buffer
+    /// before a partial batch is flushed anyway, measured from the OLDEST
+    /// buffered completion. This bounds both result latency at low load and
+    /// the §4.1 crash duplicate window (a worker killed mid-window loses at
+    /// most one unflushed buffer per queue to redelivery). 0 flushes every
+    /// completion immediately.
+    #[arg(long, default_value_t = 2, help_heading = ADVANCED)]
+    pub ack_flush_ms: u64,
 }
 
 /// Concrete per-process execution settings after applying the -c/--procs
@@ -357,6 +375,8 @@ mod tests {
         assert_eq!(a.stats_interval, 10);
         assert_eq!(a.log_level, "info");
         assert_eq!(a.redis_timeout, 5);
+        assert_eq!(a.ack_batch, 64);
+        assert_eq!(a.ack_flush_ms, 2);
     }
 
     /// Behaviour change: cpu children recycle by default now. 0 has to stay
@@ -406,6 +426,10 @@ mod tests {
             "debug",
             "--redis-timeout",
             "7",
+            "--ack-batch",
+            "16",
+            "--ack-flush-ms",
+            "1",
         ])
         .unwrap();
         assert_eq!(a.queues, vec!["default", "emails", "bulk-2"]);
@@ -421,6 +445,8 @@ mod tests {
         assert_eq!(a.stats_interval, 1);
         assert_eq!(a.log_level, "debug");
         assert_eq!(a.redis_timeout, 7);
+        assert_eq!(a.ack_batch, 16);
+        assert_eq!(a.ack_flush_ms, 1);
     }
 
     /// docs/CONFIGURATION.md states --print-plan needs no app and no Redis.

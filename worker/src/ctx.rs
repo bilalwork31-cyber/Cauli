@@ -1,5 +1,6 @@
 //! Shared worker context + executor outcome model.
 
+use crate::broker::AckBufs;
 use crate::cli::Args;
 use crate::cpu::CpuPool;
 use crate::envelope::ErrorJson;
@@ -16,8 +17,12 @@ use tokio::sync::{watch, Semaphore};
 pub struct Ctx {
     pub args: Args,
     pub registry: HashMap<String, TaskSpec>,
-    /// Write-side connection (results, acks, mover, idemp, recovery). Clone per use.
+    /// Write-side connection (results, mover, idemp, recovery, trim). Clone per use.
     pub redis: ConnectionManager,
+    /// §4.1 completion buffers: every finish (success, duplicate, retry,
+    /// DLQ) funnels through these, one flusher task per queue. See
+    /// `broker::AckBufs` for the batching and ordering contract.
+    pub acks: AckBufs,
     pub counters: Arc<Counters>,
     pub io_sem: Arc<Semaphore>,
     /// Total permits `io_sem` was built with. The fetch loop needs the

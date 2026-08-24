@@ -506,10 +506,12 @@ async fn run_worker(
         .iter()
         .map(|q| (q.clone(), std::sync::Mutex::new(Default::default())))
         .collect();
+    let acks = broker::AckBufs::start(&write_conn, &queues, args.ack_batch, args.ack_flush_ms);
     let ctx = Arc::new(Ctx {
         io_sem: Arc::new(tokio::sync::Semaphore::new(io_concurrency)),
         io_concurrency,
         inflight_entries,
+        acks,
         sync_pool: pyrt::SyncPool::start(pyrt.clone(), sync_threads, io_concurrency),
         cpu: tokio::sync::OnceCell::new(),
         cpu_cfg,
@@ -531,6 +533,7 @@ async fn run_worker(
 
     spawn_signal_task(shutdown_tx, ctx.clone());
     tokio::spawn(loops::mover_loop(ctx.clone()));
+    tokio::spawn(loops::trim_loop(ctx.clone()));
     tokio::spawn(loops::recovery_loop(ctx.clone()));
     tokio::spawn(loops::stats_loop(ctx.clone()));
     tokio::spawn(loops::wedge_loop(ctx.clone()));
@@ -707,6 +710,11 @@ fn print_plan(args: &cli::Args, r: &cli::Resolved, cores: usize) {
     println!(
         "    tokio runtime threads {}  (redis io and dispatch; never run Python)",
         (cores / r.procs).max(1)
+    );
+    println!(
+        "    ack flush           {} completions or {} ms, whichever first (per queue)",
+        args.ack_batch.max(1),
+        args.ack_flush_ms
     );
     println!(
         "    cpu children        {}  ({}; only if the app registers kind=\"cpu\" tasks)",

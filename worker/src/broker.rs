@@ -3,8 +3,11 @@
 //! (PROTOCOL §1, §4.1-§4.3, §4.5).
 
 use crate::envelope::ErrorJson;
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use redis::aio::ConnectionManager;
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::{mpsc, oneshot};
 
 pub fn q_key(queue: &str) -> String {
     format!("cauli:q:{queue}")
@@ -294,58 +297,226 @@ pub async fn idemp_claim(
     })
 }
 
-/// §4.1 success: [SET result EX ttl]? + XACK + XDEL, one pipeline.
+/// One buffered completion: the caller's own writes (result SET, retry ZADD,
+/// DLQ XADD), the entry to ack, and the channel its flush outcome travels
+/// back on. Built by the `finish_*` functions below, drained by `flusher`.
+struct AckReq {
+    stream_id: String,
+    extra: Vec<redis::Cmd>,
+    done: oneshot::Sender<FlushOutcome>,
+}
+
+/// Shared per-flush result: one pipeline serves up to `--ack-batch`
+/// completions, so its single error has to be cloneable to every waiter.
+type FlushOutcome = std::result::Result<(), Arc<redis::RedisError>>;
+
+/// §4.1 completion buffers, one flusher task per queue.
+///
+/// Every completion (success, duplicate, retry, DLQ) used to pay redis one
+/// round trip of four commands (MULTI + XACK + XDEL + EXEC). Measured on the
+/// bench box, the per-round-trip work (socket read, parse, reply build,
+/// write) costs redis's single command-execution thread ~10x the commands
+/// themselves, and that thread was the whole system's throughput ceiling.
+/// Buffering completions per queue and flushing them as ONE pipeline with
+/// ONE multi-id XACK and ONE multi-id XDEL (batching an XACK is 6.2x
+/// cheaper per id than acking ids singly, and XDEL batches the same way)
+/// cuts redis main-thread CPU per task by ~3-5x. The XDEL stays per-flush,
+/// not per-entry, and it stays AT ALL — an earlier revision of this design
+/// dropped it and left removal to the §4.1 trim alone, whose boundary is
+/// the group's oldest PENDING id: one slow task then retained every
+/// completed entry behind it (throughput x that task's duration — 30k/s
+/// under a default 300s timeout_ms is nine million entries, gigabytes of
+/// redis memory). The batched XDEL frees each completed entry at its own
+/// flush, whatever else is still running. No MULTI wraps the pair: the old
+/// per-entry MULTI existed because a torn XACK/XDEL stranded the entry
+/// forever, and `loops::trim_loop` now reclaims exactly that orphan shape,
+/// so a tear costs one trim tick of residue instead of a transaction per
+/// completion.
+///
+/// A flush fires at whichever comes first: `--ack-batch` buffered
+/// completions, or `--ack-flush-ms` since the OLDEST buffered one. The
+/// window is the at-least-once cost of this design and it is bounded: a
+/// worker killed mid-window loses only unflushed acks, at most one buffer
+/// per queue, and those entries are simply redelivered (§4.4) and resolved
+/// by the §4.5 idempotency guard like any other crash duplicate. It is not
+/// a durability cost: `finish_*` do not return until their flush has been
+/// answered, so a completion the worker has reported (counters, drain) is
+/// on the broker.
+///
+/// Command order inside one flush pipeline is a correctness property, not a
+/// layout choice: every caller's own writes (result SET, retry ZADD, DLQ
+/// XADD) are queued BEFORE the batch XACK, so a connection torn mid-flush
+/// can apply a task's writes without its ack (redelivered, then resolved as
+/// a duplicate) but never the ack without the writes (which would drop a
+/// retry or a dead letter on the floor). The batch XDEL comes LAST, after
+/// the XACK: torn between them, the entries are acked-but-undeleted, which
+/// the trim reclaims. The other order would delete entries still in the
+/// PEL, and a pending entry whose payload is gone can never be peeked,
+/// claimed or acked by §4.4 — it pins XPENDING forever. `build_flush` owns
+/// this order and `extras_precede_ack_precedes_del_on_the_wire` pins it.
+#[derive(Clone)]
+pub struct AckBufs {
+    senders: Arc<HashMap<String, mpsc::Sender<AckReq>>>,
+}
+
+impl AckBufs {
+    /// One buffer + flusher task per queue. Must be called on a tokio
+    /// runtime. `batch`/`flush_ms` come from `--ack-batch`/`--ack-flush-ms`.
+    pub fn start(conn: &ConnectionManager, queues: &[String], batch: usize, flush_ms: u64) -> Self {
+        let batch = batch.max(1);
+        let mut senders = HashMap::new();
+        for q in queues {
+            // Capacity bounds worker memory if redis stalls; senders then
+            // wait in `submit`, exactly where they used to wait on their own
+            // completion round trip.
+            let (tx, rx) = mpsc::channel(batch.saturating_mul(4).max(256));
+            tokio::spawn(flusher(conn.clone(), q.clone(), rx, batch, flush_ms));
+            senders.insert(q.clone(), tx);
+        }
+        Self {
+            senders: Arc::new(senders),
+        }
+    }
+
+    /// Queue one completion and wait for the flush that carries it. The
+    /// caller is not done until this returns: the §4.7 drain counts a task
+    /// in flight until its ack is on the broker.
+    async fn submit(&self, queue: &str, stream_id: &str, extra: Vec<redis::Cmd>) -> Result<()> {
+        let Some(tx) = self.senders.get(queue) else {
+            // Unreachable in the worker (queues are fixed at startup and the
+            // fetch loop only reads them), but a completion must never be
+            // silently dropped, so refuse loudly instead of panicking.
+            return Err(anyhow!("no completion buffer for queue {queue}"));
+        };
+        let (done, rx) = oneshot::channel();
+        tx.send(AckReq {
+            stream_id: stream_id.to_string(),
+            extra,
+            done,
+        })
+        .await
+        .map_err(|_| anyhow!("completion flusher for queue {queue} is gone"))?;
+        match rx.await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(anyhow!("completion flush failed: {e}")),
+            Err(_) => Err(anyhow!("completion flush dropped before it was answered")),
+        }
+    }
+}
+
+/// Drain one queue's completion buffer: collect up to `max_batch` requests
+/// or until `flush_ms` has passed since the first one, then write them as
+/// one pipeline and answer every waiter. Exits when every sender is gone
+/// (process teardown); nothing is dropped on the way out, because `submit`
+/// holds its sender alive until its own flush is answered.
+async fn flusher(
+    mut conn: ConnectionManager,
+    queue: String,
+    mut rx: mpsc::Receiver<AckReq>,
+    max_batch: usize,
+    flush_ms: u64,
+) {
+    loop {
+        let Some(first) = rx.recv().await else { return };
+        let mut batch = vec![first];
+        // The deadline anchors on the OLDEST buffered completion, so no ack
+        // ever waits more than one window regardless of arrival pattern.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(flush_ms);
+        while batch.len() < max_batch {
+            match tokio::time::timeout_at(deadline, rx.recv()).await {
+                Ok(Some(req)) => batch.push(req),
+                Ok(None) | Err(_) => break, // senders gone, or window elapsed
+            }
+        }
+        let (pipe, dones) = build_flush(&queue, batch);
+        let outcome: FlushOutcome = pipe
+            .query_async::<()>(&mut conn)
+            .await
+            .map_err(Arc::new)
+            .map(|_: ()| ());
+        for done in dones {
+            // A receiver gone before the answer means its dispatch task was
+            // torn down (process exit); there is no one left to inform.
+            let _ = done.send(outcome.clone());
+        }
+    }
+}
+
+/// The wire layout of one flush: every request's own writes first, then one
+/// XACK naming every entry, then one XDEL naming the same entries. See the
+/// ordering note on `AckBufs`.
+fn build_flush(
+    queue: &str,
+    batch: Vec<AckReq>,
+) -> (redis::Pipeline, Vec<oneshot::Sender<FlushOutcome>>) {
+    let qk = q_key(queue);
+    let mut pipe = redis::pipe();
+    let mut xack = redis::cmd("XACK");
+    xack.arg(&qk).arg("cauli");
+    let mut xdel = redis::cmd("XDEL");
+    xdel.arg(&qk);
+    let mut dones = Vec::with_capacity(batch.len());
+    for req in batch {
+        xack.arg(&req.stream_id);
+        xdel.arg(&req.stream_id);
+        for cmd in req.extra {
+            pipe.add_command(cmd).ignore();
+        }
+        dones.push(req.done);
+    }
+    pipe.add_command(xack).ignore();
+    pipe.add_command(xdel).ignore();
+    (pipe, dones)
+}
+
+/// §4.1 success: [SET result EX ttl]? + batched XACK + XDEL (via `AckBufs`).
 pub async fn finish_success(
-    conn: &mut ConnectionManager,
+    bufs: &AckBufs,
     queue: &str,
     stream_id: &str,
     task_id: &str,
     result_json: Option<&str>, // None when store_result = false
     result_ttl_s: u64,
 ) -> Result<()> {
-    let mut pipe = redis::pipe();
+    let mut extra = Vec::new();
     if let Some(rj) = result_json {
-        pipe.cmd("SET")
-            .arg(result_key(task_id))
+        let mut set = redis::cmd("SET");
+        set.arg(result_key(task_id))
             .arg(rj)
             .arg("EX")
-            .arg(result_ttl_s)
-            .ignore();
+            .arg(result_ttl_s);
+        extra.push(set);
     }
-    add_ack_del(&mut pipe, queue, stream_id);
-    pipe.query_async::<()>(conn).await?;
-    Ok(())
+    bufs.submit(queue, stream_id, extra).await
 }
 
-/// Duplicate resolution (§4.5): optional duplicate result + XACK + XDEL.
+/// Duplicate resolution (§4.5): optional duplicate result + batched XACK + XDEL.
 pub async fn finish_duplicate(
-    conn: &mut ConnectionManager,
+    bufs: &AckBufs,
     queue: &str,
     stream_id: &str,
     task_id: &str,
     result_json: Option<&str>,
     result_ttl_s: u64,
 ) -> Result<()> {
-    finish_success(conn, queue, stream_id, task_id, result_json, result_ttl_s).await
+    finish_success(bufs, queue, stream_id, task_id, result_json, result_ttl_s).await
 }
 
-/// §4.2 retry: ZADD delayed + XACK + XDEL (no result key), one pipeline.
+/// §4.2 retry: ZADD delayed + batched XACK + XDEL (no result key). The ZADD
+/// rides the same flush pipeline as the ack, queued before it
+/// (`build_flush`), so the ack can never land without the reschedule.
 pub async fn finish_retry(
-    conn: &mut ConnectionManager,
+    bufs: &AckBufs,
     queue: &str,
     stream_id: &str,
     envelope_json: &str,
     fire_at_ms: u64,
 ) -> Result<()> {
-    let mut pipe = redis::pipe();
-    pipe.cmd("ZADD")
-        .arg(delayed_key(queue))
+    let mut zadd = redis::cmd("ZADD");
+    zadd.arg(delayed_key(queue))
         .arg(fire_at_ms)
-        .arg(envelope_json)
-        .ignore();
-    add_ack_del(&mut pipe, queue, stream_id);
-    pipe.query_async::<()>(conn).await?;
-    Ok(())
+        .arg(envelope_json);
+    bufs.submit(queue, stream_id, vec![zadd]).await
 }
 
 /// Cap on each DLQ stream (`cauli:dlq:{queue}`), enforced with approximate
@@ -379,9 +550,11 @@ const DLQ_MAXLEN: u64 = 1000;
 const DLQ_TTL_S: u64 = 7 * 24 * 60 * 60;
 
 /// DLQ write (final failure §4.2, malformed/unregistered §4, redelivery §4.4):
-/// XADD dlq + [SET result]? + XACK + XDEL, one pipeline.
+/// XADD dlq + [SET result]? + batched XACK + XDEL. The dead letter rides the same
+/// flush pipeline as the ack, queued before it (`build_flush`), so the ack
+/// can never land without the dead letter.
 pub async fn finish_dlq(
-    conn: &mut ConnectionManager,
+    bufs: &AckBufs,
     queue: &str,
     stream_id: &str,
     envelope_json: &str,
@@ -394,9 +567,9 @@ pub async fn finish_dlq(
         None => String::new(),
     };
     let dk = dlq_key(queue);
-    let mut pipe = redis::pipe();
-    pipe.cmd("XADD")
-        .arg(&dk)
+    let mut extra = Vec::new();
+    let mut xadd = redis::cmd("XADD");
+    xadd.arg(&dk)
         .arg("MAXLEN")
         .arg("~")
         .arg(DLQ_MAXLEN)
@@ -406,54 +579,95 @@ pub async fn finish_dlq(
         .arg("reason")
         .arg(reason)
         .arg("error")
-        .arg(error_field)
-        .ignore();
+        .arg(error_field);
+    extra.push(xadd);
     // Bound the stream by AGE as well as by count: see DLQ_TTL_S.
-    pipe.cmd("EXPIRE").arg(&dk).arg(DLQ_TTL_S).ignore();
+    let mut expire = redis::cmd("EXPIRE");
+    expire.arg(&dk).arg(DLQ_TTL_S);
+    extra.push(expire);
     if let Some((task_id, rj, ttl)) = result {
-        pipe.cmd("SET")
-            .arg(result_key(task_id))
-            .arg(rj)
-            .arg("EX")
-            .arg(ttl)
-            .ignore();
+        let mut set = redis::cmd("SET");
+        set.arg(result_key(task_id)).arg(rj).arg("EX").arg(ttl);
+        extra.push(set);
     }
-    add_ack_del(&mut pipe, queue, stream_id);
-    pipe.query_async::<()>(conn).await?;
-    Ok(())
+    bufs.submit(queue, stream_id, extra).await
 }
 
-/// XACK + XDEL for one entry, in their own MULTI/EXEC.
+/// §4.1 trim boundary: the id below which EVERY entry in `cauli:q:{queue}`
+/// is acked, so `trim_acked` may remove it. None when nothing is safely
+/// below anything (no group yet, or nothing ever delivered).
 ///
-/// The pair has to land together or not at all. A pipeline is one write, but
-/// a write can tear: if the connection dies after redis has read the XACK and
-/// before it reads the XDEL, the entry leaves the pending entries list while
-/// staying in the stream. Nothing can ever reach it again, because it is in
-/// no PEL, it sits behind the group's last-delivered-id, and nothing XTRIMs
-/// `cauli:q:{queue}`, so it stays resident until someone deletes the key by
-/// hand. Inside MULTI the tear costs the EXEC instead, and redis discards a
-/// transaction whose client disconnects before EXEC: the entry simply stays
-/// pending and the §4.4 recovery loop redelivers it, which is the
-/// at-least-once behaviour PROTOCOL.md already promises.
+/// The boundary is the group's oldest pending id, or, when the PEL is
+/// empty, one sequence past its last-delivered-id. Proof that nothing
+/// pending or undelivered is ever below the returned id, including against
+/// concurrent delivery, acking, claiming, and a second process trimming:
 ///
-/// MULTI wraps ONLY this pair, never the surrounding pipeline (so not
-/// `Pipeline::atomic()`, which would hoist MULTI to the head of it). Both
-/// commands address the single key `cauli:q:{queue}`, so the transaction
-/// lives in one slot; the callers' other writes (`cauli:result:{id}`,
-/// `cauli:delayed:{queue}`, `cauli:dlq:{queue}`) do not, and a transaction
-/// spanning them is CROSSSLOT on a cluster node.
-fn add_ack_del(pipe: &mut redis::Pipeline, queue: &str, stream_id: &str) {
-    // One allocation, not two: this runs on every single completion (success,
-    // duplicate, retry, and DLQ all funnel through here).
-    let qk = q_key(queue);
-    pipe.cmd("MULTI").ignore();
-    pipe.cmd("XACK")
-        .arg(&qk)
-        .arg("cauli")
-        .arg(stream_id)
-        .ignore();
-    pipe.cmd("XDEL").arg(&qk).arg(stream_id).ignore();
-    pipe.cmd("EXEC").ignore();
+/// * ids enter the PEL only via XREADGROUP `>`, which delivers strictly
+///   ascending ids, so once `P` = oldest-pending is observed, every id that
+///   is pending NOW or LATER is >= `P` (acks only remove; new deliveries are
+///   above the last-delivered-id, which `P`'s own delivery already bounded);
+///   XCLAIM moves ownership of an existing PEL id, it never adds one below.
+/// * with the PEL observed empty, any entry pending later was delivered
+///   after that observation, so its id is strictly above last-delivered-id
+///   as read BEFORE the PEL probe — which is why this function reads XINFO
+///   first and XPENDING second. Do not swap them: read the other way, a
+///   delivery landing between the two reads sits below the boundary while
+///   pending, and the trim would destroy it. That is silent task loss.
+/// * undelivered ids are strictly above last-delivered-id at all times.
+///
+/// A second worker trimming concurrently computes its own boundary under
+/// the same invariants, and XTRIM MINID only ever removes ids strictly
+/// below a valid boundary, so concurrent trims are idempotent and safe.
+pub async fn acked_below(conn: &mut ConnectionManager, queue: &str) -> Result<Option<String>> {
+    let key = q_key(queue);
+    // XINFO before XPENDING — see the ordering proof above.
+    let info: redis::streams::StreamInfoGroupsReply = redis::cmd("XINFO")
+        .arg("GROUPS")
+        .arg(&key)
+        .query_async(conn)
+        .await?;
+    let Some(group) = info.groups.iter().find(|g| g.name == "cauli") else {
+        return Ok(None); // group gone: the fetch loop's NOGROUP path owns this
+    };
+    if let Some(oldest) = oldest_pending_id(conn, queue).await? {
+        return Ok(Some(oldest));
+    }
+    if group.last_delivered_id == "0-0" {
+        return Ok(None); // nothing ever delivered, nothing is provably acked
+    }
+    Ok(stream_id_after(&group.last_delivered_id))
+}
+
+/// The id one sequence number after `id` (`"5-3"` -> `"5-4"`): the smallest
+/// id an XTRIM MINID boundary can carry that also removes `id` itself.
+/// None for anything that is not `<ms>-<seq>`. At `seq == u64::MAX` it
+/// returns the id unchanged (one entry retained, never one destroyed):
+/// unreachable in practice, but the conservative direction costs one entry
+/// of memory where the other direction would need `ms+1` reasoning for no
+/// benefit.
+fn stream_id_after(id: &str) -> Option<String> {
+    let (ms, seq) = crate::ctx::parse_stream_id(id)?;
+    Some(match seq.checked_add(1) {
+        Some(next) => format!("{ms}-{next}"),
+        None => id.to_string(),
+    })
+}
+
+/// §4.1 bulk removal of acked entries: `XTRIM cauli:q:{queue} MINID
+/// {boundary}` with a boundary from `acked_below`. Replaces the per-entry
+/// XDEL the completion path used to pay: entries below the boundary are all
+/// acked (or the acked-without-XDEL orphans the old MULTI'd pair existed to
+/// prevent — the trim now cleans those too), and MINID removes ids strictly
+/// below the boundary, so the pending entry the boundary names survives.
+/// Returns the number of entries removed.
+pub async fn trim_acked(conn: &mut ConnectionManager, queue: &str, boundary: &str) -> Result<u64> {
+    let n: u64 = redis::cmd("XTRIM")
+        .arg(q_key(queue))
+        .arg("MINID")
+        .arg(boundary)
+        .query_async(conn)
+        .await?;
+    Ok(n)
 }
 
 /// Entry id of the group's oldest pending (delivered, unacked) entry, or
@@ -1091,6 +1305,7 @@ mod tests {
         ensure_groups(&mut conn, &[queue.to_string()])
             .await
             .expect("groups");
+        let bufs = AckBufs::start(&conn, &[queue.to_string()], 1, 1);
         let sid: String = redis::cmd("XADD")
             .arg(q_key(queue))
             .arg("*")
@@ -1099,9 +1314,22 @@ mod tests {
             .query_async(&mut conn)
             .await
             .expect("seed entry");
+        // Deliver it: XACK only removes entries that are actually pending.
+        let _: Option<redis::streams::StreamReadReply> = redis::cmd("XREADGROUP")
+            .arg("GROUP")
+            .arg("cauli")
+            .arg("c1")
+            .arg("COUNT")
+            .arg(1)
+            .arg("STREAMS")
+            .arg(q_key(queue))
+            .arg(">")
+            .query_async(&mut conn)
+            .await
+            .expect("deliver");
 
         finish_dlq(
-            &mut conn,
+            &bufs,
             queue,
             &sid,
             r#"{"id":"d1","task":"t","args":["secret"]}"#,
@@ -1127,7 +1355,7 @@ mod tests {
             .await
             .expect("xlen");
         assert_eq!(len, 1, "the dead letter itself must still be written");
-        // The EXPIRE must not have displaced the ack/delete half.
+        // The EXPIRE must not have displaced the ack half of the flush.
         let pending: Vec<(String, String, u64, u64)> = redis::cmd("XPENDING")
             .arg(q_key(queue))
             .arg("cauli")
@@ -1148,7 +1376,7 @@ mod tests {
             .await
             .expect("shorten");
         finish_dlq(
-            &mut conn,
+            &bufs,
             queue,
             "0-0",
             r#"{"id":"d2","task":"t"}"#,
@@ -1201,55 +1429,84 @@ mod tests {
         );
     }
 
-    /// The ack and the delete must be one transaction, and ONLY they may be
-    /// in it. A torn write between them acks an entry that stays in the
-    /// stream, where no PEL scan and no backlog scan can ever reach it again.
-    /// The second half matters just as much: pulling a caller's other key
-    /// (here the result key) inside the MULTI would make every completion
-    /// CROSSSLOT on a cluster node, so the transaction must name
-    /// `cauli:q:{queue}` and nothing else.
+    /// The ordering rules a flush pipeline lives by: every request's own
+    /// writes (result SET, retry ZADD, DLQ XADD) are queued BEFORE the
+    /// single batch XACK, the single batch XDEL comes AFTER the XACK, and
+    /// both name every entry in the batch. Torn before the XACK: writes
+    /// without the ack, redelivered and resolved as a duplicate. Torn
+    /// between XACK and XDEL: acked-but-undeleted, reclaimed by the trim.
+    /// The reverse order would delete entries still in the PEL, which §4.4
+    /// can then never peek, claim or ack — an entry pinned forever.
     #[test]
-    fn ack_and_del_are_one_single_slot_transaction() {
-        let mut pipe = redis::pipe();
-        pipe.cmd("SET")
-            .arg(result_key("t1"))
-            .arg("{}")
-            .arg("EX")
-            .arg(60)
-            .ignore();
-        add_ack_del(&mut pipe, "q", "1-1");
+    fn extras_precede_ack_precedes_del_on_the_wire() {
+        let req = |sid: &str, extra: Vec<redis::Cmd>| {
+            let (done, _rx) = oneshot::channel();
+            (
+                AckReq {
+                    stream_id: sid.to_string(),
+                    extra,
+                    done,
+                },
+                _rx,
+            )
+        };
+        let mut set = redis::cmd("SET");
+        set.arg(result_key("t1")).arg("{}").arg("EX").arg(60);
+        let mut zadd = redis::cmd("ZADD");
+        zadd.arg(delayed_key("q")).arg(123).arg("{}");
+        let (r1, _k1) = req("1-1", vec![set]);
+        let (r2, _k2) = req("2-2", vec![zadd]);
+        let (r3, _k3) = req("3-3", vec![]);
+        let (pipe, dones) = build_flush("q", vec![r1, r2, r3]);
+        assert_eq!(dones.len(), 3, "one answer channel per request");
         let wire = String::from_utf8(pipe.get_packed_pipeline()).expect("utf8 wire");
         let at = |needle: &str| {
             wire.find(needle)
                 .unwrap_or_else(|| panic!("{needle} missing from wire: {wire:?}"))
         };
         assert!(
-            at("SET") < at("MULTI"),
-            "the caller's own writes stay outside the transaction: {wire:?}"
+            at("SET") < at("XACK") && at("ZADD") < at("XACK"),
+            "every extra must precede the ack: {wire:?}"
         );
         assert!(
-            at("MULTI") < at("XACK") && at("XACK") < at("XDEL") && at("XDEL") < at("EXEC"),
-            "ack and delete must be queued between MULTI and EXEC: {wire:?}"
-        );
-        let body = &wire[at("MULTI")..at("EXEC")];
-        assert!(
-            !body.contains(&result_key("t1")),
-            "no second key may enter the transaction: {body:?}"
+            at("XACK") < at("XDEL"),
+            "the ack must land before the delete, or a tear strands a PEL              entry whose payload is gone: {wire:?}"
         );
         assert_eq!(
-            body.matches(&q_key("q")).count(),
-            2,
-            "both queued commands address the one stream key: {body:?}"
+            wire.matches("XACK").count(),
+            1,
+            "one batch XACK, not one per entry: {wire:?}"
+        );
+        assert_eq!(
+            wire.matches("XDEL").count(),
+            1,
+            "one batch XDEL, not one per entry: {wire:?}"
+        );
+        let ack_tail = &wire[at("XACK")..at("XDEL")];
+        let del_tail = &wire[at("XDEL")..];
+        for sid in ["1-1", "2-2", "3-3"] {
+            assert!(
+                ack_tail.contains(sid),
+                "the batch XACK must name {sid}: {ack_tail:?}"
+            );
+            assert!(
+                del_tail.contains(sid),
+                "the batch XDEL must name {sid}: {del_tail:?}"
+            );
+        }
+        assert!(
+            !wire.contains("MULTI"),
+            "no transaction on the completion path: {wire:?}"
         );
     }
 
-    /// End to end proof that the MULTI/EXEC pair is hand written into the
-    /// middle of a pipeline correctly: a miscounted reply would fail the
-    /// whole completion, and the completion write is what makes a task
-    /// finished. Asserts all three effects of a success write land: the
-    /// result key with its TTL, the ack, and the delete.
+    /// End to end proof of one success completion under the buffered path:
+    /// the result key lands with its TTL, the entry leaves the PEL, and the
+    /// flush's own batched XDEL removes it from the stream immediately —
+    /// stream residence must never depend on the trim (whose boundary a
+    /// long-running task can pin) for ordinary completions.
     #[tokio::test]
-    async fn finish_success_acks_deletes_and_writes_the_result() {
+    async fn finish_success_acks_writes_the_result_and_deletes() {
         let redis = ThrowawayRedis::start(6425, false);
         let client = redis::Client::open(redis.url()).expect("client");
         let mut conn = ConnectionManager::new(client)
@@ -1260,6 +1517,7 @@ mod tests {
         ensure_groups(&mut conn, &[queue.to_string()])
             .await
             .expect("groups");
+        let bufs = AckBufs::start(&conn, &[queue.to_string()], 64, 1);
         let _: String = redis::cmd("XADD")
             .arg(q_key(queue))
             .arg("*")
@@ -1293,7 +1551,7 @@ mod tests {
             .expect("xpending");
         let sid = pending.first().expect("one delivered entry").0.clone();
 
-        finish_success(&mut conn, queue, &sid, "s1", Some(r#"{"ok":true}"#), 60)
+        finish_success(&bufs, queue, &sid, "s1", Some(r#"{"ok":true}"#), 60)
             .await
             .expect("success write");
 
@@ -1318,6 +1576,445 @@ mod tests {
             .query_async(&mut conn)
             .await
             .expect("xlen");
-        assert_eq!(len, 0, "the acked entry must also be deleted, not orphaned");
+        assert_eq!(
+            len, 0,
+            "the flush's batched XDEL must remove the entry immediately,              not leave it for the trim"
+        );
+    }
+
+    /// THE regression this file's trim exists to avoid reintroducing: one
+    /// slow task pins the group's oldest-pending id, and stream residence of
+    /// COMPLETED entries must not depend on it. One entry is delivered and
+    /// held (never acked) while 500 later entries are delivered and
+    /// completed through the buffered path; XLEN must come back to the one
+    /// held entry, not grow with the completed count. Under trim-only
+    /// removal this reads 501.
+    #[tokio::test]
+    async fn a_long_pending_task_does_not_retain_completed_entries() {
+        let redis = ThrowawayRedis::start(6433, false);
+        let client = redis::Client::open(redis.url()).expect("client");
+        let mut conn = ConnectionManager::new(client)
+            .await
+            .expect("connection manager");
+
+        let queue = "slowmix";
+        ensure_groups(&mut conn, &[queue.to_string()])
+            .await
+            .expect("groups");
+        let bufs = AckBufs::start(&conn, &[queue.to_string()], 64, 1);
+
+        // The slow task: delivered, in the PEL, never acked in this test.
+        let _: String = redis::cmd("XADD")
+            .arg(q_key(queue))
+            .arg("*")
+            .arg("e")
+            .arg(r#"{"id":"slow","task":"t"}"#)
+            .query_async(&mut conn)
+            .await
+            .expect("seed slow");
+        let _: Option<redis::streams::StreamReadReply> = redis::cmd("XREADGROUP")
+            .arg("GROUP")
+            .arg("cauli")
+            .arg("c1")
+            .arg("COUNT")
+            .arg(1)
+            .arg("STREAMS")
+            .arg(q_key(queue))
+            .arg(">")
+            .query_async(&mut conn)
+            .await
+            .expect("deliver slow");
+
+        // The fast churn behind it.
+        for i in 0..500 {
+            let sid: String = redis::cmd("XADD")
+                .arg(q_key(queue))
+                .arg("*")
+                .arg("e")
+                .arg(format!(r#"{{"id":"fast{i}","task":"t"}}"#))
+                .query_async(&mut conn)
+                .await
+                .expect("seed fast");
+            let _: Option<redis::streams::StreamReadReply> = redis::cmd("XREADGROUP")
+                .arg("GROUP")
+                .arg("cauli")
+                .arg("c1")
+                .arg("COUNT")
+                .arg(1)
+                .arg("STREAMS")
+                .arg(q_key(queue))
+                .arg(">")
+                .query_async(&mut conn)
+                .await
+                .expect("deliver fast");
+            finish_success(&bufs, queue, &sid, "f", None, 60)
+                .await
+                .expect("ack fast");
+        }
+
+        let len: u64 = redis::cmd("XLEN")
+            .arg(q_key(queue))
+            .query_async(&mut conn)
+            .await
+            .expect("xlen");
+        assert_eq!(
+            len, 1,
+            "only the still-pending slow entry may remain; completed entries              must not be retained behind it (trim-only removal reads 501 here)"
+        );
+        let pending: Vec<(String, String, u64, u64)> = redis::cmd("XPENDING")
+            .arg(q_key(queue))
+            .arg("cauli")
+            .arg("-")
+            .arg("+")
+            .arg(10)
+            .query_async(&mut conn)
+            .await
+            .expect("xpending");
+        assert_eq!(pending.len(), 1, "the slow task is still pending");
+    }
+
+    /// Ack WITHOUT delete: the orphan shape a flush torn between its XACK
+    /// and its XDEL leaves behind, and exactly what the trim backstop
+    /// exists to reclaim.
+    async fn raw_ack(conn: &mut ConnectionManager, queue: &str, sid: &str) {
+        let _: u64 = redis::cmd("XACK")
+            .arg(q_key(queue))
+            .arg("cauli")
+            .arg(sid)
+            .query_async(conn)
+            .await
+            .expect("raw xack");
+    }
+
+    /// The correctness bar of the trim backstop, live against redis: the
+    /// boundary must never name an id at or below a pending or undelivered
+    /// entry, whatever mix of acked-undeleted orphans, pending and
+    /// undelivered the stream holds, so `XTRIM MINID` can never destroy
+    /// work. Orphans are manufactured with `raw_ack` (ack, no delete — the
+    /// torn-flush shape); a normal completion's own XDEL never reaches the
+    /// trim at all. Walks the exact states: orphan-behind-a-pending-entry
+    /// (retained until the boundary passes, harmless), pending (kept),
+    /// undelivered backlog (kept), then full drain.
+    #[tokio::test]
+    async fn trim_never_removes_a_pending_or_undelivered_entry() {
+        let redis = ThrowawayRedis::start(6406, false);
+        let client = redis::Client::open(redis.url()).expect("client");
+        let mut conn = ConnectionManager::new(client)
+            .await
+            .expect("connection manager");
+
+        let queue = "trimsafe";
+        ensure_groups(&mut conn, &[queue.to_string()])
+            .await
+            .expect("groups");
+        let mut sids: Vec<String> = Vec::new();
+        for i in 0..5 {
+            let sid: String = redis::cmd("XADD")
+                .arg(q_key(queue))
+                .arg("*")
+                .arg("e")
+                .arg(format!(r#"{{"id":"t{i}","task":"t"}}"#))
+                .query_async(&mut conn)
+                .await
+                .expect("seed");
+            sids.push(sid);
+        }
+        // Deliver the first three; the last two stay undelivered backlog.
+        let _: Option<redis::streams::StreamReadReply> = redis::cmd("XREADGROUP")
+            .arg("GROUP")
+            .arg("cauli")
+            .arg("c1")
+            .arg("COUNT")
+            .arg(3)
+            .arg("STREAMS")
+            .arg(q_key(queue))
+            .arg(">")
+            .query_async(&mut conn)
+            .await
+            .expect("deliver 3");
+
+        async fn exists(conn: &mut ConnectionManager, sid: &str) -> bool {
+            let r: redis::streams::StreamRangeReply = redis::cmd("XRANGE")
+                .arg(q_key("trimsafe"))
+                .arg(sid)
+                .arg(sid)
+                .query_async(conn)
+                .await
+                .expect("xrange");
+            !r.ids.is_empty()
+        }
+
+        // Ack #0 and #2. #1 stays pending, so the boundary is #1: the trim
+        // removes #0 and MUST retain #2 (acked, but above a pending id).
+        raw_ack(&mut conn, queue, &sids[0]).await;
+        raw_ack(&mut conn, queue, &sids[2]).await;
+        let boundary = acked_below(&mut conn, queue)
+            .await
+            .expect("boundary")
+            .expect("a pending entry bounds the trim");
+        assert_eq!(boundary, sids[1], "the oldest pending id is the boundary");
+        trim_acked(&mut conn, queue, &boundary).await.expect("trim");
+        assert!(!exists(&mut conn, &sids[0]).await, "acked below: gone");
+        assert!(exists(&mut conn, &sids[1]).await, "pending: kept");
+        assert!(
+            exists(&mut conn, &sids[2]).await,
+            "acked above pending: kept"
+        );
+        assert!(exists(&mut conn, &sids[3]).await, "undelivered: kept");
+        assert!(exists(&mut conn, &sids[4]).await, "undelivered: kept");
+
+        // Ack #1: PEL is now empty, so the boundary moves to one past
+        // last-delivered (#2), and the undelivered backlog must survive.
+        raw_ack(&mut conn, queue, &sids[1]).await;
+        let boundary = acked_below(&mut conn, queue)
+            .await
+            .expect("boundary")
+            .expect("empty PEL with deliveries still yields a boundary");
+        assert_eq!(
+            boundary,
+            stream_id_after(&sids[2]).expect("valid id"),
+            "empty PEL: one past last-delivered-id"
+        );
+        trim_acked(&mut conn, queue, &boundary).await.expect("trim");
+        assert!(!exists(&mut conn, &sids[1]).await, "acked: gone");
+        assert!(!exists(&mut conn, &sids[2]).await, "acked: gone");
+        assert!(exists(&mut conn, &sids[3]).await, "undelivered: kept");
+
+        // Drain the backlog: deliver, ack, trim -> empty stream.
+        let _: Option<redis::streams::StreamReadReply> = redis::cmd("XREADGROUP")
+            .arg("GROUP")
+            .arg("cauli")
+            .arg("c1")
+            .arg("COUNT")
+            .arg(2)
+            .arg("STREAMS")
+            .arg(q_key(queue))
+            .arg(">")
+            .query_async(&mut conn)
+            .await
+            .expect("deliver rest");
+        raw_ack(&mut conn, queue, &sids[3]).await;
+        raw_ack(&mut conn, queue, &sids[4]).await;
+        let boundary = acked_below(&mut conn, queue)
+            .await
+            .expect("boundary")
+            .expect("boundary after full drain");
+        trim_acked(&mut conn, queue, &boundary).await.expect("trim");
+        let len: u64 = redis::cmd("XLEN")
+            .arg(q_key(queue))
+            .query_async(&mut conn)
+            .await
+            .expect("xlen");
+        assert_eq!(len, 0, "fully acked stream trims to empty");
+    }
+
+    /// The boundary's own edge states: no group at all (None, the fetch
+    /// loop's NOGROUP path owns that), and a group that has never delivered
+    /// (None: nothing is provably acked, so nothing may be trimmed).
+    #[tokio::test]
+    async fn trim_boundary_is_none_without_a_group_or_a_delivery() {
+        let redis = ThrowawayRedis::start(6413, false);
+        let client = redis::Client::open(redis.url()).expect("client");
+        let mut conn = ConnectionManager::new(client)
+            .await
+            .expect("connection manager");
+
+        let queue = "trimedge";
+        // Stream exists, group does not.
+        let _: String = redis::cmd("XADD")
+            .arg(q_key(queue))
+            .arg("*")
+            .arg("e")
+            .arg("{}")
+            .query_async(&mut conn)
+            .await
+            .expect("seed");
+        assert_eq!(
+            acked_below(&mut conn, queue).await.expect("no group"),
+            None,
+            "no consumer group: nothing may be trimmed"
+        );
+        // Group exists, nothing ever delivered: the seeded entry is pure
+        // backlog and must not be trimmable.
+        ensure_groups(&mut conn, &[queue.to_string()])
+            .await
+            .expect("groups");
+        assert_eq!(
+            acked_below(&mut conn, queue).await.expect("no delivery"),
+            None,
+            "nothing delivered: nothing is provably acked"
+        );
+    }
+
+    /// Concurrent trimming against live acking, the way two worker
+    /// processes overlap in production: while entries are being delivered
+    /// and acked one at a time, a second connection trims in a loop. Before
+    /// each ack, the still-pending entry must exist; at the end, everything
+    /// acked must be trimmable to an empty stream. Any trim of a pending
+    /// entry fails the mid-loop existence check.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_trim_never_eats_the_entry_being_worked() {
+        let redis = ThrowawayRedis::start(6418, false);
+        let client = redis::Client::open(redis.url()).expect("client");
+        let mut conn = ConnectionManager::new(client)
+            .await
+            .expect("connection manager");
+
+        let queue = "trimrace";
+        ensure_groups(&mut conn, &[queue.to_string()])
+            .await
+            .expect("groups");
+        let bufs = AckBufs::start(&conn, &[queue.to_string()], 8, 1);
+
+        // The rival: trims as fast as it can for the whole run.
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let rival_stop = stop.clone();
+        let mut rival_conn = conn.clone();
+        let rival = tokio::spawn(async move {
+            while !rival_stop.load(std::sync::atomic::Ordering::Relaxed) {
+                if let Ok(Some(boundary)) = acked_below(&mut rival_conn, "trimrace").await {
+                    let _ = trim_acked(&mut rival_conn, "trimrace", &boundary).await;
+                }
+            }
+        });
+
+        for i in 0..100 {
+            let sid: String = redis::cmd("XADD")
+                .arg(q_key(queue))
+                .arg("*")
+                .arg("e")
+                .arg(format!(r#"{{"id":"r{i}","task":"t"}}"#))
+                .query_async(&mut conn)
+                .await
+                .expect("seed");
+            let _: Option<redis::streams::StreamReadReply> = redis::cmd("XREADGROUP")
+                .arg("GROUP")
+                .arg("cauli")
+                .arg("c1")
+                .arg("COUNT")
+                .arg(1)
+                .arg("STREAMS")
+                .arg(q_key(queue))
+                .arg(">")
+                .query_async(&mut conn)
+                .await
+                .expect("deliver");
+            // Pending: whatever the rival has trimmed, THIS entry must
+            // still be here, or the trim destroyed in-flight work.
+            let r: redis::streams::StreamRangeReply = redis::cmd("XRANGE")
+                .arg(q_key(queue))
+                .arg(&sid)
+                .arg(&sid)
+                .query_async(&mut conn)
+                .await
+                .expect("xrange");
+            assert!(
+                !r.ids.is_empty(),
+                "entry {sid} was pending and a concurrent trim removed it"
+            );
+            finish_success(&bufs, queue, &sid, "r", None, 60)
+                .await
+                .expect("ack");
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        rival.await.expect("rival task");
+
+        // Everything is acked: one final trim empties the stream.
+        if let Some(boundary) = acked_below(&mut conn, queue).await.expect("boundary") {
+            trim_acked(&mut conn, queue, &boundary).await.expect("trim");
+        }
+        let len: u64 = redis::cmd("XLEN")
+            .arg(q_key(queue))
+            .query_async(&mut conn)
+            .await
+            .expect("xlen");
+        assert_eq!(len, 0, "all 100 acked entries trim away, none early");
+    }
+
+    /// The two flush triggers, each proven to fire without the other: a
+    /// full batch flushes immediately under a window that would otherwise
+    /// park it for ten seconds, and a lone completion is answered within
+    /// its window rather than waiting for a batch that never fills. The
+    /// second half is what makes §4.7's drain bounded: nothing buffered is
+    /// ever held past `--ack-flush-ms`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn flush_fires_on_a_full_batch_and_on_the_window() {
+        let redis = ThrowawayRedis::start(6444, false);
+        let client = redis::Client::open(redis.url()).expect("client");
+        let mut conn = ConnectionManager::new(client)
+            .await
+            .expect("connection manager");
+
+        let queue = "flushq";
+        ensure_groups(&mut conn, &[queue.to_string()])
+            .await
+            .expect("groups");
+        let mut sids = Vec::new();
+        for i in 0..5 {
+            let sid: String = redis::cmd("XADD")
+                .arg(q_key(queue))
+                .arg("*")
+                .arg("e")
+                .arg(format!(r#"{{"id":"f{i}","task":"t"}}"#))
+                .query_async(&mut conn)
+                .await
+                .expect("seed");
+            sids.push(sid);
+        }
+        let _: Option<redis::streams::StreamReadReply> = redis::cmd("XREADGROUP")
+            .arg("GROUP")
+            .arg("cauli")
+            .arg("c1")
+            .arg("COUNT")
+            .arg(5)
+            .arg("STREAMS")
+            .arg(q_key(queue))
+            .arg(">")
+            .query_async(&mut conn)
+            .await
+            .expect("deliver");
+
+        // Batch of 4 under a 10s window: four submits must complete on the
+        // count trigger, far inside the window.
+        let bufs = AckBufs::start(&conn, &[queue.to_string()], 4, 10_000);
+        let t0 = std::time::Instant::now();
+        let mut waits = Vec::new();
+        for sid in &sids[..4] {
+            let bufs = bufs.clone();
+            let sid = sid.clone();
+            waits.push(tokio::spawn(async move {
+                finish_success(&bufs, "flushq", &sid, "f", None, 60).await
+            }));
+        }
+        for w in waits {
+            w.await.expect("join").expect("ack");
+        }
+        assert!(
+            t0.elapsed() < std::time::Duration::from_secs(5),
+            "a full batch must flush on count, not wait out the window"
+        );
+
+        // The fifth, alone in a buffer whose batch (1000) will never fill,
+        // must be answered by its 200ms window, not parked forever.
+        let lone = AckBufs::start(&conn, &[queue.to_string()], 1000, 200);
+        let t0 = std::time::Instant::now();
+        finish_success(&lone, queue, &sids[4], "f4", None, 60)
+            .await
+            .expect("ack");
+        let waited = t0.elapsed();
+        assert!(
+            waited < std::time::Duration::from_secs(5),
+            "a lone completion waited {waited:?}; the window must bound it"
+        );
+        let pending: Vec<(String, String, u64, u64)> = redis::cmd("XPENDING")
+            .arg(q_key(queue))
+            .arg("cauli")
+            .arg("-")
+            .arg("+")
+            .arg(10)
+            .query_async(&mut conn)
+            .await
+            .expect("xpending");
+        assert!(pending.is_empty(), "all five acked: {pending:?}");
     }
 }

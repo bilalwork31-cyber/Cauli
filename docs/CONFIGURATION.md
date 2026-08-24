@@ -194,6 +194,8 @@ the resident children.
 | `--redis-timeout` | 5 | Response and connection timeout, in seconds, for every redis round trip. Forwarded to every supervised worker process |
 | `--mover-interval` | 50 | Milliseconds between delayed and retry sweeps (PROTOCOL section 4.3). A floor on retry latency: every countdown, eta, retry and beat firing waits out at most one tick before it can run |
 | `--mover-limit` | 128 | Entries the sweep moves per queue per round trip. The sweep repeats within one tick until a queue comes back short, so this bounds one `EVAL`, not the drain rate |
+| `--ack-batch` | 64 | Completions buffered per queue before they flush as one pipeline with one multi-id `XACK` and one multi-id `XDEL` (PROTOCOL section 4.1). Batching acks is what keeps redis's single command thread from capping throughput. Values below 1 mean 1. Forwarded to every supervised worker process |
+| `--ack-flush-ms` | 2 | Max milliseconds a completed task's ack waits for a fuller batch, measured from the oldest buffered completion. Bounds result latency at low load and the crash duplicate window: a worker killed mid-window loses at most one unflushed buffer per queue to redelivery. 0 flushes every completion immediately. Forwarded to every supervised worker process |
 
 **`--visibility-timeout` must exceed your longest task's `timeout`** (PROTOCOL
 section 4.4). The worker warns at startup when a registered task violates it.

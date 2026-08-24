@@ -66,6 +66,7 @@ async fn e2e_sigterm_drain_and_sigkill_recovery() {
     drop(w2);
     drop(w1);
 
+    kill9_mid_ack_flush_loses_nothing(&mut c).await;
     h1_visibility_floor_does_not_reclaim_long_task(&mut c).await;
     h2_sync_pool_survives_hard_timeout_abandonment(&mut c).await;
     m8_cli_floors_reject_zero();
@@ -73,6 +74,83 @@ async fn e2e_sigterm_drain_and_sigkill_recovery() {
     bulk_recovery_drains_backlog_per_tick(&mut c).await;
 
     stop_redis();
+}
+
+/// §4.1 batched-completion crash window: a `kill -9` landing while
+/// completions sit in the ack buffer must lose ZERO tasks. The first worker
+/// runs with an absurd flush window (`--ack-flush-ms 8000 --ack-batch
+/// 100000`), so everything it executes is still unflushed — no ack, no
+/// result — when the SIGKILL lands. Every entry must then still be pending,
+/// be redelivered (§4.4), and finish on a second worker with normal flush
+/// settings. This is the widest version of the window a real crash can hit
+/// (the default is 64 completions / 2ms).
+async fn kill9_mid_ack_flush_loses_nothing(c: &mut redis::aio::MultiplexedConnection) {
+    const N: usize = 40;
+    let mut w1 = Worker::spawn(
+        "ackflushq",
+        &[
+            "--visibility-timeout",
+            "2",
+            "--ack-flush-ms",
+            "8000",
+            "--ack-batch",
+            "100000",
+        ],
+    );
+    wait_group(c, "ackflushq", 20).await;
+    let mut ids = Vec::with_capacity(N);
+    for i in 0..N {
+        let (id, e) = envelope("fx.echo", "ackflushq", |v| {
+            v["args"] = json!([format!("survivor-{i}")]);
+            v["timeout_ms"] = json!(1000);
+        });
+        xadd(c, "ackflushq", &e.to_string()).await;
+        ids.push(id);
+    }
+    // Give w1 time to fetch and EXECUTE everything; with the 8s window
+    // nothing may have flushed: every entry still pending, no result key.
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    assert_eq!(
+        xpending_count(c, "ackflushq").await as usize,
+        N,
+        "with an 8s flush window nothing may be acked yet"
+    );
+    let first: Option<String> = redis::cmd("GET")
+        .arg(format!("cauli:result:{}", ids[0]))
+        .query_async(c)
+        .await
+        .unwrap();
+    assert!(
+        first.is_none(),
+        "results ride the flush pipeline: none may exist before the flush"
+    );
+    w1.signal(libc::SIGKILL);
+    let _ = w1.wait_code(10);
+
+    // --redis-timeout 1 shrinks the reclaim margin so redelivery happens in
+    // seconds here: required idle = 1000 (timeout_ms) + 2000 (grace) +
+    // max(1000, 2000) = 5s, recovery tick 1s.
+    let w2 = Worker::spawn(
+        "ackflushq",
+        &["--visibility-timeout", "2", "--redis-timeout", "1"],
+    );
+    for id in &ids {
+        let r = wait_result(c, id, 30).await;
+        assert_eq!(
+            r["status"], "success",
+            "every buffered-but-unflushed completion must be redelivered and finish"
+        );
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while xpending_count(c, "ackflushq").await > 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "redelivered entries must end up acked"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    drop(w2);
+    drop(w1);
 }
 
 /// Recovery-throughput regression: after a `kill -9` with ~200 tasks in

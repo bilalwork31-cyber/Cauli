@@ -153,8 +153,7 @@ async fn process(ctx: &Arc<Ctx>, queue: &str, sid: &str, raw: Option<String>) {
             let store = env
                 .store_result
                 .then_some((env.id.as_str(), rj.as_str(), ctx.result_ttl));
-            let mut conn = ctx.redis.clone();
-            match broker::finish_dlq(&mut conn, queue, sid, &raw, "expired", None, store).await {
+            match broker::finish_dlq(&ctx.acks, queue, sid, &raw, "expired", None, store).await {
                 Ok(()) => {
                     ctx.counters.expired.fetch_add(1, Ordering::Relaxed);
                     ctx.counters.dlq.fetch_add(1, Ordering::Relaxed);
@@ -186,7 +185,7 @@ async fn process(ctx: &Arc<Ctx>, queue: &str, sid: &str, raw: Option<String>) {
                 // success branch in `finish` below: a write failure must
                 // not be counted as if it happened.
                 match broker::finish_duplicate(
-                    &mut conn,
+                    &ctx.acks,
                     queue,
                     sid,
                     &env.id,
@@ -230,7 +229,6 @@ async fn process(ctx: &Arc<Ctx>, queue: &str, sid: &str, raw: Option<String>) {
 
 /// §4.1 / §4.2 completion handling.
 async fn finish(ctx: &Arc<Ctx>, queue: &str, sid: &str, mut env: Envelope, outcome: Outcome) {
-    let mut conn = ctx.redis.clone();
     let now = now_ms();
     match outcome {
         Outcome::Success(v) => {
@@ -239,7 +237,7 @@ async fn finish(ctx: &Arc<Ctx>, queue: &str, sid: &str, mut env: Envelope, outco
             // with the size of whatever the task returned.
             let rj = env.store_result.then(|| envelope::result_success(&v, now));
             let store = rj.as_deref();
-            match broker::finish_success(&mut conn, queue, sid, &env.id, store, ctx.result_ttl)
+            match broker::finish_success(&ctx.acks, queue, sid, &env.id, store, ctx.result_ttl)
                 .await
             {
                 Ok(()) => {
@@ -260,7 +258,7 @@ async fn finish(ctx: &Arc<Ctx>, queue: &str, sid: &str, mut env: Envelope, outco
         Outcome::ForceRetry { countdown, err } => {
             if env.retries < env.max_retries {
                 let cd_ms = countdown.map(|s| (s.max(0.0) * 1000.0).round() as u64);
-                schedule_retry(ctx, &mut conn, queue, sid, &mut env, cd_ms).await;
+                schedule_retry(ctx, queue, sid, &mut env, cd_ms).await;
             } else {
                 // A forced retry is inherently retryable; reaching here at
                 // all means the budget ran out, never that it was refused.
@@ -269,7 +267,7 @@ async fn finish(ctx: &Arc<Ctx>, queue: &str, sid: &str, mut env: Envelope, outco
         }
         Outcome::Failure { err, retryable } => {
             if retryable && env.retries < env.max_retries {
-                schedule_retry(ctx, &mut conn, queue, sid, &mut env, None).await;
+                schedule_retry(ctx, queue, sid, &mut env, None).await;
             } else {
                 // PROTOCOL §4.2: "max_retries" names the case where the
                 // retry budget ran out specifically. A `retryable: false`
@@ -316,7 +314,6 @@ fn retry_delay_ms(env: &Envelope, countdown_ms: Option<u64>) -> u64 {
 /// §4.2 steps 1-4. `countdown_ms` overrides the computed backoff (cauli.Retry).
 async fn schedule_retry(
     ctx: &Arc<Ctx>,
-    conn: &mut redis::aio::ConnectionManager,
     queue: &str,
     sid: &str,
     env: &mut Envelope,
@@ -335,7 +332,7 @@ async fn schedule_retry(
     // Gated on the write, like every sibling branch in `finish`: an
     // unconditional increment made `retried=` climb at full rate through a
     // redis brownout in which nothing was actually scheduled.
-    match broker::finish_retry(conn, queue, sid, &ej, fire_at).await {
+    match broker::finish_retry(&ctx.acks, queue, sid, &ej, fire_at).await {
         Ok(()) => {
             debug!(id = %env.id, retries = env.retries, delay_ms = d_ms, "scheduled retry");
             ctx.counters.retried.fetch_add(1, Ordering::Relaxed);
@@ -347,11 +344,7 @@ async fn schedule_retry(
 }
 
 /// Final failure: DLQ `reason` ("max_retries" or "not_retryable", see
-/// `finish` above) + failure result (if store_result). Clones its own
-/// connection from `ctx` (rather than taking one as a parameter, the way
-/// `schedule_retry` does) so this stays at seven arguments instead of eight;
-/// a `ConnectionManager` clone is a cheap handle, the same one every other
-/// call site in this file already takes fresh from `ctx.redis`.
+/// `finish` above) + failure result (if store_result).
 async fn final_failure(
     ctx: &Arc<Ctx>,
     queue: &str,
@@ -361,7 +354,6 @@ async fn final_failure(
     now: u64,
     reason: &str,
 ) {
-    let mut conn = ctx.redis.clone();
     // Infallible: same reasoning as schedule_retry above.
     let ej = serde_json::to_string(env).expect("envelope serialize");
     let rj = envelope::result_failure(err, now);
@@ -370,7 +362,7 @@ async fn final_failure(
         .then_some((env.id.as_str(), rj.as_str(), ctx.result_ttl));
     // Gated the same way, and for the same reason, as the success branch in
     // `finish` above: a write failure must not be counted as if it happened.
-    match broker::finish_dlq(&mut conn, queue, sid, &ej, reason, Some(err), result).await {
+    match broker::finish_dlq(&ctx.acks, queue, sid, &ej, reason, Some(err), result).await {
         Ok(()) => {
             ctx.counters.failed.fetch_add(1, Ordering::Relaxed);
             ctx.counters.dlq.fetch_add(1, Ordering::Relaxed);
@@ -427,7 +419,6 @@ pub async fn dlq_terminal(
     reason: &str,
     err: Option<&ErrorJson>,
 ) {
-    let mut conn = ctx.redis.clone();
     let recovered_id = recover_id(raw_e);
     let synthesized = err.is_none().then(|| dlq_error(reason));
     let result_error = err.or(synthesized.as_ref());
@@ -441,7 +432,7 @@ pub async fn dlq_terminal(
     };
     // Gated the same way, and for the same reason, as the success branch in
     // `finish` above: a write failure must not be counted as if it happened.
-    match broker::finish_dlq(&mut conn, queue, sid, raw_e, reason, err, store).await {
+    match broker::finish_dlq(&ctx.acks, queue, sid, raw_e, reason, err, store).await {
         Ok(()) => {
             ctx.counters.dlq.fetch_add(1, Ordering::Relaxed);
         }

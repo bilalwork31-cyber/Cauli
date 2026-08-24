@@ -217,6 +217,64 @@ fn report_mover_error(q: &str, e: &anyhow::Error) {
     }
 }
 
+/// §4.1 trim cadence. The trim is a BACKSTOP (see `trim_loop`), so 100ms
+/// only bounds how long a torn flush's orphans linger, costing one or two
+/// probe commands per queue per tick — the same order of chatter as the
+/// mover's own 50ms EVAL tick.
+const TRIM_INTERVAL_MS: u64 = 100;
+
+/// §4.1 trim backstop. Ordinary completions remove their own entries: the
+/// flush pipeline ends in a batched XDEL (broker::AckBufs), so nothing here
+/// is on the normal path. What this loop reclaims is the acked-undeleted
+/// orphan a flush torn between its XACK and its XDEL leaves behind, plus
+/// any orphans from pre-1.0 per-entry writes — the state that, before this
+/// loop existed, sat in the stream forever. Per queue: compute the boundary
+/// below which everything is provably acked (`broker::acked_below`, which
+/// carries the safety proof) and `XTRIM MINID` up to it.
+///
+/// The boundary is the group's OLDEST PENDING id, so an orphan behind a
+/// long-running task waits for that task before it is reclaimed. That is
+/// acceptable for orphans (rare, tear-sized: at most one flush of them per
+/// tear) and is exactly why the trim must never be the primary removal
+/// path — it briefly was, and one slow task then retained every completed
+/// entry behind it, gigabytes at full throughput under the default 300s
+/// timeout. The batched XDEL is the primary path; do not remove it in
+/// favour of this loop.
+///
+/// Keeps running through a §4.7 drain, deliberately: completions keep
+/// flushing during the drain, and a tear during the drain should not leave
+/// orphans for the next worker.
+pub async fn trim_loop(ctx: Arc<Ctx>) {
+    let mut conn = ctx.redis.clone();
+    let mut tick = tokio::time::interval(Duration::from_millis(TRIM_INTERVAL_MS));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Last boundary trimmed per queue: an unchanged boundary means no ack
+    // has moved it, so the XTRIM would be a guaranteed no-op round trip.
+    let mut trimmed_to: std::collections::HashMap<String, String> = Default::default();
+    loop {
+        tick.tick().await;
+        for q in &ctx.queues {
+            let boundary = match broker::acked_below(&mut conn, q).await {
+                Ok(Some(b)) => b,
+                Ok(None) => continue,
+                Err(e) => {
+                    warn!(queue = %q, "trim boundary probe failed: {e}");
+                    continue;
+                }
+            };
+            if trimmed_to.get(q).is_some_and(|prev| *prev == boundary) {
+                continue;
+            }
+            match broker::trim_acked(&mut conn, q, &boundary).await {
+                Ok(_) => {
+                    trimmed_to.insert(q.clone(), boundary);
+                }
+                Err(e) => warn!(queue = %q, "XTRIM failed: {e}"),
+            }
+        }
+    }
+}
+
 /// Extra idle margin the reclaim threshold carries ON TOP of an envelope's
 /// own execution backstop.
 ///
@@ -861,15 +919,13 @@ pub async fn stats_loop(ctx: Arc<Ctx>) {
 ///     which is the first entry after the group's `last-delivered-id`.
 ///
 /// This replaced a single `XRANGE q - + COUNT 1`, which read the oldest
-/// entry in the STREAM regardless of its state. `add_ack_del` used to
-/// pipeline XACK and XDEL unwrapped, so a connection drop between them left
-/// an entry acked but present. Such an orphan is in no PEL and behind
-/// `last-delivered-id`, so no recovery path can ever reach it and nothing
-/// XTRIMs the stream, and the old probe reported its ever growing age
-/// forever, across restarts, as though the queue were permanently wedged.
-/// That pair is now one `MULTI`/`EXEC` over the single stream key, which
-/// closes the window; reading the two real states keeps this leading
-/// indicator correct regardless.
+/// entry in the STREAM regardless of its state. Under the batched
+/// completion path (broker::AckBufs) the stream legitimately holds a flush
+/// window of completed-but-unflushed entries, and a torn flush can leave
+/// acked-undeleted orphans until the trim backstop reclaims them, so a raw
+/// stream head is wrong by design, not only in the old torn-write corner:
+/// reading the two real states (oldest pending, oldest undelivered) is
+/// what keeps this leading indicator correct regardless.
 async fn oldest_unacked_ms(ctx: &Arc<Ctx>, conn: &mut redis::aio::ConnectionManager) -> u64 {
     let now = now_ms();
     let mut oldest = 0;

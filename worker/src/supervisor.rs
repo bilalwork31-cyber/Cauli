@@ -212,6 +212,10 @@ fn child_argv(args: &cli::Args, r: &cli::Resolved) -> Vec<String> {
         args.mover_interval.to_string(),
         "--mover-limit".into(),
         args.mover_limit.to_string(),
+        "--ack-batch".into(),
+        args.ack_batch.to_string(),
+        "--ack-flush-ms".into(),
+        args.ack_flush_ms.to_string(),
     ];
     // Only when the operator set one: with no flag each child resolves its
     // own embedded interpreter, which is the same binary and so the same
