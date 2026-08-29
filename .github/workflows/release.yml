@@ -60,8 +60,8 @@ jobs:
     name: versions agree
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - name: cauli, cauli-worker and the tag all say the same thing
@@ -74,13 +74,13 @@ jobs:
     needs: version
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
       - run: pip install build
       - run: python -m build --sdist --wheel --outdir dist py
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: dist-client
           path: dist/*
@@ -100,12 +100,12 @@ jobs:
           - target: aarch64
             runner: ubuntu-22.04-arm
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # The interpreter the worker will embed. setup-python ships CPython
       # built with --enable-shared, which is the property the manylinux
       # images lack and the readelf assertion below depends on.
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python }}
 
@@ -179,7 +179,7 @@ jobs:
           head -1 "${scripts[0]}" | grep -qx '#!python'
           echo "ok: cauli-worker console script present and executable"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: dist-worker-${{ matrix.target }}-cp${{ matrix.python }}
           path: worker/dist/*.whl
@@ -193,8 +193,8 @@ jobs:
       matrix:
         python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python }}
       - name: Install redis-server
@@ -203,11 +203,11 @@ jobs:
       # Two explicit downloads rather than one brace pattern: only the wheel
       # built for THIS CPython version may be present, or pip would happily
       # resolve a different one and the verification would prove nothing.
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: dist-client
           path: artifacts
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: dist-worker-x86_64-cp${{ matrix.python }}
           path: artifacts
@@ -284,11 +284,11 @@ jobs:
       # so on an interpreter whose libpython is neither in the ldconfig cache
       # nor on LD_LIBRARY_PATH it dies inside the dynamic loader, before main,
       # and even `cauli-worker --version` fails.
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: dist-client
           path: artifacts
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: dist-worker-x86_64-cp${{ matrix.python }}
           path: artifacts
@@ -356,7 +356,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: dist-worker-*
           path: wheels
@@ -381,7 +381,7 @@ jobs:
           done
           ls -l release
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           files: |
             release/*.tar.gz
@@ -401,7 +401,7 @@ jobs:
       # Trusted publishing (OIDC). No API token stored in the repo.
       id-token: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           pattern: dist-*
           path: dist
