@@ -69,9 +69,9 @@ needs no Redis and no app.
 
 **The glibc 2.35 floor is deliberate, and it is worth understanding before you
 plan a deployment.** The worker wheels are tagged
-`manylinux_2_35_{x86_64,aarch64}`, so pip installs them on Ubuntu 22.04,
-Debian 12, RHEL 9 and newer, and on every current `python:3.x-slim` image, and
-refuses them anywhere older. The floor is set by the runner each wheel is built
+`manylinux_2_34_{x86_64,aarch64}` (the newest glibc symbol version the binary
+pulls in), and the supported floor is glibc 2.35: Ubuntu 22.04, Debian 12,
+RHEL 9 and newer, and every current `python:3.x-slim` image. The floor is set by the runner each wheel is built
 on rather than by a manylinux container, because the two requirements are in
 direct conflict: the worker embeds CPython and must link libpython dynamically,
 and the manylinux images ship a static only CPython, so pyo3 refuses to build
