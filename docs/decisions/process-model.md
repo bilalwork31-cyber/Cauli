@@ -6,7 +6,7 @@
 > [docs/CONFIGURATION.md](../CONFIGURATION.md), those win. The status line below was
 > checked against the source, not carried over.
 >
-> **Status: shipped in 1.0.0.** The wedge watchdog in `worker/src/loops.rs` stamps every
+> **Status: shipped in 0.1.0.** The wedge watchdog in `worker/src/loops.rs` stamps every
 > embedded loop every 5 seconds and exits the process with code 87 once a loop has been
 > unresponsive for 15 seconds and a second signal agrees. The other four questions were
 > frozen as they were.

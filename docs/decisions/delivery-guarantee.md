@@ -6,7 +6,7 @@
 > [docs/CONFIGURATION.md](../CONFIGURATION.md), those win. The status line below was
 > checked against the source, not carried over.
 >
-> **Status: shipped in 1.0.0.** The idempotency claim TTL now
+> **Status: shipped in 0.1.0.** The idempotency claim TTL now
 > derives from the execution it guards (`broker::claim_ttl_s`), the worker carries the
 > claimant id back on a suppressed duplicate, PROTOCOL.md section 4 carries the delivery
 > guarantee preamble, and README no longer offers an idempotency key as an alternative to

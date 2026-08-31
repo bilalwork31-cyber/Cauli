@@ -6,7 +6,7 @@
 > [docs/CONFIGURATION.md](../CONFIGURATION.md), those win. The status line below was
 > checked against the source, not carried over.
 >
-> **Status: shipped in 1.0.0.** `worker/src/clock.rs` anchors on Redis `TIME`, re anchors
+> **Status: shipped in 0.1.0.** `worker/src/clock.rs` anchors on Redis `TIME`, re anchors
 > on a periodic sample and warns at boot about a skew worth naming. The Python client is
 > still on its own clock, which CHANGELOG's known limitations now says plainly.
 

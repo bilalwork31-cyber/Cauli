@@ -6,7 +6,7 @@
 > [docs/CONFIGURATION.md](../CONFIGURATION.md), those win. The status line below was
 > checked against the source, not carried over.
 >
-> **Status: shipped in 1.0.0, with one correction to the recommendation below.** The worker
+> **Status: shipped in 0.1.0, with one correction to the recommendation below.** The worker
 > probes the topology at startup, before it touches a consumer group, and exits 1 with a
 > message naming the topology when the reply says the node runs in cluster mode
 > (`probe_cluster_info`, `cluster_info_says_enabled` and `cluster_decision` in

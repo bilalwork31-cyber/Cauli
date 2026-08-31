@@ -13,7 +13,7 @@
 
 |  |  |
 |---|---|
-| **Version** | 1.0.0 |
+| **Version** | 0.1.0 |
 | **Source** | https://github.com/bilalwork31-cyber/Cauli |
 | **Download** | https://pypi.org/project/cauli/ |
 | **Protocol** | [PROTOCOL.md](PROTOCOL.md) |
@@ -44,7 +44,7 @@ def send_email(to):
 
 ## What do I need?
 
-cauli 1.x runs on:
+cauli runs on:
 
 - CPython 3.10, 3.11, 3.12, 3.13, 3.14
 - Redis 7.0 or newer, as broker and result store
@@ -124,14 +124,15 @@ means several deployments; cauli routes with `kind="cpu"` on the task instead.
 
 **Correct under crash.** Redis Streams consumer groups plus a visibility
 timeout give at least once delivery. A `kill -9` at 160 of 500 tagged tasks
-lost 0 of them, and recovery took 34 seconds.
+lost 0 of them, and recovery took 10.8 seconds.
 
 **Cheap to hold work.** A held task costs about 6.6 KiB, so 10,000 tasks in
 flight fit in 215.7 MiB. See [Benchmarks](#benchmarks), including where that
 loses.
 
 **Stable.** The envelope and the Redis key layout in [PROTOCOL.md](PROTOCOL.md)
-are frozen for the 1.x series.
+are stable: any change to either before 1.0 will be called out as breaking in
+the changelog.
 
 ## It supports...
 
@@ -477,9 +478,10 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) to build from source, and
 
 ## Status
 
-cauli 1.0.0, the first public release. 1.0 means the wire format in
-[PROTOCOL.md](PROTOCOL.md) and the stats line key set are frozen for the 1.x
-series. It does not mean a decade of production mileage.
+cauli 0.1.0, the first public release. The wire format in
+[PROTOCOL.md](PROTOCOL.md) and the stats line key set are stable, and any
+change to either before 1.0 will be called out as breaking in the changelog.
+0.x means what it says: no third party production mileage yet.
 
 ## License
 

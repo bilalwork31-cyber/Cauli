@@ -6,7 +6,7 @@
 > [docs/CONFIGURATION.md](../CONFIGURATION.md), those win. The status line below was
 > checked against the source, not carried over.
 >
-> **Status: shipped in 1.0.0.** Name plus countdown matching was kept, as recommended. The
+> **Status: shipped in 0.1.0.** Name plus countdown matching was kept, as recommended. The
 > defect it uncovered is fixed: `worker/src/shim.py` rebinds its `SoftTimeLimitExceeded`
 > from the real `cauli` module once the app is loaded, so a task's own
 > `except SoftTimeLimitExceeded` clause matches the class the worker raises.

@@ -6,7 +6,7 @@
 > [docs/CONFIGURATION.md](../CONFIGURATION.md), those win. The status line below was
 > checked against the source, not carried over.
 >
-> **Status: shipped in 1.0.0.** The stats line gained per lane latency percentiles,
+> **Status: shipped in 0.1.0.** The stats line gained per lane latency percentiles,
 > `oldest_ms`, `cpu_rss_mb`, `sync_live`, `sync_abandoned`, `async_rejected`,
 > `cpu_backlog` and `loop_lag_ms`, then `pid`, `host` and `duplicate` in the release audit
 > pass. `pending_async` was removed. cpu child recycling now defaults to 1000 tasks.

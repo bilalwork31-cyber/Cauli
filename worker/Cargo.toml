@@ -1,6 +1,6 @@
 [package]
 name = "cauli-worker"
-version = "1.0.0"
+version = "0.1.0"
 edition = "2021"
 description = "Rust worker runtime for cauli Python task queues"
 readme = "README.md"

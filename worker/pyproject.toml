@@ -33,7 +33,7 @@ license = { text = "MIT OR Apache-2.0" }
 authors = [{ name = "the cauli contributors" }]
 keywords = ["task-queue", "background-jobs", "redis", "worker", "celery"]
 classifiers = [
-    "Development Status :: 5 - Production/Stable",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "License :: OSI Approved :: Apache Software License",
@@ -50,7 +50,7 @@ classifiers = [
 # share one wire contract (PROTOCOL.md). Pinned exactly rather than ranged: the
 # two halves are one release cut in two, so a mismatched pair is a bug and not
 # a convenience. scripts/check_versions.py gates this pin on every push.
-dependencies = ["cauli==1.0.0"]
+dependencies = ["cauli==0.1.0"]
 dynamic = ["version"]
 
 [project.urls]

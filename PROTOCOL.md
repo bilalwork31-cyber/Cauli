@@ -371,7 +371,7 @@ plus at most roughly one flush window of completed entries. Backlog itself is wh
 `oldest_ms` reads: the oldest pending entry and the oldest undelivered entry, neither of which
 the flush's `XDEL` or the trim can touch.
 
-**1.x compatibility.** This change is inside the frozen envelope: the key set, key types,
+**Compatibility.** This change is inside the stable envelope: the key set, key types,
 envelope JSON, result JSON and consumer group layout are byte-for-byte unchanged, and old and
 new workers interoperate on the same queues (an old worker's per-entry `XACK`+`XDEL` and a new
 worker's batched `XACK`+trim are both valid transitions of the same state machine — the trim

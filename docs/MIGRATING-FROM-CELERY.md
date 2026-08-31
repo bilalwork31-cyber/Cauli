@@ -16,7 +16,7 @@ Three things to settle before anything else, because each one is a hard stop:
    against Redis Cluster, and Sentinel is reachable from the Python client and
    `cauli-beat` but not from the worker.
 3. **There are no chains, groups, chords, rate limits or task priorities**, and
-   none are planned for the 1.x series. If your codebase depends on canvas
+   none are planned. If your codebase depends on canvas
    primitives, stop here.
 
 ## What ports directly
@@ -117,14 +117,14 @@ runs and the assertion fails with nothing enqueued. Use
 
 Stated plainly, so you can decide before you port anything.
 
-| Celery feature | Status in cauli 1.x |
+| Celery feature | Status in cauli |
 |---|---|
 | `chain`, `group`, `chord`, `map`, `starmap`, signatures | Not implemented, not planned |
 | Task priorities | Not implemented, not planned |
 | Rate limits (`rate_limit=`) | Not implemented, not planned |
 | `celery inspect`, `celery purge`, `celery control` | No equivalent. `cauli-beat` is the only console script besides the worker |
 | Flower or any dashboard | None. The operator interface is a stats log line every `--stats-interval` seconds |
-| A metrics endpoint, JSON logging, a health endpoint | All rejected for 1.0. Scraping means parsing a log line |
+| A metrics endpoint, JSON logging, a health endpoint | All rejected for now. Scraping means parsing a log line |
 | Brokers other than Redis | Not planned |
 | Result backends other than Redis | Not planned |
 | Pickle or a custom serializer | Not planned. JSON only, by design |
@@ -150,6 +150,6 @@ Stated plainly, so you can decide before you port anything.
 5. Check every task that has no explicit `max_retries`. It now retries three
    times where Celery did not retry at all.
 6. Port one low stakes queue first and run both workers side by side. The
-   envelope format is frozen for 1.x
+   envelope format is stable
    ([PROTOCOL.md](../PROTOCOL.md)), but the queues are separate, so there is no
    shared state to corrupt while you do it.

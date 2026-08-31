@@ -9,10 +9,10 @@ its own dependency -- and it fails at the user's `pip install`, not in our CI.
 Cheap to check, so it runs on every push rather than only at tag time.
 
 README.md's Status section is checked too, and for a reason
-this project already lived through: four artifacts shipped 1.0.0 marked
-Production/Stable while the landing page still said "v0.1", and CI stayed green
-the whole time because nothing read the README. The Status section must open
-with a full `cauli X.Y.Z` version, and it must be the same one.
+this project already lived through: every artifact carried the full version
+while the landing page still said "v0.1", and CI stayed green the whole time
+because nothing read the README. The Status section must open with a full
+`cauli X.Y.Z` version, and it must be the same one.
 
     python scripts/check_versions.py            # the six places agree
     python scripts/check_versions.py v0.2.0     # ...and match this git tag

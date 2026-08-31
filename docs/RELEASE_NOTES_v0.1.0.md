@@ -1,4 +1,4 @@
-# cauli 1.0.0
+# cauli 0.1.0
 
 cauli runs Python background tasks from one Rust binary that embeds CPython.
 It is built for FastAPI and Django teams who want a Celery alternative with an
@@ -9,9 +9,10 @@ retries, a dead letter queue, idempotency keys and timeouts, with `async def`,
 blocking `def` and `kind="cpu"` tasks all running side by side in the same
 worker.
 
-This is the first public release. 1.0 means the wire format in
-[PROTOCOL.md](https://github.com/bilalwork31-cyber/Cauli/blob/v1.0.0/PROTOCOL.md) and the stats line key set are frozen for the 1.x
-series. It does not mean a decade of production mileage. Read
+This is the first public release. The wire format in
+[PROTOCOL.md](https://github.com/bilalwork31-cyber/Cauli/blob/v0.1.0/PROTOCOL.md) and the stats line key set are stable, and any change
+to either before 1.0 will be called out as breaking in the changelog. 0.x
+means what it says: no third party production mileage yet. Read
 [What is proven, and what is not](#what-is-proven-and-what-is-not) before you
 adopt it.
 
@@ -38,7 +39,7 @@ adopt it.
   task for FastAPI, Starlette and Litestar.
 - **Safe beat.** Schedule state lives in Redis behind a leader lease, so two
   `cauli-beat` replicas produce one task per slot.
-- **Idempotency keys are derived with SHA-256.** If you ran a pre 1.0 build
+- **Idempotency keys are derived with SHA-256.** If you ran a pre release build
   from source, read
   [Upgrade and compatibility notes](#upgrade-and-compatibility-notes) before
   you roll.
@@ -95,10 +96,10 @@ libpython, and `pyenv` needs
 `actions/setup-python` all work.
 
 Raw binaries are attached to this release as
-`cauli-worker-1.0.0-cp3XX-cp3XX-<platform>.tar.gz` for deployments that are not
+`cauli-worker-0.1.0-cp3XX-cp3XX-<platform>.tar.gz` for deployments that are not
 a virtualenv. The CPython version stays in the filename because for this binary
 it is not optional information. Full packaging rules are in
-[PROTOCOL.md](https://github.com/bilalwork31-cyber/Cauli/blob/v1.0.0/PROTOCOL.md) section 13.
+[PROTOCOL.md](https://github.com/bilalwork31-cyber/Cauli/blob/v0.1.0/PROTOCOL.md) section 13.
 
 ## Quickstart
 
@@ -171,56 +172,65 @@ pool to the loop that first uses it, and `await cauli.aclose()` on shutdown.
 
 ## Benchmarks
 
-Two numbers, both from [bench/RESULTS.md](https://github.com/bilalwork31-cyber/Cauli/blob/v1.0.0/bench/RESULTS.md), which is the
-only place any figure in this project comes from.
+Every figure comes from [bench/RESULTS.md](https://github.com/bilalwork31-cyber/Cauli/blob/v0.1.0/bench/RESULTS.md), the
+only place any number in this project is allowed to come from.
 
-**Environment for both: WSL2 (Ubuntu 24.04), 6 shared vCPUs, 11 GiB RAM, Redis
-7.0.15 on a dedicated instance.** A shared virtualized box, not bare metal with
-isolated cores. Redis, every worker under test and the harness driving them
-compete for the same 6 cores, so read every figure as directional. Throughput
-is a drain rate: preload the tasks, start the worker, take the slope of
-completions between the 10th and 90th percentile of the run.
+**Environment: WSL2 (Ubuntu 24.04), 6 shared vCPUs, 11 GiB RAM, Redis
+7.0.15.** A shared virtualized box, not bare metal with isolated cores. Redis,
+every worker under test and the harness driving them compete for the same
+cores, so read every figure as directional. Throughput is a drain rate:
+preload the tasks, start the worker, take the slope of completions between the
+10th and 90th percentile of the run.
 
-- **Dispatch: 30,438 tasks per second**, cauli's async lane at
-  `--procs 8 --io-concurrency 96`, on a task body of one `redis.incr` and
-  nothing else. On the same box a hand rolled asyncio and redis loop with no
-  framework at all reaches 79,792 tasks per second, so cauli captures about 38
-  percent of that ceiling. The remaining 62 percent is real framework cost:
-  envelope building, JSON encode and decode, retry and idempotency
-  bookkeeping, consumer group ack.
-- **Memory: 215.7 MiB for 10,000 I/O tasks held in flight**, PSS summed across
-  every worker process, using `-c N` and cauli's own derived plan. PSS rather
-  than RSS, because RSS counts Celery prefork's copy on write pages once per
-  child and would have biased the comparison in cauli's favour.
+- **Dispatch: 27,060 tasks per second**, cauli's async lane at
+  `--procs 6 --io-concurrency 96`, on a task body of one `redis.incr` and
+  nothing else. Same box, same session: taskiq reached 7,812/s (cauli 3.5x)
+  and Celery prefork 826/s (cauli 32.8x). Every cauli row was box bound at
+  4.6 to 4.9 of 6 cores, so the defensible claim is "at least 27,060/s",
+  not a ceiling.
+- **Django ORM: 4,256 tasks per second against Celery prefork's 247** (17.2x)
+  at nearly the same worker CPU, on one `objects.create()` per task with
+  Postgres deliberately made cheap so the row measures the framework rather
+  than WAL fsync.
+- **Memory: 227.1 MiB for 10,000 I/O tasks held in flight** at `--procs 6`,
+  PSS summed across the whole process group. PSS rather than RSS, because RSS
+  counts Celery prefork's copy on write pages once per child and would have
+  biased the comparison in cauli's favour.
+- **Crash correctness: `kill -9` at 160 of 500 tasks, restart, count.**
+  cauli: 0 lost, 0 duplicated, recovered in 10.8s. Celery's default
+  configuration permanently loses exactly `concurrency x (prefetch + 1)`
+  tasks, verified against three configurations predicting each exactly, and
+  its `acks_late=True` path loses none but recovers 8.5x slower.
 
 ### Where cauli loses
 
-A table that only shows wins is rigged. Two entries carried over from
-[bench/RESULTS.md](https://github.com/bilalwork31-cyber/Cauli/blob/v1.0.0/bench/RESULTS.md) unchanged:
+A list that only shows wins is rigged. From the same measurement round:
 
-- **SQLAlchemy async ORM: taskiq wins.** On the same insert, taskiq measured
-  733.6 tasks per second against cauli's 378.6. Root caused rather than left
-  unexplained: the gap is not ORM overhead, it is SQLAlchemy's greenlet based
-  async engine, which did not scale with added concurrency in this
-  environment. External to cauli, and still a loss.
-- **Memory below the crossover.** Celery with `-P gevent` or `-P threads` is
-  one process with N greenlets or threads, and it is cheaper than cauli up to
-  roughly 4,500 to 6,000 tasks in flight. cauli's floor is higher because it
-  always runs a supervisor plus one or more worker processes, each embedding
-  its own CPython. It only wins past the crossover, on marginal cost per held
-  task.
+- **Memory below 10,000 tasks in flight.** Celery gevent is one process with
+  N greenlets and beats cauli's auto-derived plan at every smaller size
+  (49.2 vs 59.7 MiB at 100 in flight; 70.8 vs 245.6 at 1,000). Each cauli
+  process embeds its own CPython and costs about 22.6 MiB before it holds a
+  single task. If you are optimising for memory, set `--procs` low
+  explicitly: the auto-derivation optimises for throughput.
+- **CPU bound tasks converge to a tie.** 4.31x Celery prefork at 0.5ms task
+  bodies, 1.06x at 10ms, 1.01x at 50ms. Dispatch overhead is a fixed cost per
+  task, so it disappears into a long task. If your tasks run 50ms or longer,
+  no task queue saves you meaningful CPU; choose one on other grounds.
+- **SQLAlchemy async ORM is close, not a rout: 1.17x taskiq** (2,032/s vs
+  1,736/s) at identical CPU. An earlier round published taskiq winning this
+  lane 733.6/s to 378.6/s; that was a harness bug in the benchmark's own
+  connection pool sizing, and the retraction is in
+  [bench/RESULTS.md](https://github.com/bilalwork31-cyber/Cauli/blob/v0.1.0/bench/RESULTS.md).
 
-The full picture, including the CPU bound lane where all five frameworks tie at
-50 ms per task, the reliability cliff above 104 slots per process on
-`--io-concurrency`, and the Django lane that needs pgbouncer at any real
-concurrency, is in [bench/RESULTS.md](https://github.com/bilalwork31-cyber/Cauli/blob/v1.0.0/bench/RESULTS.md). Read
-[bench/CLAIMS.md](https://github.com/bilalwork31-cyber/Cauli/blob/v1.0.0/bench/CLAIMS.md) first: it states what each measurement is
-allowed to prove.
+The full picture, every config swept, and the "not yet measured" list are in
+[bench/RESULTS.md](https://github.com/bilalwork31-cyber/Cauli/blob/v0.1.0/bench/RESULTS.md). Read
+[bench/CLAIMS.md](https://github.com/bilalwork31-cyber/Cauli/blob/v0.1.0/bench/CLAIMS.md) first: it states what each
+measurement is allowed to prove.
 
 ## Known limitations
 
 Stated before you adopt it, not after. The full list is "Known limitations" in
-[CHANGELOG.md](https://github.com/bilalwork31-cyber/Cauli/blob/v1.0.0/CHANGELOG.md), and "Still open" just above it.
+[CHANGELOG.md](https://github.com/bilalwork31-cyber/Cauli/blob/v0.1.0/CHANGELOG.md), and "Still open" just above it.
 
 - **Redis Cluster is not supported and the worker refuses to start on one.** It
   sends `INFO cluster` before touching a consumer group and exits 1 on
@@ -253,7 +263,7 @@ Stated before you adopt it, not after. The full list is "Known limitations" in
   metrics endpoint, no JSON logging, no health endpoint, no queue depth field,
   no dashboard. Scraping means parsing a log line.
 - **cpu child memory is invisible in `rss_mb`.** That field covers the worker
-  process only. `--cpu-max-tasks-per-child`, default 1000, is the only bound on
+  process only. `--cpu-max-tasks-per-child`, default 10000, is the only bound on
   a child's memory.
 - **No Python `atexit` handler ever runs.** The worker leaves through an
   immediate process exit, deliberately: running C library atexit handlers while
@@ -267,7 +277,7 @@ Stated before you adopt it, not after. The full list is "Known limitations" in
   beat are. A client whose clock runs behind Redis shortens every deadline it
   stamps. Keep the hosts that enqueue on NTP, not only the workers.
 - **No chains, groups, chords, rate limits or task priorities**, and none are
-  planned for 1.x. There is also no CLI for the dead letter queue, queue depth
+  planned yet. There is also no CLI for the dead letter queue, queue depth
   or the delayed set, so Celery's `inspect`, `purge` and `control` have no
   equivalent.
 - **Memory over a long run is unverified.** See below.
@@ -276,7 +286,7 @@ Stated before you adopt it, not after. The full list is "Known limitations" in
 
 Proven, and reproducible from this repository:
 
-- **163 Rust tests, 345 Python tests and 26 cross component integration tests,
+- **172 Rust tests, 350 Python tests and 26 cross component integration tests,
   all passing.** The integration tests run a real worker binary, real cpu
   children and a real Redis, not mocks.
 - **CI runs the Python suite on 3.10 through 3.14**, clippy under both the
@@ -304,7 +314,7 @@ Not proven, stated plainly:
   soaked against a workload that deliberately fails, so retries, dead letters
   and expiry are the least exercised paths of all. Watch `rss_mb` in the stats
   line, and remember it does not cover cpu children.
-- **No third party production usage.** This is a 1.0 that has never run in
+- **No third party production usage.** This has never run in
   anyone else's production. Everything above is a test suite, a benchmark suite
   and a release verification, which is not the same thing as mileage.
 - **No published latency table**, no duplicate delivery test, no Redis round
@@ -313,15 +323,15 @@ Not proven, stated plainly:
 
 ## Upgrade and compatibility notes
 
-Version 0.1.0 was never published, so there is no released version to upgrade
-from. This section is for deployments running the 0.1.0 development series from
-source. If you are installing cauli for the first time, skip to the
+Nothing was published before this release, so there is no released version to
+upgrade from. This section is for deployments running the pre release
+development builds from source. If you are installing cauli for the first time, skip to the
 compatibility promise at the end.
 
-Several 1.0 changes turn a previously silent outcome into a raised exception,
-so code that ran under 0.1.0 can fail under 1.0. That is the intended
+Several changes turn a previously silent outcome into a raised exception,
+so code that ran on a development build can fail on 0.1.0. That is the intended
 direction, and it is not a quiet upgrade. The full list is "Breaking changes"
-in [CHANGELOG.md](https://github.com/bilalwork31-cyber/Cauli/blob/v1.0.0/CHANGELOG.md).
+in [CHANGELOG.md](https://github.com/bilalwork31-cyber/Cauli/blob/v0.1.0/CHANGELOG.md).
 
 ### Idempotency keys change shape, so a rolling upgrade can run a guarded task twice
 
@@ -335,7 +345,7 @@ invertible, so a caller who controls one key could suppress another tenant's
 task on purpose. There is no new dependency: the digest is implemented in
 crate, and `sha2` is not in `Cargo.toml`.
 
-A key minted by a pre 1.0 worker never matches the key a 1.0 worker computes
+A key minted by a pre release worker never matches the key a 0.1.0 worker computes
 for the same string, so a claim written by an old worker is invisible to a new
 one. For the length of the rollout, and for as long as any old claim is still
 live afterwards, a task carrying an `idempotency_key` can execute twice.
@@ -343,7 +353,7 @@ Nothing in cauli can bridge the two derivations.
 
 Two ways forward, and you have to pick one:
 
-1. **Drain the queues and stop every old worker before starting a 1.0 one.**
+1. **Drain the queues and stop every old worker before starting a 0.1.0 one.**
    No duplicate window at all.
 2. **Roll normally and accept duplicates for the window.** Old claim keys are
    never read again and expire on their own TTL.
@@ -354,7 +364,7 @@ A worker that does not recognise a task name consumes the message and dead
 letters it terminally. It now also writes an `UnregisteredTask` failure result,
 so the caller receives a definitive error rather than blocking forever, but the
 task still does not survive the rollout. In a rolling deploy every worker must
-be running 1.0 and must know the new task name before anything enqueues it.
+be running 0.1.0 and must know the new task name before anything enqueues it.
 
 ### Before deploying, check for
 
@@ -389,11 +399,12 @@ be running 1.0 and must know the new task name before anything enqueues it.
   under load. A false trip costs one log line and at most one visibility
   timeout of added latency, never data loss.
 
-### Compatibility promise for 1.x
+### Compatibility promise
 
 The envelope, the Redis key layout and the worker semantics in
-[PROTOCOL.md](https://github.com/bilalwork31-cyber/Cauli/blob/v1.0.0/PROTOCOL.md) are frozen for the 1.x series, as is the stats
-line key set in section 7. The two packages `cauli` and `cauli-worker` pin each
+[PROTOCOL.md](https://github.com/bilalwork31-cyber/Cauli/blob/v0.1.0/PROTOCOL.md) are stable, as is the stats line key set in
+section 7. Any change to either before 1.0 will be called out as breaking in
+the changelog. The two packages `cauli` and `cauli-worker` pin each
 other exactly and are published together, so a mismatched pair is a pip
 resolution error rather than a protocol bug at runtime.
 
@@ -402,7 +413,7 @@ resolution error rather than a protocol bug at runtime.
 Most of the surface ports directly: `@app.task()`, `.delay()`,
 `.apply_async(countdown=..., queue=...)`, `AsyncResult`, `.get(timeout=...)`
 and a beat process for periodic work.
-[docs/MIGRATING-FROM-CELERY.md](https://github.com/bilalwork31-cyber/Cauli/blob/v1.0.0/docs/MIGRATING-FROM-CELERY.md) has the full mapping
+[docs/MIGRATING-FROM-CELERY.md](https://github.com/bilalwork31-cyber/Cauli/blob/v0.1.0/docs/MIGRATING-FROM-CELERY.md) has the full mapping
 table, the eight divergences that bite silently, the list of what cauli does
 not do, and a migration order that works. The two that change behaviour without
 raising are `crontab()` field order and `-c`, which counts tasks rather than
@@ -419,7 +430,7 @@ rule this project holds itself to hardest: no figure in any document without a
 harness in `bench/` that reproduces it. Security reports go through
 `SECURITY.md`.
 
-**Full changelog:** [CHANGELOG.md](https://github.com/bilalwork31-cyber/Cauli/blob/v1.0.0/CHANGELOG.md).
+**Full changelog:** [CHANGELOG.md](https://github.com/bilalwork31-cyber/Cauli/blob/v0.1.0/CHANGELOG.md).
 
 ## License
 

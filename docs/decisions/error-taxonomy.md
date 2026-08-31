@@ -6,7 +6,7 @@
 > [docs/CONFIGURATION.md](../CONFIGURATION.md), those win. The status line below was
 > checked against the source, not carried over.
 >
-> **Status: shipped in 1.0.0.** `error.origin` is on the wire (PROTOCOL.md section 8) and
+> **Status: shipped in 0.1.0.** `error.origin` is on the wire (PROTOCOL.md section 8) and
 > the worker minted `TimeoutError` was renamed `TimeLimitExceeded`. Everything else in the
 > taxonomy is frozen for 1.x.
 

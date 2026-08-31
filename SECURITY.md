@@ -4,8 +4,8 @@
 
 | Version | Supported |
 |---|---|
-| 1.0.x | yes |
-| anything older | no. 0.1.0 was never published |
+| 0.1.x | yes |
+| anything older | no. Nothing older was ever published |
 
 Both packages, `cauli` and `cauli-worker`, ship the same version number and are
 covered by the same policy.
@@ -54,12 +54,12 @@ link to this section.
   execution in your workers.
 - **Task arguments, results and tracebacks are stored in Redis in plaintext.**
   Keep secrets out of all three.
-- **Dead letter entries hold the full envelope, arguments included, with no
-  expiry.** They are capped at roughly 1000 entries per queue by count only.
-- **Idempotency keys are folded through 64 bit FNV-1a**, which is not a
-  cryptographic hash. A caller who can choose keys can construct a collision
-  and suppress a distinct task. Do not derive idempotency keys from untrusted
-  input. This is a known 1.0 gap, tracked for a 128 bit replacement, and a
-  report of it will be closed as already known rather than as invalid.
+- **Dead letter entries hold the full envelope, arguments included.** The
+  stream is capped at roughly 1000 entries per queue and expires 7 days
+  after the last dead letter written to it.
+- **Idempotency keys are hashed with SHA-256 truncated to 128 bits.** The
+  hash is not the guard against malice: a caller who can enqueue with a
+  chosen `idempotency_key` can reuse a live key and suppress a distinct
+  task. Do not derive idempotency keys from untrusted input.
 - **A task body can do anything the worker process can.** cauli runs your code;
   it is not a sandbox.

@@ -3,92 +3,17 @@
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## Unreleased
+## 0.1.0 (2026-08-31)
 
-### Changed
+First release. Nothing was published before this, so everything below is
+relative to the unpublished development builds that preceded it, which some
+deployments run from source.
 
-- **Completions are batched.** The worker buffers completions per queue and
-  flushes them as one pipeline: each completion's own writes, then one
-  multi-id `XACK`, then one multi-id `XDEL`. A flush fires at `--ack-batch`
-  completions (default 64) or `--ack-flush-ms` milliseconds (default 2),
-  whichever comes first. Redis executes commands on one thread, and per task
-  round trips were the measured ceiling of the whole system: the same command
-  mix costs 98.1us of redis CPU per task at one round trip each against 9.1us
-  at 64 per round trip. Redis dropped from 0.76 to 0.68 cores at peak while
-  throughput rose 5.2% (95% CI 1.024 to 1.079); the point is not the 5.2% but
-  that redis is no longer the bound, so more worker cores now buy throughput.
-  **A crash, not a graceful stop, can now lose up to one unflushed buffer per
-  queue to redelivery** (at most `--ack-batch` entries, at most
-  `--ack-flush-ms` old). The idempotency guard absorbs it. Nothing else
-  narrows. `XLEN cauli:q:{queue}` now includes up to one flush window of
-  completed entries and is not backlog; §7's `oldest_ms` is.
-- `--cpu-max-tasks-per-child` now defaults to **10000**, was 1000. Measured
-  child private RSS plateaus at 2416kB by 5000 tasks and moves 4kB more out to
-  20000, so the old default re-forked mid ramp for no memory benefit.
-- `--mover-interval` now defaults to **50ms**, was 250ms. Every countdown,
-  eta, retry and beat firing waits out at most one tick, so at 250ms it added
-  up to 250ms to a default first retry of 250 to 500ms.
-- `-c` derivation now **floors** every per process division instead of
-  rounding up. `-c` is a ceiling on the whole worker, and each supervised
-  child receives the same resolved flags, so rounding each child up overshot:
-  `-c 65` derived 2 x 33 = 66 slots and `-c 512` derived 6 x 86 = 516.
-  Overshoot is the dangerous direction, since `-c` is what an operator sizes a
-  database connection pool against.
-- cpu children can no longer exceed the core count. The rule was already
-  documented; `div_ceil` broke it, deriving 8 children for 6 cores at `-c 200`.
-- The tokio runtime is sized per worker process rather than taking a whole box
-  each. Six processes on six cores meant 36 runtime threads, none of which ever
-  executes Python. `TOKIO_WORKER_THREADS` still wins.
-- `AsyncResult.get()` and `aget()` poll at 1ms for their first ten reads before
-  doubling to `poll_interval`. A flat 50ms poll charged every awaited task 25ms
-  on average just to be noticed. `poll_interval` keeps its meaning as the
-  ceiling.
-- Task ids are generated with `os.urandom(16).hex()` rather than
-  `uuid.uuid4().hex`. Same 32 hex characters on the wire, 128 bits of entropy
-  instead of 122, and nothing ever parsed it back as a UUID.
-
-### Added
-
-- `--ack-batch` and `--ack-flush-ms` (64 / 2), under Advanced tuning, shown in
-  `--print-plan` and forwarded to every supervised worker process.
-- A trim backstop (`XTRIM MINID` at the provably acked boundary) that reclaims
-  entries orphaned by a torn flush, and by pre 1.0 per entry writes.
-
-### Fixed
-
-- **Logging could freeze the whole runtime.** Every tokio worker reaches a per
-  envelope `warn!`/`error!` site, so a stalled log reader filled the 64KiB pipe
-  and parked them one by one inside `write(2)`, with no error and nothing for
-  the wedge watchdog to see. Logs now go through a bounded non blocking sink
-  that drops and counts rather than blocking.
-- `gc.freeze()` now runs in the embedded interpreter after the app import. The
-  cpu fork parent already did this; the io lane never did, so the whole app
-  image sat in gen2 and every gen2 collection rescanned it while holding the
-  GIL that all in process tasks share. Measured on a 300k object image: 9.28ms
-  to 0.14ms.
-- Async `kind="cpu"` tasks run on a persistent per thread event loop instead of
-  `asyncio.run` per request, which cost 114.2us against 9.7us. Tasks left
-  running by a body that never awaited them are still cancelled at the end of
-  the request, so an orphan cannot outlive its own request.
-- `inspect.signature()` is bound once when a task is declared rather than
-  rebuilt on every `.delay()`, where it was 66% of the call.
-- The soft timeout disarm is skipped when nothing was armed, saving 893ns of
-  GIL held time on every task that declares no `soft_timeout`.
-- The idempotency digest hex encoder uses a nibble table rather than
-  `write!("{b:02x}")`, which cost more than the SHA-256 it was formatting.
-- `--print-plan` reports the tokio runtime threads it was omitting from its own
-  totals.
-
-## 1.0.0 (2026-08-17)
-
-First release. Version 0.1.0 was never published, so everything below is
-relative to the 0.1.0 development series, which some deployments run from
-source.
-
-Most of this release is the result of one audit pass over the pre 1.0 tree.
-Read the breaking changes first: several of them turn a previously silent
-outcome into a raised exception, so code that ran under 0.1.0 can fail under
-1.0. That is the intended direction, but it is not a quiet upgrade.
+Most of this release is the result of one audit pass over that pre release
+tree. Read the breaking changes first: several of them turn a previously
+silent outcome into a raised exception, so code that ran on a development
+build can fail on 0.1.0. That is the intended direction, but it is not a
+quiet upgrade.
 
 ### Breaking changes
 
@@ -253,7 +178,72 @@ Protocol and worker behaviour:
   string needs updating. See PROTOCOL section 8.2, and Known limitations for
   the one async case that stays conflated.
 
+### Changed
+
+- **Completions are batched.** The worker buffers completions per queue and
+  flushes them as one pipeline: each completion's own writes, then one
+  multi-id `XACK`, then one multi-id `XDEL`. A flush fires at `--ack-batch`
+  completions (default 64) or `--ack-flush-ms` milliseconds (default 2),
+  whichever comes first. Redis executes commands on one thread, and per task
+  round trips were the measured ceiling of the whole system: the same command
+  mix costs 98.1us of redis CPU per task at one round trip each against 9.1us
+  at 64 per round trip. Redis dropped from 0.76 to 0.68 cores at peak while
+  throughput rose 5.2% (95% CI 1.024 to 1.079); the point is not the 5.2% but
+  that redis is no longer the bound, so more worker cores now buy throughput.
+  **A crash, not a graceful stop, can now lose up to one unflushed buffer per
+  queue to redelivery** (at most `--ack-batch` entries, at most
+  `--ack-flush-ms` old). The idempotency guard absorbs it. Nothing else
+  narrows. `XLEN cauli:q:{queue}` now includes up to one flush window of
+  completed entries and is not backlog; §7's `oldest_ms` is.
+- `--cpu-max-tasks-per-child` now defaults to **10000**, was 1000. Measured
+  child private RSS plateaus at 2416kB by 5000 tasks and moves 4kB more out to
+  20000, so the old default re-forked mid ramp for no memory benefit.
+- `--mover-interval` now defaults to **50ms**, was 250ms. Every countdown,
+  eta, retry and beat firing waits out at most one tick, so at 250ms it added
+  up to 250ms to a default first retry of 250 to 500ms.
+- `-c` derivation now **floors** every per process division instead of
+  rounding up. `-c` is a ceiling on the whole worker, and each supervised
+  child receives the same resolved flags, so rounding each child up overshot:
+  `-c 65` derived 2 x 33 = 66 slots and `-c 512` derived 6 x 86 = 516.
+  Overshoot is the dangerous direction, since `-c` is what an operator sizes a
+  database connection pool against.
+- cpu children can no longer exceed the core count. The rule was already
+  documented; `div_ceil` broke it, deriving 8 children for 6 cores at `-c 200`.
+- The tokio runtime is sized per worker process rather than taking a whole box
+  each. Six processes on six cores meant 36 runtime threads, none of which ever
+  executes Python. `TOKIO_WORKER_THREADS` still wins.
+- `AsyncResult.get()` and `aget()` poll at 1ms for their first ten reads before
+  doubling to `poll_interval`. A flat 50ms poll charged every awaited task 25ms
+  on average just to be noticed. `poll_interval` keeps its meaning as the
+  ceiling.
+- Task ids are generated with `os.urandom(16).hex()` rather than
+  `uuid.uuid4().hex`. Same 32 hex characters on the wire, 128 bits of entropy
+  instead of 122, and nothing ever parsed it back as a UUID.
+
 ### Fixed
+
+- **Logging could freeze the whole runtime.** Every tokio worker reaches a per
+  envelope `warn!`/`error!` site, so a stalled log reader filled the 64KiB pipe
+  and parked them one by one inside `write(2)`, with no error and nothing for
+  the wedge watchdog to see. Logs now go through a bounded non blocking sink
+  that drops and counts rather than blocking.
+- `gc.freeze()` now runs in the embedded interpreter after the app import. The
+  cpu fork parent already did this; the io lane never did, so the whole app
+  image sat in gen2 and every gen2 collection rescanned it while holding the
+  GIL that all in process tasks share. Measured on a 300k object image: 9.28ms
+  to 0.14ms.
+- Async `kind="cpu"` tasks run on a persistent per thread event loop instead of
+  `asyncio.run` per request, which cost 114.2us against 9.7us. Tasks left
+  running by a body that never awaited them are still cancelled at the end of
+  the request, so an orphan cannot outlive its own request.
+- `inspect.signature()` is bound once when a task is declared rather than
+  rebuilt on every `.delay()`, where it was 66% of the call.
+- The soft timeout disarm is skipped when nothing was armed, saving 893ns of
+  GIL held time on every task that declares no `soft_timeout`.
+- The idempotency digest hex encoder uses a nibble table rather than
+  `write!("{b:02x}")`, which cost more than the SHA-256 it was formatting.
+- `--print-plan` reports the tokio runtime threads it was omitting from its own
+  totals.
 
 #### Silent data corruption and lost work
 
@@ -456,6 +446,11 @@ Protocol and worker behaviour:
 
 ### Added
 
+- `--ack-batch` and `--ack-flush-ms` (64 / 2), under Advanced tuning, shown in
+  `--print-plan` and forwarded to every supervised worker process.
+- A trim backstop (`XTRIM MINID` at the provably acked boundary) that reclaims
+  entries orphaned by a torn flush, and by earlier per entry writes.
+
 - **`error.origin` on the result document**, valued `task` or `worker`, so a
   caller can tell an exception that came out of its own code from one cauli
   synthesized. Additive: a client reading an older result simply finds it
@@ -510,9 +505,9 @@ Protocol and worker behaviour:
 
 ### Pre release audit fixes
 
-1.0.0 was never tagged before this pass. A five lens review of the tree found
+0.1.0 was never tagged before this pass. A five lens review of the tree found
 5 blockers and 19 high findings; everything below landed in response, so a
-reader comparing 1.0.0 against notes written earlier in the series will find
+reader comparing 0.1.0 against notes written earlier in the series will find
 these behaviours changed under the same version number.
 
 **Connectivity and the client surface**
@@ -666,7 +661,7 @@ that never ran**
 - **The stats line carries `pid=`, `host=` and `duplicate=`,** and `retried`
   is incremented only when the retry write succeeded. During a Redis brownout
   `retried` used to climb at full rate while nothing was scheduled. Section 7
-  of PROTOCOL.md is updated: those three keys are part of the frozen 1.x key
+  of PROTOCOL.md is updated: those three keys are part of the stable key
   set.
 
 **Documentation and repository**
@@ -696,7 +691,7 @@ that never ran**
   `docs/AUDIT_LOG.md`) are no longer tracked. They named unpushed branches and
   interim verdicts that read as the project's current position.
 - `scripts/check_versions.py` reads README.md's Status section as a fifth
-  version source. Four artifacts shipped 1.0.0 marked Production/Stable while
+  version source. Four artifacts shipped one version marked Production/Stable while
   the landing page said v0.1 and CI stayed green, because nothing read it.
 - `docs/decisions/` is reframed as historical design notes with a verified
   status line per document, instead of nine documents all stamped as not
@@ -723,14 +718,14 @@ that never ran**
   has no retry rate lane.
 - Nothing XTRIMs `cauli:q:{queue}`. The ack and the delete are one
   transaction now, so no new orphan can be created, but an orphan left in a
-  live stream by a pre 1.0 build stays there. A periodic sweep was considered
+  live stream by a pre release build stays there. A periodic sweep was considered
   and rejected: MAXLEN and MINID cannot tell an orphan from a legitimately
   pending or undelivered entry, so a sweep aggressive enough to reap orphans
   can delete live work.
 - `AsyncResult.get()` and `aget()` poll `GET cauli:result:{id}` every 50ms by
   default. There is no push notification, so a result wait carries a 25ms mean
   floor and 20 reads per second per waiter. `poll_interval` is tunable per
-  call. Replacing the poll with pub/sub is a wire change and is not in 1.x.
+  call. Replacing the poll with pub/sub is a wire change and is not currently planned.
 - `--io-concurrency` defaults to 256 while the only slot sweep in `bench/`
   stalls above 104 per process. The stall is unattributed: the same harness
   opens one Redis connection per concurrent caller, so it may have exhausted
@@ -827,7 +822,7 @@ that never ran**
   throughput while inflating latency is visible rather than silent, plus
   `pid=` and `host=` so one supervised process can be told from another. What
   is still missing is the shape of it: there is no metrics endpoint, no JSON
-  logging, no health endpoint and no queue depth field, all rejected for 1.0
+  logging, no health endpoint and no queue depth field, all rejected for this release
   in `docs/decisions/observability.md`. Scraping means parsing a log line.
   Percentiles are per interval and are drained on read, so a scraper and a
   human tailing the log will not see the same numbers.
@@ -897,22 +892,22 @@ that never ran**
 
 **Upgrade workers before producers.** A worker that does not recognise a task
 name consumes the message and dead letters it terminally. That was already
-true before 1.0; what changed is that it now also writes an
+true before this release; what changed is that it now also writes an
 `UnregisteredTask` failure result, so the caller stops waiting and receives a
 definitive error rather than blocking. Either way the task does not survive
 the rollout to be picked up by a newer worker, so in a rolling deploy every
-worker must be running 1.0 and must know the new task name before anything
+worker must be running 0.1.0 and must know the new task name before anything
 enqueues it.
 
 **Idempotency keys change shape, so a rolling upgrade can run a guarded task
 twice.** The Redis key is now derived with SHA-256 instead of 64 bit FNV-1a,
-so a key minted by a pre 1.0 worker never matches the key a 1.0 worker
+so a key minted by a pre release worker never matches the key a 0.1.0 worker
 computes for the same string. A claim written by an old worker is invisible
 to a new one. For the length of the rollout, and for as long as any old claim
 is still live afterwards, a task carrying an `idempotency_key` can execute
 twice. Nothing in cauli can bridge the two derivations. If your workload
 cannot tolerate that, drain the queues and stop every old worker before
-starting a 1.0 one, rather than rolling. If it can, roll normally and accept
+starting a 0.1.0 one, rather than rolling. If it can, roll normally and accept
 duplicates for the window. Old claim keys are not read again and expire on
 their own TTL.
 

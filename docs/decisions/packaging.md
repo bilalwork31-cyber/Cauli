@@ -6,7 +6,7 @@
 > [docs/CONFIGURATION.md](../CONFIGURATION.md), those win. The status line below was
 > checked against the source, not carried over.
 >
-> **Status: shipped in 1.0.0.** Wheels are built for CPython 3.10 through 3.14, and the
+> **Status: shipped in 0.1.0.** Wheels are built for CPython 3.10 through 3.14, and the
 > `cauli-worker` console script points the dynamic loader at the running interpreter's own
 > library directory before it execs the binary, which is what makes conda, uv managed
 > interpreters and minimal containers work. Claiming the PyPI names happens outside this

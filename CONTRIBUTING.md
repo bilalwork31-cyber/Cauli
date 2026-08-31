@@ -7,7 +7,7 @@ Thanks for looking. Read this first, it is short.
 Open an issue for anything larger than a bug fix or a documentation change.
 This project has a narrow scope on purpose: chains, groups, chords, rate
 limits, task priorities, brokers other than Redis and Redis Cluster are all
-non goals for 1.x, listed in [PROTOCOL.md](PROTOCOL.md) section 11. A pull
+non goals, listed in [PROTOCOL.md](PROTOCOL.md) section 11. A pull
 request implementing one of those will be declined however good it is, and an
 issue first saves you the work.
 
@@ -68,8 +68,9 @@ packaging job that builds both distributions.
 
 - **A failing test before, a passing test after.** Reproduce, root cause, fix,
   verify. A fix with no test that would have caught it will be asked for one.
-- **The wire format is frozen for 1.x.** Any change to the envelope, the Redis
-  key names or the stats line key set is a major version change. Adding a stats
+- **The wire format is stable.** Any change to the envelope, the Redis
+  key names or the stats line key set is a breaking change and must be
+  called out as one in the changelog. Adding a stats
   key is allowed; renaming or removing one is not.
   [PROTOCOL.md](PROTOCOL.md) is the contract, and a protocol change means
   changing that document in the same pull request.
