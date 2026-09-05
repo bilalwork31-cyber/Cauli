@@ -58,8 +58,8 @@ clap = { version = "4", features = ["derive"] }
 crossbeam-channel = "0.5"
 gethostname = "1"
 libc = "0.2"
-pyo3 = { version = "0.26", features = ["auto-initialize"] }
-rand = "0.9"
+pyo3 = { version = "0.29", features = ["auto-initialize"] }
+rand = "0.10"
 # tokio-rustls-comp (audit BLOCKER, TLS): with no TLS feature compiled in,
 # redis::Client::open("rediss://...") fails at parse, so every managed redis
 # that requires TLS in transit (Upstash, ElastiCache with encryption in
@@ -70,7 +70,7 @@ rand = "0.9"
 # rustls-native-certs; `tls-rustls-webpki-roots` would REPLACE that with a
 # baked in bundle, which is the wrong default for a worker that has to trust
 # a private CA or a corporate proxy.
-redis = { version = "0.32", features = ["tokio-comp", "connection-manager", "tokio-rustls-comp"] }
+redis = { version = "1.6", features = ["tokio-comp", "connection-manager", "tokio-rustls-comp"] }
 # Direct dependency for exactly one reason: redis depends on rustls with
 # default-features off, so no crypto provider is selected and
 # `ClientConfig::builder()` would panic on the first rediss:// connection.
@@ -110,6 +110,6 @@ libc = "0.2"
 # connection-manager: worker/tests/redis_response_timeout.rs exercises
 # ConnectionManager/ConnectionManagerConfig directly, the same types
 # main.rs builds its two redis connections with.
-redis = { version = "0.32", features = ["tokio-comp", "connection-manager"] }
+redis = { version = "1.6", features = ["tokio-comp", "connection-manager"] }
 serde_json = { version = "1", features = ["arbitrary_precision"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
