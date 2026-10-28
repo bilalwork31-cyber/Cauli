@@ -12,6 +12,9 @@
 //! target its own source file and compile the runtime once. See
 //! worker/Cargo.toml for the features that select between the two names.
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod backoff;
 mod broker;
 mod cli;

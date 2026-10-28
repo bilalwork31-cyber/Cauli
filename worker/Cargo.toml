@@ -58,6 +58,7 @@ clap = { version = "4", features = ["derive"] }
 crossbeam-channel = "0.5"
 gethostname = "1"
 libc = "0.2"
+mimalloc = { version = "0.1", default-features = false }
 pyo3 = { version = "0.26", features = ["auto-initialize"] }
 rand = "0.9"
 # tokio-rustls-comp (audit BLOCKER, TLS): with no TLS feature compiled in,
@@ -109,6 +110,7 @@ codegen-units = 1
 
 [dev-dependencies]
 libc = "0.2"
+mimalloc = { version = "0.1", default-features = false }
 # connection-manager: worker/tests/redis_response_timeout.rs exercises
 # ConnectionManager/ConnectionManagerConfig directly, the same types
 # main.rs builds its two redis connections with.
