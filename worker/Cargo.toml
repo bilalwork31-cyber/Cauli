@@ -48,6 +48,7 @@ libc = "0.2"
 mimalloc = { version = "0.1", default-features = false }
 pyo3 = { version = "0.26", features = ["auto-initialize"] }
 rand = "0.9"
+ring = "0.17"
 # tokio-rustls-comp: without a TLS feature, rediss:// URLs fail to parse and
 # every TLS only managed Redis is unreachable. rustls avoids an OpenSSL build
 # dependency. It trusts the platform certificate store; webpki-roots would

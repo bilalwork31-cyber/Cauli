@@ -146,6 +146,7 @@ dependencies = [
  "pyo3",
  "rand",
  "redis",
+ "ring",
  "rustls",
  "serde",
  "serde_json",
