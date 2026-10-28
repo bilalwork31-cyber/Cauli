@@ -110,10 +110,21 @@ Beat:
 
 ### Performance
 
-Worker CPU per task, single process, noop tasks, interleaved A/B against
-0.1.0 with a 95% interval: async 47.7 to 28.7 us, sync 131.1 to 77.2 us, cpu
-105.8 to 62.0 us. With a real task body the body dominates; a redis INCR
-body moves the sync lane 1.14x and the async lane not measurably.
+Worker CPU per task, single process, noop tasks, interleaved A/B with a 95%
+interval, 0.1.0 against this release: async 47.7 to 22.8 us (120k tasks/s),
+sync 131.1 to 22.1 us (114k tasks/s), cpu 105.8 to 57.4 us. With a real task
+body the body dominates: a sync task sleeping 1 ms is bound by the GIL
+handing over between threads, and runs 3.9x faster on free threaded 3.14t.
+
+- The global allocator is mimalloc: glibc malloc and its arena locks were
+  about 10% of the worker's Rust threads (sync 1.16x, cpu 1.07x the rate).
+- A sync pool thread takes a job off the queue only once it holds the GIL,
+  with one thread on standby: each job used to wake a thread that then
+  queued for the GIL behind the others (sync noop 3.63x the rate, a 1 ms
+  blocking body unchanged).
+- Async tasks start eagerly on their loop (Python 3.12 and newer), and every
+  async deadline shares one loop timer and a heap instead of one timer per
+  task (async noop 1.32x the rate together).
 
 - Task arguments and results cross the worker as the producer's JSON text.
   The worker no longer parses them into a tree, converts that tree to Python

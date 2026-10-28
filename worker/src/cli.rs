@@ -111,8 +111,12 @@ pub struct Args {
     pub no_fork_server: bool,
 
     /// XREADGROUP COUNT per fetch. Must be at least 1. A fetch never takes
-    /// more than the free io slots; 64 measured 1.29x (async) and 2.1x (cpu)
-    /// the drain rate of 16, and 128 or 256 added nothing.
+    /// more than the free io slots. For sub millisecond tasks a larger batch
+    /// drains faster (noop tasks, one process: 128 was about 1.35x sync and
+    /// 1.10x async; 256 with --cpu-prefetch 16 took noop cpu tasks from 85k/s
+    /// to 134k/s), but fetched cpu entries wait for a cpu slot inside the
+    /// worker with their recovery clock running, so raise it only for short
+    /// tasks.
     #[arg(long, default_value_t = 64, help_heading = ADVANCED)]
     pub batch: usize,
 
