@@ -19,7 +19,7 @@
 //! measured out at roughly double the broker command load. A timestamp is not
 //! worth that. Between samples the reading extrapolates from a monotonic
 //! `Instant`, so it never steps and never goes backwards, and quartz drift is
-//! about 3ms per minute against the 250ms mover granularity.
+//! about 3ms per minute against the 50ms default mover interval.
 
 use redis::aio::ConnectionManager;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};

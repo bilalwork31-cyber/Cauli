@@ -223,11 +223,11 @@ def test_path_annotation_survives_the_envelope_shape(codec):
     assert str(info.value).startswith("args[1]['attachment']: ")
 
 
-def test_cyclic_payload_still_raises_recursion_error(codec):
-    """RecursionError is deliberately not annotated with a path (there is no
-    finite one), and must still reach the caller as a member of
-    ENCODE_ERRORS rather than being swallowed by the annotation handler."""
+def test_cyclic_payload_is_refused_at_the_nesting_limit(codec):
+    """A cycle has no finite depth, so the worker parse limit stops the walk
+    with a ValueError (a member of ENCODE_ERRORS) long before the
+    interpreter recursion limit is reached."""
     loop: list = [1]
     loop.append(loop)
-    with pytest.raises(RecursionError):
+    with pytest.raises(ValueError, match="nested deeper than 127"):
         codec.encode({"args": loop})

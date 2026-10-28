@@ -385,3 +385,32 @@ def test_response_write_failure_is_logged(capsys):
     err = capsys.readouterr().err
     assert "response write failed for request 'w1'" in err
     assert "BrokenPipeError" in err
+
+
+def test_undecodable_request_still_answers_its_own_id(child):
+    # serde_json in the worker accepts both numbers; msgspec here does not.
+    # The response must carry the id, or the worker drops it and the task
+    # waits out its hard timeout. Retrying the same bytes cannot succeed.
+    for i, bad in enumerate(("1e400", "9" * 5000)):
+        child.proc.stdin.write(
+            '{"id":"u%d.1","task":"add","args":[%s,1],"kwargs":{}}\n' % (i, bad)
+        )
+        child.proc.stdin.flush()
+        resp = child.read_json()
+        assert resp["id"] == "u%d.1" % i
+        assert resp["ok"] is False
+        assert resp["retryable"] is False
+        assert resp["error"]["type"] == "ProtocolError"
+
+
+def test_a_task_can_terminate_its_own_forked_subprocess(child):
+    resp = child.request(
+        {
+            "id": "g1",
+            "task": "terminate_grandchild",
+            "args": [],
+            "kwargs": {},
+            "soft_timeout_ms": None,
+        }
+    )
+    assert resp == {"id": "g1", "ok": True, "result": -15}

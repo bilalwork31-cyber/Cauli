@@ -13,6 +13,7 @@ import os
 import re
 import threading
 import time
+import weakref
 from datetime import datetime
 from typing import Any, Callable, Iterable, overload
 
@@ -27,16 +28,22 @@ log = logging.getLogger("cauli.app")
 
 _DEFAULT_REDIS_URL = "redis://localhost:6379/0"
 # Matches the Rust worker's --redis-timeout default (worker/src/cli.rs). Passed
-# explicitly to redis.Redis.from_url below: redis-py's own default for this
-# depends on the installed version (pyproject pins only "redis>=5", no upper
+# explicitly to the connection pools below: redis-py's own default for this
+# depends on the installed version (pyproject pins only "redis>=5.0.1", no upper
 # bound), so leaving it unset would make this client's hang behavior an
 # accident of whatever version happens to be installed rather than a decision.
 _DEFAULT_SOCKET_TIMEOUT = 5
+# Connections per client. redis-py 8 caps its default pool at 100 and raises
+# MaxConnectionsError on the 101st concurrent caller (redis-py 5 had no cap),
+# so a burst of adelay() calls lost enqueues. A blocking pool keeps the cap but
+# makes a caller past it wait, up to the socket timeout, for a free connection.
+_POOL_MAX_CONNECTIONS = 100
 # Matches the Rust worker's --max-envelope-bytes default (worker/src/cli.rs).
 # The two are one setting in two places: the client refuses to write what the
 # worker would refuse to read.
 _DEFAULT_MAX_ENVELOPE_BYTES = 1_048_576
 _QUEUE_NAME_RE = re.compile(r"[a-zA-Z0-9_.-]+\Z")
+_U64_MAX = 2**64 - 1
 
 #: Wildcard key in :attr:`Cauli.queue_ttl` meaning "every queue without an
 #: explicit entry". Also read by the Rust worker (PROTOCOL.md section 9.2).
@@ -191,23 +198,28 @@ def _redact_redis_url(url: str) -> str:
     if scheme_sep == -1:
         return url
     rest = url[scheme_sep + 3 :]
-    # Authority ends at the first "/", "?" or "#"; "@" means the
-    # userinfo/host boundary only within it, so an "@" inside a later
-    # password= value (masked separately below) can never be mistaken for a
-    # second one and corrupt the visible host.
+    # The userinfo "@" is searched for up to the query, not just up to the
+    # first "/" or "#": an unencoded "/" or "#" in a password (base64 output
+    # has "/") makes the URL unparseable, and whatever reports that must not
+    # print the password. Last "@", not first, for a password that itself
+    # contains "@". An "@" inside ?password= is masked below.
+    query_start = rest.find("?")
+    at = rest.rfind("@", 0, len(rest) if query_start == -1 else query_start)
+    mask = "***@" if at != -1 else ""
+    rest = rest[at + 1 :]
     authority_end = len(rest)
     for ch in "/?#":
         i = rest.find(ch)
         if i != -1:
             authority_end = min(authority_end, i)
     authority, tail = rest[:authority_end], rest[authority_end:]
-    # Last "@", not first: urllib.parse (what redis-py itself uses) resolves
-    # a password containing a literal "@" the same way, so splitting at the
-    # first one would leave that password's own tail in plaintext right
-    # after the mask.
-    at = authority.rfind("@")
-    new_authority = f"***@{authority[at + 1 :]}" if at != -1 else authority
-    return f"{url[:scheme_sep]}://{new_authority}{_redact_query_credentials(tail)}"
+    return f"{url[:scheme_sep]}://{mask}{authority}{_redact_query_credentials(tail)}"
+
+
+def _is_credential_key(name: str) -> bool:
+    # redis-py percent-decodes query keys (parse_qs), so a key holding a "%"
+    # may spell "password". pass/user are redis-rs's unix socket keys.
+    return name in ("password", "username", "pass", "user") or "%" in name
 
 
 def _redact_query_credentials(tail: str) -> str:
@@ -226,9 +238,7 @@ def _redact_query_credentials(tail: str) -> str:
     pairs = []
     for pair in rest.split("&"):
         name, sep, _value = pair.partition("=")
-        pairs.append(
-            f"{name}=***" if sep and name in ("password", "username") else pair
-        )
+        pairs.append(f"{name}=***" if sep and _is_credential_key(name) else pair)
     return f"{path}?{'&'.join(pairs)}{fragment}"
 
 
@@ -321,8 +331,13 @@ class Cauli:
     def _new_redis(self) -> redis.Redis:
         """Build the client: the injected one (or its factory), else ``redis_url``."""
         if self.redis_client is None:
-            return redis.Redis.from_url(
-                self.redis_url, socket_timeout=_DEFAULT_SOCKET_TIMEOUT
+            return redis.Redis.from_pool(
+                redis.BlockingConnectionPool.from_url(
+                    self.redis_url,
+                    max_connections=_POOL_MAX_CONNECTIONS,
+                    timeout=_DEFAULT_SOCKET_TIMEOUT,
+                    socket_timeout=_DEFAULT_SOCKET_TIMEOUT,
+                )
             )
         return self.redis_client() if callable(self.redis_client) else self.redis_client
 
@@ -617,6 +632,11 @@ class Cauli:
                 "pass either countdown (relative seconds) or eta (absolute "
                 "datetime), not both"
             )
+        if idempotency_key is not None and not isinstance(idempotency_key, str):
+            raise TypeError(
+                f"idempotency_key must be a str, got {type(idempotency_key).__name__}; "
+                f"pass str({idempotency_key!r}) explicitly"
+            )
         kwargs = dict(kwargs or {})
         args = list(args or ())
         now = _now_ms() if now is None else int(now)
@@ -649,6 +669,14 @@ class Cauli:
                 raise TypeError(
                     "expires must be seconds (number) or a timezone-aware datetime, "
                     f"got {type(expires).__name__}"
+                )
+            # The worker parses expires_at as an unsigned 64 bit integer; a
+            # value outside that range fails the whole envelope parse, so no
+            # result is ever written and get() waits forever.
+            if not 0 <= expires_at <= _U64_MAX:
+                raise ValueError(
+                    f"expires={expires!r} gives epoch ms {expires_at}, outside "
+                    f"0..{_U64_MAX}"
                 )
         elif queue_ttl_ms is not None:
             # Only a client-side DEFAULT, which is why it is in the `elif`:
@@ -891,10 +919,10 @@ class AsyncCauli(Cauli):
     path reuses :meth:`make_envelope` and :meth:`_publish` unchanged, so there
     is no second wire format to keep in step.
 
-    The asyncio client is created lazily and cached, and redis-py binds its
-    connections to the loop that first uses them. So use one ``AsyncCauli`` per
-    event loop, and call ``await app.aclose()`` at shutdown (FastAPI's lifespan
-    handler is the natural place) to close the pool.
+    The asyncio client is created lazily and cached per event loop, since
+    redis-py binds its connections to the loop that first uses them. Call
+    ``await app.aclose()`` on that loop at shutdown (FastAPI's lifespan
+    handler is the natural place) to close its pool.
     """
 
     def __init__(
@@ -905,7 +933,7 @@ class AsyncCauli(Cauli):
         # or a zero-arg factory returning one. Same reason it exists -- a
         # Sentinel set, a TLS context or a shared pool has no URL form.
         self.async_redis_client: Any = async_redis_client
-        self._aredis: Any = None
+        self._aredis: weakref.WeakKeyDictionary[Any, Any] = weakref.WeakKeyDictionary()
 
     def _new_async_redis(self) -> Any:
         # Imported here, not at module scope: the worker's embedded interpreter
@@ -914,26 +942,47 @@ class AsyncCauli(Cauli):
         from redis import asyncio as aioredis
 
         if self.async_redis_client is None:
-            return aioredis.Redis.from_url(
-                self.redis_url, socket_timeout=_DEFAULT_SOCKET_TIMEOUT
+            return aioredis.Redis.from_pool(
+                aioredis.BlockingConnectionPool.from_url(
+                    self.redis_url,
+                    max_connections=_POOL_MAX_CONNECTIONS,
+                    timeout=_DEFAULT_SOCKET_TIMEOUT,
+                    socket_timeout=_DEFAULT_SOCKET_TIMEOUT,
+                )
             )
         supplied = self.async_redis_client
         return supplied() if callable(supplied) else supplied
 
     def _get_async_redis(self) -> Any:
-        """The cached ``redis.asyncio`` client. Creating it opens no connection.
+        """The running loop's cached ``redis.asyncio`` client. Creating it
+        opens no connection.
+
+        One client per loop: redis-py binds a pool's connections and its lock
+        to the loop that first used them, so one client shared by a second
+        loop raised "Event loop is closed" on every other ``asyncio.run()``
+        (``async_to_sync``, pytest-asyncio) and hung outright when two loop
+        threads raced it. Weak keys drop a client together with its loop.
 
         Guarded by the SAME threading lock as the sync client rather than an
         ``asyncio.Lock``: an asyncio lock binds to the first loop that awaits
-        it, which would make a second ``asyncio.run()`` in the same process
-        fail on a lock that has nothing to do with the task at hand. Building
-        the client object does no I/O, so a plain lock costs nothing here.
+        it. Building the client object does no I/O, so a plain lock costs
+        nothing here.
         """
-        if self._aredis is None:
+        import asyncio
+
+        loop = asyncio.get_running_loop()
+        client = self._aredis.get(loop)
+        if client is None:
             with self._redis_lock:
-                if self._aredis is None:
-                    self._aredis = self._new_async_redis()
-        return self._aredis
+                client = self._aredis.get(loop)
+                if client is None:
+                    # The client's connections hold its loop, so a weak key
+                    # alone never lets go of a finished asyncio.run(): drop
+                    # closed loops here, and their sockets with them.
+                    for closed in [lp for lp in self._aredis if lp.is_closed()]:
+                        del self._aredis[closed]
+                    client = self._aredis[loop] = self._new_async_redis()
+        return client
 
     async def _aenqueue(
         self,
@@ -979,12 +1028,15 @@ class AsyncCauli(Cauli):
         return [AsyncResult(task_id, self) for task_id, _raw, _q, _f in prepared]
 
     async def aclose(self) -> None:
-        """Close the asyncio client and its pool. Safe to call more than once.
+        """Close the running loop's asyncio client and its pool. Safe to call
+        more than once.
 
         Does NOT touch the sync client: that one has its own lifetime and is
         not bound to any event loop.
         """
-        client, self._aredis = self._aredis, None
+        import asyncio
+
+        client = self._aredis.pop(asyncio.get_running_loop(), None)
         if client is None:
             return
         # redis-py renamed the coroutine to `aclose()` in 5.0.1 and deprecated

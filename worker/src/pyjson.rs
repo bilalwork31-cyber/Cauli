@@ -76,10 +76,17 @@ pub fn json_to_py<'py>(py: Python<'py>, v: &Value, depth: usize) -> PyResult<Bou
                 if text.contains('.') || text.contains('e') || text.contains('E') {
                     // Genuinely written with a decimal point or exponent, so
                     // this is a float on the wire, not an integer literal.
-                    // serde_json only produces finite f64 here (it rejects
-                    // NaN/Infinity at parse time), so this cannot make a
-                    // non-JSON float.
-                    n.as_f64().unwrap_or(0.0).into_pyobject(py)?.into_any()
+                    // Under arbitrary_precision a literal past f64 range
+                    // (`1e400`) parses fine and `as_f64` is None for it.
+                    // Rejected, as msgspec rejects it, never read as 0.0.
+                    n.as_f64()
+                        .ok_or_else(|| {
+                            pyo3::exceptions::PyValueError::new_err(format!(
+                                "number {text} is outside the float range"
+                            ))
+                        })?
+                        .into_pyobject(py)?
+                        .into_any()
                 } else {
                     // A plain integer literal outside i64/u64 range, e.g.
                     // uuid.uuid4().int. With the arbitrary_precision feature
@@ -102,13 +109,11 @@ pub fn json_to_py<'py>(py: Python<'py>, v: &Value, depth: usize) -> PyResult<Bou
         Value::Object(map) => {
             let dict = PyDict::new(py);
             for (k, val) in map {
-                // Interned: object keys are overwhelmingly kwarg names and
-                // record field names, i.e. the SAME handful of short strings
-                // on every invocation of a task. Interning lets CPython reuse
-                // one object per distinct key instead of allocating a fresh
-                // PyString per key per task, and makes the dict insert hit the
-                // fast pointer-equality path.
-                dict.set_item(PyString::intern(py, k), json_to_py(py, val, depth + 1)?)?;
+                // Not interned: keys come from task payloads, and on 3.12 and
+                // free threaded builds an interned string is immortal, so every
+                // distinct key (a uuid keyed map, say) would leak for the life
+                // of the process.
+                dict.set_item(PyString::new(py, k), json_to_py(py, val, depth + 1)?)?;
             }
             dict.into_any()
         }
@@ -137,9 +142,14 @@ pub fn py_to_json(obj: &Bound<'_, PyAny>, depth: usize) -> Result<Value, ConvErr
         if let Ok(u) = obj.extract::<u64>() {
             return Ok(Value::Number(u.into()));
         }
-        return Err(ConvError::new(
-            "integer is outside the range JSON can represent",
-        ));
+        // Beyond 64 bits: arbitrary_precision keeps the exact digits, the
+        // same way json_to_py accepts them on the way in.
+        let digits = obj
+            .str()
+            .map_err(|_| ConvError::new("could not read integer"))?;
+        return serde_json::from_str::<serde_json::Number>(&digits.to_string_lossy())
+            .map(Value::Number)
+            .map_err(|_| ConvError::new("integer is outside the range JSON can represent"));
     }
     if obj.downcast::<PyFloat>().is_ok() {
         let f: f64 = obj
@@ -341,6 +351,27 @@ mod tests {
         });
     }
 
+    /// `1e400` is valid JSON syntax that arbitrary_precision keeps as text.
+    /// It used to reach the task as 0.0, silently; msgspec, the client's
+    /// codec, rejects it as out of range, and so must this.
+    #[test]
+    fn float_literal_past_f64_range_is_rejected_not_zeroed() {
+        Python::initialize();
+        Python::attach(|py| {
+            for raw in ["1e400", "-1e400"] {
+                let v: Value = serde_json::from_str(raw).unwrap();
+                let got = json_to_py(py, &v, 0).map(|o| o.str().unwrap().to_string());
+                assert!(got.is_err(), "{raw} must be rejected, got {got:?}");
+            }
+            let v: Value = serde_json::from_str("1e-400").unwrap();
+            let tiny: f64 = json_to_py(py, &v, 0).unwrap().extract().unwrap();
+            assert_eq!(
+                tiny, 0.0,
+                "underflow to 0.0 is what every JSON decoder does"
+            );
+        });
+    }
+
     /// End to end version of the reproduction above: the exact value from
     /// the audit, arriving as a real envelope's kwargs, must reach the task
     /// as an int with the exact value the caller sent.
@@ -419,5 +450,53 @@ mod tests {
         };
         assert!(serde_json::from_str::<Value>(&nested(MAX_DEPTH - 1)).is_ok());
         assert!(serde_json::from_str::<Value>(&nested(MAX_DEPTH)).is_err());
+    }
+
+    /// The way out must accept what the way in does: a task returning
+    /// `uuid.uuid4().int` (or anything past 64 bits) must keep its exact
+    /// value instead of dead lettering as SerializationError.
+    #[test]
+    fn huge_integer_result_converts_exactly() {
+        Python::initialize();
+        Python::attach(|py| {
+            for raw in ["18446744073709551616", "-9223372036854775809"] {
+                let obj = py
+                    .eval(&std::ffi::CString::new(raw).unwrap(), None, None)
+                    .unwrap();
+                let v = py_to_json(&obj, 0).map_err(|e| e.0).expect(raw);
+                assert_eq!(v.to_string(), raw);
+            }
+        });
+    }
+
+    /// Payload keys must stay mortal: on 3.12 and free threaded builds an
+    /// interned string is immortal, so interning every key leaks each
+    /// distinct one forever.
+    #[test]
+    fn object_keys_are_not_immortalized() {
+        Python::initialize();
+        Python::attach(|py| {
+            let obj =
+                json_to_py(py, &serde_json::json!({"rv_exec_unique_key_0b1c": 1}), 0).unwrap();
+            let key = obj
+                .downcast::<PyDict>()
+                .unwrap()
+                .keys()
+                .get_item(0)
+                .unwrap();
+            let refs: u64 = py
+                .import("sys")
+                .unwrap()
+                .getattr("getrefcount")
+                .unwrap()
+                .call1((key,))
+                .unwrap()
+                .extract()
+                .unwrap();
+            assert!(
+                refs < 1 << 30,
+                "payload key was immortalized (refcount {refs})"
+            );
+        });
     }
 }

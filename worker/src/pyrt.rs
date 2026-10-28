@@ -159,9 +159,12 @@ fn outcome_from_py(obj: &Bound<'_, PyAny>) -> Outcome {
     let err = get("error")
         .and_then(|e| {
             let f = |k: &str| {
+                // Lossy, not extract::<String>: one lone surrogate must not
+                // blank the whole message or traceback.
                 e.get_item(k)
                     .ok()
-                    .and_then(|v| v.extract::<String>().ok())
+                    .and_then(|v| v.downcast_into::<pyo3::types::PyString>().ok())
+                    .map(|s| s.to_string_lossy().into_owned())
                     .unwrap_or_default()
             };
             let type_ = f("type");
@@ -191,8 +194,9 @@ fn outcome_from_py(obj: &Bound<'_, PyAny>) -> Outcome {
     Outcome::Failure { err, retryable }
 }
 
-/// `json_to_py`'s only failure mode is the argument tree nesting deeper than
-/// `pyjson::MAX_DEPTH`: a structural property of the payload itself, not a
+/// `json_to_py` fails only on the argument tree nesting deeper than
+/// `pyjson::MAX_DEPTH` or on a float literal past f64 range: either way a
+/// structural property of the payload itself, not a
 /// transient shim or environment problem, so retrying parses the identical
 /// too deep tree again and fails identically every time. Classified the
 /// same as the opposite direction's depth failure (`py_to_json`, handled in
@@ -249,24 +253,25 @@ fn pyerr_string(py: Python<'_>, e: &PyErr) -> String {
 /// guard exists to convert into an immediate startup error.
 static RUNTIME_BUILT: AtomicBool = AtomicBool::new(false);
 
-/// `sys.executable` of the interpreter this worker already embeds, or None
+/// The interpreter cpu children should run, as `shim.cpu_child_python()`
+/// picks it: one that loads the same libpython this worker embeds, or None
 /// when the embedding gives no path (a statically linked or frozen build).
 ///
-/// This is the right default for `--python`, which spawns cpu children. The
-/// old default was the bare string `"python3"`, resolved through `PATH` by
-/// `Command::new`: a systemd `ExecStart=/opt/app/venv/bin/cauli-worker` or a
-/// Docker `CMD` never activates the venv, so it found the base interpreter
-/// with no `cauli` package in it. The fork server then failed, the stdio
-/// fallback respawn looped, the cpu backlog filled, and the fetch loop's
-/// backlog gate stopped fetching io work too — one misrouted interpreter
-/// taking the whole worker offline at warn level. The embedded interpreter
-/// is by construction the one that successfully imported the app.
+/// This is the default for `--python`. A bare `"python3"` off `PATH` finds
+/// the base interpreter with no `cauli` in it under a systemd unit or Docker
+/// `CMD` that never activates the venv, and the embedded `sys.executable` is
+/// itself only a `PATH` guess: on a uv, pyenv or free threaded build it named
+/// a different CPython, whose children could not import the app's C
+/// extensions. A misrouted interpreter fails the fork server, the cpu
+/// backlog fills, and the fetch loop's backlog gate stops io work too.
 pub fn interpreter_executable() -> Option<String> {
     Python::attach(|py| {
         let exe: String = py
-            .import("sys")
+            .import("cauli_worker_shim")
             .ok()?
-            .getattr("executable")
+            .getattr("cpu_child_python")
+            .ok()?
+            .call0()
             .ok()?
             .extract()
             .ok()?;
@@ -720,6 +725,33 @@ pub struct SyncPool {
     pub live_threads: Arc<std::sync::atomic::AtomicI64>,
 }
 
+fn run_sync_job(rt: &PyRuntime, job: SyncJob) {
+    if job.resp.is_closed() {
+        // The dispatcher already abandoned this job (hard timeout while
+        // still queued): running it now would be zombie execution with no
+        // one listening.
+        return;
+    }
+    #[cfg(any(test, feature = "test-hooks"))]
+    if job.name == TEST_HOOK_PANIC_JOB {
+        panic!("test-hooks: deliberate sync pool worker panic");
+    }
+    // Committing to run: from here the dispatcher charges the job's own
+    // timeout_ms. An Err means it stopped waiting between the is_closed
+    // check above and now, so skip rather than run a zombie.
+    if job.started.send(()).is_err() {
+        return;
+    }
+    let out = rt.run_sync_blocking(
+        &job.name,
+        &job.args,
+        &job.kwargs,
+        job.soft_timeout_ms,
+        job.meta.as_deref(),
+    );
+    let _ = job.resp.send(out);
+}
+
 impl SyncPool {
     /// `queue_capacity` bounds the crossbeam channel; pass `--io-concurrency`
     /// (the same admission gate that already bounds outstanding submissions
@@ -797,32 +829,22 @@ impl SyncPool {
                     pyo3::ffi::PyGILState_Ensure();
                     pyo3::ffi::PyEval_SaveThread();
                 }
-                while let Ok(job) = rx.recv() {
-                    if job.resp.is_closed() {
-                        // The dispatcher already abandoned this job (hard
-                        // timeout while still queued): running it now would
-                        // be zombie execution with no one listening.
-                        continue;
-                    }
-                    #[cfg(any(test, feature = "test-hooks"))]
-                    if job.name == TEST_HOOK_PANIC_JOB {
-                        panic!("test-hooks: deliberate sync pool worker panic");
-                    }
-                    // Committing to run: from here the dispatcher charges the
-                    // job's own timeout_ms. An Err means it stopped waiting
-                    // between the is_closed check above and now, so skip
-                    // rather than run a zombie.
-                    if job.started.send(()).is_err() {
-                        continue;
-                    }
-                    let out = rt.run_sync_blocking(
-                        &job.name,
-                        &job.args,
-                        &job.kwargs,
-                        job.soft_timeout_ms,
-                        job.meta.as_deref(),
-                    );
-                    let _ = job.resp.send(out);
+                while let Ok(first) = rx.recv() {
+                    // One GIL entry per burst, not per job: while jobs are
+                    // queued this thread keeps the GIL and runs the next one.
+                    // Taking it per job made every pool thread park on the
+                    // GIL behind the others and be woken again for each
+                    // task: at --io-threads 4 and up a noop sync task cost
+                    // 127us of CPU against 22us on one thread. A task that
+                    // blocks still releases the GIL inside CPython, so the
+                    // other threads keep overlapping blocking io as before.
+                    Python::attach(|_py| {
+                        let mut next = Some(first);
+                        while let Some(job) = next {
+                            run_sync_job(&rt, job);
+                            next = rx.try_recv().ok();
+                        }
+                    });
                 }
             })
             .expect("failed to spawn sync pool thread");
@@ -1291,7 +1313,7 @@ app = _App()
                 !sys_modules
                     .contains("cauli")
                     .expect("sys.modules supports __contains__"),
-                "test setup invalid: cauli must not already be importable in this process"
+                "cauli is importable in this test process: run cargo test with no virtualenv activated (embedded CPython finds one through PATH)"
             );
             let code = CString::new(include_str!("shim.py")).expect("shim.py contains NUL byte");
 
@@ -1540,5 +1562,181 @@ app = _App()
                 outcome_name(&other)
             ),
         }
+    }
+
+    /// A lone surrogate in an exception message (an undecodable filename
+    /// joined into an f-string) must not blank the message and traceback.
+    #[test]
+    fn lone_surrogate_in_error_keeps_message_and_traceback() {
+        #[allow(deprecated)]
+        pyo3::prepare_freethreaded_python();
+        Python::attach(|py| {
+            let obj = py
+                .eval(
+                    c"{'ok': False, 'retryable': True, 'error': {'type': 'ValueError', 'message': 'bad \\udc80 name', 'traceback': 'Traceback \\udc80', 'origin': 'task'}}",
+                    None,
+                    None,
+                )
+                .unwrap();
+            match outcome_from_py(&obj) {
+                Outcome::Failure { err, .. } => {
+                    assert!(
+                        err.message.starts_with("bad "),
+                        "message lost: {:?}",
+                        err.message
+                    );
+                    assert!(
+                        err.traceback.starts_with("Traceback"),
+                        "traceback lost: {:?}",
+                        err.traceback
+                    );
+                }
+                other => panic!("expected a failure, got {}", outcome_name(&other)),
+            }
+        });
+    }
+
+    const ASYNC_TIMEOUT_APP_SRC: &str = r#"
+import asyncio
+
+
+class _Task:
+    def __init__(self, fn):
+        self.fn = fn
+        self.kind = "io"
+        self.is_async = True
+
+
+ran_past_hard = []
+
+
+async def stubborn(hold_s):
+    try:
+        await asyncio.sleep(hold_s)
+    except asyncio.CancelledError:
+        await asyncio.sleep(hold_s)
+    ran_past_hard.append(True)
+
+
+async def own_timeout():
+    await asyncio.wait_for(asyncio.sleep(5), 0.01)
+
+
+class _App:
+    redis_url = "redis://localhost:6379/0"
+    default_queue = "default"
+    result_ttl = 3600
+    idemp_ttl = 86400
+    queue_ttl = {}
+    _tasks = {"stubborn": _Task(stubborn), "own_timeout": _Task(own_timeout)}
+
+
+app = _App()
+"#;
+
+    /// The hard deadline behind a soft one must stop the body, not just
+    /// report TimeLimitExceeded while the body runs on beside its retry.
+    #[test]
+    fn async_hard_deadline_after_soft_cancels_the_body() {
+        let _shim_state = shim_state_guard();
+        let app_spec = Python::attach(|py| {
+            install_fake_app_module(py, "cauli_test_hard_cancel_app", ASYNC_TIMEOUT_APP_SRC)
+        });
+        let (rt, _cfg) = PyRuntime::init(&app_spec, 1).expect("valid app must init cleanly");
+        let (_token, rx) = rt.queue_submit(
+            "stubborn",
+            &serde_json::json!([0.6]),
+            &serde_json::json!({}),
+            0.4,
+            Some(0.1),
+            None,
+        );
+        match rx.blocking_recv().expect("submitter thread must respond") {
+            Outcome::Failure { err, .. } => assert_eq!(err.type_, "TimeLimitExceeded"),
+            other => panic!("expected a hard timeout, got {}", outcome_name(&other)),
+        }
+        std::thread::sleep(std::time::Duration::from_millis(900));
+        let ran: usize = Python::attach(|py| {
+            py.import("cauli_test_hard_cancel_app")
+                .and_then(|m| m.getattr("ran_past_hard"))
+                .and_then(|l| l.len())
+                .unwrap()
+        });
+        assert_eq!(
+            ran, 0,
+            "the body kept running after its hard deadline was reported"
+        );
+    }
+
+    /// A TimeoutError the async body raises itself (its own inner wait_for)
+    /// is the task's error, not the worker's TimeLimitExceeded.
+    #[test]
+    fn async_task_own_timeout_error_is_reported_as_the_tasks() {
+        let _shim_state = shim_state_guard();
+        let app_spec = Python::attach(|py| {
+            install_fake_app_module(py, "cauli_test_own_timeout_app", ASYNC_TIMEOUT_APP_SRC)
+        });
+        let (rt, _cfg) = PyRuntime::init(&app_spec, 1).expect("valid app must init cleanly");
+        let (_token, rx) = rt.queue_submit(
+            "own_timeout",
+            &serde_json::json!([]),
+            &serde_json::json!({}),
+            5.0,
+            None,
+            None,
+        );
+        match rx.blocking_recv().expect("submitter thread must respond") {
+            Outcome::Failure { err, .. } => {
+                assert_eq!(err.type_, "TimeoutError", "{err:?}");
+                assert_eq!(err.origin, "task");
+                assert!(err.traceback.contains("own_timeout"), "{err:?}");
+            }
+            other => panic!(
+                "expected the task's own TimeoutError, got {}",
+                outcome_name(&other)
+            ),
+        }
+    }
+
+    /// The worker's own hard deadline must always read as TimeLimitExceeded.
+    /// uvloop keeps time in whole milliseconds, so its timer fires at a time
+    /// that can compare one float ulp below the deadline `_arun` computed.
+    #[test]
+    fn async_hard_deadline_is_never_reported_as_the_tasks_own_timeout() {
+        let _shim_state = shim_state_guard();
+        let src = ASYNC_TIMEOUT_APP_SRC.replace(
+            "_tasks = {",
+            "_tasks = {\"nap\": _Task(lambda: asyncio.sleep(10)), ",
+        );
+        let app_spec =
+            Python::attach(|py| install_fake_app_module(py, "cauli_test_deadline_clock_app", &src));
+        let (rt, _cfg) = PyRuntime::init(&app_spec, 1).expect("valid app must init cleanly");
+        // Whether a deadline lands an ulp low depends on the loop clock
+        // reading it starts at, so spread starts over many milliseconds.
+        let rxs: Vec<_> = (0..400)
+            .map(|k| {
+                if k % 8 == 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                let timeout_s = (k % 50 + 1) as f64 / 1000.0;
+                let args = serde_json::json!([]);
+                rt.queue_submit("nap", &args, &serde_json::json!({}), timeout_s, None, None)
+                    .1
+            })
+            .collect();
+        let mut wrong = Vec::new();
+        for rx in rxs {
+            match rx.blocking_recv().expect("submitter thread must respond") {
+                Outcome::Failure { err, .. } if err.type_ == "TimeLimitExceeded" => {}
+                Outcome::Failure { err, .. } => wrong.push(err.type_),
+                other => wrong.push(outcome_name(&other).to_string()),
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "{} of 400 misreported: {:?}",
+            wrong.len(),
+            &wrong[..wrong.len().min(3)]
+        );
     }
 }

@@ -287,3 +287,101 @@ def test_beat_refuses_redis_url_against_an_injected_client(
 
     assert beat_module.main(["--app", "x:app", "--redis-url", redis_url, "--once"]) == 1
     injected.close()
+
+
+def test_one_app_serves_successive_event_loops(redis_url, redis_client):
+    # asgiref's async_to_sync and pytest-asyncio both run each call on a new
+    # loop. A client cached from a previous loop raised "Event loop is closed"
+    # on every second call.
+    app = AsyncCauli(redis_url=redis_url)
+
+    @app.task(name="t")
+    def t(i):
+        return i
+
+    for i in range(3):
+        asyncio.run(t.adelay(i))
+    assert redis_client.xlen("cauli:q:default") == 3
+
+
+def test_one_app_serves_two_loops_in_two_threads(redis_url, redis_client):
+    import threading
+
+    app = AsyncCauli(redis_url=redis_url)
+
+    @app.task(name="t")
+    def t(i):
+        return i
+
+    async def burst():
+        await asyncio.gather(*[t.adelay(i) for i in range(20)])
+        await app.aclose()
+
+    errors = []
+
+    def run():
+        try:
+            asyncio.run(burst())
+        except RuntimeError as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=run, daemon=True) for _ in range(2)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join(10)
+    assert not any(th.is_alive() for th in threads), "an enqueue hung"
+    assert errors == []
+    assert redis_client.xlen("cauli:q:default") == 40
+
+
+# More concurrent callers than redis-py's default pool of 100 connections.
+MORE_THAN_POOL = 300
+
+
+def test_adelay_past_the_connection_pool_size_waits_instead_of_failing(
+    redis_url, redis_client
+):
+    app = AsyncCauli(redis_url=redis_url)
+
+    @app.task(name="t")
+    def t(i):
+        return i
+
+    async def burst():
+        return await asyncio.gather(*(t.adelay(i) for i in range(MORE_THAN_POOL)))
+
+    assert len(_run(app, burst)) == MORE_THAN_POOL
+    assert redis_client.xlen("cauli:q:default") == MORE_THAN_POOL
+
+
+def test_delay_from_more_threads_than_the_pool_waits_instead_of_failing(
+    redis_url, redis_client
+):
+    from concurrent.futures import ThreadPoolExecutor
+
+    app = Cauli(redis_url=redis_url)
+
+    @app.task(name="t")
+    def t(i):
+        return i
+
+    with ThreadPoolExecutor(max_workers=MORE_THAN_POOL) as pool:
+        list(pool.map(t.delay, range(MORE_THAN_POOL * 4)))
+    assert redis_client.xlen("cauli:q:default") == MORE_THAN_POOL * 4
+
+
+def test_successive_event_loops_do_not_leak_connections(redis_url, redis_client):
+    import gc
+
+    app = AsyncCauli(redis_url=redis_url)
+
+    @app.task(name="t")
+    def t(i):
+        return i
+
+    before = len(redis_client.client_list())
+    for i in range(20):
+        asyncio.run(t.adelay(i))
+    gc.collect()
+    assert len(redis_client.client_list()) - before <= 1

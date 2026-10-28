@@ -4,7 +4,7 @@
 
 use crate::envelope::ErrorJson;
 use anyhow::{anyhow, Result};
-use redis::aio::ConnectionManager;
+use redis::aio::{ConnectionLike, ConnectionManager};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
@@ -343,17 +343,19 @@ type FlushOutcome = std::result::Result<(), Arc<redis::RedisError>>;
 /// answered, so a completion the worker has reported (counters, drain) is
 /// on the broker.
 ///
-/// Command order inside one flush pipeline is a correctness property, not a
-/// layout choice: every caller's own writes (result SET, retry ZADD, DLQ
-/// XADD) are queued BEFORE the batch XACK, so a connection torn mid-flush
+/// Command order inside one flush is a correctness property, not a layout
+/// choice: every caller's own writes (result SET, retry ZADD, DLQ XADD) go
+/// out and are answered BEFORE the batch XACK is sent, and only entries
+/// whose writes all succeeded are acked (`flush_batch`), so a connection torn mid-flush
 /// can apply a task's writes without its ack (redelivered, then resolved as
 /// a duplicate) but never the ack without the writes (which would drop a
 /// retry or a dead letter on the floor). The batch XDEL comes LAST, after
 /// the XACK: torn between them, the entries are acked-but-undeleted, which
 /// the trim reclaims. The other order would delete entries still in the
 /// PEL, and a pending entry whose payload is gone can never be peeked,
-/// claimed or acked by §4.4 — it pins XPENDING forever. `build_flush` owns
-/// this order and `extras_precede_ack_precedes_del_on_the_wire` pins it.
+/// claimed or acked by §4.4 — it pins XPENDING forever. `flush_batch` owns
+/// this order; `ack_precedes_del_on_the_wire` and
+/// `a_refused_write_never_lets_its_ack_land` pin it.
 #[derive(Clone)]
 pub struct AckBufs {
     senders: Arc<HashMap<String, mpsc::Sender<AckReq>>>,
@@ -428,45 +430,77 @@ async fn flusher(
                 Ok(None) | Err(_) => break, // senders gone, or window elapsed
             }
         }
-        let (pipe, dones) = build_flush(&queue, batch);
-        let outcome: FlushOutcome = pipe
-            .query_async::<()>(&mut conn)
-            .await
-            .map_err(Arc::new)
-            .map(|_: ()| ());
-        for done in dones {
-            // A receiver gone before the answer means its dispatch task was
-            // torn down (process exit); there is no one left to inform.
-            let _ = done.send(outcome.clone());
-        }
+        flush_batch(&mut conn, &queue, batch).await;
     }
 }
 
-/// The wire layout of one flush: every request's own writes first, then one
-/// XACK naming every entry, then one XDEL naming the same entries. See the
-/// ordering note on `AckBufs`.
-fn build_flush(
-    queue: &str,
-    batch: Vec<AckReq>,
-) -> (redis::Pipeline, Vec<oneshot::Sender<FlushOutcome>>) {
+/// Write one batch in two round trips: every request's own writes first,
+/// each reply read, then one XACK and one XDEL naming only the entries whose
+/// writes ALL landed. One pipeline cannot keep that promise: redis runs a
+/// pipeline's XACK even after an earlier command in it was refused, and OOM
+/// under `noeviction` refuses ZADD, XADD and SET but not XACK or XDEL, so a
+/// retry, a dead letter or a result that was never written got acked and
+/// deleted. A refused entry stays pending and is redelivered (section 4.4).
+async fn flush_batch(conn: &mut ConnectionManager, queue: &str, batch: Vec<AckReq>) {
+    let mut writes = redis::pipe();
+    let mut owner = Vec::new();
+    let mut reqs: Vec<(String, oneshot::Sender<FlushOutcome>, FlushOutcome)> = Vec::new();
+    for (i, req) in batch.into_iter().enumerate() {
+        for cmd in req.extra {
+            writes.add_command(cmd);
+            owner.push(i);
+        }
+        reqs.push((req.stream_id, req.done, Ok(())));
+    }
+    if !owner.is_empty() {
+        match conn.req_packed_commands(&writes, 0, owner.len()).await {
+            Ok(replies) => {
+                for (i, reply) in owner.into_iter().zip(replies) {
+                    if let (Err(e), Ok(())) = (reply.extract_error(), &reqs[i].2) {
+                        reqs[i].2 = Err(Arc::new(e));
+                    }
+                }
+            }
+            Err(e) => {
+                let e = Arc::new(e);
+                reqs.iter_mut().for_each(|r| r.2 = Err(e.clone()));
+            }
+        }
+    }
+    let (written, refused): (Vec<_>, Vec<_>) = reqs.into_iter().partition(|r| r.2.is_ok());
+    // A receiver gone before the answer means its dispatch task was torn
+    // down (process exit); there is no one left to inform.
+    for (_, done, outcome) in refused {
+        let _ = done.send(outcome);
+    }
+    if written.is_empty() {
+        return;
+    }
+    let outcome: FlushOutcome = ack_pipeline(queue, written.iter().map(|r| r.0.as_str()))
+        .query_async::<()>(conn)
+        .await
+        .map_err(Arc::new);
+    for (_, done, _) in written {
+        let _ = done.send(outcome.clone());
+    }
+}
+
+/// The ack half of one flush: one XACK naming every entry, then one XDEL
+/// naming the same entries. See the ordering note on `AckBufs`.
+fn ack_pipeline<'a>(queue: &str, stream_ids: impl Iterator<Item = &'a str>) -> redis::Pipeline {
     let qk = q_key(queue);
-    let mut pipe = redis::pipe();
     let mut xack = redis::cmd("XACK");
     xack.arg(&qk).arg("cauli");
     let mut xdel = redis::cmd("XDEL");
     xdel.arg(&qk);
-    let mut dones = Vec::with_capacity(batch.len());
-    for req in batch {
-        xack.arg(&req.stream_id);
-        xdel.arg(&req.stream_id);
-        for cmd in req.extra {
-            pipe.add_command(cmd).ignore();
-        }
-        dones.push(req.done);
+    for sid in stream_ids {
+        xack.arg(sid);
+        xdel.arg(sid);
     }
+    let mut pipe = redis::pipe();
     pipe.add_command(xack).ignore();
     pipe.add_command(xdel).ignore();
-    (pipe, dones)
+    pipe
 }
 
 /// §4.1 success: [SET result EX ttl]? + batched XACK + XDEL (via `AckBufs`).
@@ -503,8 +537,8 @@ pub async fn finish_duplicate(
 }
 
 /// §4.2 retry: ZADD delayed + batched XACK + XDEL (no result key). The ZADD
-/// rides the same flush pipeline as the ack, queued before it
-/// (`build_flush`), so the ack can never land without the reschedule.
+/// rides the same flush as the ack, answered before it is sent
+/// (`flush_batch`), so the ack can never land without the reschedule.
 pub async fn finish_retry(
     bufs: &AckBufs,
     queue: &str,
@@ -551,7 +585,7 @@ const DLQ_TTL_S: u64 = 7 * 24 * 60 * 60;
 
 /// DLQ write (final failure §4.2, malformed/unregistered §4, redelivery §4.4):
 /// XADD dlq + [SET result]? + batched XACK + XDEL. The dead letter rides the same
-/// flush pipeline as the ack, queued before it (`build_flush`), so the ack
+/// flush as the ack, answered before it is sent (`flush_batch`), so the ack
 /// can never land without the dead letter.
 pub async fn finish_dlq(
     bufs: &AckBufs,
@@ -1438,50 +1472,19 @@ mod tests {
     /// The reverse order would delete entries still in the PEL, which §4.4
     /// can then never peek, claim or ack — an entry pinned forever.
     #[test]
-    fn extras_precede_ack_precedes_del_on_the_wire() {
-        let req = |sid: &str, extra: Vec<redis::Cmd>| {
-            let (done, _rx) = oneshot::channel();
-            (
-                AckReq {
-                    stream_id: sid.to_string(),
-                    extra,
-                    done,
-                },
-                _rx,
-            )
-        };
-        let mut set = redis::cmd("SET");
-        set.arg(result_key("t1")).arg("{}").arg("EX").arg(60);
-        let mut zadd = redis::cmd("ZADD");
-        zadd.arg(delayed_key("q")).arg(123).arg("{}");
-        let (r1, _k1) = req("1-1", vec![set]);
-        let (r2, _k2) = req("2-2", vec![zadd]);
-        let (r3, _k3) = req("3-3", vec![]);
-        let (pipe, dones) = build_flush("q", vec![r1, r2, r3]);
-        assert_eq!(dones.len(), 3, "one answer channel per request");
+    fn ack_precedes_del_on_the_wire() {
+        let pipe = ack_pipeline("q", ["1-1", "2-2", "3-3"].into_iter());
         let wire = String::from_utf8(pipe.get_packed_pipeline()).expect("utf8 wire");
         let at = |needle: &str| {
             wire.find(needle)
                 .unwrap_or_else(|| panic!("{needle} missing from wire: {wire:?}"))
         };
         assert!(
-            at("SET") < at("XACK") && at("ZADD") < at("XACK"),
-            "every extra must precede the ack: {wire:?}"
-        );
-        assert!(
             at("XACK") < at("XDEL"),
-            "the ack must land before the delete, or a tear strands a PEL              entry whose payload is gone: {wire:?}"
+            "the ack must land before the delete, or a tear strands a PEL entry whose payload is gone: {wire:?}"
         );
-        assert_eq!(
-            wire.matches("XACK").count(),
-            1,
-            "one batch XACK, not one per entry: {wire:?}"
-        );
-        assert_eq!(
-            wire.matches("XDEL").count(),
-            1,
-            "one batch XDEL, not one per entry: {wire:?}"
-        );
+        assert_eq!(wire.matches("XACK").count(), 1, "one batch XACK: {wire:?}");
+        assert_eq!(wire.matches("XDEL").count(), 1, "one batch XDEL: {wire:?}");
         let ack_tail = &wire[at("XACK")..at("XDEL")];
         let del_tail = &wire[at("XDEL")..];
         for sid in ["1-1", "2-2", "3-3"] {
@@ -2016,5 +2019,97 @@ mod tests {
             .await
             .expect("xpending");
         assert!(pending.is_empty(), "all five acked: {pending:?}");
+    }
+
+    /// A broker refusing writes (OOM under `maxmemory-policy noeviction`, the
+    /// policy PROTOCOL section 4 recommends) refuses ZADD, XADD and SET but
+    /// still accepts XACK and XDEL. The retry's ZADD must therefore never be
+    /// sent in the same round trip as its ack: otherwise the ack lands, the
+    /// entry is deleted, and the task exists nowhere. Expected: the retry
+    /// write fails, the entry stays pending for section 4.4, and a completion
+    /// with no writes of its own in the same batch still succeeds.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_write_never_lets_its_ack_land() {
+        let redis = ThrowawayRedis::start(6401, false);
+        let client = redis::Client::open(redis.url()).expect("client");
+        let mut conn = ConnectionManager::new(client)
+            .await
+            .expect("connection manager");
+
+        let queue = "oomq";
+        ensure_groups(&mut conn, &[queue.to_string()])
+            .await
+            .expect("groups");
+        let mut sids = Vec::new();
+        for i in 0..2 {
+            let sid: String = redis::cmd("XADD")
+                .arg(q_key(queue))
+                .arg("*")
+                .arg("e")
+                .arg(format!(r#"{{"id":"o{i}","task":"t"}}"#))
+                .query_async(&mut conn)
+                .await
+                .expect("seed");
+            sids.push(sid);
+        }
+        let _: Option<redis::streams::StreamReadReply> = redis::cmd("XREADGROUP")
+            .arg("GROUP")
+            .arg("cauli")
+            .arg("c1")
+            .arg("COUNT")
+            .arg(2)
+            .arg("STREAMS")
+            .arg(q_key(queue))
+            .arg(">")
+            .query_async(&mut conn)
+            .await
+            .expect("deliver");
+        let _: () = redis::cmd("CONFIG")
+            .arg("SET")
+            .arg("maxmemory")
+            .arg(1)
+            .query_async(&mut conn)
+            .await
+            .expect("force OOM");
+
+        // Both completions ride ONE flush: batch of 2, a window far longer
+        // than the test.
+        let bufs = AckBufs::start(&conn, &[queue.to_string()], 2, 10_000);
+        let (retry, plain) = tokio::join!(
+            finish_retry(&bufs, queue, &sids[0], r#"{"id":"o0"}"#, 1),
+            finish_success(&bufs, queue, &sids[1], "o1", None, 60),
+        );
+        let _: () = redis::cmd("CONFIG")
+            .arg("SET")
+            .arg("maxmemory")
+            .arg(0)
+            .query_async(&mut conn)
+            .await
+            .expect("lift OOM");
+
+        let err = retry.expect_err("a refused ZADD must fail the retry write");
+        assert!(err.to_string().contains("OOM"), "unexpected error: {err}");
+        plain.expect("a completion with no writes of its own is unaffected");
+        let pending: Vec<(String, String, u64, u64)> = redis::cmd("XPENDING")
+            .arg(q_key(queue))
+            .arg("cauli")
+            .arg("-")
+            .arg("+")
+            .arg(10)
+            .query_async(&mut conn)
+            .await
+            .expect("xpending");
+        let pending: Vec<&str> = pending.iter().map(|p| p.0.as_str()).collect();
+        assert_eq!(
+            pending,
+            vec![sids[0].as_str()],
+            "the entry whose retry was refused must stay pending for redelivery"
+        );
+        let len: u64 = redis::cmd("XLEN")
+            .arg(q_key(queue))
+            .query_async(&mut conn)
+            .await
+            .expect("xlen");
+        assert_eq!(len, 1, "the refused entry must not be deleted");
     }
 }

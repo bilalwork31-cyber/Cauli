@@ -15,3 +15,17 @@ class BenchIo(models.Model):
         app_label = "djapp"
         db_table = "bench_io"
         managed = False
+
+
+class WebJob(models.Model):
+    """One row per web request in bench/web. ``processed`` is incremented by
+    the task, so after a drain 0 means lost and 2 or more means duplicated."""
+
+    id = models.BigAutoField(primary_key=True)
+    payload = models.TextField()
+    processed = models.IntegerField(default=0)
+
+    class Meta:
+        app_label = "djapp"
+        db_table = "web_job"
+        managed = False

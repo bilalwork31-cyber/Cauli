@@ -21,10 +21,27 @@ CAULI_WORKER = os.environ.get("CAULI_WORKER_BIN", "cauli-worker")
 CELERY_BIN = os.environ.get("CELERY_BIN", "celery")
 TASKIQ_BIN = os.environ.get("TASKIQ_BIN", "taskiq")
 REDIS_URL = os.environ.get("BENCH_REDIS_URL", "redis://127.0.0.1:6395/0")
+# One Celery node runs one consumer and topped out near 870/s on a 10 core
+# box whatever -c was; scaling Celery means more nodes. 8 solo nodes was the
+# best of the sweep in RESULTS.md, so it is the Celery number to compare with.
+CELERY_NODES = 8
+CELERY_NODE_CMD = (
+    f"{CELERY_BIN} -A tasks_celery worker -P solo --prefetch-multiplier=32"
+    " --without-heartbeat --without-gossip --without-mingle -l warning"
+)
 
 CONFIGS = [
     {
-        "label": "celery (sync)",
+        "label": f"celery ({CELERY_NODES} solo nodes)",
+        "framework": "celery",
+        "n": 40_000,
+        "cmd": [
+            "bash", "-c",
+            f"for i in $(seq {CELERY_NODES}); do {CELERY_NODE_CMD} -n w$i@%h & done; wait",
+        ],
+    },
+    {
+        "label": "celery (1 node)",
         "framework": "celery",
         "n": 30_000,
         "cmd": [

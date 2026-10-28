@@ -47,7 +47,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14", "3.14t"]
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -64,7 +64,7 @@ jobs:
           # the code under test, so the third party dependencies are installed
           # first and the client goes in with --no-deps. The packaging job is
           # where that pin is proved, against the wheels it just built.
-          pip install "redis>=5" "msgspec>=0.18" tzdata "pytest>=8"
+          pip install "redis>=5.0.1" "msgspec>=0.18" tzdata "pytest>=8"
           pip install -e py --no-deps
           pip install ruff==0.15.22
       - name: ruff check
@@ -80,26 +80,34 @@ jobs:
         run: pytest -q
 
   itest:
-    name: itest (cross-component)
+    name: itest (cross-component, python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
     needs: [worker, py]
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.14t: the free threaded build, which the worker embeds with the
+        # GIL off; this is the job that exercises it end to end.
+        python-version: ["3.12", "3.14t"]
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v7
         with:
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
       - name: Install redis-server
         run: sudo apt-get update && sudo apt-get install -y redis-server
       - name: Build release worker
         working-directory: worker
+        env:
+          PYO3_PYTHON: ${{ env.pythonLocation }}/bin/python
         run: cargo build --release --bin cauli-worker
       - name: Install cauli (editable) and pytest
         # --no-deps for the same reason as the py job: cauli-worker is built
         # here, not fetched, and this job runs against the binary cargo just
         # produced.
         run: |
-          pip install "redis>=5" "msgspec>=0.18" tzdata pytest
+          pip install "redis>=5.0.1" "msgspec>=0.18" tzdata pytest
           pip install -e py --no-deps
       - name: Run itest
         working-directory: itest
@@ -214,7 +222,7 @@ jobs:
           # Third party dependencies from the index first, so the resolve below
           # can be --no-index and cauli/cauli-worker can only be the wheels
           # just built rather than an older pair already on PyPI.
-          .onecmd/bin/pip install "redis>=5" "msgspec>=0.18" tzdata
+          .onecmd/bin/pip install "redis>=5.0.1" "msgspec>=0.18" tzdata
           .onecmd/bin/pip install --no-index --find-links dist cauli
           .onecmd/bin/pip show cauli-worker >/dev/null
           test -x .onecmd/bin/cauli-worker

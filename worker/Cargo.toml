@@ -86,7 +86,9 @@ serde = { version = "1", features = ["derive"] }
 # exact int the caller sent (see pyjson.rs). Changes how serde_json::Number
 # is represented crate wide; every inspection site was reviewed for fallout,
 # see the commit message.
-serde_json = { version = "1", features = ["arbitrary_precision"] }
+# preserve_order: a Python task gets its dicts and kwargs back in the order the
+# caller built them; the default BTreeMap would hand them over sorted.
+serde_json = { version = "1", features = ["arbitrary_precision", "preserve_order"] }
 # Trimmed from "full" (audit dependency review) to the features actually used:
 # rt-multi-thread/macros (runtime + tokio::spawn + #[tokio::test]), sync
 # (oneshot/watch/Semaphore), time (timeout/interval/sleep), io-util

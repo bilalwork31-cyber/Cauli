@@ -14,11 +14,11 @@ import redis
 from cauli import Cauli
 from psycopg_pool import ConnectionPool
 
-from common import DONE_KEY, REDIS_URL
+from common import DONE_KEY, REDIS_POOL_MAX, REDIS_URL
 from workloads import PG_DSN, PG_INSERT_SQL, PG_PAYLOAD, PG_POOL_MAX
 
 app = Cauli(redis_url=REDIS_URL)
-_r = redis.Redis.from_url(REDIS_URL)
+_r = redis.Redis.from_url(REDIS_URL, max_connections=REDIS_POOL_MAX)
 _pool = ConnectionPool(
     PG_DSN, min_size=2, max_size=PG_POOL_MAX, kwargs={"autocommit": True, "prepare_threshold": None}
 )

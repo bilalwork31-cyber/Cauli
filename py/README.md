@@ -5,7 +5,7 @@ Define tasks in Python, enqueue from any web framework, execute on the Rust work
 
 ## Install
 
-    pip install cauli               # Python >= 3.10 (deps: redis>=5, msgspec)
+    pip install cauli               # Python >= 3.10 (deps: redis>=5.0.1, msgspec, tzdata)
 
 That also installs the `cauli-worker` binary, but only where its wheels exist:
 Linux (glibc) on x86_64 or aarch64, CPython 3.10 through 3.14. Anywhere else, a
@@ -13,7 +13,7 @@ macOS laptop, Windows, PyPy, a CPython newer than the release matrix, the worker
 requirement is dropped rather than failing the install: the client still lands
 and enqueueing still works, there is simply no `cauli-worker` to run. Two
 targets fail the install instead, because no marker can describe them: musl
-(Alpine) and the free threaded build. For those, and for enqueue only web dynos
+(Alpine) and free threaded 3.13t (free threaded 3.14t has a worker wheel). For those, and for enqueue only web dynos
 that never run a worker, see `PROTOCOL.md` section 13.4.
 
 ## Define an app and tasks (myproj/tasks.py)

@@ -10,10 +10,10 @@ import time
 import redis.asyncio as aredis
 from arq.connections import RedisSettings
 
-from common import REDIS_URL
+from common import REDIS_POOL_MAX, REDIS_URL
 from workloads import POISON_BURST_MS, cpu_burn
 
-_r = aredis.Redis.from_url(REDIS_URL)
+_r = aredis.Redis.from_url(REDIS_URL, max_connections=REDIS_POOL_MAX)
 redis_settings = RedisSettings.from_dsn(REDIS_URL)
 
 

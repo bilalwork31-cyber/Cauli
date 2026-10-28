@@ -280,6 +280,17 @@ number — not the pathological zero-scaling gevent showed above.
 
 ### Reliability cliffs (not in the throughput table, but load-bearing)
 
+> **Correction, 2026-10-28.** Both cliffs below were the harness. Every
+> `bench/tasks_*.py` module built its redis-py client with the default pool
+> of 100 connections, so slot 101 onward raised `MaxConnectionsError` in the
+> task body and, with `max_retries=0`, was dead lettered. The completion
+> counter never reached N, which read as a hang. Reproduced at one process:
+> at `--io-concurrency 128`, 6,725 of 60,000 tasks never completed and every
+> dead letter entry kept (1,001, the stream cap) was `MaxConnectionsError`; with `REDIS_POOL_MAX` in `common.py` the same run at 128,
+> 256 and 512 left none. The sync lane at `--io-threads 128` showed the same
+> error, and none with the fix.
+> The text below is kept as recorded.
+
 cauli's throughput does not degrade gracefully past a per-process resource
 limit — it falls off a cliff into near-total stall:
 
@@ -734,7 +745,14 @@ property of the box, so the honest statement is "at least 27,060/s while using
 4.71 cores", not "cauli's maximum is 27,060/s".
 
 Ratios at best observed config: cauli async is **3.5x taskiq** and **32.8x
-Celery prefork**.
+one Celery prefork node**.
+
+> **Correction, 2026-10-28.** 32.8x compares six cauli processes with one
+> Celery node. One Celery node does not scale with `-c`, but more nodes do: on
+> 10 vCPUs, 8 nodes at `-P solo --prefetch-multiplier=32` reached 4,233
+> tasks/s against 32,798 for cauli async at `--procs 8 --io-concurrency 96`,
+> a ratio of 7.7x. Quote that one. "Celery cannot convert more hardware into
+> more throughput" below is true per node and false per box.
 
 ### Django ORM, sync tasks
 
@@ -966,6 +984,81 @@ deprioritized rather than spending further time working around a local
 environment problem unrelated to the benchmark itself. Whoever runs this
 next should treat `docker compose up --build` as untested until it's been
 run once for real.
+
+## Web integration: enqueue inside real Django and FastAPI requests (2026-10-28)
+
+Harness: `bench/web/campaign.py`. WSL2 Ubuntu 24.04, 10 vCPU, 11 GB, Redis
+7.0.15, PostgreSQL 16, k6 as the load generator, all on one box. Django 6.0.7
+under gunicorn (4 gthread workers x 8 threads) and under uvicorn (4 workers),
+FastAPI under uvicorn (4 workers, uvloop). Every request inserts one row
+through the ORM; the enqueue arms hand its id to a task that increments the
+row's `processed` column, so after a drain `processed = 0` is a lost task and
+`processed > 1` a duplicated one.
+
+Per arm and rep: closed loop saturation with 64 clients and no worker
+running (the request rate is the web tier's alone), then a drain with the
+worker started, then an open loop at 500 requests/s with the worker live,
+giving request latency at a fixed load and end to end latency from request
+start to task end. Arm order is shuffled every rep. 3 reps, medians; the
+before and after columns are separate sessions, not interleaved pairs, so
+read the throughput columns as within run to run drift unless the gap is
+large.
+
+| arm | sat req/s | e2e p50 ms | e2e p99 ms | lost / dup / dlq, 0.1.0 | lost / dup / dlq, fixed |
+|---|---:|---:|---:|---|---|
+| Django WSGI, insert only | 1,272 / 1,028 | | | | |
+| Django WSGI, `delay_on_commit` | 1,081 / 1,060 | 2.2 / 2.2 | 18.9 / 16.4 | 0 / 0 / 0 | 0 / 0 / 0 |
+| Django WSGI, async task with async ORM | 854 / 851 | n/a / 2.9 | n/a / 39.7 | **106,499** / 0 / 1,001 | 0 / 0 / 0 |
+| Django WSGI, Celery `.delay` on commit (producer only) | 880 / 880 | | | | |
+| Django ASGI, insert only | 279 / 285 | | | | |
+| Django ASGI, enqueue | 266 / 285 | 824 / 1,477 | 1,573 / 3,286 | 0 / 0 / 0 | 0 / 0 / 0 |
+| FastAPI, insert only | 2,242 / 2,156 | | | | |
+| FastAPI, `adelay` | 1,944 / 1,823 | 4.3 / 4.4 | 471.1 / 33.1 | 0 / 0 / 0 | 0 / 0 / 0 |
+| FastAPI, blocking `.delay` in `async def` | 1,850 / 1,842 | 4.4 / 4.5 | 311.0 / 24.1 | 0 / 0 / 0 | 0 / 0 / 0 |
+
+Cells with two numbers are 0.1.0 / fixed.
+
+- **Lost tasks.** On 0.1.0 every `async def` task using Django's async ORM
+  dead lettered (asgiref 3.13 incompatibility in `cauli.contrib.django`).
+- **FastAPI tail.** The p99 came from `sqlalchemy_app()`'s engine: SQLAlchemy's
+  default pool keeps 5 connections and closes each overflow connection on
+  return, so above 5 concurrent tasks nearly every task opened a new
+  connection. Keeping the same 15 connections pooled took p99 from 564 ms to
+  31 ms in a single run sweep, 471 to 33 ms in the 3 rep campaign.
+- **Enqueue cost per request.** Django WSGI: cauli `delay_on_commit` costs
+  15% of the insert only rate in the 0.1.0 session and Celery's producer 31%;
+  FastAPI `adelay` 13%. These are single session ratios on a shared box.
+- **Django ASGI is Django bound.** Its insert only arm tops out near 280
+  requests/s, so the 500 requests/s open loop overloads it by design and its
+  latency columns describe Django under overload, not cauli. Under ASGI,
+  `CONN_MAX_AGE` must be 0: with 60, the server climbed to 385 of 400
+  Postgres connections in 15 s and starved the worker.
+
+## Free threaded CPython 3.14t against GIL 3.12 (2026-10-28)
+
+Harness: `bench/free_threaded.py`, tasks in `bench/tasks_cauli_threads.py`.
+Same worker source built twice, once against CPython 3.12.3 and once against
+3.14.5t, run with `PYTHON_GIL=0`. One worker process (`--procs 1`), drain rate
+over the middle 80% of the tasks, 3 interleaved pairs, medians. Box: Intel
+i7-9750H, 5 physical cores with 2 hyperthreads each (10 vCPU), so CPU bound
+Python tops out near 5 cores: plain threads with no cauli involved reach 2.88
+cores at 5 threads and 4.71 at 10 on the same box. The burn body is 2.44 ms on
+3.12 and 2.01 ms on 3.14t; cores = rate x body time.
+
+| lane | GIL 3.12 | free threaded 3.14t | ratio | cores, GIL / free threaded |
+|---|---:|---:|---:|---|
+| noop with a redis INCR, sync, 10 threads | 2,477/s | 14,070/s | 5.68x | |
+| CPU bound body, sync, 10 threads | 299/s | 1,429/s | 4.78x | 0.73 / 2.87 |
+| CPU bound body, cpu lane, 10 processes | 1,532/s | 1,932/s | 1.26x | 3.74 / 3.88 |
+
+- On the GIL build the sync lane runs CPU bound work on 0.73 cores whatever
+  `--io-threads` is, which is why `kind="cpu"` exists. On 3.14t the same lane
+  reaches 2.87 cores, 74% of what the forked cpu lane gets, without forking.
+- The noop row is the GIL's handoff cost on blocking I/O: ten threads that
+  each do one Redis round trip queue for one lock on 3.12.
+- The cpu lane gains only the interpreter's own speedup (the body is 18%
+  faster on 3.14); its parallelism came from processes already.
+- Not measured: `--procs` above 1, async lanes, and 3.13t (no wheel).
 
 ## Not yet done
 

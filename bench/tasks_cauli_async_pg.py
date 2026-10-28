@@ -7,11 +7,11 @@ import redis.asyncio as aredis
 from cauli import Cauli
 from psycopg_pool import AsyncConnectionPool
 
-from common import DONE_KEY, REDIS_URL
+from common import DONE_KEY, REDIS_POOL_MAX, REDIS_URL
 from workloads import PG_DSN, PG_INSERT_SQL, PG_PAYLOAD, PG_POOL_MAX
 
 app = Cauli(redis_url=REDIS_URL)
-_r = aredis.Redis.from_url(REDIS_URL)
+_r = aredis.Redis.from_url(REDIS_URL, max_connections=REDIS_POOL_MAX)
 # prepare_threshold=None: see tasks_cauli_sync_pg.py -- required for
 # pgbouncer transaction-pooling compatibility, ~3% cost direct-to-Postgres.
 _pool = AsyncConnectionPool(

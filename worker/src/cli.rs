@@ -6,12 +6,8 @@ const ADVANCED: &str = "Advanced tuning (derived from -c; see docs/CONFIGURATION
 #[derive(Parser, Debug, Clone)]
 #[command(name = "cauli-worker", version, about)]
 pub struct Args {
-    /// App location as module:attr (e.g. myproj.tasks:app)
-    ///
-    /// Optional for --print-plan alone. That flag derives the plan from -c
-    /// and the core count with no interpreter and no Redis, which is the
-    /// contract docs/CONFIGURATION.md states, so demanding an importable app
-    /// there would make it unusable for capacity planning off the host.
+    /// App location as module:attr (e.g. myproj.tasks:app). Not needed with
+    /// --print-plan.
     #[arg(short = 'A', long, required_unless_present = "print_plan")]
     pub app: Option<String>,
 
@@ -41,10 +37,8 @@ pub struct Args {
     #[arg(long, default_value_t = false)]
     pub print_plan: bool,
 
-    /// Visibility timeout in seconds (crash recovery, PROTOCOL §4.4). Must be
-    /// at least 1 (0 would make the recovery loop reclaim every
-    /// currently-executing task on nearly every tick, audit M8) and must
-    /// exceed your longest task timeout; enforced/warned in main.rs.
+    /// Seconds before a dead worker's tasks are redelivered (PROTOCOL §4.4).
+    /// At least 1.
     #[arg(long, default_value_t = 60)]
     pub visibility_timeout: u64,
 
@@ -71,19 +65,8 @@ pub struct Args {
     pub io_threads: Option<usize>,
 
     /// Max in flight io tasks (admission semaphore), sync and async together.
-    /// Default: 256, or derived from -c as c/procs
-    ///
-    /// Not a free knob, and the measured band ends below the default. The
-    /// single process async sweep (docs/AUDIT_LOG.md) has the gate binding
-    /// up to about 64 per process and flat past it: 64 gave 25.3k tps, 128
-    /// gave 27.2k, about 7% for twice the slots. The `--procs 6` sweep in
-    /// bench/RESULTS.md peaked at 96 per process and then saw runs finish
-    /// 91% to 99% and stall above 104, completing 11% at 512. That cliff is
-    /// unresolved: the harness opened one redis connection per slot, so it
-    /// may have measured its own connection count rather than cauli. Until
-    /// it is re run with connections pinned, treat anything above 128 per
-    /// process as untested rather than supported, and size your database
-    /// pool for the gate (docs/CONFIGURATION.md, connection sizing).
+    /// Default: 256, or derived from -c as c/procs. Size the connection
+    /// pools your tasks use to at least this value.
     #[arg(long, help_heading = ADVANCED)]
     pub io_concurrency: Option<usize>,
 
@@ -93,7 +76,7 @@ pub struct Args {
 
     /// Worker threads per cpu child (fork-server mode). M > 1 pipelines up
     /// to M requests per child; responses are matched by id (PROTOCOL §5.1).
-    /// Must be within [1, 1024] (FS-10 — enforced in main.rs after parsing).
+    /// Must be within [1, 1024].
     #[arg(long, default_value_t = 1, help_heading = ADVANCED)]
     pub cpu_child_threads: usize,
 
@@ -110,18 +93,9 @@ pub struct Args {
     #[arg(long, default_value_t = 4, help_heading = ADVANCED)]
     pub cpu_prefetch: usize,
 
-    /// Recycle a cpu child after it completes this many tasks. THE DEFAULT
-    /// IS 10000: children are recycled unless you say otherwise. Pass 0 to opt
-    /// out and let a child live for the whole worker lifetime. This is the
-    /// backstop for leaky C extensions and slowly dirtied copy on write
-    /// pages, like Celery's maxtasksperchild, and nothing else in the worker
-    /// bounds cpu child memory. Staged prefetch work always drains before the
-    /// recycle fires, so no task is lost to it.
-    ///
-    /// It is a leak backstop, not a copy on write one: measured child private
-    /// RSS plateaus at 2416kB by 5000 tasks and moves 4kB more out to 20000,
-    /// so the old default of 1000 was re-forking mid ramp for no memory
-    /// benefit while throwing away a warm child
+    /// Recycle a cpu child after it completes this many tasks, like Celery's
+    /// maxtasksperchild. 0 never recycles. Staged work drains first, so no
+    /// task is lost to a recycle
     #[arg(long, default_value_t = 10000, help_heading = ADVANCED)]
     pub cpu_max_tasks_per_child: usize,
 
@@ -136,92 +110,49 @@ pub struct Args {
     #[arg(long, default_value_t = false, help_heading = ADVANCED)]
     pub no_fork_server: bool,
 
-    /// XREADGROUP COUNT per fetch. Must be >= 1: 0 would mean "unlimited" to
-    /// Redis (audit M8); enforced in main.rs after parsing (exit 1).
-    #[arg(long, default_value_t = 16, help_heading = ADVANCED)]
+    /// XREADGROUP COUNT per fetch. Must be at least 1. A fetch never takes
+    /// more than the free io slots; 64 measured 1.29x (async) and 2.1x (cpu)
+    /// the drain rate of 16, and 128 or 256 added nothing.
+    #[arg(long, default_value_t = 64, help_heading = ADVANCED)]
     pub batch: usize,
 
-    /// Max accepted envelope size in bytes; oversize entries are DLQ'd as
-    /// "malformed" before parsing (audit M2 — bounds the json::Value memory
-    /// amplification and processing cost of an oversized/hostile payload).
+    /// Max accepted envelope size in bytes. Larger entries are dead lettered
+    /// as "malformed" before parsing. Keep it equal to the app's
+    /// max_envelope_bytes.
     #[arg(long, default_value_t = 1_048_576, help_heading = ADVANCED)]
     pub max_envelope_bytes: usize,
 
     /// Python executable used to spawn cpu children.
     /// Default: this worker's own embedded interpreter (`sys.executable`)
-    ///
-    /// The old default was the bare string "python3", resolved through PATH
-    /// by `Command::new`. A systemd `ExecStart=/opt/app/venv/bin/cauli-worker`
-    /// or a Docker CMD never activates the venv, so it found the base
-    /// interpreter with no `cauli` package installed: the fork server failed,
-    /// the stdio fallback respawn looped, the cpu channel filled, and the
-    /// fetch loop's cpu backlog gate then stopped fetching io work too. One
-    /// misrouted interpreter took the whole worker offline at warn level.
-    /// The embedded interpreter is by construction the one that imported the
-    /// app, so it is the right default.
     #[arg(long, help_heading = ADVANCED)]
     pub python: Option<String>,
 
-    /// Response and connection timeout, in seconds, for every redis round
-    /// trip: fetch (XREADGROUP), the idempotency claim before a task body
-    /// runs, the delayed mover, crash recovery, and task result writes.
-    /// Unset in the underlying client, a redis that accepts the TCP
-    /// connection but never answers (paused, swapping, or a network
-    /// partition dropping packets rather than refusing them) hangs these
-    /// calls forever. BLOCK on XREADGROUP is a server side wait, not a
-    /// client side deadline, and does not substitute for this.
-    ///
-    /// This is new configuration surface, deliberately: the right value
-    /// depends on this deployment's redis tail latency, which cannot be
-    /// known in advance, so one hardcoded number would be wrong for either
-    /// a shared noisy redis or a dedicated local one. Below roughly 1
-    /// second, ordinary fork, fsync and network jitter risk a false trip
-    /// (the delayed mover's Lua script alone can touch up to 128 items in
-    /// one round trip). Past roughly half of visibility_timeout, a slow but
-    /// genuinely alive redis is not caught meaningfully sooner than doing
-    /// nothing.
-    ///
-    /// A trip is never a new failure mode: every affected call site already
-    /// has a tested fallback for a redis error (finish() leaves the entry
-    /// unacked for XCLAIM to redeliver; idemp_claim fails open and executes
-    /// anyway), so this only reaches an existing safe outcome sooner, at the
-    /// cost of one log line and at most one visibility timeout of added
-    /// latency on that task. Never data loss.
+    /// Connection and response timeout, in seconds, for every redis call.
+    /// A timed out call is handled like any redis error: the task is
+    /// redelivered, never lost. Keep it between 1 and half of
+    /// --visibility-timeout.
     #[arg(long, default_value_t = 5, help_heading = ADVANCED)]
     pub redis_timeout: u64,
 
     /// Delayed and retry sweep interval in milliseconds (PROTOCOL §4.3).
-    /// Every countdown, eta, retry and beat firing waits out at most one of
-    /// these before it can run, so the tick is a floor on retry latency: at
-    /// 250ms it added up to 250ms to a default first retry of 250-500ms, a
-    /// +50% error on the backoff curve the user asked for
+    /// Countdowns, etas, retries and beat firings can start up to this late
     #[arg(long, default_value_t = 50, help_heading = ADVANCED)]
     pub mover_interval: u64,
 
-    /// Entries the delayed/retry sweep moves per queue per EVAL. The sweep
-    /// now repeats within one tick until a queue comes back short, so this
-    /// bounds one round trip, not the drain rate. It used to be a hard,
-    /// unflaggable ceiling of `limit * (1000 / interval)` per queue per
-    /// process -- 512 per second on the defaults, 40x below the headline
-    /// throughput, with every retry, countdown and eta passing through it.
+    /// Entries the delayed and retry sweep moves per queue per round trip.
+    /// The sweep repeats until a queue is drained, so this does not cap the
+    /// rate.
     #[arg(long, default_value_t = 128, help_heading = ADVANCED)]
     pub mover_limit: usize,
 
-    /// Completions buffered per queue before they are flushed as ONE
-    /// pipeline with ONE multi-id XACK and ONE multi-id XDEL (PROTOCOL
-    /// §4.1). Batching acks is what keeps redis's single command-execution
-    /// thread from being the throughput ceiling; 64 was measured as past
-    /// the knee of that curve. Values below 1 are treated as 1 (no
-    /// batching).
+    /// Completions buffered per queue before one XACK and XDEL flush
+    /// (PROTOCOL §4.1). Values below 1 mean no batching.
     #[arg(long, default_value_t = 64, help_heading = ADVANCED)]
     pub ack_batch: usize,
 
-    /// Max milliseconds a completed task's ack may wait in the buffer
-    /// before a partial batch is flushed anyway, measured from the OLDEST
-    /// buffered completion. This bounds both result latency at low load and
-    /// the §4.1 crash duplicate window (a worker killed mid-window loses at
-    /// most one unflushed buffer per queue to redelivery). 0 flushes every
-    /// completion immediately.
+    /// Max milliseconds the oldest buffered ack waits before a partial
+    /// flush. A crash inside this window redelivers, and reruns, at most one
+    /// buffer per queue. 0 flushes every completion immediately.
     #[arg(long, default_value_t = 2, help_heading = ADVANCED)]
     pub ack_flush_ms: u64,
 }
@@ -365,7 +296,7 @@ mod tests {
         assert!(!a.eager_cpu);
         assert!(!a.print_plan);
         assert!(!a.no_fork_server);
-        assert_eq!(a.batch, 16);
+        assert_eq!(a.batch, 64);
         assert_eq!(a.visibility_timeout, 60);
         assert_eq!(a.max_envelope_bytes, 1_048_576);
         assert_eq!(a.drain_timeout, 30);
@@ -493,22 +424,6 @@ mod tests {
                 cpu_workers: 6,
             }
         );
-    }
-
-    /// The standalone gate default of 256 is above every band this repo has
-    /// measured, and bench/RESULTS.md asked for the mismatch to be fixed or
-    /// loudly documented. It is documented, in the one place a tuning user
-    /// looks: `--help`. Deleting that text is a regression, so pin it.
-    #[test]
-    fn io_concurrency_long_help_carries_the_measured_band() {
-        use clap::CommandFactory;
-        let help = Args::command().render_long_help().to_string();
-        for token in ["--io-concurrency", "bench/RESULTS.md", "104", "128"] {
-            assert!(
-                help.contains(token),
-                "--io-concurrency long help lost {token}"
-            );
-        }
     }
 
     #[test]

@@ -68,6 +68,12 @@ _TRACEBACK_CAP = 8192  # max chars of formatted traceback kept in error JSON (se
 # stripped, and only when the tail really is that generated hex counter.
 _WIRE_SUFFIX_RE = re.compile(r"\.[0-9a-f]+\Z")
 
+# The worker serializes `id` first (worker/src/exec.rs CpuRequest), so a line
+# the codec rejects (an integer past 4300 digits, 1e400) still names the
+# request it answers. Without the id the worker drops the response and the
+# task holds its cpu slot until the hard timeout SIGKILLs the child.
+_REQUEST_ID_RE = re.compile(r'\{"id":"([^"\\]*)"')
+
 _set_async_exc = ctypes.pythonapi.PyThreadState_SetAsyncExc
 
 
@@ -450,9 +456,11 @@ def _handle_request_line(
     try:
         request = _codec.decode(line)
     except _codec.DECODE_ERRORS as exc:
+        id_match = _REQUEST_ID_RE.match(line)
         return {
-            "id": None,
+            "id": id_match.group(1) if id_match else None,
             "ok": False,
+            "retryable": False,
             "error": {
                 "type": "ProtocolError",
                 "message": f"malformed request line: {exc}",
@@ -530,6 +538,31 @@ def _set_pdeathsig() -> None:
         pass
 
 
+def _ignore_stop(signum: int, frame: Any) -> None:
+    """A stop signal is the worker's to act on, not this process's.
+
+    A tty Ctrl+C or systemd's KillMode=control-group signals every process,
+    so a default disposition killed the cpu task mid run while the worker
+    was gracefully draining it. The worker ends this process itself (stdin
+    EOF, SIGKILL, PR_SET_PDEATHSIG). A handler rather than SIG_IGN, because
+    SIG_IGN survives exec and a task's own subprocesses would inherit it.
+    """
+
+
+def _restore_stop() -> None:
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+
+
+def _guard_stop_signals() -> None:
+    signal.signal(signal.SIGINT, _ignore_stop)
+    signal.signal(signal.SIGTERM, _ignore_stop)
+    # A Python handler survives fork, so a task's own os.fork() or
+    # multiprocessing child would ignore Process.terminate() too. The
+    # fork server's own task children call this again right after forking.
+    os.register_at_fork(after_in_child=_restore_stop)
+
+
 def _rss_kb() -> tuple[int | None, int | None]:
     """(VmRSS kB, private (dirty+clean) kB) from /proc; Nones off-Linux.
 
@@ -605,6 +638,7 @@ def _fork_server_main(app_spec: str, sock_path: str, child_threads: int) -> int:
         pass
 
     _set_pdeathsig()
+    _guard_stop_signals()
     app = _load_app(app_spec)  # import errors: nonzero exit before the server line
 
     # Process-init hooks run in the parent BEFORE the first fork (PROTOCOL.md
@@ -665,6 +699,7 @@ def _fork_server_main(app_spec: str, sock_path: str, child_threads: int) -> int:
                 _write_line(proto, {"error": f"fork failed: {exc}"})
                 continue
             if pid == 0:
+                _guard_stop_signals()
                 code = 1
                 try:
                     code = _forked_child_main(app, proto_fd, sock_path, child_threads)
@@ -888,6 +923,7 @@ def main(argv: list[str] | None = None) -> int:
     except Exception:
         pass
 
+    _guard_stop_signals()
     app = _load_app(ns.app)  # import errors propagate: nonzero exit before ready line
 
     # Process-init hooks (PROTOCOL.md section 4.8): once per stdio child,

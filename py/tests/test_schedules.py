@@ -267,14 +267,12 @@ def test_dst_fall_back_fires_a_repeated_wall_time_exactly_once():
     assert fired == sorted(fired), "slots must be strictly increasing instants"
 
 
-def test_dst_fall_back_hourly_job_does_not_double_fire():
-    """An hourly job across the fall-back fires once per WALL-CLOCK hour.
+def test_dst_fall_back_hourly_job_fires_in_both_repeated_hours():
+    """An hourly job across the fall back fires once per REAL hour, as cron(8)
+    does for a job whose hour field is "*".
 
-    The hour 01:00-01:59 local happens twice. The 01:30 slot fires on the
-    first (EDT) pass; the second (EST) 01:30 is not a later instant than a slot
-    already consumed, so it is skipped rather than duplicated. Net effect: the
-    repeated hour contributes one firing, not two, and the run is strictly
-    increasing throughout.
+    The hour 01:00-01:59 local happens twice, and 01:30 EST is an hour after
+    01:30 EDT, so skipping it would leave a two hour hole in an hourly job.
     """
     ny = ZoneInfo("America/New_York")
     s = crontab(minute=30, timezone="America/New_York")
@@ -284,17 +282,15 @@ def test_dst_fall_back_hourly_job_does_not_double_fire():
         slot = s.next_after(slot)
         fired.append(slot)
 
-    assert fired == sorted(set(fired)), "no repeated or out-of-order instants"
     stamps = [datetime.fromtimestamp(x / 1000, tz=ny) for x in fired]
     assert [f"{d.hour:02d}:{d.minute:02d}{d.tzname()}" for d in stamps] == [
         "00:30EDT",
         "01:30EDT",
-        # 01:30 EST (the repeat) is skipped; the run continues at 02:30 EST.
+        "01:30EST",
         "02:30EST",
-        "03:30EST",
     ]
     gaps = [b - a for a, b in zip(fired, fired[1:])]
-    assert gaps == [3_600_000, 7_200_000, 3_600_000]
+    assert gaps == [3_600_000, 3_600_000, 3_600_000]
 
 
 def test_dst_spring_forward_nonexistent_wall_time_still_fires_once():
@@ -549,3 +545,14 @@ def test_no_real_slot_is_ever_lost_on_a_transition_day(tz_name, day):
             assert repeated and ms(second) == want, (
                 f"{tz_name} {day} '{minute} {hour}' lost a real slot at {want}"
             )
+
+
+@pytest.mark.parametrize(
+    "tz_name, day",
+    [("America/New_York", (2025, 11, 2)), ("Europe/London", (2025, 10, 26))],
+)
+def test_dst_fall_back_every_15_minutes_keeps_firing_in_the_repeated_hour(tz_name, day):
+    s = crontab(minute="*/15", timezone=tz_name)
+    fired = fires_during_local_day(s, tz_name, *day)
+    assert fired == real_matching_instants(s, tz_name, *day)
+    assert len(fired) == 25 * 4

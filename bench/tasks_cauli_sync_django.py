@@ -25,12 +25,12 @@ django.setup()  # must run before importing djapp.models below
 import redis  # noqa: E402
 from cauli.contrib.django import django_app  # noqa: E402
 
-from common import DONE_KEY, REDIS_URL  # noqa: E402
+from common import DONE_KEY, REDIS_POOL_MAX, REDIS_URL  # noqa: E402
 from djapp.models import BenchIo  # noqa: E402
 from workloads import PG_PAYLOAD  # noqa: E402
 
 app = django_app(redis_url=REDIS_URL)  # apps already ready; installs the DB hooks
-_r = redis.Redis.from_url(REDIS_URL)
+_r = redis.Redis.from_url(REDIS_URL, max_connections=REDIS_POOL_MAX)
 
 
 @app.task(store_result=False, max_retries=0)

@@ -19,8 +19,7 @@ Good places to start, in rough order of value:
   do it. Celery's `inspect`, `purge` and `control` have no equivalent either.
 - Benchmark lanes `bench/RESULTS.md` names as never started, particularly the
   retry rate lane and the result round trip latency lane.
-- The open items listed at the end of the "Pre release audit fixes" section in
-  [CHANGELOG.md](CHANGELOG.md).
+- Issues labelled `good first issue`.
 
 ## Repository layout
 
@@ -30,12 +29,22 @@ Good places to start, in rough order of value:
 | `py/` | the `cauli` client library and `cauli-beat` |
 | `itest/` | cross component tests: a real worker binary against a real Redis |
 | `bench/` | the benchmark campaign. Read `bench/CLAIMS.md` before any number in it |
-| `docs/decisions/` | historical design notes, not current documentation |
+| `docs/decisions/` | architecture decision records: why the design is the way it is |
 
 ## Running the checks
 
-The worker needs Linux and a CPython built with `--enable-shared`. A local
-`redis-server` on the default port is enough for the suites.
+| Platform | What you can build and test |
+|---|---|
+| Linux | everything below |
+| macOS | the Python client suite and the linters. The worker does not build |
+| Windows | use WSL 2 (Ubuntu) and follow the Linux steps. Native Windows runs only the linters and the tests that need no Redis |
+
+The worker needs a CPython built with `--enable-shared` (python.org, uv,
+distro packages; pyenv only with `PYTHON_CONFIGURE_OPTS=--enable-shared`).
+The suites need `redis-server` on `PATH`, not a running Redis: each suite
+starts its own throwaway instances on ports 6390 to 6399, so stop anything
+else using those ports first. `scripts/check_versions.py` needs Python 3.11 or
+newer.
 
 ```bash
 # Rust: the test-hooks feature is required, several tests do not exist without it
@@ -43,11 +52,12 @@ cd worker
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo clippy --all-targets --features test-hooks -- -D warnings
+# With no virtualenv activated: the tests embed CPython, which finds an
+# activated venv through PATH, and one test needs cauli NOT to be importable.
 cargo test --release --features test-hooks
 
 # Python client
-pip install -e "py[dev]"
-pip install ruff==0.15.22
+pip install -e "py[dev]"   # includes the pinned ruff; a newer ruff reports errors CI does not
 ruff check py/ worker/src/shim.py itest/ scripts/ worker/wheel-data/scripts/cauli-worker
 ruff format --check py/ worker/src/shim.py itest/ scripts/ worker/wheel-data/scripts/cauli-worker
 cd py && pytest -q

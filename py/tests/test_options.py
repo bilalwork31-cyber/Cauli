@@ -287,3 +287,15 @@ def test_add_periodic_task_itself_does_not_validate_the_task_name(redis_url):
     app = Cauli(redis_url=redis_url)
     app.add_periodic_task("never_registered", "jobs.does_not_exist", schedule=60)
     assert "never_registered" in app._periodic
+
+
+def test_repr_redacts_credentials_in_awkward_urls():
+    # A password with an unencoded "/" or "#", a percent-encoded query key
+    # (redis-py decodes it to "password"), and redis-rs's unix socket keys.
+    for url in (
+        "redis://u:Zm9v/hunter2@dbhost:6379/0",
+        "redis://u:abc#hunter2@dbhost:6379/0",
+        "redis://dbhost:6379/0?%70assword=hunter2",
+        "redis+unix:///run/redis.sock?user=svc&pass=hunter2",
+    ):
+        assert "hunter2" not in repr(Cauli(redis_url=url)), url

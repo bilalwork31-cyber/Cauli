@@ -788,4 +788,20 @@ mod tests {
         );
         assert!(serde_json::from_str::<Envelope>(r#"{"id":"a","task":"t","v":1.0}"#).is_ok());
     }
+
+    /// A Python task receives its kwargs, and every dict argument, in the
+    /// order the caller built them; dicts are ordered in Python. Sorting
+    /// keys on the way through the worker hands the task a different dict
+    /// than the one  was given, and a retry re-enqueues it sorted.
+    #[test]
+    fn object_key_order_survives_parse_and_reserialize() {
+        let raw = r#"{"id":"a","task":"t","args":[{"zeta":1,"alpha":2}],"kwargs":{"z":1,"a":2}}"#;
+        let e: Envelope = serde_json::from_str(raw).unwrap();
+        let kw: Vec<&String> = e.kwargs.as_object().unwrap().keys().collect();
+        assert_eq!(kw, ["z", "a"]);
+        let arg: Vec<&String> = e.args[0].as_object().unwrap().keys().collect();
+        assert_eq!(arg, ["zeta", "alpha"]);
+        let back = serde_json::to_string(&e).unwrap();
+        assert!(back.contains(r#""kwargs":{"z":1,"a":2}"#), "{back}");
+    }
 }

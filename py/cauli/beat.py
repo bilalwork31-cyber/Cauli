@@ -77,6 +77,9 @@ MIN_SLEEP = 0.05
 #: Most due entries claimed per tick. Bounds one tick's work when a large
 #: schedule comes due at once (e.g. every entry at midnight).
 DUE_BATCH = 500
+#: Longest wait before retrying an entry that could not be fired. Its slot
+#: stays due, so without this the loop would retry it every MIN_SLEEP.
+FAILED_FIRE_RETRY = 1.0
 
 
 # --------------------------------------------------------------------------
@@ -584,6 +587,7 @@ class Beat:
                 "the rest are deferred to the next tick and will fire late",
                 len(due),
             )
+        failed: set[str] = set()
         for name, slot in due:
             entry = entries.get(name)
             if entry is None or not entry.enabled:
@@ -595,22 +599,28 @@ class Beat:
                 )
                 self.store.drop_slot(name)
                 continue
-            self._fire(entry, slot, now)
+            if not self._fire(entry, slot, now):
+                failed.add(name)
 
-        return self._sleep_for(now, started)
+        sleep_s = self._sleep_for(now, started, failed)
+        return min(sleep_s, FAILED_FIRE_RETRY) if failed else sleep_s
 
-    def _fire(self, entry: ScheduleEntry, slot: int, now: int) -> None:
+    def _fire(self, entry: ScheduleEntry, slot: int, now: int) -> bool:
+        """False when the slot could not be claimed and is still due."""
         try:
             next_slot, missed = entry.schedule.advance_past_with_missed(slot, now)
         except ValueError as exc:
             log.error("beat: cannot advance entry %r: %s", entry.name, exc)
-            return
+            return False
 
         lateness = now - slot
+        # Judged on the NEWEST coalesced slot, not the oldest: after a day of
+        # downtime yesterday's 03:00 is too late, but today's may not be.
         suppress = (
             entry.on_missed == "skip"
             and entry.max_lateness_ms is not None
             and lateness > entry.max_lateness_ms
+            and entry.schedule.advance_past(slot, now - entry.max_lateness_ms - 1) > now
         )
 
         envelope: dict[str, Any] | None = None
@@ -632,7 +642,7 @@ class Beat:
                 )
             except Exception as exc:
                 log.error("beat: cannot build envelope for %r: %s", entry.name, exc)
-                return
+                return False
             # Provenance: which schedule entry and which slot produced this
             # task. Informational only -- the worker preserves but ignores it
             # (PROTOCOL.md section 2).
@@ -654,14 +664,14 @@ class Beat:
             )
         except Exception as exc:
             log.error("beat: claim failed for %r: %s", entry.name, exc)
-            return
+            return False
 
         if not won:
             # Another replica advanced this slot first. Expected under
             # contention; the whole point is that it is harmless.
             self.lost_races += 1
             log.debug("beat: lost the claim race for %r slot %s", entry.name, slot)
-            return
+            return True
         if suppress:
             self.skipped += 1
             log.warning(
@@ -673,7 +683,7 @@ class Beat:
                 (entry.max_lateness or 0.0),
                 next_slot,
             )
-            return
+            return True
         self.fired += 1
         # A coalesced firing silently consumes every slot it slept through
         # (PROTOCOL.md section 10.4), so say how many rather than leaving an
@@ -696,19 +706,27 @@ class Beat:
             next_slot,
             coalesced,
         )
+        return True
 
-    def _sleep_for(self, now: int, started: float) -> float:
+    def _sleep_for(self, now: int, started: float, failed: set[str]) -> float:
         """Sleep until the next slot, bounded by max_interval and the lease.
 
         ``now`` is the instant the tick STARTED, so the tick's own duration is
         subtracted from the wait. Without that correction every tick wakes a
         tick-duration late, and a schedule whose interval is close to the tick
         cost drifts far enough to start coalescing slots that were never
-        actually missed.
+        actually missed. A ``failed`` slot is still due and is left out, so it
+        neither spins the loop nor delays the next slot of any other entry.
         """
-        upcoming = self.store.due(now + int(self.max_interval * 1000), limit=1)
+        upcoming = [
+            slot
+            for name, slot in self.store.due(
+                now + int(self.max_interval * 1000), limit=len(failed) + 1
+            )
+            if name not in failed
+        ]
         if upcoming:
-            wait = (upcoming[0][1] - now) / 1000.0
+            wait = (upcoming[0] - now) / 1000.0
         else:
             wait = self.max_interval
         wait = min(wait, self.max_interval)

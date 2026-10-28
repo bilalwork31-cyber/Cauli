@@ -427,3 +427,27 @@ def test_db_restart_survival_all_three_paths(stack, pg):
     assert t.db_add.delay(f"post-s-{suffix}").get(timeout=30)["count"] == 1
     assert t.adb_add.delay(f"post-a-{suffix}").get(timeout=30)["count"] == 1
     assert t.cpu_db_add.delay(f"post-c-{suffix}").get(timeout=30)["count"] == 1
+
+
+def test_async_orm_task_keeps_one_thread_and_one_connection_across_awaits(stack, pg):
+    """acreate, aget and aupdate of one async task, interleaved with other
+    tasks, must all run on one sticky executor thread over one Postgres
+    backend, and the process must hold no more backends than executors."""
+    from cauli.contrib.django import DEFAULT_ORM_EXECUTORS
+
+    t = _tasks()
+    prefix = f"sticky-{uuid.uuid4().hex[:8]}"
+    handles = [t.adb_sticky.delay(f"{prefix}-{i}") for i in range(16)]
+    backends = set()
+    for seen in (h.get(timeout=30) for h in handles):
+        threads = {thread for thread, _ in seen}
+        pids = {pid for _, pid in seen}
+        assert len(threads) == 1, f"one task hopped threads: {seen}"
+        assert threads.pop().startswith("cauli-orm-"), seen
+        assert len(pids) == 1, f"one task used {len(pids)} backends: {seen}"
+        backends |= pids
+    assert 1 < len(backends) <= DEFAULT_ORM_EXECUTORS, backends
+    updated = pg.sql(
+        f"SELECT count(*) FROM dapp_item WHERE name LIKE '{prefix}-%-updated'"
+    )
+    assert updated == "16"

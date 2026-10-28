@@ -13,6 +13,7 @@ use redis::AsyncCommands;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+use tokio::sync::Notify;
 use tracing::{error, info, warn};
 
 /// Server side BLOCK window for XREADGROUP, in ms.
@@ -63,7 +64,14 @@ pub async fn fetch_loop(ctx: Arc<Ctx>, mut fetch_conn: redis::aio::ConnectionMan
         // line + a warn on the zero/nonzero edge); the coupling itself stays.
         let permits = ctx.io_sem.available_permits();
         if permits < min_permits || ctx.cpu_backlog() > 0 {
-            gate_wait(&ctx.io_sem, min_permits, permits, GATE_POLL).await;
+            gate_wait(
+                &ctx.io_sem,
+                cpu_drained(&ctx),
+                min_permits,
+                permits,
+                GATE_POLL,
+            )
+            .await;
             continue;
         }
         // Fetch only what there is capacity to START, not a full --batch.
@@ -384,8 +392,12 @@ async fn admission_open(ctx: &Arc<Ctx>) -> Option<usize> {
         if permits > 0 && ctx.cpu_backlog() == 0 {
             return Some(permits.min(RECOVERY_SCAN_BATCH));
         }
-        gate_wait(&ctx.io_sem, 1, permits, GATE_POLL).await;
+        gate_wait(&ctx.io_sem, cpu_drained(ctx), 1, permits, GATE_POLL).await;
     }
+}
+
+fn cpu_drained(ctx: &Ctx) -> Option<&Notify> {
+    ctx.cpu.get().map(|pool| pool.drained.as_ref())
 }
 
 /// Ceiling on how long either admission gate may sit on a condition it
@@ -400,11 +412,30 @@ const GATE_POLL: Duration = Duration::from_millis(25);
 /// semaphore ever signals. Waiting on `io_sem` in that state returns
 /// INSTANTLY, and the caller loops straight back into the same closed gate --
 /// a full speed spin for as long as the backlog lasts, on the worker's
-/// hottest loop. So the poll is the wait there, and the semaphore is the wait
-/// only when the semaphore is the thing that is shut.
-async fn gate_wait(io_sem: &tokio::sync::Semaphore, want: usize, free: usize, poll: Duration) {
+/// hottest loop. So the backlog drain signal (with the poll as its ceiling)
+/// is the wait there, and the semaphore is the wait only when the semaphore
+/// is the thing that is shut.
+async fn gate_wait(
+    io_sem: &tokio::sync::Semaphore,
+    cpu_drained: Option<&Notify>,
+    want: usize,
+    free: usize,
+    poll: Duration,
+) {
     if free >= want.max(1) {
-        tokio::time::sleep(poll).await;
+        // The poll stays as the ceiling for shutdown and for the second
+        // waiter that a single notify_one does not reach. Sleeping out the
+        // whole poll here idled every cpu child once its few staged requests
+        // were done: a noop cpu task on one child ran at 1.6k/s.
+        match cpu_drained {
+            Some(drained) => {
+                tokio::select! {
+                    _ = drained.notified() => {}
+                    _ = tokio::time::sleep(poll) => {}
+                }
+            }
+            None => tokio::time::sleep(poll).await,
+        }
     } else {
         await_capacity(io_sem, want, poll).await;
     }
@@ -1133,10 +1164,29 @@ mod tests {
         let poll = Duration::from_millis(30);
         let sem = Arc::new(tokio::sync::Semaphore::new(8));
         let t0 = Instant::now();
-        gate_wait(&sem, 2, 8, poll).await;
+        gate_wait(&sem, None, 2, 8, poll).await;
         assert!(t0.elapsed() >= poll, "free permits must not short circuit");
         // The permits were never held: dispatch still sees all eight.
         assert_eq!(sem.available_permits(), 8);
+    }
+
+    /// The backlog shut the gate and then drained: the drain signal wakes
+    /// it, not the poll. `poll` is 30s, so passing means the notify did it.
+    #[tokio::test]
+    async fn the_gate_wakes_when_the_cpu_backlog_drains() {
+        let sem = Arc::new(tokio::sync::Semaphore::new(8));
+        let drained = Arc::new(Notify::new());
+        let draining = drained.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            draining.notify_one();
+        });
+        let t0 = Instant::now();
+        gate_wait(&sem, Some(&drained), 2, 8, Duration::from_secs(30)).await;
+        assert!(
+            t0.elapsed() < Duration::from_secs(5),
+            "drained while waiting"
+        );
     }
 
     /// ...and when the semaphore IS the shut half, the wait stays event
@@ -1150,7 +1200,7 @@ mod tests {
             freeing.add_permits(2);
         });
         let t0 = Instant::now();
-        gate_wait(&sem, 2, 0, Duration::from_secs(30)).await;
+        gate_wait(&sem, None, 2, 0, Duration::from_secs(30)).await;
         assert!(t0.elapsed() < Duration::from_secs(5), "freed while waiting");
     }
 }

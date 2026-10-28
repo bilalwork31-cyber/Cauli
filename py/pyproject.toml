@@ -24,10 +24,11 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: Free Threading :: 3 - Stable",
     "Topic :: System :: Distributed Computing",
 ]
 dependencies = [
-    "redis>=5",
+    "redis>=5.0.1",
     # Required, not an accelerator. cauli has no stdlib json fallback: two
     # backends meant two sets of semantics (they disagreed on lone surrogates,
     # dict-key coercion and exception types), and a fallback lets the slow path
@@ -54,9 +55,10 @@ dependencies = [
     # absent. Raise the python_version bound when the matrix gains a version.
     #
     # Two gaps the marker CANNOT close, because PEP 508 has no marker for
-    # either: musl (Alpine) and the free threaded build. Both look like
-    # supported platforms to the marker, no compatible wheel exists, and pip
-    # therefore fails the whole install rather than dropping the requirement.
+    # either: musl (Alpine) and the free threaded 3.13t build (3.14t has a
+    # cp314t worker wheel). Both look like supported platforms to the marker,
+    # no compatible wheel exists, and pip therefore fails the whole install
+    # rather than dropping the requirement.
     # Use the enqueue only command below there, or build the worker from
     # source. See PROTOCOL.md section 13.4.
     #
@@ -79,6 +81,8 @@ Issues = "https://github.com/bilalwork31-cyber/Cauli/issues"
 [project.optional-dependencies]
 dev = [
     "pytest>=8",
+    # Same pin as .github/workflows/ci.yml. Newer ruff enables more rules by default.
+    "ruff==0.15.22",
 ]
 # Opt-in Django integration (cauli.contrib.django, TaskDef.delay_on_commit).
 # Core never imports django; this extra just pins a floor for users who do.

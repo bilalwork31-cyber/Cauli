@@ -5,12 +5,12 @@ Run with: celery -A tasks_celery_cpu worker -P prefork -c ...
 import redis
 from celery import Celery
 
-from common import DONE_KEY, REDIS_URL
+from common import DONE_KEY, REDIS_POOL_MAX, REDIS_URL
 from workloads import cpu_burn
 
 app = Celery("fwbench", broker=REDIS_URL, backend=None)
 app.conf.task_ignore_result = True
-_r = redis.Redis.from_url(REDIS_URL)
+_r = redis.Redis.from_url(REDIS_URL, max_connections=REDIS_POOL_MAX)
 
 
 @app.task(ignore_result=True)

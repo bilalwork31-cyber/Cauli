@@ -13,7 +13,8 @@ covered by the same policy.
 ## Reporting a vulnerability
 
 Report privately through GitHub's advisory form:
-<https://github.com/bilalwork31-cyber/Cauli/security/advisories/new>. Please do
+<https://github.com/bilalwork31-cyber/Cauli/security/advisories/new>, or by
+email to bilalwork31@gmail.com with "cauli security" in the subject. Please do
 not open a public issue for a suspected vulnerability, and please do not post a
 proof of concept anywhere public before a fix is out.
 

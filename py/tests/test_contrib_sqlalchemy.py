@@ -15,6 +15,7 @@ before and during the run) is a manual verification built on
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import time
 import uuid
@@ -87,6 +88,26 @@ def test_sqlalchemy_app_builds_engine_and_wires_hooks():
     assert [h.__name__ for h in app._process_init_hooks] == [
         "cauli_dispose_sqlalchemy_engine"
     ]
+
+
+def test_sqlalchemy_app_task_enqueues_without_blocking_from_a_coroutine(
+    redis_url, redis_client
+):
+    app = sqlalchemy_app(_FAKE_DATABASE_URL, redis_url=redis_url)
+
+    @app.task(name="sa.adelay")
+    def t(x):
+        return x
+
+    async def endpoint():
+        try:
+            return await t.adelay(5)
+        finally:
+            await app.aclose()
+
+    result = asyncio.run(endpoint())
+    [(_id, fields)] = redis_client.xrange("cauli:q:default")
+    assert json.loads(fields[b"e"])["id"] == result.id
 
 
 def test_get_session_raises_outside_any_task():
@@ -279,6 +300,55 @@ def test_process_init_dispose_hook_runs_without_error_on_real_engine():
         assert n == 0, "dispose() left the real backend connection open"
     finally:
         asyncio.run(engine.dispose())  # belt and suspenders: never leak a real backend
+
+
+def test_sqlalchemy_app_keeps_every_connection_it_opens_pooled():
+    """SQLAlchemy's default pool keeps 5 connections and closes each overflow
+    connection when it is returned, so any burst above 5 concurrent tasks paid
+    a fresh connect on nearly every task (FastAPI benchmark: end to end p99
+    564 ms, against 31 ms with the same 15 connections all pooled). Two bursts
+    of 12 concurrent tasks: the second must reuse the first's backends."""
+    burst = 12
+    app = sqlalchemy_app(
+        _BENCH_PG_DSN.replace("postgresql://", "postgresql+psycopg://", 1),
+        redis_url=_FAKE_REDIS_URL,
+    )
+    before, after = app._before_task_hooks[0], app._after_task_hooks[0]
+
+    async def one_burst() -> set[int]:
+        holding = 0
+        all_holding = asyncio.Event()
+
+        async def one_task() -> int:
+            nonlocal holding
+            before()
+            try:
+                result = await get_session().execute(
+                    sqlalchemy.text("select pg_backend_pid()")
+                )
+                holding += 1
+                if holding == burst:
+                    all_holding.set()
+                await all_holding.wait()  # keep the connection checked out
+                return result.scalar()
+            finally:
+                await after()
+
+        return set(await asyncio.gather(*(one_task() for _ in range(burst))))
+
+    async def two_bursts() -> tuple[set[int], set[int]]:
+        return await one_burst(), await one_burst()
+
+    try:
+        first, second = asyncio.run(two_bursts())
+    except sqlalchemy.exc.OperationalError as exc:
+        pytest.skip(f"bench Postgres not reachable at {_BENCH_PG_DSN}: {exc}")
+    finally:
+        app._process_init_hooks[0]()
+    assert len(first) == burst
+    assert second <= first, (
+        f"{len(second - first)} of {burst} tasks opened a new connection"
+    )
 
 
 # The module was called cauli.contrib.fastapi until the 1.0 API freeze. That

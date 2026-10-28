@@ -101,6 +101,9 @@ pub fn run() -> ! {
     exit_now(code);
 }
 
+/// Longest `exit_now` waits for queued log lines to reach stdout.
+const EXIT_LOG_FLUSH_BUDGET: Duration = Duration::from_secs(1);
+
 /// Terminate the process immediately, WITHOUT running libc `atexit` handlers
 /// or shared-library destructors.
 ///
@@ -129,18 +132,22 @@ pub fn run() -> ! {
 /// server socket) is released explicitly before this is reached, and Rust
 /// destructors never ran under `process::exit` either.
 ///
-/// Only Rust's own buffered stdout needs draining first -- that is where
-/// tracing writes. The embedded interpreter's `sys.stdout` buffer is not
-/// flushed, but it never was: CPython only flushes it from `Py_Finalize`,
-/// which an embedded worker with live daemon threads must not call.
+/// Only the log sink needs draining first: tracing lines wait in its channel
+/// for the `cauli-log` thread, and `_exit` alone discarded them, which is
+/// how a fatal startup error exited 1 with nothing printed. `logsink::flush`
+/// waits a bounded time and never takes the stdout lock, because a stalled
+/// log reader leaves the writer blocked holding it, and the
+/// `stdout().flush()` this used to call then never returned. The embedded
+/// interpreter's `sys.stdout` buffer is not flushed, but it never was:
+/// CPython only flushes it from `Py_Finalize`, which an embedded worker with
+/// live daemon threads must not call.
 ///
 /// Callers: this `main`, the forced exit on a second signal (130), and
 /// `loops::wedge_loop` on a confirmed event loop wedge
 /// (`loops::WEDGE_EXIT_CODE`), which is the one that runs with the whole
 /// process still executing tasks.
 fn exit_now(code: i32) -> ! {
-    use std::io::Write;
-    let _ = std::io::stdout().flush();
+    logsink::flush(EXIT_LOG_FLUSH_BUDGET);
     // SAFETY: `_exit` is async-signal-safe and valid to call from any thread
     // at any time; it does not return.
     unsafe { libc::_exit(code) }
@@ -294,47 +301,14 @@ fn real_main() -> i32 {
         resolved.io_concurrency,
         resolved.cpu_workers
     );
-    // H1 operator diagnostic: loops::recovery_loop's per-envelope idle check
-    // already prevents reclaiming a still-running task regardless of this
-    // default, but a task whose registered timeout_ms is >= the visibility
-    // floor is a strong signal of a misconfigured deployment (the invariant
-    // documented in PROTOCOL.md §4.4: visibility_timeout should exceed your
-    // longest task) — warn loudly at startup so operators catch it early.
-    let vt_ms = visibility_timeout_ms(args.visibility_timeout);
-    for (name, spec) in &appcfg.tasks {
-        if spec.timeout_ms >= vt_ms {
-            warn!(
-                task = %name, timeout_ms = spec.timeout_ms, visibility_timeout_s = args.visibility_timeout,
-                "task timeout_ms >= visibility_timeout*1000 (PROTOCOL.md §4.4 invariant \
-                 violated) -- consider raising --visibility-timeout"
-            );
-        }
-    }
-    // Same diagnostic, mirrored for idemp_ttl (section 4.5): it is one
-    // global value while a task's own timeout_ms is not, and nothing else
-    // cross checks them. If a task legitimately runs longer than idemp_ttl,
-    // its idempotency key expires while the task is still running, and a
-    // second attempt with the same key then claims Fresh: the exact
-    // duplicate concurrent execution the key exists to prevent.
-    let idemp_ttl_ms = idemp_ttl_ms(appcfg.idemp_ttl);
-    for (name, spec) in &appcfg.tasks {
-        if spec.timeout_ms >= idemp_ttl_ms {
-            warn!(
-                task = %name, timeout_ms = spec.timeout_ms, idemp_ttl_s = appcfg.idemp_ttl,
-                "task timeout_ms >= idemp_ttl*1000: an idempotency key can expire while \
-                 this task is still running, so a second attempt with the same key would \
-                 claim Fresh and run concurrently with the first. Consider raising idemp_ttl."
-            );
-        }
-    }
-    // The third cross check the other two imply and nothing performed: §4.7's
-    // drain waits `--drain-timeout` and then `_exit`s, killing whatever is
-    // still running. The default pair is 30s of drain against a 300s task
+    // §4.7's drain waits `--drain-timeout` and then `_exit`s, killing whatever
+    // is still running. The default pair is 30s of drain against a 300s task
     // timeout, so a rolling deploy kills every task older than 30 seconds and
     // the entry survives only because it stays pending for recovery. Warned
-    // ONCE, naming the longest registered task, rather than per task like the
-    // two loops above: with stock defaults every task in every app trips it,
-    // and a per task warning would be a wall of text at every boot.
+    // ONCE, naming the longest registered task: with stock defaults every
+    // task in every app trips it, and a per task warning would be a wall of
+    // text at every boot. (No such check exists for idemp_ttl: the claim is
+    // written with at least the task's own timeout, broker::claim_ttl_s.)
     if let Some((name, timeout_ms)) = longest_timeout_past_drain(&appcfg.tasks, args.drain_timeout)
     {
         warn!(
@@ -393,6 +367,9 @@ async fn run_worker(
     // path instead of leaving it dormant. Do not "simplify" this back to a
     // per call tokio::timeout; it silently breaks reconnection.
     let conn_cfg = ConnectionManagerConfig::new()
+        .set_factor(REDIS_RETRY_FACTOR)
+        .set_max_delay(REDIS_RETRY_MAX_DELAY_MS)
+        .set_number_of_retries(REDIS_RETRIES)
         .set_response_timeout(Duration::from_secs(args.redis_timeout))
         .set_connection_timeout(Duration::from_secs(args.redis_timeout));
     let mut write_conn =
@@ -560,6 +537,10 @@ async fn run_worker(
     code
 }
 
+/// A stop signal this soon after the first is the same stop request
+/// delivered twice, not an operator asking for the forced exit.
+const SECOND_SIGNAL_MIN_GAP: Duration = Duration::from_secs(1);
+
 fn spawn_signal_task(shutdown_tx: watch::Sender<bool>, ctx: Arc<Ctx>) {
     tokio::spawn(async move {
         let mut term = signal(SignalKind::terminate()).expect("SIGTERM handler");
@@ -569,9 +550,21 @@ fn spawn_signal_task(shutdown_tx: watch::Sender<bool>, ctx: Arc<Ctx>) {
             _ = int.recv() => info!("SIGINT: stop fetching, draining"),
         }
         let _ = shutdown_tx.send(true);
-        tokio::select! {
-            _ = term.recv() => {},
-            _ = int.recv() => {},
+        // One stop request often arrives as two signals: systemd's default
+        // KillMode=control-group signals this process AND the supervisor,
+        // which forwards its own; a SIGKILLed supervisor re-delivers
+        // PDEATHSIG once per thread it had. Only a signal sent after a
+        // human-scale gap means "stop waiting".
+        let first = tokio::time::Instant::now();
+        loop {
+            tokio::select! {
+                _ = term.recv() => {},
+                _ = int.recv() => {},
+            }
+            if first.elapsed() >= SECOND_SIGNAL_MIN_GAP {
+                break;
+            }
+            info!("signal within {SECOND_SIGNAL_MIN_GAP:?} of the first: same stop request, still draining");
         }
         warn!("second signal: forced exit 130");
         // FS-8: this path bypasses run_worker's normal drain-then-cleanup
@@ -587,6 +580,17 @@ fn spawn_signal_task(shutdown_tx: watch::Sender<bool>, ctx: Arc<Ctx>) {
         exit_now(130);
     });
 }
+
+/// Reconnect backoff for every redis connection. redis-rs 0.32 builds it
+/// with `backon`, whose delay starts at 1 s and multiplies by `factor`; the
+/// crate default factor of 100 jumps straight to backon's 60 s cap, so an
+/// unreachable redis at startup kept the worker silent for about 5 minutes
+/// per connection, and a redis restart at runtime stalled it up to a minute.
+/// Delays here are 1 s, then 2 s capped, plus jitter: startup gives up and
+/// says why after about 17 s (measured against a refused port).
+const REDIS_RETRY_FACTOR: u64 = 2;
+const REDIS_RETRY_MAX_DELAY_MS: u64 = 2_000;
+const REDIS_RETRIES: usize = 6;
 
 /// Operator override for the Redis Cluster startup refusal.
 ///
@@ -898,22 +902,20 @@ fn redact_redis_url(url: &str) -> String {
     };
     let scheme = &url[..scheme_end];
     let rest = &url[scheme_end + 3..];
-    // Authority ends at the first '/', '?' or '#'; '@' means the
-    // userinfo/host boundary only within it, so an '@' inside a later
-    // `?password=` value (masked separately below) can never be mistaken
-    // for a second one and corrupt the visible host.
+    // The userinfo '@' is searched for up to the query, not just up to the
+    // first '/' or '#': an unencoded '/' or '#' in a password (base64 output
+    // has '/') makes the URL unparseable, and the error that reports it must
+    // not print the password. Last '@', not first, for a password that
+    // itself contains '@'. An '@' inside `?password=` is masked below.
+    let userinfo_end = rest.find('?').unwrap_or(rest.len());
+    let (mask, rest) = match rest[..userinfo_end].rfind('@') {
+        Some(at) => ("***@", &rest[at + 1..]),
+        None => ("", rest),
+    };
     let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let (authority, tail) = rest.split_at(authority_end);
-    // Last '@', not first: the `url` crate (and the client that uses it)
-    // resolves a password containing a literal '@' the same way, so
-    // splitting at the first one would leave that password's own tail in
-    // plaintext right after the mask.
-    let new_authority = match authority.rfind('@') {
-        Some(at) => format!("***@{}", &authority[at + 1..]),
-        None => authority.to_string(),
-    };
     format!(
-        "{scheme}://{new_authority}{}",
+        "{scheme}://{mask}{authority}{}",
         redact_query_credentials(tail)
     )
 }
@@ -933,7 +935,7 @@ fn redact_query_credentials(tail: &str) -> String {
     let masked = query
         .split('&')
         .map(|pair| match pair.split_once('=') {
-            Some((k, _)) if k == "password" || k == "username" => format!("{k}=***"),
+            Some((k, _)) if is_credential_key(k) => format!("{k}=***"),
             _ => pair.to_string(),
         })
         .collect::<Vec<_>>()
@@ -941,52 +943,16 @@ fn redact_query_credentials(tail: &str) -> String {
     format!("{path}?{masked}{fragment}")
 }
 
-/// Seconds to milliseconds for the visibility timeout. Saturating, matching
-/// the overflow safe style used elsewhere for hostile or just huge input
-/// (dispatch.rs, envelope.rs, exec.rs, cpu.rs): release builds have no
-/// overflow-checks, so a plain multiply would wrap silently instead.
-fn visibility_timeout_ms(visibility_timeout_s: u64) -> u64 {
-    visibility_timeout_s.saturating_mul(1000)
-}
-
-/// Seconds to milliseconds for idemp_ttl, same reasoning and same
-/// saturating style as `visibility_timeout_ms` above.
-fn idemp_ttl_ms(idemp_ttl_s: u64) -> u64 {
-    idemp_ttl_s.saturating_mul(1000)
+/// `password`/`username` are redis-py's query credentials, `pass`/`user` are
+/// redis-rs's for `redis+unix://`. Both clients percent-decode the key, so
+/// any key holding a '%' is treated as a possible credential too.
+fn is_credential_key(key: &str) -> bool {
+    matches!(key, "password" | "username" | "pass" | "user") || key.contains('%')
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn visibility_timeout_ms_saturates_instead_of_wrapping() {
-        assert_eq!(visibility_timeout_ms(60), 60_000);
-        assert_eq!(visibility_timeout_ms(u64::MAX), u64::MAX);
-    }
-
-    #[test]
-    fn idemp_ttl_ms_saturates_instead_of_wrapping() {
-        assert_eq!(idemp_ttl_ms(86_400), 86_400_000);
-        assert_eq!(idemp_ttl_ms(u64::MAX), u64::MAX);
-    }
-
-    /// F4 reproduction: idemp_ttl and a task's own timeout_ms are unrelated
-    /// numbers nothing else cross checks. The default idemp_ttl (86400s)
-    /// comfortably outlives the default task timeout (300s / 300_000ms); a
-    /// short idemp_ttl against that same default timeout is exactly the
-    /// dangerous combination the new startup warning must catch.
-    #[test]
-    fn idemp_ttl_shorter_than_task_timeout_is_detected() {
-        assert!(
-            300_000 < idemp_ttl_ms(86_400),
-            "default idemp_ttl must be safe"
-        );
-        assert!(
-            300_000 >= idemp_ttl_ms(60),
-            "a 60s idemp_ttl against a 300s task timeout must be flagged"
-        );
-    }
 
     /// Audit (perf): the sync pool used to start `--io-threads` threads
     /// whatever the app registered, so a pure `async def` workload paid for
@@ -1171,6 +1137,34 @@ mod tests {
         assert_eq!(
             redact_redis_url("redis://dbhost:6379/0?username=svc&password=s3cr3t"),
             "redis://dbhost:6379/0?username=***&password=***"
+        );
+    }
+
+    #[test]
+    fn redacts_unix_socket_and_percent_encoded_query_credentials() {
+        assert_eq!(
+            redact_redis_url("redis+unix:///run/redis.sock?db=1&user=svc&pass=s3cr3t"),
+            "redis+unix:///run/redis.sock?db=1&user=***&pass=***"
+        );
+        assert_eq!(
+            redact_redis_url("redis://dbhost:6379/0?%70assword=s3cr3t"),
+            "redis://dbhost:6379/0?%70assword=***"
+        );
+    }
+
+    #[test]
+    fn redacts_password_with_unencoded_slash_or_hash() {
+        assert_eq!(
+            redact_redis_url("redis://u:Zm9v/YmFy@dbhost:6379/0"),
+            "redis://***@dbhost:6379/0"
+        );
+        assert_eq!(
+            redact_redis_url("redis://u:abc#def@dbhost:6379/0"),
+            "redis://***@dbhost:6379/0"
+        );
+        assert_eq!(
+            redact_redis_url("redis://dbhost:6379/0?password=a@b"),
+            "redis://dbhost:6379/0?password=***"
         );
     }
 

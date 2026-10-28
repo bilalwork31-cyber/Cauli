@@ -175,3 +175,27 @@ async def aleak_check():
     """Long enough for a surviving orphan to have fired."""
     await asyncio.sleep(0.2)
     return _leaked["ran"]
+
+
+def _sleep_forever(started):
+    started.set()
+    time.sleep(3600)
+
+
+@app.task(name="terminate_grandchild", kind="cpu")
+def terminate_grandchild():
+    # Fork start method: the grandchild inherits this process's Python signal
+    # handlers, and Process.terminate() sends SIGTERM.
+    import multiprocessing
+
+    ctx = multiprocessing.get_context("fork")
+    started = ctx.Event()
+    proc = ctx.Process(target=_sleep_forever, args=(started,))
+    proc.start()
+    started.wait(5)
+    proc.terminate()
+    proc.join(5)
+    if proc.exitcode is None:
+        proc.kill()
+        proc.join()
+    return proc.exitcode

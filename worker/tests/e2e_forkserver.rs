@@ -14,6 +14,7 @@ async fn e2e_fork_server() {
     let _: String = redis::cmd("FLUSHALL").query_async(&mut c).await.unwrap();
 
     threaded_child_pipelining(&mut c).await;
+    idle_children_take_a_burst_before_prefetch_stages_it(&mut c).await;
     kill_and_respawn_via_fork(&mut c).await;
     threaded_soft_timeout(&mut c).await;
     fallback_stdio_mode(&mut c).await;
@@ -60,6 +61,47 @@ async fn threaded_child_pipelining(c: &mut redis::aio::MultiplexedConnection) {
     assert!(
         elapsed < std::time::Duration::from_millis(3600),
         "4 x 1.2s tasks on one 4-thread child must interleave, took {elapsed:?}"
+    );
+
+    w.signal(libc::SIGTERM);
+    assert_eq!(w.wait_code(20), 0);
+    drop(w);
+}
+
+/// Two tasks arriving together on two idle single-threaded children must
+/// run one per child. With the default `--cpu-prefetch 4` the first slot to
+/// wake used to take both, stage the second behind the first, and leave its
+/// sibling idle: twice the wall time.
+async fn idle_children_take_a_burst_before_prefetch_stages_it(
+    c: &mut redis::aio::MultiplexedConnection,
+) {
+    let mut w = Worker::spawn("burstq", &["--cpu-workers", "2", "--eager-cpu"]);
+    wait_group(c, "burstq", 20).await;
+    // Both children forked and connected before the burst.
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+    let t0 = std::time::Instant::now();
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        let (id, e) = envelope("fx.cpu_slow_pid", "burstq", |v| {
+            v["kind"] = json!("cpu");
+            v["args"] = json!([1.5]);
+            v["max_retries"] = json!(0);
+        });
+        xadd(c, "burstq", &e.to_string()).await;
+        ids.push(id);
+    }
+    let mut pids = std::collections::HashSet::new();
+    for id in &ids {
+        let r = wait_result(c, id, 20).await;
+        assert_eq!(r["status"], "success");
+        pids.insert(r["result"]["pid"].as_u64().unwrap());
+    }
+    let elapsed = t0.elapsed();
+    assert_eq!(pids.len(), 2, "one task per idle child (got pids {pids:?})");
+    assert!(
+        elapsed < std::time::Duration::from_millis(2700),
+        "2 x 1.5s tasks on 2 idle children must run in parallel, took {elapsed:?}"
     );
 
     w.signal(libc::SIGTERM);

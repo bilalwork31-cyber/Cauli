@@ -15,13 +15,13 @@ import time
 import redis
 from celery import Celery
 
-from common import REDIS_URL
+from common import REDIS_POOL_MAX, REDIS_URL
 
 EXEC_KEY = "bench:chaos:executions"
 
 app = Celery("fwbench", broker=REDIS_URL, backend=None)
 app.conf.task_ignore_result = True
-_r = redis.Redis.from_url(REDIS_URL)
+_r = redis.Redis.from_url(REDIS_URL, max_connections=REDIS_POOL_MAX)
 
 
 @app.task(ignore_result=True)

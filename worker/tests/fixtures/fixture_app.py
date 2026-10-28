@@ -210,3 +210,8 @@ app.add(TaskDef("fx.cpu_die_once", cpu_die_once, kind="cpu"))
 app.add(TaskDef("fx.cpu_die_always", cpu_die_always, kind="cpu"))
 app.add(TaskDef("fx.cpu_selfsignal", cpu_selfsignal, kind="cpu"))
 app.add(TaskDef("fx.cpu_ghost", cpu_ghost, kind="cpu"))
+
+# exit_path.rs: enough registered tasks that their startup warnings overflow
+# a pipe buffer nobody reads.
+for _i in range(int(os.environ.get("FIXTURE_FILLER_TASKS", "0"))):
+    app.add(TaskDef(f"fx.filler_{_i}", echo))

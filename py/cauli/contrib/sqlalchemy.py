@@ -49,10 +49,13 @@ What :func:`sqlalchemy_app` gives you on top of a plain ``Cauli()``:
   body, and a ``ContextVar`` plus one accessor is the minimum that does it.
 
 Connection count is a different question from lifecycle, and this module
-does not manage it either. One process builds one engine, and that engine's
-pool is bounded by SQLAlchemy's own ``pool_size`` (default 5) and
-``max_overflow`` (default 10), 15 connections total, a ceiling nothing here
-knows about. cauli's own concurrency knob for the async lane is
+does not manage it either. One process builds one engine. :func:`sqlalchemy_app`
+gives it ``pool_size=15, max_overflow=0``: the same 15 connection ceiling as
+SQLAlchemy's default of 5 plus 10 overflow, but every connection stays pooled,
+where the default closes each overflow connection on return and makes any
+burst above 5 concurrent tasks pay a fresh connect per task. Build your own
+engine and call :func:`install_sqlalchemy_session` for another size. cauli's
+own concurrency knob for the async lane is
 ``--io-concurrency`` (default 256, see ``docs/CONFIGURATION.md``), and
 nothing wires the two together: cauli will admit up to 256 tasks at once,
 each opening a session in the before task hook, while the pool underneath
@@ -150,7 +153,7 @@ import asyncio
 from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any
 
-from cauli.app import Cauli
+from cauli.app import AsyncCauli, Cauli
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
@@ -186,20 +189,27 @@ def get_session() -> AsyncSession:
     return session
 
 
-def sqlalchemy_app(database_url: str, **overrides: Any) -> Cauli:
-    """Build a :class:`cauli.Cauli` app wired with a session per task async
-    SQLAlchemy engine.
+#: Connections in the engine sqlalchemy_app() builds, all kept pooled (see the
+#: module docstring on connection count).
+DEFAULT_POOL_SIZE = 15
+
+
+def sqlalchemy_app(database_url: str, **overrides: Any) -> AsyncCauli:
+    """Build a :class:`cauli.AsyncCauli` app wired with a session per task
+    async SQLAlchemy engine, so an endpoint can ``await task.adelay(...)``.
 
     ``database_url`` is passed straight to ``create_async_engine`` (an async
     driver dialect such as ``postgresql+psycopg://`` or
     ``postgresql+asyncpg://``; this module does not choose one for you).
-    Keyword ``overrides`` go to ``Cauli(...)`` unchanged (``redis_url=...``
+    Keyword ``overrides`` go to ``AsyncCauli(...)`` unchanged (``redis_url=...``
     etc). Registers the session hooks via :func:`install_sqlalchemy_session`.
     """
     from sqlalchemy.ext.asyncio import create_async_engine
 
-    engine = create_async_engine(database_url)
-    app = Cauli(**overrides)
+    engine = create_async_engine(
+        database_url, pool_size=DEFAULT_POOL_SIZE, max_overflow=0
+    )
+    app = AsyncCauli(**overrides)
     return install_sqlalchemy_session(app, engine)
 
 
