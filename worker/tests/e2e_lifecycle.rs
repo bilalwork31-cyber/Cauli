@@ -437,7 +437,7 @@ async fn xpending_count(c: &mut redis::aio::MultiplexedConnection, queue: &str) 
     // summary form: [count, min, max, consumers]
     match v {
         redis::Value::Array(items) => match items.first() {
-            Some(n) => redis::from_redis_value::<i64>(n).unwrap_or(0),
+            Some(n) => redis::from_redis_value_ref::<i64>(n).unwrap_or(0),
             None => 0,
         },
         _ => 0,

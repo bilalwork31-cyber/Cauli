@@ -124,7 +124,7 @@ pub async fn fetch_loop(ctx: Arc<Ctx>, mut fetch_conn: redis::aio::ConnectionMan
                 let raw = entry
                     .map
                     .get("e")
-                    .and_then(|v| redis::from_redis_value::<String>(v).ok());
+                    .and_then(|v| redis::from_redis_value_ref::<String>(v).ok());
                 spawn_dispatch(ctx.clone(), queue.clone(), entry.id.clone(), raw);
             }
         }

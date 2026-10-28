@@ -71,7 +71,7 @@ rand = "0.9"
 # rustls-native-certs; `tls-rustls-webpki-roots` would REPLACE that with a
 # baked in bundle, which is the wrong default for a worker that has to trust
 # a private CA or a corporate proxy.
-redis = { version = "0.32", features = ["tokio-comp", "connection-manager", "tokio-rustls-comp"] }
+redis = { version = "1.8", features = ["tokio-comp", "connection-manager", "tokio-rustls-comp"] }
 # Direct dependency for exactly one reason: redis depends on rustls with
 # default-features off, so no crypto provider is selected and
 # `ClientConfig::builder()` would panic on the first rediss:// connection.
@@ -114,6 +114,6 @@ mimalloc = { version = "0.1", default-features = false }
 # connection-manager: worker/tests/redis_response_timeout.rs exercises
 # ConnectionManager/ConnectionManagerConfig directly, the same types
 # main.rs builds its two redis connections with.
-redis = { version = "0.32", features = ["tokio-comp", "connection-manager"] }
+redis = { version = "1.8", features = ["tokio-comp", "connection-manager"] }
 serde_json = { version = "1", features = ["arbitrary_precision"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

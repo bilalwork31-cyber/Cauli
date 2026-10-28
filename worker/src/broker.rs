@@ -198,7 +198,7 @@ pub async fn run_mover(
 /// ordinary redis error.
 pub fn is_crossslot(e: &anyhow::Error) -> bool {
     e.downcast_ref::<redis::RedisError>()
-        .is_some_and(|re| re.kind() == redis::ErrorKind::CrossSlot)
+        .is_some_and(|re| re.kind() == redis::ErrorKind::Server(redis::ServerErrorKind::CrossSlot))
 }
 
 /// True if `e` is Redis's NOGROUP: the consumer group named in the command
@@ -782,7 +782,7 @@ pub async fn xpending_idle(
 
 fn raw_e_field(map: &std::collections::HashMap<String, redis::Value>) -> Option<String> {
     map.get("e")
-        .and_then(|v| redis::from_redis_value::<String>(v).ok())
+        .and_then(|v| redis::from_redis_value_ref::<String>(v).ok())
 }
 
 /// §4.4 (H1) non-destructive peek at pending entries' envelopes, one
