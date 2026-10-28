@@ -11,67 +11,33 @@
   <img src="https://img.shields.io/badge/worker-Linux-lightgrey" alt="Linux worker">
 </p>
 
-|  |  |
-|---|---|
-| **Version** | 0.1.0 |
-| **Source** | https://github.com/bilalwork31-cyber/Cauli |
-| **Download** | https://pypi.org/project/cauli/ |
-| **Protocol** | [PROTOCOL.md](PROTOCOL.md) |
-| **Keywords** | task, queue, job, async, redis, python, worker, celery, django, fastapi |
+cauli is a task queue for Python. You write tasks in Python; one Rust binary,
+`cauli-worker`, runs them from Redis.
 
-## What is cauli?
+## Why
 
-cauli is a task queue for Python. You write tasks in Python, and one Rust
-binary runs them.
+- **One worker for every kind of task.** `async def` tasks run on an event
+  loop, `def` tasks on a thread pool, `kind="cpu"` tasks in forked child
+  processes, all inside one `cauli-worker` command. There is no pool type to
+  choose and no second deployment for CPU work.
+- **One concurrency flag.** `-c 50` means 50 tasks in flight, not 50
+  processes. Processes, threads and slots derive from it; `--print-plan`
+  shows the result.
+- **At least once delivery.** Redis Streams consumer groups, a visibility
+  timeout, retries with backoff, a dead letter queue, idempotency keys, soft
+  and hard timeouts. A crashed worker's tasks run again elsewhere.
+- **Async native client.** `await task.adelay(...)` never blocks your loop.
 
-A task queue distributes work across threads or machines. Your web process puts
-a message on a Redis queue, and a worker process picks it up and runs it. cauli
-is the worker, plus the Python client that talks to it.
-
-What makes it different from the alternatives is the worker. Async tasks,
-blocking tasks and CPU bound tasks are all served by one `cauli-worker`
-command: async and blocking tasks run in the worker processes, CPU bound tasks
-in child processes the worker forks and supervises. One flag sets the
-concurrency for all three. There is no pool type to choose.
-
-```python
-from cauli import Cauli
-
-app = Cauli(redis_url="redis://localhost:6379/0")
-
-@app.task()
-def send_email(to):
-    return "sent"
-```
-
-## What do I need?
-
-cauli runs on:
-
-- CPython 3.10, 3.11, 3.12, 3.13, 3.14
-- Redis 7.0 or newer, as broker and result store
-
-The **client** installs and enqueues anywhere, macOS and Windows included.
-
-The **worker** is Linux only: x86_64 and aarch64, glibc 2.35 or newer, on an
-interpreter built with `--enable-shared` (python.org, the `python:*` Docker
-images, distro packages, uv). Free threaded 3.14t is supported, and the
-worker runs it with the GIL off. musl (Alpine), conda and free threaded 3.13t
-have no worker wheel yet.
-
-Redis is the only broker. There is no RabbitMQ, SQS or Pub/Sub transport.
-
-## Get Started
+## Install
 
 ```bash
 pip install cauli
 ```
 
-That is the whole install. The prebuilt `cauli-worker` binary comes with it and
-pip puts it on PATH. No Rust toolchain, no compiler, no second step. Check it
-with `cauli-worker --print-plan`, which needs no Redis and no app.
+This installs the client and, on Linux, the prebuilt `cauli-worker` binary.
+`cauli-worker --print-plan` checks it without Redis or an app.
 
-Define the tasks:
+## Quickstart
 
 ```python
 # myproj/tasks.py
@@ -80,103 +46,31 @@ from cauli import Cauli
 app = Cauli(redis_url="redis://localhost:6379/0")
 
 @app.task(max_retries=5)
-def send_email(to: str):
+def send_email(to: str) -> None:       # sync: runs on the thread pool
     ...
 
-@app.task()                       # async def just works
-async def call_api(url: str):
+@app.task()
+async def call_api(url: str) -> int:    # async: runs on the event loop
     ...
 
 @app.task(kind="cpu", timeout=120)
-def crunch(data: list[int]):
-    ...
+def crunch(numbers: list[int]) -> int:  # cpu: runs in a child process
+    return sum(n * n for n in numbers)
 ```
-
-Enqueue from anywhere:
 
 ```python
-from myproj.tasks import send_email
+from myproj.tasks import crunch
 
-result = send_email.delay("a@b.com")
-result.get(timeout=10)
+result = crunch.delay([1, 2, 3])
+result.get(timeout=10)                  # 14
 ```
-
-Run the worker:
 
 ```bash
 cauli-worker -A myproj.tasks:app -c 50
 ```
 
-`-A` takes `module:attr`, not a module. `-c 50` means 50 tasks in flight, the
-unit Sidekiq and Hangfire use. Add `--print-plan` to see the processes, threads
-and slots it derives.
-
-## cauli is...
-
-**Simple.** One flag. `-c 50` is 50 tasks in flight, not 50 processes. Process,
-thread and slot counts all derive from it, and `--print-plan` shows the
-derivation before anything starts. No configuration file.
-
-**Async native.** `async def` tasks execute directly on an event loop. On the
-client side `await send_email.adelay(...)` never blocks your event loop.
-
-**One deployment.** Async, blocking and CPU bound tasks are served by one
-worker command. Celery picks one pool type per worker, so a mixed workload
-usually means several worker deployments; cauli routes with `kind="cpu"` on
-the task instead.
-
-**Correct under crash.** Redis Streams consumer groups plus a visibility
-timeout give at least once delivery. A `kill -9` at 160 of 500 tagged tasks
-lost 0 of them, and with `--visibility-timeout 5` recovery took 10.8 seconds.
-At the default of 60 seconds, expect recovery to take at least a minute.
-
-**Cheap to hold work.** Each worker process costs about 22.6 MiB and each held
-task about 6.6 KiB, so 10,000 tasks in flight took 227.1 MiB at `--procs 6`.
-With the auto derived process count, Celery gevent uses less memory. See
-[Benchmarks](#benchmarks).
-
-**Stable.** The envelope and the Redis key layout in [PROTOCOL.md](PROTOCOL.md)
-are stable: any change to either before 1.0 will be called out as breaking in
-the changelog.
-
-## It supports...
-
-**Execution lanes**
-
-- `async def` tasks on an event loop, uvloop by default
-- `def` tasks on a thread pool
-- `kind="cpu"` tasks on forked child processes, for real multicore
-
-**Transports and stores**
-
-- Redis 7.0+ as broker, including `rediss://` TLS
-- Redis as result store, with a per task `store_result` switch
-
-**Serialization**
-
-- JSON on the wire, frozen in [PROTOCOL.md](PROTOCOL.md)
-- msgspec for encoding and decoding, a required dependency
-
-**Reliability**
-
-- at least once delivery, retries with exponential backoff and jitter
-- dead letter queue, idempotency keys, soft and hard task timeouts
-- `cauli-beat` scheduling behind a Redis leader lease, so two replicas produce
-  one task per slot
-
-## Framework Integration
-
-| Framework | Integration |
-|---|---|
-| Django | `cauli.contrib.django` |
-| FastAPI | `cauli.contrib.sqlalchemy` |
-| Starlette | `cauli.contrib.sqlalchemy` |
-| Litestar | `cauli.contrib.sqlalchemy` |
-| Flask | not needed |
-
-The integration packages are not strictly necessary, but they add the hooks
-that matter: closing database connections around each task, and a session per
-task.
+`-A` takes `module:attr`. A task object stays a plain callable, so
+`crunch([1, 2, 3])` runs inline in tests with no broker.
 
 ### Django
 
@@ -187,44 +81,26 @@ from cauli.contrib.django import django_app
 app = django_app("myproj.settings")
 
 @app.task()
-def send_receipt(order_id: int): ...
-```
+def send_receipt(order_id: int) -> None: ...
 
-```python
 # in a view, inside transaction.atomic()
-order = Order.objects.create(...)
-send_receipt.delay_on_commit(order.id)
+send_receipt.delay_on_commit(order.id)  # published only if the transaction commits
 ```
 
-The task publishes when the transaction commits, and not at all if it rolls
-back. Arguments are validated at the call site, so a value that cannot be
-serialized raises inside your `atomic()` block instead of at COMMIT with the
-row already written.
-
-Under `django.test.TestCase` nothing is ever enqueued, because the test itself
-runs inside an atomic block that always rolls back. Wrap the assertion in
-`self.captureOnCommitCallbacks(execute=True)`, or subclass
-`TransactionTestCase`.
+`django_app` reads `CAULI_*` settings and closes stale connections around
+every task, like Celery's Django fixup.
 
 ### FastAPI
 
 ```python
-# myproj/tasks.py
+from fastapi import FastAPI
 from cauli import AsyncCauli
 
 cauli = AsyncCauli(redis_url="redis://localhost:6379/0")
-
-@cauli.task(max_retries=5)
-async def send_email(to: str) -> None:
-    ...
-```
-
-```python
-# myproj/api.py
-from fastapi import FastAPI
-from myproj.tasks import send_email
-
 api = FastAPI()
+
+@cauli.task()
+async def send_email(to: str) -> None: ...
 
 @api.post("/signup")
 async def signup(email: str):
@@ -232,243 +108,51 @@ async def signup(email: str):
     return {"task_id": result.id}
 ```
 
-`AsyncCauli` is a `Cauli`, so `.delay()` and `.get()` keep working on the same
-app and the envelope is identical either way. Use one `AsyncCauli` per event
-loop, and `await cauli.aclose()` on shutdown.
+For a session per task on async SQLAlchemy, use `cauli.contrib.sqlalchemy`.
+
+## Supported platforms
+
+| Part | Runs on |
+|---|---|
+| Client and `cauli-beat` | CPython 3.10 to 3.14, any OS |
+| Worker | Linux, x86_64 or aarch64, glibc 2.35+, CPython 3.10 to 3.14 built with `--enable-shared`, free threaded 3.14t |
+| Broker and result store | Redis 7.0+ standalone, `rediss://` supported. Sentinel from the client and `cauli-beat` only |
+
+No worker wheel exists for musl (Alpine) or free threaded 3.13t; conda is untested. Redis
+Cluster, other brokers and canvas primitives (chains, groups, chords) are not
+supported. See [PROTOCOL.md section 13](PROTOCOL.md#13-distribution) for the
+install marker and the enqueue only install.
 
 ## Benchmarks
 
-<!-- assets/benchmark.svg is NOT shown here: it encodes the earlier measurement
-     round (30,438 cauli async, 9,622 taskiq, 850.6 celery) and would contradict
-     the tables below, which come from a later re-measurement with CPU
-     attribution. Regenerate it from the current numbers before restoring it. -->
+Method, environment and every losing result: [bench/RESULTS.md](bench/RESULTS.md).
+Read [bench/CLAIMS.md](bench/CLAIMS.md) for what each number may claim.
 
-Full method, every losing result, and the "not yet measured" list live in
-[bench/RESULTS.md](bench/RESULTS.md). Read [bench/CLAIMS.md](bench/CLAIMS.md)
-first: it states what each measurement is allowed to claim.
-
-**Environment.** WSL2 (Ubuntu 24.04), 11 GiB RAM, shared virtualized cores.
-The dispatch table was measured on 10 vCPUs, the Django and SQLAlchemy tables
-on 6. Redis, PostgreSQL, every worker under test and the harness driving them
-compete for the same cores, so treat every number as directional.
-
-### Dispatch throughput
-
-No database, no ORM, no web framework: the task body is one `redis.incr`, so
-this is the queue runtime and nothing else. Drain rate, 10 vCPUs, one session.
-Every framework is shown at the best configuration measured for it, and for
-Celery that means several worker nodes, because one Celery node stops scaling
-near 850 tasks/s whatever `-c` is.
-
-| Framework | Best config measured | Tasks/s |
-|---|---|---:|
-| **cauli async** | `--procs 8 --io-concurrency 96` | **32,798** |
-| **cauli sync** | `--procs 12 --io-threads 80` | **20,554** |
-| taskiq | `--workers 8` | 10,527 |
-| Celery | 8 nodes, `-P solo --prefetch-multiplier=32` | 4,233 |
-| Celery, one node | `-c 4 --prefetch-multiplier=1` | 871 |
-
-cauli async is 3.1x taskiq and 7.7x Celery at Celery's best measured
-configuration. Against a single Celery node it is 37.7x, but that compares
-eight cauli processes with one Celery node and is not a fair headline.
-
-Redis is not the bottleneck for anyone here. cauli's own ceiling on this box is
-unknown, because every cauli row shares its cores with Redis and the harness.
-
-### Django ORM
-
-One `objects.create()` per task, with Postgres deliberately made cheap
-(UNLOGGED table, `synchronous_commit=off`) so the row measures the framework
-rather than WAL fsync. 6 vCPUs.
-
-| Framework | Best config | Tasks/s | Worker cores | Postgres cores |
-|---|---|---:|---:|---:|
-| **cauli sync** | `--procs 6 --io-threads 24` | **4,256** | 3.92 | 0.76 |
-| Celery prefork, one node | `-c 16` | 247 | 3.24 | 0.16 |
-
-Celery was measured as a single node only. The dispatch table shows that more
-Celery nodes raise Celery's throughput about 5x, so the 17.2x ratio here is an
-upper bound, not a like for like result. A multi node Celery run of this lane
-has not been done.
-
-### SQLAlchemy async ORM, the FastAPI shape
-
-| Framework | Config | Tasks/s | Worker cores |
-|---|---|---:|---:|
-| **cauli async** | `--procs 4 --io-concurrency 32` | **2,032** | 3.88 |
-| taskiq | `--workers 4 --max-async-tasks 32` | 1,736 | 3.88 |
-
-Both framework bound at **identical CPU**, cauli 1.17x ahead. A separate
-paired run at higher concurrency measured **1.145, 95% CI 1.078 to 1.211,
-cauli ahead in 6 of 6 pairs**. Two independent methods within 3% of each other.
-
-*This lane previously published the opposite result: taskiq winning 733.6/s to
-378.6/s. That was a harness bug. `sqla_models.make_engine` used
-`pool_size=2, max_overflow=98`, and SQLAlchemy closes overflow connections on
-return, so nearly every insert paid a fresh connect and handshake. Both
-frameworks roughly doubled once it was fixed. The full retraction is in
-[bench/RESULTS.md](bench/RESULTS.md).*
-
-### Memory per unit of concurrency
-
-N tasks that `sleep(3600)`, all held in flight at once, PSS summed across the
-whole worker process group. Re-measured 2026-08-24 on 10 vCPU.
-
-| Tasks in flight | cauli, `--procs` auto | cauli, `--procs 6` | Celery gevent |
-|---:|---:|---:|---:|
-| 100 | 59.7 MiB | — | **49.2 MiB** |
-| 1,000 | 245.6 MiB | — | **70.8 MiB** |
-| 5,000 | 277.4 MiB | — | **166.9 MiB** |
-| 10,000 | 317.1 MiB | **227.1 MiB** | 285.4 MiB |
-
-**The number that decides this table is `--procs`, not the task count.** Each
-worker process embeds its own CPython and costs about **22.6 MiB** before it
-holds a single task; a held task itself costs about 6.6 KiB. Celery gevent is
-one process with N greenlets, so it pays that floor once no matter how you
-tune it.
-
-At 10,000 in flight, cauli at `--procs 6` uses 227.1 MiB and **beats** gevent's
-285.4; the same cauli at `--procs 10` uses 317.4 MiB and **loses** to it. Same
-code, same workload, same box. `-c` derives `procs` from the core count because
-that is what maximises throughput, which is the wrong objective if what you are
-short of is memory.
-
-**So: if you are optimising for memory at high concurrency, set `--procs`
-explicitly and keep it low.** The auto-derivation will not do it for you.
-
-### CPU bound work
-
-`kind="cpu"` against Celery prefork, both at 6 worker processes, both pinned to
-the same 8 CPUs. Paired and interleaved, 3 pairs per size, reported as the mean
-of per-pair ratios with a 95% interval.
-
-| Task size | cauli | Celery prefork | Ratio | 95% CI |
-|---:|---:|---:|---:|---|
-| 0.5ms | **3,770.6/s** | 875.9/s | **4.31x** | 3.76 - 4.86 |
-| 2ms | **2,580.9/s** | 871.8/s | **2.96x** | 2.87 - 3.05 |
-| 10ms | 580.6/s | 546.5/s | 1.06x | 1.06 - 1.07 |
-| 50ms | 118.9/s | 117.6/s | 1.01x | 1.01 - 1.01 |
-
-The shape matters more than any single number. Dispatch overhead is a fixed cost per task, so it dominates a 0.5ms task and
-disappears into a 50ms one. **At 50ms the two are 1% apart.** That 1% is
-statistically real here (the interval excludes 1.0) and operationally
-irrelevant: if your tasks are 50ms or longer, no task queue is going to save
-you meaningful CPU, and you should choose one on other grounds.
-
-### Correctness under a hard crash
-
-`kill -9` the worker at 160 of 500 uniquely tagged tasks, restart it, count
-what comes out. Counts, not rates, so nothing here depends on how busy the box
-was. Re-measured 2026-08-24.
-
-| Lane | Lost permanently | Duplicates | Recovery |
-|---|---:|---:|---:|
-| **cauli**, `--visibility-timeout 5` | **0** | **0** | **10.8s** |
-| Celery, `acks_late=True`, `visibility_timeout=5` | 0 | 0 | 91.3s (**8.5x slower**) |
-| Celery, plain default | **`concurrency x (prefetch + 1)`, permanent** | 0 | never recovers |
-
-**Celery's default loss is not a number, it is a formula**, and it was verified
-against three configurations, predicting each exactly:
-
-| Celery default config | Predicted | Measured |
-|---|---:|---:|
-| `-c 4 --prefetch-multiplier=1` | 8 | **8** |
-| `-c 4 --prefetch-multiplier=4` | 20 | **20** |
-| `-c 16 --prefetch-multiplier=4` | 80 | **80** |
-
-It loses exactly what the worker had prefetched into memory, with no path back.
-The uncomfortable part is that prefetch is Celery's main throughput knob: **the
-harder you tune Celery for speed, the more it loses when a box dies.** cauli
-lost none here, at `--procs 2 --io-threads 8`, because recovery is driven by
-the consumer group's pending list in Redis rather than by whatever happened to
-be inside a worker process. Higher concurrencies were not crash tested.
-
-Celery's `acks_late` path is eventually correct and 8.5x slower to recover, for
-a reason in kombu rather than in this harness:
-`kombu.transport.redis.QoS.restore_visible` restores at most 10 stale messages
-per scan, and the scan fires on 1 invocation in 10.
-
-cauli's own recovery improved from a previously published 34.0s to 10.8s in
-this cycle, from the `--mover-interval` default moving 250ms to 50ms.
-
-**On batched acks:** completions are now flushed in batches (PROTOCOL 4.1), so
-a crash can in principle redeliver up to one unflushed buffer per queue and
-re-execute those tasks. Measured here at this configuration: **0 duplicates**,
-twice. The bound still holds and a crash at much higher throughput would
-exercise it harder, so this is reported as measured rather than as a guarantee.
-
-### Where cauli loses
-
-| Result | Number |
-|---|---|
-| **Memory, unless you pin `--procs`** | Celery gevent is cheaper at every concurrency measured when cauli runs its auto-derived process count. cauli wins at 10,000 in flight only with `--procs 6` (227.1 MiB against 285.4). Each cauli process costs ~22.6 MiB before it holds anything. |
-| **CPU bound parity at 50ms** | cauli and Celery are 1% apart at 50ms and 6% at 10ms. The lead only exists for short tasks. |
-| **The wrong config stalls under a CPU burst** | A 50ms burst every 3 seconds pushes the naive async lane to 18x baseline p99. Routing it to `kind="cpu"` brings that to 4.0x, ahead of arq at 4.4x and Celery prefork at 14.5x, but the naive number is what you get if you do not route CPU work. |
-| **Django needs pgbouncer at high concurrency** | At `--procs 12 --io-threads 80` the Django lane asks Postgres for 960 connections and exhausts `max_connections`. Django has no connection pool, and the same wall hits Celery with enough prefork workers. |
-
-### What is not measured
-
-Absence is not evidence.
-
-- **No soak result.** A 48 hour soak was killed by a host outage and the data
-  did not survive. Memory over a long run is unverified.
-- **No published latency table.** The harness works, the table does not exist.
-- **No CPU pinned re measurement** apart from one mixed workload retest.
-- **cauli's true ceiling.** Every dispatch row is box bound; a machine with the
-  broker on separate cores is needed.
-- No duplicate delivery test, no payload size sweep, no result round trip
-  latency.
-
-### Rerun it
-
-```bash
-cd bench
-./setup.sh
-python3 campaign_paired.py --suite dispatch --pairs 8
-```
-
-`campaign_paired.py` interleaves the two lanes and alternates their order every
-pair, then reports the mean of per pair ratios with a confidence interval. A
-block design is not safe here: on this box one binary and one config drifted
-from 19,532 to 12,540 tasks per second across a single session while staying
-stable to 4% inside any five minute window, which a block design would have
-reported as a difference between frameworks.
-
-`setup.sh` never touches a Redis or Postgres instance you already run.
+| Measurement | cauli | Comparison |
+|---|---:|---|
+| Dispatch, no database, tasks/s | 32,798 (async, `--procs 8`) | taskiq 10,527; Celery 8 nodes 4,233 |
+| `kill -9` at 160 of 500 tasks: lost, recovery | 0, 10.8 s (`--visibility-timeout 5`) | Celery default loses its prefetch |
+| Memory per worker process, idle | 22.6 MiB | each held task about 6.6 KiB |
 
 ## Documentation
 
-- [PROTOCOL.md](PROTOCOL.md) is the wire contract and is authoritative
-- [docs/CONFIGURATION.md](docs/CONFIGURATION.md) is every flag and the `-c`
-  derivation formulas
-- [docs/MIGRATING-FROM-CELERY.md](docs/MIGRATING-FROM-CELERY.md) maps Celery
-  concepts onto cauli
-- [CHANGELOG.md](CHANGELOG.md)
+| Document | Contents |
+|---|---|
+| [PROTOCOL.md](PROTOCOL.md) | The specification: keys, envelope, delivery, retries, results, beat, packaging |
+| [docs/configuration.md](docs/configuration.md) | Every flag, option and setting with its default, and the sizing formulas |
+| [docs/architecture.md](docs/architecture.md) | Worker internals and design decisions |
+| [docs/migrating-from-celery.md](docs/migrating-from-celery.md) | What ports, what diverges, in what order to migrate |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | Building and testing from source |
+| [SECURITY.md](SECURITY.md) | Reporting a vulnerability, and the trust model |
+| [CHANGELOG.md](CHANGELOG.md) | Changes per release |
 
-## Limitations
-
-Stated up front rather than discovered later.
-
-- **Redis only.** No RabbitMQ, SQS or Pub/Sub.
-- **Linux only worker.** The client runs anywhere.
-- **At least once, not exactly once.** A task can run twice after a crash.
-  Idempotency keys narrow the window; they do not close it.
-- **No workflow primitives.** No chains, groups, chords or canvas.
-- **No web UI.** Stats go to stdout as structured logs.
-
-## Getting Help
-
-Report bugs and ask questions at
-[github.com/bilalwork31-cyber/Cauli/issues](https://github.com/bilalwork31-cyber/Cauli/issues).
-See [CONTRIBUTING.md](CONTRIBUTING.md) to build from source, and
-[SECURITY.md](SECURITY.md) to report a vulnerability.
+Bugs and questions: [github.com/bilalwork31-cyber/Cauli/issues](https://github.com/bilalwork31-cyber/Cauli/issues).
 
 ## Status
 
-cauli 0.1.0, the first public release. The wire format in
-[PROTOCOL.md](PROTOCOL.md) and the stats line key set are stable, and any
-change to either before 1.0 will be called out as breaking in the changelog.
-0.x means what it says: no third party production mileage yet.
+cauli 0.1.0, the first public release. The envelope, the Redis key layout and
+the stats line key set are stable; any change to them before 1.0 is called out
+as breaking in the changelog. There is no third party production mileage yet.
 
 ## License
 

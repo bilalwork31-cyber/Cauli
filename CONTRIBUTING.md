@@ -1,25 +1,13 @@
 # Contributing
 
-Thanks for looking. Read this first, it is short.
+Open an issue before anything larger than a bug fix or a documentation change.
+The non goals in [PROTOCOL.md section 11](PROTOCOL.md#11-non-goals-for-v1) are
+declined however well implemented: chains, groups, chords, rate limits,
+priorities, brokers other than Redis, Redis Cluster.
 
-## Before you write code
-
-Open an issue for anything larger than a bug fix or a documentation change.
-This project has a narrow scope on purpose: chains, groups, chords, rate
-limits, task priorities, brokers other than Redis and Redis Cluster are all
-non goals, listed in [PROTOCOL.md](PROTOCOL.md) section 11. A pull
-request implementing one of those will be declined however good it is, and an
-issue first saves you the work.
-
-Good places to start, in rough order of value:
-
-- A `cauli` CLI for the dead letter queue, queue depth and the delayed set.
-  Nothing ships for any of it today, and CHANGELOG's upgrade notes tell
-  operators to arrange to drain or export the dead letter queue with no tool to
-  do it. Celery's `inspect`, `purge` and `control` have no equivalent either.
-- Benchmark lanes `bench/RESULTS.md` names as never started, particularly the
-  retry rate lane and the result round trip latency lane.
-- Issues labelled `good first issue`.
+Wanted: a `cauli` CLI for the dead letter queue, queue depth and the delayed
+set; the benchmark lanes [bench/RESULTS.md](bench/RESULTS.md) lists as not yet
+done; issues labelled `good first issue`.
 
 ## Repository layout
 
@@ -29,7 +17,7 @@ Good places to start, in rough order of value:
 | `py/` | the `cauli` client library and `cauli-beat` |
 | `itest/` | cross component tests: a real worker binary against a real Redis |
 | `bench/` | the benchmark campaign. Read `bench/CLAIMS.md` before any number in it |
-| `docs/decisions/` | architecture decision records: why the design is the way it is |
+| `docs/` | configuration, architecture and design decisions, Celery migration |
 
 ## Running the checks
 
@@ -73,6 +61,10 @@ CAULI_WORKER_BIN=$PWD/../worker/target/release/cauli-worker pytest -q
 python scripts/check_versions.py
 ```
 
+`itest/test_django.py` also needs `django>=4.2`, `psycopg[binary]` and the
+Postgres server binaries (`initdb`, `pg_ctl`); it skips itself without them.
+On a slow or network filesystem, set `CARGO_TARGET_DIR` to a local path.
+
 CI runs exactly these, plus the Python suite on 3.10 through 3.14 and a
 packaging job that builds both distributions.
 
@@ -87,11 +79,10 @@ packaging job that builds both distributions.
   [PROTOCOL.md](PROTOCOL.md) is the contract, and a protocol change means
   changing that document in the same pull request.
 - **Documentation lands with the behaviour.** If a flag, a default or a failure
-  mode changes, [docs/CONFIGURATION.md](docs/CONFIGURATION.md) and
+  mode changes, [docs/configuration.md](docs/configuration.md) and
   [CHANGELOG.md](CHANGELOG.md) change in the same commit.
-- **No number without a harness.** Do not add a performance figure to any
-  document unless something in `bench/` reproduces it. Every unbacked figure
-  this repository once carried has been removed, and they are not coming back.
+- **No number without a harness.** A performance figure in any document must
+  be reproducible by something in `bench/`.
 
 ## Reporting a bug
 
