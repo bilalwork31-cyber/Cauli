@@ -357,6 +357,51 @@ def load_app(app_spec, extra_paths_json):
     )
 
 
+def cpu_child_python():
+    """The interpreter cpu children are spawned with: one that loads this same
+    libpython, so the app's C extensions import in them too.
+
+    An embedded interpreter resolves `sys.executable` by looking "python3" up
+    on PATH, which can be a different CPython (a uv or pyenv build, a free
+    threaded one), so it is used only when it provably belongs to this
+    runtime: its binary lives in this runtime's BINDIR, or it is a venv whose
+    pyvenv.cfg `home` is that BINDIR. `$VIRTUAL_ENV`, which the wheel's
+    launcher exports, gets the same check. Failing both, the runtime's own
+    interpreter in BINDIR.
+    """
+    import sysconfig
+
+    home = os.path.realpath(sysconfig.get_config_var("BINDIR") or "")
+    own_name = f"python{sys.version_info.major}.{sys.version_info.minor}{sys.abiflags}"
+
+    def venv_home(exe):
+        cfg = os.path.join(os.path.dirname(os.path.dirname(exe)), "pyvenv.cfg")
+        if not os.path.isfile(cfg):
+            return None
+        with open(cfg, encoding="utf-8") as f:
+            for line in f:
+                key, _, value = line.partition("=")
+                if key.strip() == "home":
+                    return os.path.realpath(value.strip())
+        return None
+
+    def belongs(exe):
+        if not exe or not os.path.isfile(exe):
+            return False
+        real = os.path.realpath(exe)
+        if os.path.basename(real) != own_name:
+            return False
+        base_dir = venv_home(exe) or os.path.dirname(real)
+        return base_dir == home
+
+    venv = os.environ.get("VIRTUAL_ENV")
+    for exe in (sys.executable, venv and os.path.join(venv, "bin", "python")):
+        if belongs(exe):
+            return exe
+    own = os.path.join(home, own_name)
+    return own if os.path.isfile(own) else (sys.executable or None)
+
+
 # --------------------------------------------------------------------------
 # sync execution (called on the Rust-owned sync io thread pool, GIL held on
 # entry; CPython releases the GIL itself during blocking I/O in the task)

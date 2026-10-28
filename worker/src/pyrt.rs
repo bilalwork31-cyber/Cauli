@@ -253,24 +253,25 @@ fn pyerr_string(py: Python<'_>, e: &PyErr) -> String {
 /// guard exists to convert into an immediate startup error.
 static RUNTIME_BUILT: AtomicBool = AtomicBool::new(false);
 
-/// `sys.executable` of the interpreter this worker already embeds, or None
+/// The interpreter cpu children should run, as `shim.cpu_child_python()`
+/// picks it: one that loads the same libpython this worker embeds, or None
 /// when the embedding gives no path (a statically linked or frozen build).
 ///
-/// This is the right default for `--python`, which spawns cpu children. The
-/// old default was the bare string `"python3"`, resolved through `PATH` by
-/// `Command::new`: a systemd `ExecStart=/opt/app/venv/bin/cauli-worker` or a
-/// Docker `CMD` never activates the venv, so it found the base interpreter
-/// with no `cauli` package in it. The fork server then failed, the stdio
-/// fallback respawn looped, the cpu backlog filled, and the fetch loop's
-/// backlog gate stopped fetching io work too — one misrouted interpreter
-/// taking the whole worker offline at warn level. The embedded interpreter
-/// is by construction the one that successfully imported the app.
+/// This is the default for `--python`. A bare `"python3"` off `PATH` finds
+/// the base interpreter with no `cauli` in it under a systemd unit or Docker
+/// `CMD` that never activates the venv, and the embedded `sys.executable` is
+/// itself only a `PATH` guess: on a uv, pyenv or free threaded build it named
+/// a different CPython, whose children could not import the app's C
+/// extensions. A misrouted interpreter fails the fork server, the cpu
+/// backlog fills, and the fetch loop's backlog gate stops io work too.
 pub fn interpreter_executable() -> Option<String> {
     Python::attach(|py| {
         let exe: String = py
-            .import("sys")
+            .import("cauli_worker_shim")
             .ok()?
-            .getattr("executable")
+            .getattr("cpu_child_python")
+            .ok()?
+            .call0()
             .ok()?
             .extract()
             .ok()?;

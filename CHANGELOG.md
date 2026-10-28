@@ -70,6 +70,10 @@ Worker:
   traceback instead of both becoming empty.
 - Dict key order in args, kwargs and results is preserved (serde_json
   `preserve_order`); the worker used to sort keys.
+- cpu children run an interpreter that loads the worker's own libpython.
+  The embedded `sys.executable` is a `PATH` lookup of `python3`, so on a uv,
+  pyenv or free threaded Python the children ran a different CPython and
+  could not import the app's C extensions.
 - A dead letter for a malformed envelope gets a failure result whenever its
   `id` is readable, so `get()` returns instead of waiting forever.
 - The Redis password is redacted from worker logs and `repr(Cauli)` for
