@@ -443,3 +443,18 @@ def test_a_stop_signal_does_not_abort_a_running_task(fs, sig):
     assert resp["result"] == "done"
     assert fs.proc.poll() is None, "the fork-server parent died of the signal"
     assert fs.fork() > 1
+
+
+def test_a_forked_task_can_terminate_its_own_forked_subprocess(fs):
+    fs.fork()
+    child = fs.accept_child()
+    child.send(
+        {
+            "id": "g1",
+            "task": "terminate_grandchild",
+            "args": [],
+            "kwargs": {},
+            "soft_timeout_ms": None,
+        }
+    )
+    assert child.recv() == {"id": "g1", "ok": True, "result": -15}

@@ -725,6 +725,11 @@ def submit_async(token, name, args, kwargs, timeout_s, soft_timeout_s=None, meta
         loop.call_soon_threadsafe(_drain, idx, loop)
 
 
+# uvloop keeps loop time and timers in whole milliseconds, so the worker's
+# own deadline can fire at a reading a float ulp below the one _arun took.
+_DEADLINE_CLOCK_SLACK_S = 0.001
+
+
 def _fire_deadline(task, fired):
     fired.append(True)
     task.cancel()
@@ -858,7 +863,10 @@ async def _arun(
                 # so the clock is what separates the worker's own limit (it
                 # fires at or after the deadline) from a TimeoutError the task
                 # body raised itself, which is reported as the task's own.
-                if asyncio.get_running_loop().time() < deadline:
+                if (
+                    asyncio.get_running_loop().time()
+                    < deadline - _DEADLINE_CLOCK_SLACK_S
+                ):
                     out = _finish_exc(e)
                 else:
                     out = {

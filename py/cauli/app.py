@@ -976,6 +976,11 @@ class AsyncCauli(Cauli):
             with self._redis_lock:
                 client = self._aredis.get(loop)
                 if client is None:
+                    # The client's connections hold its loop, so a weak key
+                    # alone never lets go of a finished asyncio.run(): drop
+                    # closed loops here, and their sockets with them.
+                    for closed in [lp for lp in self._aredis if lp.is_closed()]:
+                        del self._aredis[closed]
                     client = self._aredis[loop] = self._new_async_redis()
         return client
 

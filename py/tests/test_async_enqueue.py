@@ -369,3 +369,19 @@ def test_delay_from_more_threads_than_the_pool_waits_instead_of_failing(
     with ThreadPoolExecutor(max_workers=MORE_THAN_POOL) as pool:
         list(pool.map(t.delay, range(MORE_THAN_POOL * 4)))
     assert redis_client.xlen("cauli:q:default") == MORE_THAN_POOL * 4
+
+
+def test_successive_event_loops_do_not_leak_connections(redis_url, redis_client):
+    import gc
+
+    app = AsyncCauli(redis_url=redis_url)
+
+    @app.task(name="t")
+    def t(i):
+        return i
+
+    before = len(redis_client.client_list())
+    for i in range(20):
+        asyncio.run(t.adelay(i))
+    gc.collect()
+    assert len(redis_client.client_list()) - before <= 1

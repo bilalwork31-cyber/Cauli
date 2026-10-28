@@ -1696,4 +1696,46 @@ app = _App()
             ),
         }
     }
+
+    /// The worker's own hard deadline must always read as TimeLimitExceeded.
+    /// uvloop keeps time in whole milliseconds, so its timer fires at a time
+    /// that can compare one float ulp below the deadline `_arun` computed.
+    #[test]
+    fn async_hard_deadline_is_never_reported_as_the_tasks_own_timeout() {
+        let _shim_state = shim_state_guard();
+        let src = ASYNC_TIMEOUT_APP_SRC.replace(
+            "_tasks = {",
+            "_tasks = {\"nap\": _Task(lambda: asyncio.sleep(10)), ",
+        );
+        let app_spec =
+            Python::attach(|py| install_fake_app_module(py, "cauli_test_deadline_clock_app", &src));
+        let (rt, _cfg) = PyRuntime::init(&app_spec, 1).expect("valid app must init cleanly");
+        // Whether a deadline lands an ulp low depends on the loop clock
+        // reading it starts at, so spread starts over many milliseconds.
+        let rxs: Vec<_> = (0..400)
+            .map(|k| {
+                if k % 8 == 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                let timeout_s = (k % 50 + 1) as f64 / 1000.0;
+                let args = serde_json::json!([]);
+                rt.queue_submit("nap", &args, &serde_json::json!({}), timeout_s, None, None)
+                    .1
+            })
+            .collect();
+        let mut wrong = Vec::new();
+        for rx in rxs {
+            match rx.blocking_recv().expect("submitter thread must respond") {
+                Outcome::Failure { err, .. } if err.type_ == "TimeLimitExceeded" => {}
+                Outcome::Failure { err, .. } => wrong.push(err.type_),
+                other => wrong.push(outcome_name(&other).to_string()),
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "{} of 400 misreported: {:?}",
+            wrong.len(),
+            &wrong[..wrong.len().min(3)]
+        );
+    }
 }

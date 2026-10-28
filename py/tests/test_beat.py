@@ -1064,3 +1064,19 @@ def test_run_reports_cluster_crossslot_loudly_and_keeps_polling(
     generic = [m for m in messages if "retrying in 1s" in m]
     assert loud, f"no named redis cluster failure logged: {messages}"
     assert not generic, f"fell back to the generic blip message: {generic}"
+
+
+def test_an_entry_that_cannot_be_fired_does_not_delay_the_others(
+    redis_url, store, redis_client
+):
+    def router(task_name, args, kwargs):
+        raise KeyError("tenant")
+
+    app = Cauli(redis_url=redis_url, task_routes={"app.broken": router})
+    app.add_periodic_task("broken", "app.broken", interval(1))
+    app.add_periodic_task("fast", "app.ping", interval(0.25))
+    beat = make_beat(app, store)
+    beat.sync_code_entries()
+    beat.tick()
+    store.clock += 1_000
+    assert beat.tick() <= 0.25, "the next fast slot is 250 ms away"

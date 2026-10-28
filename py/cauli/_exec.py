@@ -549,6 +549,20 @@ def _ignore_stop(signum: int, frame: Any) -> None:
     """
 
 
+def _restore_stop() -> None:
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+
+
+def _guard_stop_signals() -> None:
+    signal.signal(signal.SIGINT, _ignore_stop)
+    signal.signal(signal.SIGTERM, _ignore_stop)
+    # A Python handler survives fork, so a task's own os.fork() or
+    # multiprocessing child would ignore Process.terminate() too. The
+    # fork server's own task children call this again right after forking.
+    os.register_at_fork(after_in_child=_restore_stop)
+
+
 def _rss_kb() -> tuple[int | None, int | None]:
     """(VmRSS kB, private (dirty+clean) kB) from /proc; Nones off-Linux.
 
@@ -624,8 +638,7 @@ def _fork_server_main(app_spec: str, sock_path: str, child_threads: int) -> int:
         pass
 
     _set_pdeathsig()
-    signal.signal(signal.SIGINT, _ignore_stop)
-    signal.signal(signal.SIGTERM, _ignore_stop)
+    _guard_stop_signals()
     app = _load_app(app_spec)  # import errors: nonzero exit before the server line
 
     # Process-init hooks run in the parent BEFORE the first fork (PROTOCOL.md
@@ -686,6 +699,7 @@ def _fork_server_main(app_spec: str, sock_path: str, child_threads: int) -> int:
                 _write_line(proto, {"error": f"fork failed: {exc}"})
                 continue
             if pid == 0:
+                _guard_stop_signals()
                 code = 1
                 try:
                     code = _forked_child_main(app, proto_fd, sock_path, child_threads)
@@ -909,8 +923,7 @@ def main(argv: list[str] | None = None) -> int:
     except Exception:
         pass
 
-    signal.signal(signal.SIGINT, _ignore_stop)
-    signal.signal(signal.SIGTERM, _ignore_stop)
+    _guard_stop_signals()
     app = _load_app(ns.app)  # import errors propagate: nonzero exit before ready line
 
     # Process-init hooks (PROTOCOL.md section 4.8): once per stdio child,

@@ -586,8 +586,8 @@ fn spawn_signal_task(shutdown_tx: watch::Sender<bool>, ctx: Arc<Ctx>) {
 /// crate default factor of 100 jumps straight to backon's 60 s cap, so an
 /// unreachable redis at startup kept the worker silent for about 5 minutes
 /// per connection, and a redis restart at runtime stalled it up to a minute.
-/// Delays here are 1 s, then 2 s capped: about 11 s before startup gives up
-/// and says why.
+/// Delays here are 1 s, then 2 s capped, plus jitter: startup gives up and
+/// says why after about 17 s (measured against a refused port).
 const REDIS_RETRY_FACTOR: u64 = 2;
 const REDIS_RETRY_MAX_DELAY_MS: u64 = 2_000;
 const REDIS_RETRIES: usize = 6;

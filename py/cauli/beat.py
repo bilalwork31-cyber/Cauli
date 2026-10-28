@@ -77,8 +77,8 @@ MIN_SLEEP = 0.05
 #: Most due entries claimed per tick. Bounds one tick's work when a large
 #: schedule comes due at once (e.g. every entry at midnight).
 DUE_BATCH = 500
-#: Shortest sleep after a tick in which an entry could not be fired. Its slot
-#: stays due, so without this floor the loop retries it every MIN_SLEEP.
+#: Longest wait before retrying an entry that could not be fired. Its slot
+#: stays due, so without this the loop would retry it every MIN_SLEEP.
 FAILED_FIRE_RETRY = 1.0
 
 
@@ -587,7 +587,7 @@ class Beat:
                 "the rest are deferred to the next tick and will fire late",
                 len(due),
             )
-        failed = False
+        failed: set[str] = set()
         for name, slot in due:
             entry = entries.get(name)
             if entry is None or not entry.enabled:
@@ -599,10 +599,11 @@ class Beat:
                 )
                 self.store.drop_slot(name)
                 continue
-            failed = not self._fire(entry, slot, now) or failed
+            if not self._fire(entry, slot, now):
+                failed.add(name)
 
-        sleep_s = self._sleep_for(now, started)
-        return max(sleep_s, FAILED_FIRE_RETRY) if failed else sleep_s
+        sleep_s = self._sleep_for(now, started, failed)
+        return min(sleep_s, FAILED_FIRE_RETRY) if failed else sleep_s
 
     def _fire(self, entry: ScheduleEntry, slot: int, now: int) -> bool:
         """False when the slot could not be claimed and is still due."""
@@ -707,18 +708,25 @@ class Beat:
         )
         return True
 
-    def _sleep_for(self, now: int, started: float) -> float:
+    def _sleep_for(self, now: int, started: float, failed: set[str]) -> float:
         """Sleep until the next slot, bounded by max_interval and the lease.
 
         ``now`` is the instant the tick STARTED, so the tick's own duration is
         subtracted from the wait. Without that correction every tick wakes a
         tick-duration late, and a schedule whose interval is close to the tick
         cost drifts far enough to start coalescing slots that were never
-        actually missed.
+        actually missed. A ``failed`` slot is still due and is left out, so it
+        neither spins the loop nor delays the next slot of any other entry.
         """
-        upcoming = self.store.due(now + int(self.max_interval * 1000), limit=1)
+        upcoming = [
+            slot
+            for name, slot in self.store.due(
+                now + int(self.max_interval * 1000), limit=len(failed) + 1
+            )
+            if name not in failed
+        ]
         if upcoming:
-            wait = (upcoming[0][1] - now) / 1000.0
+            wait = (upcoming[0] - now) / 1000.0
         else:
             wait = self.max_interval
         wait = min(wait, self.max_interval)

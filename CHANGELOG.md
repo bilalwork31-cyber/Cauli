@@ -44,7 +44,7 @@ Worker:
   before the log thread wrote the line.
 - A stdout reader that stops reading no longer makes the worker unkillable
   except by SIGKILL; exit waits at most 1 s for queued log lines.
-- An unreachable Redis at startup fails in about 11 s with the reason,
+- An unreachable Redis at startup fails in about 17 s with the reason,
   instead of minutes of silence, and a Redis restart at run time reconnects
   within 2 s. redis-rs's default backoff jumped to its 60 s cap.
 - One stop request delivered as two signals (systemd control group stop with

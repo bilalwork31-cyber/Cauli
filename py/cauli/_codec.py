@@ -79,8 +79,8 @@ _ALLOWED = "allowed types: str, int, float, bool, None, list, tuple, dict with s
 
 # serde_json's default recursion limit in the worker: it refuses JSON with
 # more nested arrays/objects than this, counted from the document root. Past
-# it the whole envelope fails to parse, its task id cannot be recovered, and
-# no result is ever written for get() to find.
+# it the whole envelope fails to parse and is dead lettered as malformed
+# before the task ever runs, so the client refuses it at the call site.
 _MAX_NESTING = 127
 
 

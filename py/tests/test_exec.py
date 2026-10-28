@@ -401,3 +401,16 @@ def test_undecodable_request_still_answers_its_own_id(child):
         assert resp["ok"] is False
         assert resp["retryable"] is False
         assert resp["error"]["type"] == "ProtocolError"
+
+
+def test_a_task_can_terminate_its_own_forked_subprocess(child):
+    resp = child.request(
+        {
+            "id": "g1",
+            "task": "terminate_grandchild",
+            "args": [],
+            "kwargs": {},
+            "soft_timeout_ms": None,
+        }
+    )
+    assert resp == {"id": "g1", "ok": True, "result": -15}
