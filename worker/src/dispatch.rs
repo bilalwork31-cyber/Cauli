@@ -357,13 +357,13 @@ async fn final_failure(
 /// Best effort id for a terminal DLQ write, parsed from a 4096 byte preview
 /// so a huge hostile payload is never fully parsed.
 fn recover_id(raw_e: &str) -> Option<String> {
-    // Only the id: some other field is what failed to parse.
+    // Only the id: some other field is what failed to parse. `raw_e` is
+    // already bounded: an oversize envelope arrives here as its preview.
     #[derive(serde::Deserialize)]
     struct IdOnly {
         id: String,
     }
-    let preview = envelope::safe_truncate(raw_e, 4096);
-    match serde_json::from_str::<IdOnly>(preview) {
+    match serde_json::from_str::<IdOnly>(raw_e) {
         Ok(e) if valid_task_id(&e.id) => Some(e.id),
         _ => None,
     }
@@ -566,13 +566,19 @@ mod tests {
         );
     }
 
+    /// An unregistered task with large args is dead lettered before it runs;
+    /// its caller still needs the failure result. Oversize envelopes never
+    /// reach here whole: the size check passes only a preview.
     #[test]
-    fn recover_id_none_when_the_id_is_past_the_preview_cap() {
+    fn recover_id_from_an_envelope_larger_than_any_preview() {
         let raw = format!(
             r#"{{"pad":"{}","id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","task":"t"}}"#,
             "x".repeat(5000)
         );
-        assert_eq!(recover_id(&raw), None);
+        assert_eq!(
+            recover_id(&raw),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
+        );
     }
 
     #[test]

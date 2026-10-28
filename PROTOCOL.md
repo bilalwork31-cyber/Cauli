@@ -97,9 +97,9 @@ Worker gates, applied before execution, to every envelope as untrusted input:
   (`Cauli(max_envelope_bytes=...)`, default 1 MiB), raising at the call site
   and writing nothing. Keep the producer limit at or below the worker's.
 - For an entry dead lettered without executing, the worker recovers the task
-  id by parsing only the first 4096 bytes of `e`. An entry longer than that
-  gets no failure result (§8), and a caller in `get()` waits out its own
-  timeout.
+  id from `e` so it can write a failure result (§8). An oversize entry is read
+  only as its first 4096 bytes; if the id is not in them there is no result,
+  and a caller in `get()` waits out its own timeout.
 - Memory: `args` and `kwargs` are carried as the producer's JSON text. Size
   for `in flight io tasks x max-envelope-bytes x 10` in the worst case.
 
@@ -697,8 +697,8 @@ and exits 0.
 - An entry dead lettered without executing (malformed, unregistered,
   redelivery limit) writes a `failure` result with `error.type` `Malformed`,
   `UnregisteredTask` or `RedeliveryLimitExceeded`, whenever its id is
-  recoverable: present in the first 4096 bytes of the entry and passing the
-  §2 gate. Otherwise no result exists.
+  recoverable: readable from the entry (only its first 4096 bytes when it is
+  oversize) and passing the §2 gate. Otherwise no result exists.
 - `traceback` MAY be truncated to 8 KB.
 - A result that is not JSON serializable is a failure with type
   `SerializationError`, not retried.
