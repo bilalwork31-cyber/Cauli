@@ -710,6 +710,26 @@ def heartbeat():
     return out
 
 
+if sys.version_info >= (3, 12):
+
+    def _start_task(loop, coro):
+        """Start one `_arun` Task eagerly: its first step runs right here.
+
+        A body that finishes without suspending, the common short task,
+        completes inside this call instead of costing a trip through the
+        ready queue and a loop turn of its own. Starts stay in submission
+        order and each one still runs in its own Task and context copy.
+        Only these Tasks start eagerly; a task body's own create_task keeps
+        the loop's default scheduling.
+        """
+        return asyncio.Task(coro, loop=loop, eager_start=True)
+
+else:
+
+    def _start_task(loop, coro):
+        return loop.create_task(coro)
+
+
 def _drain(idx, loop):
     """Turn one loop's queued submissions into Tasks. Runs ON that loop."""
     queue = _pending[idx]
@@ -719,8 +739,9 @@ def _drain(idx, loop):
     for token, name, args, kwargs, timeout_s, soft_timeout_s, meta in batch:
         # _arun is defensive (it converts every exception into an outcome and
         # always invokes the callback), so a bare Task needs no result handle.
-        loop.create_task(
-            _arun(idx, token, name, args, kwargs, timeout_s, soft_timeout_s, meta)
+        _start_task(
+            loop,
+            _arun(idx, token, name, args, kwargs, timeout_s, soft_timeout_s, meta),
         )
 
 
