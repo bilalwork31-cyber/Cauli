@@ -1979,4 +1979,75 @@ app = _App()
             &wrong[..wrong.len().min(3)]
         );
     }
+
+    /// Every deadline on a loop shares one timer, moved only when a new
+    /// deadline lands first. A short deadline queued behind a long one must
+    /// still fire at its own time, not when the long one's timer comes due.
+    #[test]
+    fn async_short_deadline_behind_a_long_one_fires_on_time() {
+        let _shim_state = shim_state_guard();
+        let src = ASYNC_TIMEOUT_APP_SRC.replace(
+            "_tasks = {",
+            "_tasks = {\"nap\": _Task(lambda: asyncio.sleep(30)), ",
+        );
+        let app_spec =
+            Python::attach(|py| install_fake_app_module(py, "cauli_test_deadline_order_app", &src));
+        let (rt, _cfg) = PyRuntime::init(&app_spec, 1).expect("valid app must init cleanly");
+        let (long_token, _long) = rt.queue_submit("nap", "[]", "{}", 20.0, None, None);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let started = std::time::Instant::now();
+        let (_token, short) = rt.queue_submit("nap", "[]", "{}", 0.05, None, None);
+        match short
+            .blocking_recv()
+            .expect("submitter thread must respond")
+        {
+            Outcome::Failure { err, .. } => assert_eq!(err.type_, "TimeLimitExceeded"),
+            other => panic!("expected TimeLimitExceeded, got {}", outcome_name(&other)),
+        }
+        let waited = started.elapsed();
+        assert!(
+            waited < std::time::Duration::from_secs(2),
+            "a 50ms deadline behind a 20s one fired after {waited:?}"
+        );
+        rt.cancel(long_token);
+    }
+
+    /// Cancelled deadlines are only marked, so the heap is compacted once
+    /// they are the majority: tasks that finish early must not pile up
+    /// behind one that is still running, whatever the rate.
+    #[test]
+    fn async_deadline_heap_stays_bounded_by_live_deadlines() {
+        let _shim_state = shim_state_guard();
+        let src = ASYNC_TIMEOUT_APP_SRC.replace(
+            "_tasks = {",
+            "_tasks = {\"nap\": _Task(lambda: asyncio.sleep(30)), \
+             \"quick\": _Task(lambda: asyncio.sleep(0)), ",
+        );
+        let app_spec =
+            Python::attach(|py| install_fake_app_module(py, "cauli_test_deadline_heap_app", &src));
+        let (rt, _cfg) = PyRuntime::init(&app_spec, 1).expect("valid app must init cleanly");
+        let (long_token, _long) = rt.queue_submit("nap", "[]", "{}", 300.0, None, None);
+        let quick: Vec<_> = (0..3000)
+            .map(|_| rt.queue_submit("quick", "[]", "{}", 300.0, None, None).1)
+            .collect();
+        for rx in quick {
+            match rx.blocking_recv().expect("submitter thread must respond") {
+                Outcome::Success(_) => {}
+                other => panic!("quick task failed: {}", outcome_name(&other)),
+            }
+        }
+        let heap_len: usize = Python::attach(|py| {
+            py.import("cauli_worker_shim")
+                .and_then(|m| m.getattr("_deadline_heaps"))
+                .and_then(|h| h.get_item(0))
+                .and_then(|h| h.getattr("_heap"))
+                .and_then(|h| h.len())
+                .expect("shim exposes its deadline heaps")
+        });
+        assert!(
+            heap_len <= 102,
+            "{heap_len} entries kept for 1 live deadline after 3000 finished ones"
+        );
+        rt.cancel(long_token);
+    }
 }

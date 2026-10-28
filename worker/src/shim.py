@@ -118,6 +118,7 @@ _rr = 0
 # loop wakeup instead of N. See submit_async for the measured reason.
 _pending = []
 _pending_locks = []
+_deadline_heaps = []  # per loop: _DeadlineHeap, touched only on that loop
 _callback = None  # Rust completion callback: cb(token:int, outcome:dict)
 
 
@@ -643,6 +644,7 @@ def start_loops(n):
             _loops.append(loop)
             _pending.append([])
             _pending_locks.append(threading.Lock())
+            _deadline_heaps.append(_DeadlineHeap(loop))
             _cap_warned.append(False)
             _hb_sent.append(None)
             _hb_lag.append(0)
@@ -812,9 +814,85 @@ def _fire_deadline(task, fired):
     task.cancel()
 
 
+# asyncio's own thresholds for rebuilding its timer heap once cancelled
+# entries are the majority (base_events._MIN_SCHEDULED_TIMER_HANDLES and
+# _MIN_CANCELLED_TIMER_HANDLES_FRACTION): memory stays within twice the live
+# deadlines however many tasks finish early.
+_DEADLINE_COMPACT_MIN = 100
+_DEADLINE_COMPACT_FRACTION = 0.5
+
+
+class _DeadlineHeap:
+    """Every task deadline on one loop, behind a single loop timer.
+
+    A loop timer per task was a third of the loop thread's time on a short
+    async task: uvloop starts, stops and closes a libuv handle for each one.
+    Here a deadline is a heap entry, cancelling one only marks it, and the
+    one timer is moved only when a new deadline lands before the armed one.
+    Due entries fire in deadline order, ties in submission order, exactly as
+    one timer each would, with the same clock slack uvloop's whole
+    millisecond timers already have.
+    """
+
+    __slots__ = ("_loop", "_heap", "_seq", "_cancelled", "_armed_at", "_timer")
+
+    def __init__(self, loop):
+        self._loop = loop
+        self._heap = []
+        self._seq = 0
+        self._cancelled = 0
+        self._armed_at = None
+        self._timer = None
+
+    def add(self, when, task, fired):
+        self._seq += 1
+        entry = [when, self._seq, task, fired]
+        heapq.heappush(self._heap, entry)
+        if self._armed_at is None or when < self._armed_at:
+            self._arm(when)
+        return entry
+
+    def cancel(self, entry):
+        if entry[2] is None:  # already fired
+            return
+        entry[2] = entry[3] = None
+        self._cancelled += 1
+        if (
+            self._cancelled > _DEADLINE_COMPACT_MIN
+            and self._cancelled > _DEADLINE_COMPACT_FRACTION * len(self._heap)
+        ):
+            self._heap = [e for e in self._heap if e[2] is not None]
+            heapq.heapify(self._heap)
+            self._cancelled = 0
+
+    def _arm(self, when):
+        if self._timer is not None:
+            self._timer.cancel()
+        self._timer = self._loop.call_at(when, self._fire)
+        self._armed_at = when
+
+    def _fire(self):
+        self._timer = self._armed_at = None
+        heap = self._heap
+        due = self._loop.time() + _DEADLINE_CLOCK_SLACK_S
+        while heap and heap[0][0] <= due:
+            entry = heapq.heappop(heap)
+            task, fired = entry[2], entry[3]
+            if task is None:
+                self._cancelled -= 1
+                continue
+            entry[2] = entry[3] = None
+            _fire_deadline(task, fired)
+        while heap and heap[0][2] is None:
+            heapq.heappop(heap)
+            self._cancelled -= 1
+        if heap:
+            self._arm(heap[0][0])
+
+
 if sys.version_info >= (3, 12):
 
-    async def _await_deadline(coro, timeout_s):
+    async def _await_deadline(coro, timeout_s, deadlines):
         """`asyncio.wait_for(coro, timeout_s)` exactly as 3.12+ implements it.
 
         From 3.12 wait_for is a frame around `async with asyncio.timeout()`,
@@ -822,14 +900,14 @@ if sys.version_info >= (3, 12):
         written out. What it drops is the scaffolding around that: a Timeout
         object, two coroutine objects for `__aenter__`/`__aexit__` and the
         wait_for frame: the shim's noop async task went from 8.0us to 6.6us,
-        all of it GIL held time. 3.10 and 3.11 keep the real wait_for,
-        which is a different algorithm there.
+        all of it GIL held time. The deadline itself sits in the loop's
+        `_DeadlineHeap` rather than on a timer of its own. 3.10 and 3.11
+        keep the real wait_for, which is a different algorithm there.
         """
         task = asyncio.current_task()
-        loop = task.get_loop()
         cancelling = task.cancelling()
         fired = []
-        handle = loop.call_at(loop.time() + timeout_s, _fire_deadline, task, fired)
+        entry = deadlines.add(task.get_loop().time() + timeout_s, task, fired)
         cancelled = None
         try:
             return await coro
@@ -837,12 +915,14 @@ if sys.version_info >= (3, 12):
             cancelled = exc
             raise
         finally:
-            handle.cancel()
+            deadlines.cancel(entry)
             if fired and task.uncancel() <= cancelling and cancelled is not None:
                 raise TimeoutError from cancelled
 
 else:
-    _await_deadline = asyncio.wait_for
+
+    def _await_deadline(coro, timeout_s, deadlines):
+        return asyncio.wait_for(coro, timeout_s)
 
 
 async def _await_with_soft_limit(coro, soft_s, hard_s):
@@ -929,7 +1009,9 @@ async def _arun(
             deadline = asyncio.get_running_loop().time() + timeout_s
             try:
                 if soft_timeout_s is None:
-                    rv = await _await_deadline(fn(*args, **kwargs), timeout_s)
+                    rv = await _await_deadline(
+                        fn(*args, **kwargs), timeout_s, _deadline_heaps[idx]
+                    )
                 else:
                     rv = await _await_with_soft_limit(
                         fn(*args, **kwargs), soft_timeout_s, timeout_s
