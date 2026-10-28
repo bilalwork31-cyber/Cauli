@@ -5,7 +5,7 @@ a handler, so they have to match what the lanes actually do.
 task", which is true only of the sync lane. An ``async def`` task is cancelled
 at the soft mark and never sees the class in its body, so anyone who wrote
 ``except SoftTimeLimitExceeded`` there got a handler that could not fire.
-docs/CONFIGURATION.md's ``soft_timeout`` row states the divergence; this pins
+docs/configuration.md's ``soft_timeout`` row states the divergence; this pins
 the docstring to it.
 """
 
@@ -16,7 +16,7 @@ from pathlib import Path
 from cauli import SoftTimeLimitExceeded
 
 CONFIGURATION = (
-    Path(__file__).resolve().parent.parent.parent / "docs" / "CONFIGURATION.md"
+    Path(__file__).resolve().parent.parent.parent / "docs" / "configuration.md"
 )
 
 
@@ -53,5 +53,5 @@ def test_configuration_soft_timeout_row_still_documents_both_lanes() -> None:
         for line in CONFIGURATION.read_text(encoding="utf-8").splitlines()
         if line.startswith("| `soft_timeout`")
     ]
-    assert len(rows) == 1, "docs/CONFIGURATION.md no longer has one soft_timeout row"
+    assert len(rows) == 1, "docs/configuration.md no longer has one soft_timeout row"
     assert "asyncio.CancelledError" in rows[0]

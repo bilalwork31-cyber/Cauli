@@ -154,7 +154,9 @@ handing over between threads, and runs 3.9x faster on free threaded 3.14t.
 - The Celery comparison uses Celery at its best measured configuration
   (8 solo nodes, 4,233 tasks/s): cauli is 7.7x on the async lane and 4.9x on
   the sync lane, not 32.8x against a single Celery node.
-- `docs/decisions/` is rewritten as short architecture decision records.
+- Documentation is consolidated: README, PROTOCOL (the specification), and
+  `docs/` holding configuration, architecture (with the design decisions) and
+  the Celery migration guide.
 - The Python the worker embeds needs msgspec importable from the app's
   environment (cauli depends on it). Without it the worker exits at startup
   with an error naming that environment.
@@ -184,6 +186,7 @@ handing over between threads, and runs 3.9x faster on free threaded 3.14t.
 ## 0.1.0 (2026-08-31)
 
 First public release. Features, supported platforms, known limitations and
-upgrade notes are in [docs/RELEASE_NOTES_v0.1.0.md](docs/RELEASE_NOTES_v0.1.0.md);
+upgrade notes are in the
+[v0.1.0 release](https://github.com/bilalwork31-cyber/Cauli/releases/tag/v0.1.0);
 the full change list for this release is the
 [CHANGELOG at v0.1.0](https://github.com/bilalwork31-cyber/Cauli/blob/v0.1.0/CHANGELOG.md).

@@ -1,24 +1,14 @@
 # Migrating from Celery
 
-This is written for someone who already runs Celery in production and wants to
-know, in one sitting, what breaks. It is deliberately not a pitch. Read
-"Known limitations" in the [release notes](RELEASE_NOTES_v0.1.0.md#known-limitations)
-and in [CHANGELOG.md](../CHANGELOG.md) alongside it.
+What changes when a Celery deployment moves to cauli. Three hard stops first:
 
-Three things to settle before anything else, because each one is a hard stop:
-
-1. **The worker is Linux only.** Prebuilt wheels cover glibc 2.35 or newer on
-   x86_64 and aarch64, CPython 3.10 through 3.14. macOS and Windows can
-   enqueue and can run `cauli-beat`, but cannot run tasks. musl (Alpine) and
-   free threaded 3.13t have no wheel and fail the install; free threaded
-   3.14t is supported.
-2. **Redis is the only broker and the only result backend.** No RabbitMQ, no
-   SQS, no database backend. Standalone only: the worker refuses to start
-   against Redis Cluster, and Sentinel is reachable from the Python client and
-   `cauli-beat` but not from the worker.
-3. **There are no chains, groups, chords, rate limits or task priorities**, and
-   none are planned. If your codebase depends on canvas
-   primitives, stop here.
+1. **The worker is Linux only**: glibc 2.35+ on x86_64 or aarch64, CPython
+   3.10 to 3.14 or free threaded 3.14t. macOS and Windows can enqueue and run
+   `cauli-beat`, not tasks. musl (Alpine) and free threaded 3.13t fail the
+   install.
+2. **Redis is the only broker and result backend.** The worker refuses Redis
+   Cluster. Sentinel works from the client and `cauli-beat`, not the worker.
+3. **No chains, groups, chords, rate limits or priorities**, and none planned.
 
 ## What ports directly
 
@@ -46,10 +36,9 @@ Three things to settle before anything else, because each one is a hard stop:
 | `-P threads` | `def` task, the default | |
 | `-P gevent` | `async def` task, the default | Real asyncio, not monkey patching |
 
-## The eight divergences that bite silently
+## Eight silent divergences
 
-These are the ones that do not raise. They change behaviour and you find out
-in production.
+None of these raise.
 
 **1. `-c` counts tasks, not processes.** Celery's `-c 50` with prefork forks 50
 processes. cauli's `-c 50` is 50 tasks in flight, and it derives the process
@@ -61,7 +50,7 @@ derivation without Redis and without your app. Run it first.
 **2. `crontab()` field order is `cron(8)`'s, not Celery's.** cauli takes
 minute, hour, day_of_month, month, day_of_week. Celery takes minute, hour,
 day_of_week, day_of_month, month_of_year. The third and fourth arguments are
-swapped. Three or more positional arguments now raise `TypeError` rather than
+swapped. Three or more positional arguments raise `TypeError` rather than
 build a different schedule, and `month_of_year=` raises a message naming
 cauli's `month=`. Two positional arguments, `crontab(0, 4)`, mean the same
 thing in both.
@@ -94,8 +83,8 @@ retry will now retry three times.
 equivalent that turns it into at most once. A crashed worker's in flight tasks
 are redelivered. Worst case executions of one task are
 `(max_retries + 1) x (redelivery_limit + 1)`, which is 20 with the defaults.
-Task bodies must be safe to repeat. `idempotency_key=` suppresses a duplicate
-enqueue for the key's TTL. It narrows duplicate work, it does not make a task
+Task bodies must be safe to repeat. `idempotency_key=` suppresses a second
+execution under the same key for its TTL. It narrows duplicate work, it does not make a task
 body safe to repeat.
 
 **7. Arguments are JSON only, and the type set is smaller than you think.**
@@ -116,8 +105,6 @@ runs and the assertion fails with nothing enqueued. Use
 
 ## What cauli does not have
 
-Stated plainly, so you can decide before you port anything.
-
 | Celery feature | Status in cauli |
 |---|---|
 | `chain`, `group`, `chord`, `map`, `starmap`, signatures | Not implemented, not planned |
@@ -137,20 +124,15 @@ Stated plainly, so you can decide before you port anything.
 
 1. Run `cauli-worker --print-plan -c <your concurrency>` and read the derived
    thread and process counts against your database's `max_connections`. The
-   connection arithmetic is in
-   [docs/CONFIGURATION.md](CONFIGURATION.md). This is the step
-   people skip and then blame on cauli.
+   connection formula is in [configuration.md](configuration.md#sizing-database-connections).
 2. Grep for `crontab(` and check every call with three or more positional
    arguments, and every schedule that restricts both a day of month and a day
-   of week. These are divergences 2 and 3, and neither raises today under
-   Celery.
+   of week (divergences 2 and 3).
 3. Grep for `UUID`, `datetime`, `Decimal` and model instances in `.delay()` and
-   `.apply_async()` arguments. These now raise at the call site.
+   `.apply_async()` arguments. These raise at the call site.
 4. Grep for `except SoftTimeLimitExceeded` inside `async def` bodies and move
    the cleanup into `finally`.
 5. Check every task that has no explicit `max_retries`. It now retries three
    times where Celery did not retry at all.
 6. Port one low stakes queue first and run both workers side by side. The
-   envelope format is stable
-   ([PROTOCOL.md](../PROTOCOL.md)), but the queues are separate, so there is no
-   shared state to corrupt while you do it.
+   queues are separate, so they share no state.
