@@ -185,7 +185,9 @@ preload the tasks, start the worker, take the slope of completions between the
 - **Dispatch: 27,060 tasks per second**, cauli's async lane at
   `--procs 6 --io-concurrency 96`, on a task body of one `redis.incr` and
   nothing else. Same box, same session: taskiq reached 7,812/s (cauli 3.5x)
-  and Celery prefork 826/s (cauli 32.8x). Every cauli row was box bound at
+  and one Celery prefork node 826/s. Several Celery nodes scale further: a
+  later run on 10 vCPUs measured 4,233/s for 8 solo nodes against 32,798/s
+  for cauli, 7.7x. Every cauli row was box bound at
   4.6 to 4.9 of 6 cores, so the defensible claim is "at least 27,060/s",
   not a ceiling.
 - **Django ORM: 4,256 tasks per second against Celery prefork's 247** (17.2x)
@@ -197,7 +199,8 @@ preload the tasks, start the worker, take the slope of completions between the
   counts Celery prefork's copy on write pages once per child and would have
   biased the comparison in cauli's favour.
 - **Crash correctness: `kill -9` at 160 of 500 tasks, restart, count.**
-  cauli: 0 lost, 0 duplicated, recovered in 10.8s. Celery's default
+  cauli at `--visibility-timeout 5`: 0 lost, 0 duplicated, recovered in
+  10.8s. Celery's default
   configuration permanently loses exactly `concurrency x (prefetch + 1)`
   tasks, verified against three configurations predicting each exactly, and
   its `acks_late=True` path loses none but recovers 8.5x slower.
@@ -206,9 +209,10 @@ preload the tasks, start the worker, take the slope of completions between the
 
 A list that only shows wins is rigged. From the same measurement round:
 
-- **Memory below 10,000 tasks in flight.** Celery gevent is one process with
-  N greenlets and beats cauli's auto-derived plan at every smaller size
-  (49.2 vs 59.7 MiB at 100 in flight; 70.8 vs 245.6 at 1,000). Each cauli
+- **Memory with the auto derived process count.** Celery gevent is one
+  process with N greenlets and beats cauli's auto derived plan at every size
+  measured (49.2 vs 59.7 MiB at 100 in flight; 70.8 vs 245.6 at 1,000; 285.4
+  vs 317.1 at 10,000). Each cauli
   process embeds its own CPython and costs about 22.6 MiB before it holds a
   single task. If you are optimising for memory, set `--procs` low
   explicitly: the auto-derivation optimises for throughput.
@@ -286,8 +290,8 @@ Stated before you adopt it, not after. The full list is "Known limitations" in
 
 Proven, and reproducible from this repository:
 
-- **172 Rust tests, 350 Python tests and 26 cross component integration tests,
-  all passing.** The integration tests run a real worker binary, real cpu
+- **173 Rust tests, 350 Python tests and 26 cross component integration tests.**
+  Two Python tests fail with asgiref 3.13 (Django async ORM executors). The integration tests run a real worker binary, real cpu
   children and a real Redis, not mocks.
 - **CI runs the Python suite on 3.10 through 3.14**, clippy under both the
   default and the `test-hooks` feature sets, `cargo audit`, and a packaging job

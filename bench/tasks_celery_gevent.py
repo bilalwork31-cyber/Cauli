@@ -14,11 +14,11 @@ monkey.patch_all()
 import redis  # noqa: E402
 from celery import Celery  # noqa: E402
 
-from common import DONE_KEY, REDIS_URL  # noqa: E402
+from common import DONE_KEY, REDIS_POOL_MAX, REDIS_URL  # noqa: E402
 
 app = Celery("fwbench", broker=REDIS_URL, backend=None)
 app.conf.task_ignore_result = True
-_r = redis.Redis.from_url(REDIS_URL)
+_r = redis.Redis.from_url(REDIS_URL, max_connections=REDIS_POOL_MAX)
 
 
 @app.task(ignore_result=True)

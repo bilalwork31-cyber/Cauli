@@ -1,90 +1,81 @@
-# Decision: the delivery guarantee at 1.0
-> **Historical design note, not current documentation.** This is a record of how one
-> pre 1.0 decision was reached and what was known when it was reached. It is kept
-> because the reasoning is worth reading, not because it describes today's behaviour.
-> Where it disagrees with the code, with [PROTOCOL.md](../../PROTOCOL.md) or with
-> [docs/CONFIGURATION.md](../CONFIGURATION.md), those win. The status line below was
-> checked against the source, not carried over.
->
-> **Status: shipped in 0.1.0.** The idempotency claim TTL now
-> derives from the execution it guards (`broker::claim_ttl_s`), the worker carries the
-> claimant id back on a suppressed duplicate, PROTOCOL.md section 4 carries the delivery
-> guarantee preamble, and README no longer offers an idempotency key as an alternative to
-> writing a repeatable task body. The last piece landed in the release audit pass:
-> `AsyncResult.claimant_id` now carries the claiming task id after a duplicate resolves, and
-> `AsyncResult.claimant()` hands back a result handle for it, so a suppressed caller can read
-> the outcome that actually ran.
+# Delivery guarantee
 
-**The guarantee is coherent, not a pile of caveats.** Every cauli side failure resolves the same
-direction: toward duplicate execution or a loud dead letter, never toward silent loss. That composes.
-What does not compose is the documentation, plus one component whose name promises more than its
-mechanism delivers.
+Status: Accepted (0.1.0)
 
-## The guarantee, stated as it actually is
+## Context
 
-Once Redis has accepted an enqueue, cauli never loses the task silently: it either executes to a
-recorded outcome or lands in the dead letter stream with a stated reason. Execution is at least once.
-Every internal failure, a truncated completion pipeline, a worker crash, a mid script error, a failed
-idempotency check, resolves toward running the task again rather than dropping it, so duplicates are
-always possible; `idempotency_key` suppresses most of them for `idemp_ttl` seconds, best effort. Work
-terminates within bounds: `max_retries` failed executions, at most `max(3, max_retries + 1)` crash
-redeliveries per attempt, then a dead letter queue capped at roughly 1000 entries per queue. Beat
-fires each slot at most once per surviving Redis dataset. All of this is scoped to ONE Redis dataset:
-an async replication failover can forget unreplicated writes, which is the one place a task can
-vanish or a beat slot can fire twice, and delayed, retried and periodic tasks do not work on Cluster.
+Delivery behaviour was spread over several sections of PROTOCOL.md and stated
+differently in the README and CONFIGURATION.md. Two problems stood out.
 
-## What a user must do
+- The worst way to lose a task, an enqueue the Redis master accepted and never
+  replicated before a failover, was documented only inside the beat chapter
+  (PROTOCOL.md section 10.5).
+- The documentation offered `idempotency_key` as an alternative to writing a
+  task that is safe to repeat. It is not one.
 
-Write every task to tolerate running twice, unconditionally. `idempotency_key` narrows the window; it
-does not remove that obligation. Work that truly must not run twice needs its own dedup check inside
-the task, keyed on something stable, `beat_slot` for scheduled work. Operationally: keep
-`--visibility-timeout` above the longest task timeout and `idemp_ttl` above the longest run plus
-retry horizon, both of which the worker now warns about, watch the dead letter queue before its cap
-rotates, and run standalone or Sentinel knowing a failover can duplicate recent work.
+The idempotency guard also had two defects. Its claim used `idemp_ttl` as is, so
+a task whose timeout was longer than `idemp_ttl` could lose its claim while
+still running, and the next attempt would claim it again and run concurrently.
+And a suppressed duplicate gave the caller no way to find the task that held
+the key.
 
-## The new finding: the idempotency claim fails CLOSED after permanent failure
+## Decision
 
-This is the one caveat that resolves in the LOSS direction, and it is undocumented. Nothing ever
-deletes a claim. After the claimant has been dead lettered, a resubmission with the same key returns
-"duplicate" until the TTL runs out, and the duplicate result carries no claimant id, so the caller
-cannot even discover that the work never succeeded.
+The guarantee is stated once, in PROTOCOL.md section 4 under "Delivery
+guarantee":
 
-Orchestrator position: do NOT release claims on terminal failure, because partial side effects make
-suppression the safer default. But the caller being unable to find out is a real bug. Write the
-claimant task id into the duplicate result so a suppressed caller can chase the actual outcome.
+- Once Redis has accepted an enqueue, a task is never lost silently. It either
+  runs to a recorded outcome or lands in the dead letter stream with a reason.
+- Execution is at least once. Every internal failure (a truncated completion
+  pipeline, a worker crash, a script error, a failed idempotency check)
+  resolves toward running the task again, never toward dropping it.
+- Work terminates. A task gets `max_retries` failed executions, and each attempt
+  at most `max(3, max_retries + 1)` crash redeliveries
+  (`envelope::redelivery_limit`). Each dead letter stream is capped at about
+  1000 entries and expires 7 days after its last write
+  (`DLQ_MAXLEN` and `DLQ_TTL_S` in `worker/src/broker.rs`).
+- All of this holds within one Redis dataset. An asynchronous replication
+  failover can forget writes that were not replicated. That is the one way a
+  task can vanish or a beat slot can fire twice.
 
-## What the guard actually is
+The user's obligation follows from it: every task must tolerate running twice.
+`idempotency_key` narrows the window and does not remove the obligation.
 
-An atomic execution admission lease, not an idempotency guarantee. It kills the common double submit
-and concurrent dedup races. It also: fails open on a corrupted key; anchors its window at first claim
-and never refreshes it; shares the failover lost write window; and still has NO test for the crash
-redelivery half of its MineAgain behaviour. Keep it, rename its story.
+The idempotency guard is an atomic execution admission lease
+(`IDEMP_CLAIM_LUA` in `worker/src/broker.rs`):
 
-## The weakest point is documented at the wrong address
+- `SET NX EX` claims the key. If the holder is the same task id (a retry or a
+  crash redelivery), the claim is renewed with `PEXPIRE` and execution proceeds.
+- The claim TTL is `max(idemp_ttl, timeout_ms + backstop grace)`
+  (`broker::claim_ttl_s`), so a claim cannot expire while its own attempt runs.
+- A duplicate result carries the claimant's task id. `AsyncResult.claimant_id`
+  exposes it and `AsyncResult.claimant()` returns a handle to the claimant's
+  result.
+- Claims are never released, not even after the claimant is dead lettered.
 
-The weakest point is the Redis durability boundary, an enqueue the master acked and never replicated:
-the only failure that silently loses a task and the only one cauli cannot route to a dead letter. It
-IS documented, but only inside the beat chapter at section 10.5. Section 4 and the README's shipping
-list never mention failover, and instead point loudly at Cluster and visibility timeout, which are
-the well covered spots.
+## Consequences
 
-## The two changes
+- After the claimant has been dead lettered, a resubmission with the same key is
+  suppressed until the claim expires. This is the one behaviour that leans
+  toward loss rather than duplication. It is kept because a failed task may
+  have left partial side effects, and the claimant id lets the caller discover
+  the real outcome.
+- The guard fails open: if the claim script errors, the task runs anyway.
+- Retries and crash redeliveries are counted separately, so the worst case is
+  `(max_retries + 1) x (redelivery_limit + 1)` executions. Anyone sizing work on
+  the retry count needs that product.
+- Work that must never run twice needs its own check inside the task, keyed on
+  something stable, such as `beat_slot` for scheduled work.
+- Operators should keep `--visibility-timeout` above the longest task timeout,
+  watch the dead letter streams before the cap drops old entries, and expect a
+  failover to duplicate recent work. The worker warns at startup about task
+  timeouts at or above the visibility timeout or `idemp_ttl`.
+- The MineAgain path under crash redelivery is covered by the integration suite
+  (`itest/test_integration.py`).
 
-1. **Code, under 20 lines.** Derive the claim TTL from the execution it guards: claim with
-   `EX max(idemp_ttl, (timeout_ms + grace)/1000)` and add a PEXPIRE refresh to the MineAgain branch
-   of the Lua. That turns tonight's startup warning into an invariant, since a claim can then never
-   expire while its own execution or retry chain may still run. Plus the claimant id in the duplicate
-   result, above.
+## Alternatives considered
 
-2. **Documentation, and this matters more.** Add a "Delivery guarantee" preamble to PROTOCOL section
-   4 carrying the two paragraphs above verbatim, and move the per Redis dataset failover caveat there
-   from 10.5.
-
-   Then fix README line 266, which currently says make tasks safe to repeat **or** pass an
-   `idempotency_key`. **That "or" is false** and it is the single most misleading sentence in the
-   documentation: the key never substitutes for repeat safety. Same correction to CONFIGURATION.md's
-   "Deduplicates execution" row.
-
-Also unstated anywhere: worst case executions are `(max_retries + 1) x (redelivery_limit + 1)`,
-because the two counters are deliberately disjoint. A user sizing anything on retry count needs that
-product.
+- Release the claim when the claimant fails terminally. Rejected: partial side
+  effects make suppression the safer default.
+- Describe the guard as exactly once. Rejected: it does not survive a failover
+  and fails open on error.

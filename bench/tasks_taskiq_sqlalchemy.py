@@ -10,12 +10,12 @@ import redis.asyncio as aredis
 from sqlalchemy.ext.asyncio import AsyncSession
 from taskiq_redis import ListQueueBroker
 
-from common import DONE_KEY, REDIS_URL
+from common import DONE_KEY, REDIS_POOL_MAX, REDIS_URL
 from sqla_models import BenchIo, make_engine
 from workloads import PG_PAYLOAD, PG_POOL_MAX
 
 broker = ListQueueBroker(url=REDIS_URL, queue_name="fwbench_sqla")
-_r = aredis.Redis.from_url(REDIS_URL)
+_r = aredis.Redis.from_url(REDIS_URL, max_connections=REDIS_POOL_MAX)
 _engine = None
 
 

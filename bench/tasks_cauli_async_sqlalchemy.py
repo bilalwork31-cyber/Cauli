@@ -10,12 +10,12 @@ import redis.asyncio as aredis
 from cauli import Cauli
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from common import DONE_KEY, REDIS_URL
+from common import DONE_KEY, REDIS_POOL_MAX, REDIS_URL
 from sqla_models import BenchIo, make_engine
 from workloads import PG_PAYLOAD, PG_POOL_MAX
 
 app = Cauli(redis_url=REDIS_URL)
-_r = aredis.Redis.from_url(REDIS_URL)
+_r = aredis.Redis.from_url(REDIS_URL, max_connections=REDIS_POOL_MAX)
 # Built lazily on first task, same reason as tasks_cauli_async_pg.py's
 # pool: no asyncio loop exists yet at import time.
 _engine = None

@@ -6,11 +6,11 @@ import redis.asyncio as aredis
 from psycopg_pool import AsyncConnectionPool
 from taskiq_redis import ListQueueBroker
 
-from common import DONE_KEY, REDIS_URL
+from common import DONE_KEY, REDIS_POOL_MAX, REDIS_URL
 from workloads import PG_DSN, PG_INSERT_SQL, PG_PAYLOAD, PG_POOL_MAX
 
 broker = ListQueueBroker(url=REDIS_URL, queue_name="fwbench_pg")
-_r = aredis.Redis.from_url(REDIS_URL)
+_r = aredis.Redis.from_url(REDIS_URL, max_connections=REDIS_POOL_MAX)
 _pool = AsyncConnectionPool(
     PG_DSN, min_size=2, max_size=PG_POOL_MAX, kwargs={"autocommit": True}, open=False
 )

@@ -1,91 +1,79 @@
-# Decision: time and clock architecture at 1.0
-> **Historical design note, not current documentation.** This is a record of how one
-> pre 1.0 decision was reached and what was known when it was reached. It is kept
-> because the reasoning is worth reading, not because it describes today's behaviour.
-> Where it disagrees with the code, with [PROTOCOL.md](../../PROTOCOL.md) or with
-> [docs/CONFIGURATION.md](../CONFIGURATION.md), those win. The status line below was
-> checked against the source, not carried over.
->
-> **Status: shipped in 0.1.0.** `worker/src/clock.rs` anchors on Redis `TIME`, re anchors
-> on a periodic sample and warns at boot about a skew worth naming. The Python client is
-> still on its own clock, which CHANGELOG's known limitations now says plainly.
+# Worker clock anchored on Redis TIME
 
-**Ship 1.0 with a Redis anchored SAMPLED clock in the worker. Do not route per call through Redis
-`TIME`.** The mixed clock shared timeline is a genuine 1.0 defect, but the correct fix is small.
+Status: Accepted (0.1.0)
 
-## It corrected the audit twice, and one correction matters a lot
+## Context
 
-First, my briefing cited `ctx.rs:98-103`; that is now `DecrGuard`, and the real site is `ctx.rs:111`.
+Every duration in the worker is measured with a monotonic clock. Absolute
+instants are different: several of them are written by one process and read by
+another, so they only work if every process means the same thing by "now".
 
-Second, and this is the important one: **the recovery versus backstop window is LARGER than the audit
-judged, and in one regime it is a real defect rather than a curiosity.** The audit concluded it was
-"swamped in practice by tick granularity". That is true only on an idle system. The timer is armed
-AFTER the io semaphore is acquired (exec.rs:45 and :106) and, for cpu jobs, only at child pickup
-(`arm_started` in cpu.rs). That wait is UNBOUNDED under saturation.
+- The delayed sorted set (PROTOCOL.md section 4.3) has several writers (the
+  client, retries on every worker, beat) and a reader, the mover, on every
+  worker. Because every worker runs the mover, the fastest local clock in the
+  fleet decides when delayed work fires. One worker stepped forward fires all
+  delayed work early and defeats backoff and `eta`.
+- A forward step during `schedule_retry` writes a score far in the future, and
+  nothing ever corrects it.
+- The expiry check (PROTOCOL.md section 9.1) compares the worker's clock with a
+  deadline the client stamped. A worker ahead of the client drops valid work as
+  expired, which is the worst direction to be wrong in.
 
-So under load: an entry parked past `timeout_ms + 2000` of idle gets reclaimed while its attempt is
-still alive and has not started; repeated parking inflates `delivery_count`; and about three cycles
-reach the redelivery dead letter **without the task ever executing once**. A task dead lettered
-having never run is exactly the class of bug this audit existed to find, and it was mis-triaged.
+## Decision
 
-| regime | window | consequence | action |
-|--------|--------|-------------|--------|
-| idle | spawn plus parse plus one idemp round trip, single digit ms | one at least once duplicate, probability about window over tick | document, do not fix |
-| saturated with long tasks | io semaphore or cpu backlog wait, unbounded | dead lettered without ever executing | REAL DEFECT, fix or measure before 1.0 |
+The worker reads absolute time from a sampled, Redis anchored clock
+(`worker/src/clock.rs`).
 
-Cheap fix for the io half: fetch `COUNT = min(batch, available_permits)` at loops.rs:35, so fetched
-entries never park on the semaphore. About 5 lines. The cpu half stays partly exposed through the
-backlog channel; accept and document, since XCLAIM resets idle and self limits it.
+- `now_ms()` is a stored anchor plus monotonic time elapsed since the process
+  started. Between samples the reading never steps and never goes backwards.
+- The first `TIME` sample is taken, blocking, at startup. The worker already has
+  to reach Redis to create its consumer groups, so this costs nothing extra.
+- A background task resamples every 15 to 30 seconds. The exact period is
+  spread by pid so a fleet that booted together does not hit Redis in step.
+- If `TIME` fails at startup (some managed Redis services deny it by ACL), the
+  worker falls back to its local clock, warns, and keeps sampling. A clock that
+  has not been sampled for 90 seconds is logged once as stale.
+- At startup the worker warns when the local clock and Redis disagree by one
+  second or more, since log timestamps and anything enqueued from that host are
+  off by the same amount.
+- The retry delay is clamped to 30 days (`MAX_RETRY_DELAY_MS` in
+  `worker/src/dispatch.rs`), mirroring the 24 hour clamp on `timeout_ms`. Both
+  inputs to the delay, `backoff_max_ms` from the envelope and
+  `Retry(countdown=...)` from the task, are otherwise unbounded.
+- `cauli-beat` reads "now" from Redis `TIME` as well (`py/cauli/beat.py`).
 
-## The horizon cap I proposed does not work
+## Consequences
 
-Worth recording because it was my idea and it is wrong: `fire_at = bogus_now + backoff` passes any
-check shaped like `fire_at < bogus_now + horizon`, because both sides carry the same broken clock. A
-cap measured against the local clock cannot catch a local clock fault.
+- An NTP step on one worker host has no effect on scheduling. All workers and
+  beat agree with Redis to within the drift between two samples.
+- No wire change was needed. Scores and stamps keep their meaning.
+- The Python client still stamps `enqueued_at`, numeric `expires` and
+  `countdown` from its local clock. `eta` and a datetime `expires` are absolute
+  values the user supplies, so they do not depend on the client clock. A skewed
+  client mostly misplaces its own tasks, by the size of its skew. Client hosts
+  need NTP.
+- An entry's pending entries list idle time starts at delivery, but its
+  execution timer only starts once it holds an io permit, or for cpu tasks once
+  a child picks it up. Under saturation that wait is unbounded, so a parked
+  entry could be reclaimed by recovery and dead lettered as `redelivery_limit`
+  without ever running. The fetch loop therefore requests no more entries than
+  there are free io permits, divided across the streams it reads, and the
+  recovery loop reclaims no more than the free permit count
+  (`worker/src/loops.rs`). The cpu path is still partly exposed through the cpu
+  backlog. That is accepted: a reclaim resets the idle time, which limits the
+  effect.
+- Scores already written with a bad clock are never rewritten, and the mover
+  does not detect them.
 
-What survives is clamping the retry DELAY rather than the instant: `d_ms` at dispatch.rs:247 comes
-from envelope controlled `backoff_max_ms` and task controlled `Retry(countdown=...)`, both unbounded.
-Clamp at 30 days, mirroring the existing `MAX_TIMEOUT_MS`. Ten lines, worth doing regardless.
+## Alternatives considered
 
-## Which timestamps are in the wrong category
-
-Every DURATION in the codebase is already correctly monotonic. Only absolute instants are broken, and
-only on the worker side. The delayed sorted set has three writers on two different clocks and one
-reader on a third.
-
-Concretely wrong, all fixed at once by the sampled clock: the mover cutoff, where since every worker
-runs the mover the FASTEST local clock in the fleet defines firing, so one forward stepped worker
-fires all delayed work early and defeats backoff and eta; the retry write, where a forward step
-strands the task with no self healing; and the expiry check, where a worker ahead of the client
-silently drops valid work as expired, which is the worst direction.
-
-## The design
-
-`RedisClock`: one `AtomicI64` offset, `now_ms() = offset + monotonic_elapsed_since_start`. A
-background task samples Redis `TIME` every 15 to 30 seconds. Block once at startup for the first
-sample, which is free because the worker already requires Redis at boot for `ensure_groups`. On
-sample failure keep extrapolating monotonically and warn when stale.
-
-Local NTP steps then have zero effect anywhere, all workers agree with beat and with Redis within a
-few ms, and the pre epoch branch dies. Quartz drift between samples is about 3ms per minute, which is
-irrelevant at 250ms mover granularity. No wire change. About 150 lines.
-
-Per call `TIME` was rejected on measured grounds: it would add roughly 2 SERIAL round trips per task
-at dispatch.rs:104 and :181, roughly doubling broker command load and directly attacking the measured
-dispatch overhead claim.
-
-The client stays on its local clock at 1.0. Its remaining exposure is only `enqueued_at`, numeric
-`expires` and `countdown`; `eta` and datetime `expires` are user supplied absolutes and clock free.
-A skewed client mostly hurts its own tasks, by a bounded amount. Document the NTP requirement.
-
-## Ranked
-
-1. `RedisClock` sampled offset, about 150 lines, low risk, no wire change
-2. Clamp retry `d_ms` at 30 days, about 10 lines, no risk
-3. PROTOCOL prose on clock requirements and recovery reference points
-4. `COUNT = min(batch, permits)`, about 5 lines, closes the saturated duplicate window
-5. Stranded score warning in the mover, detection only, never rewrite scores
-
-Explicitly not doing: per call Redis TIME; a client side Redis clock at 1.0; HLC, Lamport or any wire
-change; rewriting existing delayed scores; or re anchoring executor timers at delivery, which would
-change timeout semantics for queued work to close a window duplicates already cover.
+- Read Redis `TIME` on every call. Rejected: it adds two serial round trips per
+  task (the expiry check and the finish stamp) to buy a timestamp.
+- Cap retries with a horizon such as `fire_at < now + horizon`. Rejected: both
+  sides of the comparison use the same broken clock, so a local clock fault
+  passes the check. Clamping the delay instead survives.
+- A Redis anchored clock in the Python client, a hybrid logical clock, or any
+  other wire change. Rejected as more than the problem needs.
+- Re arming execution timers at delivery. Rejected: it would change timeout
+  semantics for queued work to close a window that at least once delivery
+  already covers.

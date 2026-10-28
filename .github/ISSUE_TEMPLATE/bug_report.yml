@@ -1,0 +1,35 @@
+name: Bug report
+description: Something cauli did that it should not have, or did not do that it should
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what you expected
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Smallest reproduction
+      description: Task code, the enqueue call and the worker command line.
+      render: python
+    validations:
+      required: true
+  - type: textarea
+    id: plan
+    attributes:
+      label: Output of `cauli-worker --print-plan` with your flags
+      render: text
+  - type: textarea
+    id: log
+    attributes:
+      label: Worker log around the failure, including one stats line
+      render: text
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: cauli, cauli-worker, Python, Redis, OS. Published wheel or source build?
+    validations:
+      required: true

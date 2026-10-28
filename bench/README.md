@@ -87,6 +87,7 @@ applied in `tasks_cauli_sync_pg.py` / `tasks_cauli_async_pg.py`.
 | `soak_driver.py` | Sustained load + periodic PSS sampling for the 24-48h soak test |
 | `raw_asyncio_enqueue.py` / `raw_asyncio_worker.py` | The no-framework ceiling every lane is bounded by |
 | `djapp/` / `django_settings.py` | Minimal Django app (unmanaged model onto the shared `bench_io` table) for the Django ORM lane |
+| `web/` | Enqueue inside real Django (WSGI and ASGI) and FastAPI requests under k6 load: request rate, end to end task latency, and an exactly once check per request. `python3 -m web.campaign --reps 3`; needs k6, Postgres and the bench venv plus fastapi, uvicorn and gunicorn |
 | `sqla_models.py` | SQLAlchemy 2.0 declarative model onto the same table, for the async ORM lane (Core and ORM both go through this) |
 | `tasks_cauli_sync_pg.py` / `tasks_cauli_async_pg.py` | Raw psycopg3 PG lanes — also the pgbouncer-safe reference, `prepare_threshold=None` set unconditionally |
 | `Dockerfile` / `docker-compose.yml` / `docker-init.sql` | One-command reproduction (unvalidated on this dev machine — see RESULTS.md) |

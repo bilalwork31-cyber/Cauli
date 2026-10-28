@@ -11,10 +11,10 @@ from concurrent.futures import ProcessPoolExecutor
 import redis.asyncio as aredis
 from arq.connections import RedisSettings
 
-from common import DONE_KEY, REDIS_URL
+from common import DONE_KEY, REDIS_POOL_MAX, REDIS_URL
 from workloads import cpu_burn
 
-_r = aredis.Redis.from_url(REDIS_URL)
+_r = aredis.Redis.from_url(REDIS_URL, max_connections=REDIS_POOL_MAX)
 redis_settings = RedisSettings.from_dsn(REDIS_URL)
 # arq has no CLI concurrency knob for this (it's this file's own executor,
 # not arq's), so the pool size is an env var instead, to sweep it the same

@@ -10,13 +10,13 @@ import dramatiq
 import redis
 from dramatiq.brokers.redis import RedisBroker
 
-from common import REDIS_URL
+from common import REDIS_POOL_MAX, REDIS_URL
 
 EXEC_KEY = "bench:chaos:executions"
 
 broker = RedisBroker(url=REDIS_URL)
 dramatiq.set_broker(broker)
-_r = redis.Redis.from_url(REDIS_URL)
+_r = redis.Redis.from_url(REDIS_URL, max_connections=REDIS_POOL_MAX)
 
 
 @dramatiq.actor(max_retries=5)

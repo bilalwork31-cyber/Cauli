@@ -13,24 +13,19 @@ REDIS_PORT=${BENCH_REDIS_PORT:-6395}
 PG_ROLE=${BENCH_PG_ROLE:-bench}
 PG_DB=${BENCH_PG_DB:-bench}
 
-echo "[1/5] building cauli-worker (release, fresh)"
+echo "[1/4] building cauli-worker (release, fresh)"
 CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/cauli-target}"
 export CARGO_TARGET_DIR
 (cd "$REPO_ROOT/worker" && cargo build --release --bin cauli-worker)
 echo "cauli-worker commit: $(cd "$REPO_ROOT" && git rev-parse HEAD)"
 
-echo "[2/5] creating venv at $VENV"
+echo "[2/4] creating venv at $VENV"
 python3 -m venv "$VENV"
 "$VENV/bin/pip" install -q --upgrade pip
 "$VENV/bin/pip" install -q -e "$REPO_ROOT/py"
 "$VENV/bin/pip" install -q -r requirements.txt
 
-echo "[3/5] installing uvloop from GitHub main (not the last PyPI release)"
-"$VENV/bin/pip" install -q --upgrade --force-reinstall --no-deps \
-  'uvloop @ git+https://github.com/MagicStack/uvloop.git'
-echo "uvloop version: $("$VENV/bin/python3" -c 'import uvloop; print(uvloop.__version__)')"
-
-echo "[4/5] starting dedicated Redis on port $REDIS_PORT"
+echo "[3/4] starting dedicated Redis on port $REDIS_PORT"
 if ! redis-cli -p "$REDIS_PORT" ping > /dev/null 2>&1; then
     redis-server --port "$REDIS_PORT" --save '' --appendonly no --daemonize yes \
       --logfile "/tmp/bench-redis-${REDIS_PORT}.log"
@@ -38,7 +33,7 @@ if ! redis-cli -p "$REDIS_PORT" ping > /dev/null 2>&1; then
 fi
 redis-cli -p "$REDIS_PORT" ping
 
-echo "[5/5] creating Postgres bench_io table (role/db: $PG_ROLE/$PG_DB, assumed to already exist)"
+echo "[4/4] creating Postgres bench_io table (role/db: $PG_ROLE/$PG_DB, assumed to already exist)"
 PGPASSWORD="$PG_ROLE" psql -h 127.0.0.1 -U "$PG_ROLE" -d "$PG_DB" -c "
     CREATE TABLE IF NOT EXISTS bench_io (
         id BIGSERIAL PRIMARY KEY,

@@ -7,12 +7,12 @@ import redis
 from dramatiq.brokers.redis import RedisBroker
 from psycopg_pool import ConnectionPool
 
-from common import DONE_KEY, REDIS_URL
+from common import DONE_KEY, REDIS_POOL_MAX, REDIS_URL
 from workloads import PG_DSN, PG_INSERT_SQL, PG_PAYLOAD, PG_POOL_MAX
 
 broker = RedisBroker(url=REDIS_URL)
 dramatiq.set_broker(broker)
-_r = redis.Redis.from_url(REDIS_URL)
+_r = redis.Redis.from_url(REDIS_URL, max_connections=REDIS_POOL_MAX)
 # open=False + open() on first use: safe whether --processes forks or spawns
 # (open() is idempotent -- see tasks_cauli_sync_pg.py).
 _pool = ConnectionPool(PG_DSN, min_size=1, max_size=PG_POOL_MAX, kwargs={"autocommit": True}, open=False)

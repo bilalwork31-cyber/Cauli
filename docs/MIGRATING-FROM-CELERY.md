@@ -2,8 +2,8 @@
 
 This is written for someone who already runs Celery in production and wants to
 know, in one sitting, what breaks. It is deliberately not a pitch. Read
-"Known limitations" and "Still open" in [CHANGELOG.md](../CHANGELOG.md)
-alongside it.
+"Known limitations" in the [release notes](RELEASE_NOTES_v0.1.0.md#known-limitations)
+and in [CHANGELOG.md](../CHANGELOG.md) alongside it.
 
 Three things to settle before anything else, because each one is a hard stop:
 
@@ -41,7 +41,7 @@ Three things to settle before anything else, because each one is a hard stop:
 | `worker_process_init` signal | `@app.process_init` | Runs once per cauli managed Python process |
 | `task_prerun` / `task_postrun` | `@app.before_task` / `@app.after_task` | Called with no arguments. A raising hook is logged and skipped, never fails the task |
 | `django-celery-results`, the Celery fixup | `cauli.contrib.django` | `django_app("myproj.settings")`, connection hooks, `delay_on_commit` |
-| `-P prefork` | `@app.task(kind="cpu")` | Per task, not per worker. All three lanes run in one worker process |
+| `-P prefork` | `@app.task(kind="cpu")` | Per task, not per worker. One worker serves all three lanes; cpu tasks run in child processes it forks |
 | `-P threads` | `def` task, the default | |
 | `-P gevent` | `async def` task, the default | Real asyncio, not monkey patching |
 
@@ -94,8 +94,8 @@ equivalent that turns it into at most once. A crashed worker's in flight tasks
 are redelivered. Worst case executions of one task are
 `(max_retries + 1) x (redelivery_limit + 1)`, which is 20 with the defaults.
 Task bodies must be safe to repeat. `idempotency_key=` suppresses a duplicate
-enqueue, but it is a 64 bit fold and a collision suppresses a distinct task, so
-it is a throughput saver, not a correctness mechanism.
+enqueue for the key's TTL. It narrows duplicate work, it does not make a task
+body safe to repeat.
 
 **7. Arguments are JSON only, and the type set is smaller than you think.**
 Allowed: `str`, `int`, `float`, `bool`, `None`, `list`, `tuple`, and `dict`
@@ -130,7 +130,7 @@ Stated plainly, so you can decide before you port anything.
 | Pickle or a custom serializer | Not planned. JSON only, by design |
 | `task_always_eager` | No setting, but a task stays a plain callable: `crunch([1, 2])` runs inline with no broker |
 | Dead letter tooling | The dead letter queue exists and holds roughly the most recent 1000 entries per queue. Nothing reads, exports, requeues or purges it for you |
-| Push based result notification | `get()` polls every 50ms by default. `poll_interval` is tunable per call |
+| Push based result notification | `get()` polls, starting at 1ms and backing off to `poll_interval`, 50ms by default |
 
 ## A migration order that works
 

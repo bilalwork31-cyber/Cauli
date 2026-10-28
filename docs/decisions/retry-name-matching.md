@@ -1,95 +1,69 @@
-# Decision: Retry name matching, and what it uncovered
-> **Historical design note, not current documentation.** This is a record of how one
-> pre 1.0 decision was reached and what was known when it was reached. It is kept
-> because the reasoning is worth reading, not because it describes today's behaviour.
-> Where it disagrees with the code, with [PROTOCOL.md](../../PROTOCOL.md) or with
-> [docs/CONFIGURATION.md](../CONFIGURATION.md), those win. The status line below was
-> checked against the source, not carried over.
->
-> **Status: shipped in 0.1.0.** Name plus countdown matching was kept, as recommended. The
-> defect it uncovered is fixed: `worker/src/shim.py` rebinds its `SoftTimeLimitExceeded`
-> from the real `cauli` module once the app is loaded, so a task's own
-> `except SoftTimeLimitExceeded` clause matches the class the worker raises.
+# Retry is recognised by name, not identity
 
-**Keep name plus countdown matching. It is the correct design, forced by two hard constraints, and
-the collision is nearly behaviour neutral. The real pre 1.0 fix in this neighbourhood is a different
-bug it uncovered: the `SoftTimeLimitExceeded` stand in identity break.**
+Status: Accepted (0.1.0)
 
-## The Retry collision is much less serious than it looked
+## Context
 
-The feared outcome, silently swallowing a real error and rescheduling instead of failing, **cannot
-happen, because cauli already retries every exception by default.** `shim.py:164` marks all non Retry
-exceptions retryable, and `dispatch.rs:207-233` runs a forced retry and a retryable failure through
-the SAME bounded path: the same `retries < max_retries` gate, the same `schedule_retry`, the same dead
-letter with reason `max_retries`, and the same stored failure result carrying the user's own type,
-message and traceback.
+A task forces a retry by raising `cauli.Retry(countdown=...)`. All three lanes
+recognise it by class name plus a `countdown` attribute: `_is_retry` in
+`worker/src/shim.py` for the io lanes, `_is_retry` in `py/cauli/_exec.py` for
+the cpu child, and `parse_pyresp` in `worker/src/ctx.rs` on the Rust side of
+the cpu pipe. Any user class named `Retry` with a `countdown` therefore counts
+as a forced retry, and the question was whether that collision was acceptable.
 
-So for a user class named `Retry` carrying a `countdown`, the entire net delta is: the retry delay
-becomes their countdown value instead of the computed backoff. Nothing else. The task still retries
-`max_retries` times, still dead letters, and `.get()` still raises with their own type and full
-traceback. Worst realistic case is a large countdown delaying the final failure.
+Identity matching is not possible, for three independent reasons:
 
-And the case is largely self correcting: anyone writing a `Retry` class with a `countdown` attribute
-is almost certainly expressing the Celery retry idiom, in which case cauli's interpretation MATCHES
-their intent. Severity low, not a 1.0 blocker.
+1. The shim's module body runs before `load_app` adds the working directory,
+   extra paths and the `VIRTUAL_ENV` site packages to `sys.path`. In a source
+   built worker with no venv link, `from cauli import ...` fails at that point
+   and there is no `cauli.Retry` object to compare against.
+2. Apps that do not install `cauli` in the worker's interpreter are supported.
+   PROTOCOL.md section 4.2 documents the duck typed rule, and the worker's end to
+   end tests run against a fixture that defines its own `Retry`.
+3. The cpu decision in Rust only sees a type name in JSON read off the child's
+   pipe. Class identity cannot cross a process boundary.
 
-## Why identity matching is impossible, with evidence
+`_exec.py` once used `isinstance` and was changed to the name rule so all three
+lanes agree.
 
-Three verified constraints, any one of which would be sufficient:
+## Decision
 
-1. **The shim can run before `cauli` is importable.** `pyrt.rs:208-215` executes shim.py's module body,
-   including its `from cauli import ...` attempt at `shim.py:47`, BEFORE `load_app` inserts cwd, the
-   extra paths and the `VIRTUAL_ENV` site packages. In the documented wheel in venv deployment the
-   import succeeds; in the equally supported source built binary shape it fails, and there is then no
-   canonical `cauli.Retry` object to compare against.
-2. **Cauli-less apps are a promised contract.** PROTOCOL section 4.2 documents the duck rule
-   explicitly, saying the worker's interpreter may not have cauli installed at all, and the entire
-   worker e2e suite runs that way against a fixture defining its own `Retry`.
-3. **The Rust cpu decision point only ever sees a string.** `ctx.rs:194` operates on JSON off the
-   child's pipe, where class identity cannot cross the process boundary.
+Keep name plus `countdown` matching, and document it for users
+(docs/CONFIGURATION.md, "Task decorator").
 
-History confirms it was deliberate: `_exec.py` once used `isinstance` and audit M6 demoted it to name
-matching so all three lanes share one rule, with a positive regression test pinning the duck
-behaviour.
+The collision is close to harmless because cauli retries every exception by
+default. A forced retry and a retryable failure go through the same path in
+`worker/src/dispatch.rs`: the same `retries < max_retries` gate, the same
+`schedule_retry`, the same dead letter with reason `max_retries`, and the same
+stored failure carrying the user's own type, message and traceback. The only
+difference for a user's own `Retry` is that its `countdown` replaces the
+computed backoff. Someone writing such a class is most likely using the Celery
+retry idiom, in which case that is what they meant.
 
-Both alternatives were rejected with reasons. isinstance first with a name fallback fixes nothing,
-because the fallback still catches every collision. A marker dunder breaks version skew, since a 1.0
-worker against an older installed cauli whose `Retry` lacks the marker would silently degrade, and it
-still needs the name rule for cauli-less apps, so the collision survives anyway.
+## Consequences
 
-## THE REAL BUG: SoftTimeLimitExceeded is identity injected and the identity is wrong
+- The shim rebinds its `SoftTimeLimitExceeded` from `sys.modules["cauli"]` once
+  `load_app` has imported the app (`worker/src/shim.py`). Before this, a source
+  built or `VIRTUAL_ENV` deployment bound a local stand in class, so a sync
+  task's `except SoftTimeLimitExceeded` never matched the exception the worker
+  injected. The task context names are rebound the same way.
+- On the async lane the soft limit cancels the task, so the body sees
+  `asyncio.CancelledError` and an `except SoftTimeLimitExceeded` inside it does
+  not fire. The reported failure is still `SoftTimeLimitExceeded`.
+- A non numeric `countdown` is ignored and the computed backoff is used, on both
+  the io and cpu lanes. It no longer replaces the user's error with a
+  `ValueError`.
+- `ctx.rs` and `pyrt.rs` default `retryable` to false for a type named
+  `SerializationError` when the response does not say. Both Python executors
+  now stamp `retryable: true` on every user exception, so a user class named
+  `SerializationError` retries on every lane. Only the worker's own
+  `SerializationError`, for a result or arguments that cannot be encoded, is
+  terminal.
 
-This is the inverse problem and it is genuinely user visible. `shim.py:47`'s import runs before
-`load_app`'s path setup, so in the source built or `VIRTUAL_ENV` deployment the shim binds its own
-LOCAL STAND IN class, while the user's app imports the real `cauli.SoftTimeLimitExceeded`. The
-watchdog then injects the stand in at `shim.py:320`, and the user's `except SoftTimeLimitExceeded:`
-cleanup clause **does not match**.
+## Alternatives considered
 
-Both `docs/CONFIGURATION.md:235` and `py/cauli/exceptions.py:29-34` advertise catch and cleanup as
-supported. So this breaks an advertised behaviour, in a supported deployment shape, silently. Sync io
-lane only: the cpu child imports real cauli, and the async lane never raises it at all per section 4.6.
-
-Fix: rebind the shim's module global from `sys.modules.get("cauli")` inside `load_app` when it is
-present. About 4 lines, shim.py only, no wire change. **Should land before 1.0.**
-
-## Two smaller real defects in the same sweep
-
-- **`_exec.py:245` calls `float(cd)` unguarded**, so a non numeric countdown replaces the user's
-  actual error with a ValueError. `shim.py:158-162` already guards exactly this. About 3 lines, cpu
-  lane only.
-- **An undocumented lane divergence on `SerializationError`.** `ctx.rs:200` and `pyrt.rs:148` default
-  `retryable` to `type != "SerializationError"`. The io lanes are immune because the shim always sets
-  `retryable` explicitly, but the cpu lane falls back to that name default. So a user exception class
-  named `SerializationError`, which is not far fetched in a Celery migration since kombu ships one,
-  **retries on io and is terminal on cpu**. Cheapest fix is stamping `retryable: false` at the
-  `_exec.py:296-301` mint site. Low urgency, loud and arguably correct semantics either way.
-
-## Blast radius
-
-The core decision is documentation only: one paragraph reserving `Retry` plus `countdown` as an
-exception shape, which today is documented only in PROTOCOL and has zero user facing mention. Zero
-code, zero wire, zero test churn, breaks nobody, since the current behaviour is already the tested and
-specified contract.
-
-The SoftTimeLimitExceeded rebind and the float guard are both small, non breaking, and repair
-advertised behaviour rather than changing it.
+- `isinstance` first with a name fallback. Rejected: the fallback still catches
+  every collision.
+- A marker attribute on `cauli.Retry`. Rejected: a worker running against an
+  older installed `cauli` whose `Retry` lacks the marker would silently degrade,
+  and apps without `cauli` still need the name rule, so the collision remains.

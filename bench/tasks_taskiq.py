@@ -3,10 +3,10 @@
 import redis.asyncio as aredis
 from taskiq_redis import ListQueueBroker
 
-from common import DONE_KEY, REDIS_URL
+from common import DONE_KEY, REDIS_POOL_MAX, REDIS_URL
 
 broker = ListQueueBroker(url=REDIS_URL, queue_name="fwbench")
-_r = aredis.Redis.from_url(REDIS_URL)
+_r = aredis.Redis.from_url(REDIS_URL, max_connections=REDIS_POOL_MAX)
 
 
 @broker.task

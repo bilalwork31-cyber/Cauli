@@ -36,7 +36,7 @@ All keys use prefix `cauli:`. `{queue}` is a queue name matching `[a-zA-Z0-9_.-]
 | `cauli:beat:*` | (several) | Periodic scheduler state. Owned by `cauli-beat`, not by the worker; full layout in §10.1. |
 
 `{h}` in the idempotency key is a deterministic hash of the app-supplied `idempotency_key`
-(the worker uses FNV-1a 64-bit, hex-encoded), not the raw string. This bounds the key to a
+(the worker uses SHA-256 truncated to 128 bits, as 32 lowercase hex characters), not the raw string. This bounds the key to a
 fixed size and neutralizes cluster hash-tag injection (`{...}`) or other charset abuse from an
 app-controlled string; it does not need to be cryptographic since idempotency keys are chosen
 by the app author, not an adversary distinct from the app.
@@ -129,9 +129,13 @@ client-produced). Worker-side gates apply before an entry is ever executed:
   with / overwrite another task's `cauli:result:{id}` key.
 - The raw `e` field must not exceed `--max-envelope-bytes` (default 1 MiB); oversize -> DLQ
   reason `"malformed"` (a truncated preview is stored, not the full oversize payload). This
-  bounds the `serde_json::Value` memory amplification and processing cost of a hostile or
-  simply oversized payload. Recommendation: pass references (ids, URLs, keys) in args/kwargs,
-  not large blobs.
+  caps the size of one envelope, not the worker's memory: the parsed `serde_json::Value` tree
+  is far larger than the raw bytes. Measured worst case, a 1 MiB envelope that is one array of
+  small integers: 66 MB of worker RSS on the async lane and 75 MB on the sync lane, which
+  holds a second copy. Text heavy payloads amplify far less. Size for the worst case as
+  `in flight io tasks x max-envelope-bytes x 75`, and lower `--max-envelope-bytes` (and the
+  client's `max_envelope_bytes` with it) when that exceeds the host. Recommendation: pass
+  references (ids, URLs, keys) in args/kwargs, not large blobs.
 - **The limit is enforced on both ends.** A conforming producer MUST also refuse to publish an
   encoded envelope past its own configured ceiling, raising at the call site and writing
   nothing (`Cauli(max_envelope_bytes=...)`, same 1 MiB default). The worker side check is the
@@ -417,7 +421,7 @@ all). `.countdown` is read as a float seconds value (`None` → use the computed
 
 ### 4.3 Delayed mover
 
-Every 250ms per queue, move due members (Lua script, single EVAL):
+Every `--mover-interval` (default 50ms) per queue, move due members (Lua script, single EVAL):
 
 ```lua
 -- KEYS[1]=cauli:delayed:{queue}  KEYS[2]=cauli:q:{queue}  ARGV[1]=now_ms  ARGV[2]=limit
@@ -564,9 +568,11 @@ would be strictly worse than running it; the worker logs a warning and proceeds.
 
 ### 4.6 Timeouts
 
-- async io task: wrapped in `asyncio.wait_for(coro, effective_s)` where
-  `effective_s = min(soft_timeout_ms or timeout_ms, timeout_ms) / 1000`. Timeout → failure
-  (retryable) with error type `"TimeLimitExceeded"` (§8.2). The Rust-side backstop around
+- async io task: with no soft timeout, wrapped in `asyncio.wait_for(coro, timeout_ms / 1000)`.
+  With a soft timeout below the hard one, the body runs as a Task: at the soft deadline it is
+  cancelled and the failure is reported as `"SoftTimeLimitExceeded"`; a body that swallows the
+  cancellation is cancelled again at the hard deadline, which is reported as
+  `"TimeLimitExceeded"` (§8.2). Either timeout → failure (retryable). The Rust-side backstop around
   the completion channel is `timeout_ms + grace` (grace = 2000ms) using saturating
   arithmetic, so a crafted/huge `timeout_ms` (e.g. `u64::MAX`) cannot wrap into a near-zero
   spurious timeout.
@@ -734,7 +740,7 @@ kills/respawns the child on hard timeout or child death (each respawn re-imports
 
 ## 6. Python public API (`py/`)
 
-Package name `cauli`, pure Python, py>=3.10, only hard dependency: `redis>=5`.
+Package name `cauli`, pure Python, py>=3.10, only hard dependency: `redis>=5.0.1`.
 
 ```python
 from cauli import Cauli, Retry, SoftTimeLimitExceeded, TaskFailedError, crontab, interval
@@ -1127,11 +1133,11 @@ Four sites mint it: the sync io hard timeout, the async io Rust side backstop an
 SIGKILL (`worker/src/exec.rs`), plus the `asyncio.wait_for` limit the shim enforces
 (`worker/src/shim.py`, §4.6), which is the one an async task actually reaches first.
 
-One residual, unchanged by the rename and inherent to the language: from Python 3.11 the
-builtin `TimeoutError` and `asyncio.TimeoutError` are the same class, so an ASYNC task that
-raises `TimeoutError` itself is caught by that same `wait_for` handler and reported as
-`"TimeLimitExceeded"` with origin `"worker"`. On the sync io and cpu lanes the third row above
-is exact.
+From Python 3.11 the builtin `TimeoutError` and `asyncio.TimeoutError` are the same class, so
+the shim cannot tell the two apart by type. It compares the loop clock against the task's own
+deadline instead: a `TimeoutError` raised before the deadline is the task's own and is reported
+as a task failure with its traceback, and only one raised at or after the deadline becomes
+`"TimeLimitExceeded"`. The third row above is therefore exact on every lane.
 
 ### 8.3 Did the task ever run?
 
@@ -1383,8 +1389,9 @@ schedule an addition rather than a rewrite.
 **DST** falls out of one invariant rather than special cases: `next_after(slot)` must return an
 instant strictly greater than `slot`.
 
-- *Fall back* (a wall time occurs twice): the first occurrence fires. The second is not a later
-  instant than one already consumed, so it cannot fire. A 01:30 daily job fires once that day.
+- *Fall back* (a wall time occurs twice): a fixed wall time fires at its first occurrence only,
+  so a 01:30 daily job fires once that day. A job whose minute or hour field starts with `*`
+  fires in the repeated hour too, as `cron(8)` does, so `*/15 * * * *` keeps its cadence.
 - *Spring forward* (a wall time never occurs): `zoneinfo` resolves the nonexistent local time
   with the pre-transition offset, so a 02:30 job fires at the instant 02:30 standard time would
   have been — 03:30 by the new wall clock. It fires once; it is not dropped.
@@ -1446,7 +1453,9 @@ Whether that single recovery firing happens at all is per entry and explicit:
 | `"skip"` | `null` | Always fires (nothing is ever considered "missed"). |
 | `"skip"` | `S` | Fires if `L <= S`; otherwise does NOT fire. |
 
-In every row the slot is advanced past `now` regardless, so a suppressed firing does not leave
+`L` is measured on the newest slot the recovery firing coalesces, so after a day of downtime a
+daily 03:00 job with `max_lateness` of an hour still fires at 03:30: yesterday's slot was too
+late, today's was not. In every row the slot is advanced past `now` regardless, so a suppressed firing does not leave
 the entry stuck re-triggering. A suppressed firing is recorded in `cauli:beat:state` with
 `status: "skipped"` and its `lateness_ms`, and logged at WARNING — dropping scheduled work is
 only acceptable when it is announced.
@@ -1799,7 +1808,7 @@ binary, including deployments that only enqueue. A FastAPI or Django web dyno ne
 worker and does not need it. That install is:
 
 ```
-pip install --no-deps cauli 'redis>=5' 'msgspec>=0.18'
+pip install --no-deps cauli 'redis>=5.0.1' 'msgspec>=0.18'
 ```
 
 which is the client and its own two runtime dependencies, and nothing else. `pip check` then

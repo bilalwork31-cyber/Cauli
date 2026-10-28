@@ -9,12 +9,12 @@ from celery import Celery
 from celery.signals import worker_process_init
 from psycopg_pool import ConnectionPool
 
-from common import DONE_KEY, REDIS_URL
+from common import DONE_KEY, REDIS_POOL_MAX, REDIS_URL
 from workloads import PG_DSN, PG_INSERT_SQL, PG_PAYLOAD
 
 app = Celery("fwbench", broker=REDIS_URL, backend=None)
 app.conf.task_ignore_result = True
-_r = redis.Redis.from_url(REDIS_URL)
+_r = redis.Redis.from_url(REDIS_URL, max_connections=REDIS_POOL_MAX)
 
 # open=False: the pool must not open connections in the master process --
 # prefork children would inherit those sockets across fork() and corrupt

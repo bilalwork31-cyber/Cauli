@@ -13,11 +13,11 @@ import redis
 import redis.asyncio as aredis
 from cauli import Cauli
 
-from common import REDIS_URL
+from common import REDIS_POOL_MAX, REDIS_URL
 from workloads import POISON_BURST_MS, cpu_burn
 
 app = Cauli(redis_url=REDIS_URL)
-_r = aredis.Redis.from_url(REDIS_URL)
+_r = aredis.Redis.from_url(REDIS_URL, max_connections=REDIS_POOL_MAX)
 # Lazy, not module-level-opened: a kind="cpu" child is forked from a warmed
 # parent (README: gc.freeze() + copy-on-write fork), so a connection opened
 # before fork would be shared across every child -- same fork-safety
@@ -37,5 +37,5 @@ def poison(scheduled_ts):
     cpu_burn(POISON_BURST_MS)  # forked child -- does not touch the shared GIL
     latency_ms = (time.monotonic() - scheduled_ts) * 1000
     if _sync_r is None:
-        _sync_r = redis.Redis.from_url(REDIS_URL)
+        _sync_r = redis.Redis.from_url(REDIS_URL, max_connections=REDIS_POOL_MAX)
     _sync_r.rpush("bench:latencies:poison", f"{scheduled_ts},{latency_ms}")

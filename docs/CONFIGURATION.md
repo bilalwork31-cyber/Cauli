@@ -73,16 +73,18 @@ Two other reasons to pick `kind="cpu"`:
 
 With `-c` set, the worker derives its internals from it. Every derived value
 can still be pinned by passing its flag explicitly; an explicit flag always
-wins. Every division below is ceiling division, `⌈a / b⌉`: it rounds up, so
-`-c 65` gives 2 processes and `-c 200` gives 4, not the 1 and 3 a floor
-reading predicts. The rules, and the reasoning behind each:
+wins. The process count rounds up, `⌈a / b⌉`, so `-c 65` gives 2 processes
+and `-c 200` gives 4. Every per process value rounds down, `⌊a / b⌋`, and is
+at least 1, so the fleet never exceeds the `-c` you size a database pool
+against: `-c 65` gives 2 x 32 = 64 slots, not 66. The rules, and the reasoning
+behind each:
 
 | Derived | Formula | Why |
 |---|---|---|
 | `--procs` | min(cores, ⌈c / 64⌉) | Each process is one GIL: fanning out is the only way to run more than one GIL holding body at a time, and it lowers p99 as well as raising throughput. Scaling by `-c` keeps a small queue worker to one quiet process on a box shared with your web app and Redis, while a large `-c` on a dedicated box uses every core. The 64 slot target is a chosen default, not a swept one |
-| `--io-concurrency` | ⌈c / procs⌉ | The gate is the real bound for `async def` tasks; a slot costs about 4 KB |
-| `--io-threads` | ⌈min(c, 512) / procs⌉, at most the gate in this derivation | Thread pools stop paying somewhere around a thousand threads per process; past that, throughput and latency fall together. Staying at 1x the gate is the latency honest default: oversubscribing buys throughput by inflating task p99. The gate gets no special enforcement of its own: an explicit `--io-threads` is not capped by it, so `-c 50 --io-threads 999` really does give 999 threads against a gate of 50 |
-| `--cpu-workers` | ⌈min(cores, c) / procs⌉ | More cpu children than cores buys nothing, and more than `-c` would make `-c 8` on a cpu queue mean something other than 8 |
+| `--io-concurrency` | ⌊c / procs⌋ | The gate is the real bound for `async def` tasks; a slot costs about 4 KB |
+| `--io-threads` | ⌊min(c, 512) / procs⌋, at most the gate in this derivation | Thread pools stop paying somewhere around a thousand threads per process; past that, throughput and latency fall together. Staying at 1x the gate is the latency honest default: oversubscribing buys throughput by inflating task p99. The gate gets no special enforcement of its own: an explicit `--io-threads` is not capped by it, so `-c 50 --io-threads 999` really does give 999 threads against a gate of 50 |
+| `--cpu-workers` | ⌊min(cores, c) / procs⌋ | More cpu children than cores buys nothing, and more than `-c` would make `-c 8` on a cpu queue mean something other than 8 |
 | `--io-loops` | always 1 | Extra loops add threads that contend for one GIL, not parallelism |
 
 Without `-c`, one process and the standalone defaults below apply, unless
@@ -107,7 +109,7 @@ instead.
 | Flag | Default | Effect |
 |---|---|---|
 | `--io-threads` | 64, or derived from `-c` | OS threads for sync `kind="io"` tasks. **This is the scaling axis for sync work** |
-| `--io-concurrency` | 256, or derived from `-c` | Admission semaphore: maximum io tasks in flight, sync and async together. Above about 128 per process is untested; see the band note below |
+| `--io-concurrency` | 256, or derived from `-c` | Admission semaphore: maximum io tasks in flight, sync and async together. Size the pools your task bodies use to match; see the note below |
 | `--io-loops` | 1 | Embedded asyncio event loop threads for `async def` tasks |
 
 `--io-concurrency` is a gate, not a worker count. Raising it above
@@ -119,36 +121,24 @@ buys no sync throughput, only a longer queue in front of the same threads.
 For `async def` tasks the gate *is* the bound, because a slot costs a coroutine
 and a socket rather than a thread.
 
-**The default of 256 is higher than anything this project has confirmed
-works, and it is deliberate that the two do not agree.** Say so plainly rather
-than let a reader find it:
+**The stall above about 104 slots per process that `bench/RESULTS.md` once
+reported was the benchmark, not cauli.** The bench task modules created their
+redis-py client with the library default pool of 100 connections, so slot 101
+onward raised `MaxConnectionsError` inside the task body and, with
+`max_retries=0`, went to the dead letter queue. The completion counter then
+never reached N, which read as a hang. With the pool raised, async runs at 128,
+256 and 512 slots per process complete with an empty dead letter queue.
 
-- `bench/RESULTS.md` (the async lane at `--procs 6`) reports the per process
-  gate peaking near 96, then runs that finish 91% to 99% and stall above 104,
-  down to 11% of a run completed at 512. That harness is in the tree and is
-  rerunnable.
-- The stall is not attributed. The same harness opens one Redis connection per
-  concurrent caller and pins no `max_connections`, so at those settings it may
-  have run the Redis server out of client slots rather than found a limit in
-  cauli. Until it is rerun with connections pinned, neither reading is proven.
-- The default was left at 256 rather than lowered onto an unattributed number.
-  That is a judgement call, not a measurement, and it is the open item this
-  section exists to flag.
-
-What to do with that until it is settled:
-
-- Treat anything above 128 slots per process as untested rather than supported.
-- Expect a wall that looks like a hang, not a smooth decline, if you go past it.
-- Pin `--io-concurrency` yourself if you would rather not sit on an untested
-  default. Anything in the 64 to 128 band per process is inside what has run.
-- Remember each async slot can hold a database connection, so the gate feeds
-  the connection formula in the sizing section below.
+The same applies to your tasks: size every client pool a task body uses
+(redis-py, SQLAlchemy, httpx) to at least `--io-concurrency`, or to
+`--io-threads` for sync tasks. Each async slot can hold a database connection,
+so the gate feeds the connection formula in the sizing section below.
 
 ### CPU execution
 
 | Flag | Default | Effect |
 |---|---|---|
-| `--cpu-workers` | ⌈min(cores, c) / procs⌉ | Child processes for `kind="cpu"` tasks |
+| `--cpu-workers` | ⌊min(cores, c) / procs⌋ | Child processes for `kind="cpu"` tasks |
 | `--cpu-child-threads` | 1 | Requests pipelined per child, matched by id. Range 1 to 1024 |
 | `--cpu-prefetch` | 4 | Requests staged in a child's socket buffer beyond the one it is running. 0 disables |
 | `--cpu-max-tasks-per-child` | 10000 | Recycle a child after this many completed tasks; 0 disables recycling. The backstop for leaky C extensions and slowly dirtied copy on write pages, like Celery's maxtasksperchild. Staged work drains first; no task is lost to a recycle |
@@ -187,7 +177,7 @@ the resident children.
 
 | Flag | Default | Effect |
 |---|---|---|
-| `--batch` | 16 | `XREADGROUP COUNT` per fetch. Must be at least 1 |
+| `--batch` | 64 | `XREADGROUP COUNT` per fetch, capped by the free io slots. Must be at least 1 |
 | `--visibility-timeout` | 60 | Seconds before a dead worker's in flight tasks are reclaimed by another. Must be at least 1. This is a floor, not the whole rule: recovery waits for `max(visibility_timeout, task timeout + grace + margin)`, where the margin is sized on `--redis-timeout`, so a task never gets reclaimed while it is still legitimately running |
 | `--max-envelope-bytes` | 1048576 | Oversize entries go to the DLQ as `malformed` before being parsed. Enforced on both ends: the client refuses first, so keep this equal to the app's `max_envelope_bytes`. A client limit above the worker's produces envelopes the worker dead letters, and past 4096 bytes it cannot recover the task id, so no failure result is written and `get()` waits out its own timeout |
 | `--drain-timeout` | 30 | Seconds to finish in flight tasks on graceful shutdown |
