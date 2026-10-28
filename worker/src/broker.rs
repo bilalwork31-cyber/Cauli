@@ -555,6 +555,10 @@ pub async fn peek_entries(
     entry_ids: &[String],
 ) -> Result<Vec<Option<Option<String>>>> {
     use redis::streams::StreamRangeReply;
+    // redis-rs refuses an empty pipeline ("empty command").
+    if entry_ids.is_empty() {
+        return Ok(Vec::new());
+    }
     let qk = q_key(queue);
     let mut pipe = redis::pipe();
     for id in entry_ids {
@@ -1635,6 +1639,18 @@ mod tests {
             .await
             .expect("xpending");
         assert!(pending.is_empty(), "all five acked: {pending:?}");
+    }
+
+    /// Recovery peeks every scan, often with nothing idle enough to reclaim.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn peeking_no_entries_is_not_an_error() {
+        let redis = ThrowawayRedis::start(6402, false);
+        let client = redis::Client::open(redis.url()).expect("client");
+        let mut conn = ConnectionManager::new(client)
+            .await
+            .expect("connection manager");
+        let peeked = peek_entries(&mut conn, "peekq", &[]).await.expect("peek");
+        assert!(peeked.is_empty());
     }
 
     /// OOM under `noeviction` refuses the ZADD but would accept the XACK.
