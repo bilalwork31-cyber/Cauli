@@ -80,16 +80,11 @@ pub struct Args {
     #[arg(long, default_value_t = 1, help_heading = ADVANCED)]
     pub cpu_child_threads: usize,
 
-    /// Extra cpu requests pre-staged in each child's socket buffer beyond the
-    /// ones it is executing. Keeps a child from idling for a full IPC round
-    /// trip between tasks; its next read returns immediately. 0 disables.
-    ///
-    /// Measured drain rate, 6 children on 6 cores: for ~0.5ms tasks depth 64
-    /// is 4.1x depth 0; for ~2ms tasks depth 16 is 1.13x depth 3; for ~51ms
-    /// tasks every depth is within noise (the task dwarfs the round trip).
-    /// Deeper is not free: a child death fails everything staged behind it as
-    /// retryable WorkerLost, and a staged task waits out the tasks ahead of
-    /// it, so raise this for small tasks and leave it low for long ones.
+    /// Extra cpu requests staged in each child beyond the ones it is
+    /// running, so a child never idles for an IPC round trip. 0 disables.
+    /// Raise it for sub millisecond tasks; keep it low for long ones: a child
+    /// death fails everything staged behind it as retryable WorkerLost, and a
+    /// staged task waits out the tasks ahead of it.
     #[arg(long, default_value_t = 4, help_heading = ADVANCED)]
     pub cpu_prefetch: usize,
 
@@ -110,13 +105,10 @@ pub struct Args {
     #[arg(long, default_value_t = false, help_heading = ADVANCED)]
     pub no_fork_server: bool,
 
-    /// XREADGROUP COUNT per fetch. Must be at least 1. A fetch never takes
-    /// more than the free io slots. For sub millisecond tasks a larger batch
-    /// drains faster (noop tasks, one process: 128 was about 1.35x sync and
-    /// 1.10x async; 256 with --cpu-prefetch 16 took noop cpu tasks from 85k/s
-    /// to 134k/s), but fetched cpu entries wait for a cpu slot inside the
-    /// worker with their recovery clock running, so raise it only for short
-    /// tasks.
+    /// XREADGROUP COUNT per fetch, at least 1; a fetch never takes more than
+    /// the free io slots. Raise it only for sub millisecond tasks: fetched cpu
+    /// entries wait for a cpu slot inside the worker with their recovery clock
+    /// running.
     #[arg(long, default_value_t = 64, help_heading = ADVANCED)]
     pub batch: usize,
 
