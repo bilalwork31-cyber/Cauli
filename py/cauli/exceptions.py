@@ -43,7 +43,7 @@ class SoftTimeLimitExceeded(Exception):
 
     The failure cauli reports is ``SoftTimeLimitExceeded`` on both lanes, so
     callers, the DLQ and the result document agree. See the ``soft_timeout``
-    row in docs/CONFIGURATION.md.
+    row in docs/configuration.md.
     """
 
 

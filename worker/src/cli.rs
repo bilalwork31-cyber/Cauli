@@ -1,6 +1,6 @@
 use clap::Parser;
 
-const ADVANCED: &str = "Advanced tuning (derived from -c; see docs/CONFIGURATION.md)";
+const ADVANCED: &str = "Advanced tuning (derived from -c; see docs/configuration.md)";
 
 /// cauli-worker: Rust worker runtime for cauli Python task queues (PROTOCOL §7).
 #[derive(Parser, Debug, Clone)]
@@ -181,7 +181,7 @@ pub struct Resolved {
 /// defensible target, not yet a swept one — pin it when a wider box exists.
 const SLOTS_PER_PROC: usize = 64;
 
-/// Derivation rules (thresholds measured, bench2/bench3; docs/CONFIGURATION.md):
+/// Derivation rules (thresholds measured, bench2/bench3; docs/configuration.md):
 /// - procs: explicit, else min(cores, c/SLOTS_PER_PROC) with -c, else 1
 ///   (standalone behavior unchanged).
 ///
@@ -384,7 +384,7 @@ mod tests {
         assert_eq!(a.ack_flush_ms, 1);
     }
 
-    /// docs/CONFIGURATION.md states --print-plan needs no app and no Redis.
+    /// docs/configuration.md states --print-plan needs no app and no Redis.
     /// clap made -A unconditionally required, so the documented invocation
     /// exited 2 on a usage error instead of printing the plan.
     #[test]

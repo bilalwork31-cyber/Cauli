@@ -46,7 +46,7 @@ pub struct Counters {
 /// the entire operator interface, and `-c 500` on a six core box derives six
 /// supervised processes each emitting an independent cumulative line with
 /// identical field names: without an identity, the two alerting signals
-/// docs/CONFIGURATION.md names cannot be traced back to a process to restart.
+/// docs/configuration.md names cannot be traced back to a process to restart.
 /// Sanitized because §7 makes the line a logfmt parsing contract: a
 /// hostname carrying a space (or anything else that is not DNS-shaped)
 /// would split into two pseudo-fields and corrupt every following key for

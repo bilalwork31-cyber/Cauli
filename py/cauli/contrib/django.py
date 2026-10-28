@@ -40,7 +40,7 @@ io_concurrency)`` (async lane) plus ``procs * cpu_workers`` (cpu lane; each
 forked child connects on its own). Postgres's default ``max_connections`` is
 100, and flags that look modest can exceed it. Put a connection pooler,
 pgbouncer in transaction mode, in front of Postgres once the total
-approaches a hundred; see ``docs/CONFIGURATION.md`` for the full formula.
+approaches a hundred; see ``docs/configuration.md`` for the full formula.
 
 Enqueue-side, every task additionally has ``delay_on_commit`` /
 ``apply_async_on_commit`` (defined on ``TaskDef`` core with a lazy Django

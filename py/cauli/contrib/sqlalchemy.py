@@ -56,7 +56,7 @@ where the default closes each overflow connection on return and makes any
 burst above 5 concurrent tasks pay a fresh connect per task. Build your own
 engine and call :func:`install_sqlalchemy_session` for another size. cauli's
 own concurrency knob for the async lane is
-``--io-concurrency`` (default 256, see ``docs/CONFIGURATION.md``), and
+``--io-concurrency`` (default 256, see ``docs/configuration.md``), and
 nothing wires the two together: cauli will admit up to 256 tasks at once,
 each opening a session in the before task hook, while the pool underneath
 can only serve 15 of them at a time. The rest queue for a pool slot up to
