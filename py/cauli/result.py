@@ -125,7 +125,7 @@ class AsyncResult:
         """``"pending" | "success" | "failure" | "duplicate" | "expired"``.
 
         Readable either way: ``r.status`` (Celery's spelling) and ``r.status()``
-        (cauli's own, and the one PROTOCOL.md section 12 documents) both give
+        (cauli's own, and the one PROTOCOL.md section 6 documents) both give
         the same string. Each evaluation of the attribute reads Redis once.
 
         ``"pending"`` means the result key does not exist (yet, or anymore
@@ -211,8 +211,7 @@ class AsyncResult:
         over its redelivery limit, but only when the task id itself could not
         be recovered from the envelope (rare). In the usual case those three
         get a result key too (a synthesized failure), so ``get()`` raises
-        instead of hanging (see PROTOCOL.md §4/§4.4/§8 and ARCHITECTURE.md
-        limitation #2). Passing an explicit ``timeout`` is recommended for
+        instead of hanging (see PROTOCOL.md §4/§4.4/§8). Passing an explicit ``timeout`` is recommended for
         anything but throwaway scripts.
         """
         deadline = None if timeout is None else time.monotonic() + timeout

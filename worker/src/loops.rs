@@ -34,7 +34,7 @@ fn fetch_block_ms(redis_timeout_s: u64) -> u64 {
 }
 
 /// §4 fetch loop. Gate: fetch only when io slots are free and no cpu dispatch
-/// is blocked on a full backlog (bounded starvation, see ARCHITECTURE.md).
+/// is blocked on a full backlog (bounded starvation, see docs/architecture.md).
 pub async fn fetch_loop(ctx: Arc<Ctx>, mut fetch_conn: redis::aio::ConnectionManager) {
     let keys: Vec<String> = ctx.queues.iter().map(|q| broker::q_key(q)).collect();
     let ids: Vec<&str> = ctx.queues.iter().map(|_| ">").collect();
@@ -732,7 +732,7 @@ struct LoopWatch {
     progress_at: Instant,
 }
 
-/// Wedged event loop watchdog (docs/decisions/process-model.md, question 3).
+/// Wedged event loop watchdog (docs/architecture.md, design decisions).
 ///
 /// A blocking call inside one `async def` starves the loop thread it runs on
 /// of every callback, including asyncio's own `wait_for` deadline, for the

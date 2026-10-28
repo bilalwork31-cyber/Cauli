@@ -396,7 +396,7 @@ async fn run_worker(
     // Redis Cluster is refused here, at the first reachable point, rather
     // than diagnosed later: on a cluster every delayed and retried task is
     // already lost by the time loops::report_mover_error gets to name the
-    // cause (docs/decisions/redis-cluster.md).
+    // cause (docs/architecture.md).
     if let Some(info) = probe_cluster_info(&mut write_conn).await {
         let override_raw = std::env::var(ALLOW_REDIS_CLUSTER_ENV).ok();
         match cluster_decision(&info, override_raw.as_deref(), &redis_url) {
@@ -595,8 +595,7 @@ const REDIS_RETRIES: usize = 6;
 ///
 /// An environment variable rather than a CLI flag: the refusal is the part
 /// that matters and it ships without widening the flag surface, while the
-/// `--allow-redis-cluster` name that docs/decisions/redis-cluster.md proposed
-/// stays free for whoever adds it to cli.rs.
+/// `--allow-redis-cluster` name stays free for whoever adds it to cli.rs.
 const ALLOW_REDIS_CLUSTER_ENV: &str = "CAULI_ALLOW_REDIS_CLUSTER";
 
 /// What startup does about the topology redis just reported.
@@ -689,7 +688,7 @@ fn cluster_decision(info: &str, override_raw: Option<&str>, redis_url: &str) -> 
          the stream without ever reaching the delayed set -- silent loss, not a visible error \
          -- and fetching two or more queues fails with CROSSSLOT. Point the worker at a \
          standalone or Sentinel fronted redis, or set {ALLOW_REDIS_CLUSTER_ENV}=1 to start \
-         anyway and accept that loss (docs/decisions/redis-cluster.md)."
+         anyway and accept that loss (docs/architecture.md)."
     ))
 }
 
@@ -736,7 +735,7 @@ up to {} cpu children",
         plan_total((cores / r.procs).max(1), r.procs),
         plan_total(r.cpu_workers, r.procs)
     );
-    println!("  override any value with its flag; see --help and docs/CONFIGURATION.md");
+    println!("  override any value with its flag; see --help and docs/configuration.md");
 }
 
 /// Per process value times process count, for the --print-plan totals line.
@@ -1260,7 +1259,7 @@ mod tests {
                                        cluster_size:1\r\n";
     const TEST_REDIS_URL: &str = "redis://user:hunter2@cluster.example:6379/0";
 
-    /// docs/decisions/redis-cluster.md: pointing the worker at a Redis
+    /// docs/architecture.md: pointing the worker at a Redis
     /// Cluster used to start cleanly and then lose work, because
     /// cauli:q:{queue} and cauli:delayed:{queue} never share a hash slot --
     /// a retried task leaves the stream and never reaches the delayed set.
