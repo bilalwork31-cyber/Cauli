@@ -1,7 +1,4 @@
-# arq 0.28 requires redis<6, which conflicts with requirements.txt, so the
-# arq lanes (tasks_arq_*.py) need their own venv:
-#   python3 -m venv ~/arq-venv && ~/arq-venv/bin/pip install -r requirements-arq.txt -e ../py
+# arq 0.28 requires redis<6, which conflicts with requirements.txt:
+#   uv venv ~/arq-venv && uv pip install --python ~/arq-venv/bin/python -r requirements-arq.txt
 arq==0.28.0
 redis[hiredis]==5.3.1
-msgspec==0.21.1
-psycopg[binary,pool]==3.3.4
