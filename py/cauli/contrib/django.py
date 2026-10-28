@@ -1,6 +1,6 @@
-"""Django integration for cauli (opt-in; cauli core stays framework-agnostic).
+"""Django integration for cauli.
 
-Typical project layout, mirroring the conventional Celery setup::
+Usage, mirroring the Celery layout::
 
     # myproj/cauli.py
     from cauli.contrib.django import autodiscover_tasks, django_app
@@ -17,34 +17,18 @@ Typical project layout, mirroring the conventional Celery setup::
     # run the worker
     cauli-worker --app myproj.cauli:app
 
-What :func:`django_app` gives you on top of a plain ``Cauli()``:
+:func:`django_app` runs ``django.setup()`` when needed, reads
+``CAULI_REDIS_URL``, ``CAULI_DEFAULT_QUEUE``, ``CAULI_RESULT_TTL`` and
+``CAULI_IDEMP_TTL`` from settings, and installs :func:`install_orm_executors`
+and :func:`install_db_hooks`.
 
-- ``django.setup()`` when needed, so ``cauli-worker --app`` works standalone
-  (outside ``manage.py``) with just ``DJANGO_SETTINGS_MODULE`` set.
-- Config read from Django settings (``CAULI_REDIS_URL``,
-  ``CAULI_DEFAULT_QUEUE``, ``CAULI_RESULT_TTL``, ``CAULI_IDEMP_TTL``).
-- Database connection lifecycle parity with Celery's Django fixup
-  (:func:`install_db_hooks`): ``close_old_connections`` before and after
-  every task on every execution path (sync thread pool, asyncio loops, cpu
-  children), so ``CONN_MAX_AGE`` is honored and a connection gone stale
-  across a database restart/failover is discarded instead of poisoning the
-  worker thread that cached it. Without this, the worker's long-lived
-  threads each cache a thread-local Django connection forever.
+Connections: Postgres backends are about ``procs * io_threads`` plus
+``procs * min(CAULI_ORM_EXECUTORS, io_concurrency)`` plus
+``procs * cpu_workers``. Put pgbouncer (transaction mode) in front once that
+nears ``max_connections`` (100 by default); see ``docs/configuration.md``.
 
-Connection count is a different question from lifecycle, and this
-integration does not manage it. Each worker process opens its own pool, and
-each sync worker thread holds one Django connection for the life of the
-thread, so the number of simultaneous Postgres backends is roughly
-``procs * io_threads`` (sync lane) plus ``procs * min(CAULI_ORM_EXECUTORS,
-io_concurrency)`` (async lane) plus ``procs * cpu_workers`` (cpu lane; each
-forked child connects on its own). Postgres's default ``max_connections`` is
-100, and flags that look modest can exceed it. Put a connection pooler,
-pgbouncer in transaction mode, in front of Postgres once the total
-approaches a hundred; see ``docs/CONFIGURATION.md`` for the full formula.
-
-Enqueue-side, every task additionally has ``delay_on_commit`` /
-``apply_async_on_commit`` (defined on ``TaskDef`` core with a lazy Django
-import) to defer publishing until the current transaction commits.
+``TaskDef.delay_on_commit`` and ``apply_async_on_commit`` defer publishing
+until the current transaction commits.
 """
 
 from __future__ import annotations
@@ -66,15 +50,13 @@ _SETTINGS_MAP = (
 
 
 def django_app(settings_module: str | None = None, **overrides: Any) -> AsyncCauli:
-    """Build a :class:`cauli.AsyncCauli` app wired for a Django project, so an
-    async view can ``await task.adelay(...)`` instead of blocking its loop.
+    """Build a :class:`cauli.AsyncCauli` app wired for a Django project.
 
-    ``settings_module`` (e.g. ``"myproj.settings"``) is applied via
-    ``os.environ.setdefault("DJANGO_SETTINGS_MODULE", ...)``; omit it when the
-    environment variable is already set (``manage.py`` sets it). Keyword
-    ``overrides`` (``redis_url=...`` etc.) win over Django settings, which win
-    over the ``Cauli`` defaults. Registers the DB lifecycle hooks via
-    :func:`install_db_hooks`.
+    ``settings_module`` (e.g. ``"myproj.settings"``) is the
+    ``DJANGO_SETTINGS_MODULE`` default; omit it when the variable is set.
+    ``overrides`` win over Django settings, which win over ``Cauli``
+    defaults. ``orm_executors`` (or ``CAULI_ORM_EXECUTORS``) sizes
+    :func:`install_orm_executors`.
     """
     if settings_module:
         os.environ.setdefault("DJANGO_SETTINGS_MODULE", settings_module)
@@ -97,18 +79,14 @@ def django_app(settings_module: str | None = None, **overrides: Any) -> AsyncCau
     kwargs.update(overrides)
 
     app = AsyncCauli(**kwargs)
-    # Order matters: the executor hook must run BEFORE close_old_connections
-    # in the before-task phase, so the health check runs on the sticky thread
-    # whose connection the task is about to use, not on asgiref's global one.
+    # The executor hook must run before close_old_connections, so the health
+    # check runs on the thread whose connection the task will use.
     install_orm_executors(app, workers=orm_executors)
     install_db_hooks(app)
     return app
 
 
-#: Has this process ever opened a Django database connection? Process wide on
-#: purpose: the question "is there anything to close" is about the process, not
-#: about one app object, and several apps in one process must not each hold a
-#: private answer that only their own signal receiver updates.
+#: Process wide: several apps in one process must share one answer.
 _connection_opened = False
 _CONNECTION_SIGNAL_UID = "cauli.contrib.django.connection_opened"
 
@@ -118,10 +96,7 @@ def _note_connection_opened(**_kwargs: Any) -> None:
     _connection_opened = True
 
 
-#: Default size of the sticky ORM executor pool. Eight matches the measured
-#: knee on the reference box (348 ms -> 48 ms for 64 concurrent 5 ms calls);
-#: it is a client-side thread count, deliberately independent of the worker's
-#: --io-loops. 0 disables the pool entirely.
+#: Measured knee: 64 concurrent 5 ms ORM calls took 348 ms on one thread, 48 ms on 8.
 DEFAULT_ORM_EXECUTORS = 8
 
 _orm_executors: list[Any] = []
@@ -131,47 +106,24 @@ _orm_lock = threading.Lock()
 
 
 def install_orm_executors(app: Cauli, workers: int = DEFAULT_ORM_EXECUTORS) -> Cauli:
-    """Give async tasks M sticky executor threads for thread-bound sync work.
+    """Give async tasks ``workers`` sticky threads for Django's async ORM.
 
-    Without this, every ``sync_to_async(thread_sensitive=True)`` call in the
-    process -- which is what Django's async ORM interface (``aget``,
-    ``acreate``, ...) runs its sync DB code through -- funnels into asgiref's
-    ONE global executor thread. Measured on the reference box: 64 concurrent
-    5 ms calls took 348 ms end to end (full serialisation), and ORM work from
-    coroutines churned one database connection per task with ``CONN_MAX_AGE``
-    silently ignored.
+    Otherwise every ``sync_to_async(thread_sensitive=True)`` call, which
+    Django's ``aget``/``acreate`` use, serialises on asgiref's one global
+    thread and ``CONN_MAX_AGE`` is ignored. A before task hook assigns each
+    async task one executor round robin through asgiref's
+    ``thread_sensitive_context``, so one task keeps one thread and one
+    connection, and the process holds at most ``workers`` connections.
 
-    The fix uses asgiref's own extension point: ``SyncToAsync`` consults
-    ``thread_sensitive_context`` (a ContextVar) and routes to the executor
-    registered for that context in ``context_to_thread_executor``. This
-    installs M single-thread executors, and a before-task hook assigns each
-    async task one of them, round robin, by setting the ContextVar inside the
-    task's own context. Consequences, all verified by test:
-
-    - all thread-sensitive work of one task runs on ONE thread, so the same
-      database connection is reused across every await in the task;
-    - tasks distribute over M threads instead of one (348 ms -> 48 ms at
-      M=8 on the reference box);
-    - the process holds at most M cached connections, ``CONN_MAX_AGE`` is
-      honoured again, and the before/after ``close_old_connections`` hooks
-      (installed after this, so they see the ContextVar already set) run on
-      exactly the thread whose connections they are supposed to manage.
-
-    Sync-pool and cpu tasks are untouched: the hook only acts when it finds
-    itself on an event loop thread. ``workers=0`` disables the pool, restoring
-    asgiref's global-executor behaviour.
-
-    The executors are process-wide singletons (first installer wins on size):
-    the question "which thread runs thread-sensitive work" is about the
-    process, and two apps handing out executors from two private pools would
-    defeat the connection-count bound that is the point of having one.
+    Sync pool and cpu tasks are untouched. ``workers=0`` disables it. The
+    pool is process wide and the first caller sets its size.
     """
     if workers <= 0:
         return app
     try:
         from asgiref.sync import SyncToAsync, ThreadSensitiveContext
     except ImportError:
-        return app  # no asgiref, no async ORM path to fix
+        return app
     if not hasattr(SyncToAsync, "thread_sensitive_context") or not hasattr(
         SyncToAsync, "context_to_thread_executor"
     ):
@@ -210,12 +162,11 @@ def install_orm_executors(app: Cauli, workers: int = DEFAULT_ORM_EXECUTORS) -> C
 
             asyncio.get_running_loop()
         except RuntimeError:
-            return  # sync-pool thread or cpu child: has its own thread already
+            return
         with _orm_lock:
             token = _orm_tokens[_orm_rr % len(_orm_tokens)]
             _orm_rr += 1
-        # Set INSIDE the task's context (hooks run inside the task), so the
-        # assignment is per task and vanishes with it.
+        # Hooks run inside the task's context, so this is per task.
         SyncToAsync.thread_sensitive_context.set(token)
 
     app.before_task(cauli_assign_orm_executor)
@@ -223,42 +174,19 @@ def install_orm_executors(app: Cauli, workers: int = DEFAULT_ORM_EXECUTORS) -> C
 
 
 def install_db_hooks(app: Cauli) -> Cauli:
-    """Register Django DB connection lifecycle hooks on ``app``.
+    """Register Django connection lifecycle hooks on ``app``, as Celery does.
 
-    Celery-fixup parity (its Django fixup calls ``close_old_connections``
-    around every task), mapped onto cauli's lifecycle hooks:
+    - before and after every task: ``close_old_connections``, so
+      ``CONN_MAX_AGE`` and ``CONN_HEALTH_CHECKS`` apply and a connection
+      stale after a database restart is replaced.
+    - process init: ``connections.close_all``, so no connection opened at
+      import survives into forked cpu children.
 
-    - before/after every task: ``close_old_connections`` — closes connections
-      whose ``CONN_MAX_AGE`` expired or that errored, and (with Django's
-      ``CONN_HEALTH_CHECKS``) health-checks the cached connection so one gone
-      stale across a database restart is replaced before the task runs.
-    - process init: ``connections.close_all`` — a connection opened at app
-      import time must not survive into the fork-server's forked cpu children
-      (a socket fd shared by every child) nor be reused by the worker after
-      the fork-server parent inherited it.
-
-    On the asyncio path the hook runs Django's cleanup through
-    ``asgiref.sync_to_async(..., thread_sensitive=True)``, which executes in
-    the same thread Django's async ORM interface (``acreate``/``aget``/...)
-    runs sync DB code in — closing connections on the event loop thread
-    itself would miss the thread that actually holds them.
-
-    That hop is skipped entirely until this process has opened its first
-    database connection. It cannot be decided by inspecting
-    ``connections.all(initialized_only=True)`` from the event loop thread:
-    the connections live in the thread-sensitive executor's context, so the
-    loop thread always sees an empty handler and would skip the cleanup even
-    when it is needed. Latching on Django's ``connection_created`` signal
-    asks the question where the answer actually is. Until something opens a
-    connection there is provably nothing to close, and the two thread
-    hand-offs per task are pure overhead — measured at 21% of worker CPU on
-    an async HTTP workload, worth +61% throughput when skipped. Once a
-    connection exists the flag latches on and every task pays the hop again,
-    which is the conservative direction: the cost returns, correctness never
-    depends on the flag being cleared.
-
-    Called for you by :func:`django_app`; call directly when you build the
-    ``Cauli`` app yourself.
+    Async tasks run the cleanup through ``sync_to_async(thread_sensitive=True)``,
+    the thread that holds their connections. That hop is skipped until the
+    process opens its first connection (latched on ``connection_created``;
+    the loop thread cannot see the executor's connections), saving 21% of
+    worker CPU on an async HTTP workload.
     """
     from django.db import close_old_connections, connections
     from django.db.backends.signals import connection_created
@@ -275,12 +203,10 @@ def install_db_hooks(app: Cauli) -> Cauli:
 
             asyncio.get_running_loop()
         except RuntimeError:
-            close_old_connections()  # sync-pool thread or cpu child
+            close_old_connections()
             return None
         if not _connection_opened:
-            return None  # nothing has ever been opened; nothing to close
-        # Event loop thread (async task): run in asgiref's thread-sensitive
-        # executor — the thread Django's async ORM uses for sync DB work.
+            return None
         # The shim awaits the returned coroutine (PROTOCOL.md section 4.8).
         from asgiref.sync import sync_to_async
 
@@ -289,8 +215,8 @@ def install_db_hooks(app: Cauli) -> Cauli:
     def cauli_close_all_connections() -> None:
         global _connection_opened
         connections.close_all()
-        # A forked cpu child inherits the parent's flag but not its usable
-        # connections; close_all just dropped them, so the child starts clean.
+        # A forked child inherits the flag but close_all just dropped the
+        # connections, so it starts clean.
         _connection_opened = False
 
     app.before_task(cauli_close_old_connections)
@@ -304,18 +230,12 @@ def autodiscover_tasks(
     packages: Iterable[str] | None = None,
     related_name: str = "tasks",
 ) -> list[str]:
-    """Import ``<pkg>.<related_name>`` for each Django app (or each package in
-    ``packages``), so ``@app.task`` decorators in those modules register.
+    """Import ``<pkg>.<related_name>`` for each Django app, or each of ``packages``.
 
-    Mirrors Celery's ``app.autodiscover_tasks()``: a package without a
-    ``tasks`` module is skipped silently; a package that fails to import, or
-    a ``tasks`` module that exists but fails to import, raises (either must be
-    loud, not an unregistered-task DLQ mystery at runtime). Returns the
-    imported module names. ``app`` is unused beyond intent (imports register
-    against whatever cauli app the task modules reference) but keeps call
-    sites explicit about which app the discovery is for.
+    A package without that module is skipped; an import failure raises.
+    Returns the imported module names. ``app`` only documents intent.
     """
-    del app  # see docstring
+    del app
     if packages is None:
         from django.apps import apps as django_apps
 

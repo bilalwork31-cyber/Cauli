@@ -1,13 +1,8 @@
-//! Regression test for the "unbounded redis wait" bug (audit cycle 8, D2
-//! follow up): a redis that accepts the TCP connection but never answers
-//! must not hang a ConnectionManager call forever, and once it thaws the
-//! connection must recover on its own, with no restart.
+//! A redis that accepts TCP but never answers must not hang a
+//! ConnectionManager call forever, and the connection recovers once it thaws.
 //!
-//! Both tests use a dedicated throwaway redis-server on a port this file
-//! fully owns (never the shared :6392 instance in worker/tests/common,
-//! never itest's/bench's :6391/6394/6395, and never 6379). Freezing the
-//! shared :6392 instance with SIGSTOP would stall every other e2e test
-//! running concurrently against it; see HANDOFF.md's port table.
+//! Uses its own redis-server: freezing the shared :6392 instance with SIGSTOP
+//! would stall every other e2e test.
 
 mod common;
 
@@ -21,10 +16,8 @@ fn url() -> String {
     format!("redis://127.0.0.1:{PORT}/0")
 }
 
-/// A throwaway redis-server this test fully owns, freezable with
-/// SIGSTOP/SIGCONT to simulate "alive socket, dead application". Unlike a
-/// killed server, a frozen one never resets the connection or errors
-/// promptly. That is the exact case an unset response_timeout cannot survive.
+/// A redis-server this test owns, frozen with SIGSTOP to simulate "alive
+/// socket, dead application": no reset, no prompt error.
 struct FrozenRedis(Child);
 
 impl FrozenRedis {
@@ -75,29 +68,22 @@ impl FrozenRedis {
 
 impl Drop for FrozenRedis {
     fn drop(&mut self) {
-        // Thaw before killing: SIGKILL does terminate a stopped process on
-        // Linux without a prior SIGCONT, but thawing first keeps this a
-        // plain reap rather than relying on that if a test above panicked
-        // while redis was still frozen.
+        // Thaw first so a test that panicked while frozen still gets a plain reap.
         self.thaw();
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
 }
 
-/// `ConnectionManager::new_with_config` with response_timeout and
-/// connection_timeout set, the types main.rs constructs, returns an Err
-/// against a frozen redis inside the configured bound, and that Err carries
-/// the IoError kind the crate's reconnect path treats as reconnect worthy,
-/// so once redis thaws, the SAME manager recovers on its own.
+/// With response_timeout set, a call against a frozen redis returns an
+/// reconnect worthy IoError within the bound, and the same manager recovers
+/// after thaw.
 #[tokio::test(flavor = "multi_thread")]
 async fn frozen_redis_times_out_and_recovers_configured() {
     let redis_proc = FrozenRedis::start();
     let client = redis::Client::open(url()).unwrap();
 
-    // Connected while redis is still healthy: this test targets an existing
-    // connection going silent mid steady state (the fetch loop, idemp_claim,
-    // the mover, recovery), not a cold connect.
+    // Connected while healthy: an existing connection going silent, not a cold connect.
     let configured = ConnectionManager::new_with_config(
         client,
         ConnectionManagerConfig::new()
@@ -109,9 +95,7 @@ async fn frozen_redis_times_out_and_recovers_configured() {
 
     redis_proc.freeze();
 
-    // After: response_timeout=700ms configured, so the SAME kind of call
-    // against the SAME frozen redis returns an Err, bounded, well inside
-    // the 3s outer bound.
+    // response_timeout 700ms: the call errors well inside the 3s outer bound.
     let mut c = configured.clone();
     let t0 = Instant::now();
     let result: Result<redis::RedisResult<String>, _> =
@@ -134,9 +118,7 @@ async fn frozen_redis_times_out_and_recovers_configured() {
          reconnecting. Got {err:?}"
     );
 
-    // Recovery: thaw, and the SAME manager (no new connection, no restart)
-    // must serve requests again: proof the previously dormant reconnect
-    // path actually fired rather than merely being eligible to.
+    // Thaw: the same manager serves again, so reconnect actually fired.
     redis_proc.thaw();
     let mut c = configured.clone();
     let recovered: String = tokio::time::timeout(Duration::from_secs(5), async move {
@@ -148,13 +130,8 @@ async fn frozen_redis_times_out_and_recovers_configured() {
     assert_eq!(recovered, "PONG");
 }
 
-/// System level companion to the test above: the real cauli-worker binary,
-/// talking to a redis it owns, must survive that redis going silent mid run
-/// and keep fetching once it comes back. Proves the --redis-timeout wiring
-/// in main.rs (args.redis_timeout -> ConnectionManagerConfig, used for both
-/// the write connection and the dedicated fetch connection) is actually
-/// connected, not just that the underlying ConnectionManager mechanism
-/// works in isolation.
+/// The real binary survives its redis going silent and resumes fetching:
+/// --redis-timeout reaches both connections.
 #[tokio::test(flavor = "multi_thread")]
 async fn worker_binary_survives_a_frozen_redis() {
     const WORKER_PORT: u16 = 6393;
@@ -203,9 +180,7 @@ async fn worker_binary_survives_a_frozen_redis() {
     cmd.current_dir(common::fixtures_dir())
         .args(["--app", "fixture_app:app", "--queues", "default"])
         .args(["--redis-url", &worker_url])
-        // Short on purpose: keeps the outage window (and this test) fast.
-        // Still comfortably above the "ordinary jitter" floor the flag's
-        // help text documents (~1s).
+        // Short to keep the test fast, above the ~1s jitter floor in --help.
         .args(["--redis-timeout", "2"])
         .args(["--io-threads", "4", "--io-concurrency", "8"])
         .args(["--cpu-workers", "1", "--stats-interval", "1"])
@@ -238,15 +213,12 @@ async fn worker_binary_survives_a_frozen_redis() {
     let r = common::wait_result(&mut c, &id, 15).await;
     assert_eq!(r["status"], "success");
 
-    // Outage: redis goes silent (frozen, not killed) for longer than
-    // --redis-timeout, spanning at least one fetch loop poll.
+    // Frozen longer than --redis-timeout, spanning a fetch poll.
     unsafe { libc::kill(redis_guard.0.id() as i32, libc::SIGSTOP) };
     tokio::time::sleep(Duration::from_secs(4)).await;
     unsafe { libc::kill(redis_guard.0.id() as i32, libc::SIGCONT) };
 
-    // The worker process itself must have survived the outage: no panic, no
-    // exit, unlike what an unbounded wait risks under load elsewhere (see
-    // the drain-timeout finding this fix does not touch).
+    // The worker survived: no panic, no exit.
     assert!(
         worker.0.try_wait().unwrap().is_none(),
         "worker must still be running after a redis outage it can recover from"

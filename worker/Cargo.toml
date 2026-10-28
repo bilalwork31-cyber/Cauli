@@ -12,31 +12,18 @@ categories = ["asynchronous", "concurrency"]
 
 [features]
 default = ["dev-bin"]
-# Enables the CAULI_EXEC_CMD test hook in src/cpu.rs (audit M5). Not part of a
-# normal release build; the e2e suite needs `cargo test --features test-hooks`.
+# Enables the CAULI_EXEC_CMD hook in src/cpu.rs. The e2e suite needs it; a
+# release build must not have it.
 test-hooks = []
-# Which NAME the binary is built under. Identical code either way.
-#
-# The published wheel installs a Python console script called `cauli-worker`
-# (worker/wheel-data/scripts/cauli-worker) that points the dynamic loader at
-# libpython and then execs the real binary, so the real binary has to land
-# under a different name or the two would fight over one file in the venv's
-# bin directory. The source tree keeps building plain `cauli-worker`, because
-# itest, bench, PROTOCOL.md and both READMEs all name that path.
-#
-# maturin ships every bin target the build produced and has no flag to select
-# one, so required-features does the selecting: a plain cargo build gets
-# `cauli-worker`, and maturin is invoked with `--no-default-features -F
-# wheel-bin` to get `cauli-worker-bin` and nothing else.
+# Which name the binary is built under; identical code either way. The wheel's
+# `cauli-worker` console script execs `cauli-worker-bin`, so the two names must
+# differ. maturin ships every bin it built and cannot select one, so
+# required-features selects: maturin runs with `--no-default-features -F wheel-bin`.
 dev-bin = []
 wheel-bin = []
 
-# The runtime itself, so that the two names below are two THREE LINE entry
-# points over one compilation rather than two build targets pointing at one
-# `src/main.rs` -- which cargo reports on every single command as "file
-# `src/main.rs` found to be present in multiple build targets". Nothing
-# outside this crate consumes the library; `cauli_worker::run` is its only
-# public item.
+# The runtime, shared by both bins below. Two bins naming one source file make
+# cargo warn on every command. Nothing outside this crate uses the library.
 [lib]
 name = "cauli_worker"
 path = "src/lib.rs"
@@ -61,61 +48,36 @@ libc = "0.2"
 mimalloc = { version = "0.1", default-features = false }
 pyo3 = { version = "0.26", features = ["auto-initialize"] }
 rand = "0.9"
-# tokio-rustls-comp (audit BLOCKER, TLS): with no TLS feature compiled in,
-# redis::Client::open("rediss://...") fails at parse, so every managed redis
-# that requires TLS in transit (Upstash, ElastiCache with encryption in
-# transit, Redis Cloud, Azure Cache) is unreachable while redis-py happily
-# keeps enqueueing into it. rustls rather than native-tls deliberately: no
-# OpenSSL headers, no system build dependency. Plain `tls-rustls` (pulled in
-# by tokio-rustls-comp) trusts the PLATFORM certificate store through
-# rustls-native-certs; `tls-rustls-webpki-roots` would REPLACE that with a
-# baked in bundle, which is the wrong default for a worker that has to trust
-# a private CA or a corporate proxy.
+ring = "0.17"
+# tokio-rustls-comp: without a TLS feature, rediss:// URLs fail to parse and
+# every TLS only managed Redis is unreachable. rustls avoids an OpenSSL build
+# dependency. It trusts the platform certificate store; webpki-roots would
+# replace that with a baked in bundle and break private CAs.
 redis = { version = "1.8", features = ["tokio-comp", "connection-manager", "tokio-rustls-comp"] }
-# Direct dependency for exactly one reason: redis depends on rustls with
-# default-features off, so no crypto provider is selected and
-# `ClientConfig::builder()` would panic on the first rediss:// connection.
-# `ring` builds with cc alone (aws-lc-rs would add cmake + nasm to every
-# build). main.rs installs it explicitly so the choice is deterministic
-# rather than left to feature unification.
+# redis pulls rustls with no crypto provider, so the first rediss:// connection
+# would panic. `ring` needs only cc (aws-lc-rs needs cmake and nasm). The
+# runtime installs it explicitly rather than leaving it to feature unification.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 serde = { version = "1", features = ["derive"] }
-# arbitrary_precision (audit CRITICAL): without it, serde_json's default
-# Number silently falls back to f64 for any integer literal outside i64/u64
-# range, at parse time. With it, the parser keeps the exact source digits, so
-# an unknown envelope field (`Envelope::extra`) that a retry re-enqueues goes
-# back out with the exact integer the caller wrote.
-# preserve_order: the same passthrough keeps that field's nested key order;
-# the default BTreeMap would write it back sorted.
-# raw_value: args, kwargs and task results cross the worker as opaque JSON
-# text (envelope.rs). The worker never reads them, so it never builds a tree
-# for them; the Python side decodes and encodes them with msgspec, the codec
-# the client uses.
+# arbitrary_precision: unknown envelope fields re-enqueued on retry keep exact
+# integers outside i64/u64 instead of rounding through f64.
+# preserve_order: the same passthrough keeps nested key order.
+# raw_value: args, kwargs and results cross the worker as opaque JSON text.
 serde_json = { version = "1", features = ["arbitrary_precision", "preserve_order", "raw_value"] }
-# Trimmed from "full" (audit dependency review) to the features actually used:
-# rt-multi-thread/macros (runtime + tokio::spawn + #[tokio::test]), sync
-# (oneshot/watch/Semaphore), time (timeout/interval/sleep), io-util
-# (AsyncBufReadExt/AsyncWriteExt/BufReader), process (child processes),
-# signal (SIGTERM/SIGINT handling), net (UnixListener for the cpu fork server).
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "process", "signal", "net"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [profile.release]
-# Cross-crate inlining across the hot path (envelope parse -> conversion ->
-# broker write), which is spread over several modules and dependencies.
-# Deliberately NOT panic = "abort": the dispatch path relies on unwinding, both
-# for DecrGuard's panic-safe inflight accounting and so a panic in one task
-# cannot take down the worker.
+# Not panic = "abort": DecrGuard's inflight accounting and per task panic
+# isolation rely on unwinding.
 lto = "fat"
 codegen-units = 1
 
 [dev-dependencies]
 libc = "0.2"
 mimalloc = { version = "0.1", default-features = false }
-# connection-manager: worker/tests/redis_response_timeout.rs exercises
-# ConnectionManager/ConnectionManagerConfig directly, the same types
-# main.rs builds its two redis connections with.
+# connection-manager: tests/redis_response_timeout.rs uses ConnectionManager.
 redis = { version = "1.8", features = ["tokio-comp", "connection-manager"] }
 serde_json = { version = "1", features = ["arbitrary_precision"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

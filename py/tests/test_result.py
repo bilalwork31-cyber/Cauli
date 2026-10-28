@@ -295,7 +295,7 @@ def test_duplicate_with_null_claimant_id_stays_none(app, redis_client):
 def test_status_reads_both_as_an_attribute_and_as_a_call(app, redis_client):
     # `if r.status == "success":` is the Celery idiom and used to compare a
     # bound method to a string, which is False forever and raises nothing.
-    # `r.status()` is cauli's own spelling (PROTOCOL.md section 12) and every
+    # `r.status()` is cauli's own spelling (PROTOCOL.md section 6) and every
     # existing call site uses it. Both have to be correct.
     ar = _ar(app)
     assert ar.status == "pending"

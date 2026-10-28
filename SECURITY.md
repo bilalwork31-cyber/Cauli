@@ -18,8 +18,7 @@ email to bilalwork31@gmail.com with "cauli security" in the subject. Please do
 not open a public issue for a suspected vulnerability, and please do not post a
 proof of concept anywhere public before a fix is out.
 
-This is a small project run by one maintainer. What that means for you, stated
-so you can plan around it rather than guess:
+One maintainer runs this project:
 
 - Acknowledgement inside 7 days.
 - A first assessment, including whether it is accepted, inside 14 days.
@@ -30,8 +29,7 @@ the published wheel or a source build, and the smallest reproduction you have.
 
 ## What is in scope
 
-cauli executes application code that arrives over a broker, so the interesting
-boundary is what a message can make a worker do:
+The boundary is what a message can make a worker do:
 
 - Anything that makes a worker execute code the app did not register.
 - Anything that escapes the JSON envelope: cauli never unpickles and resolves
@@ -46,8 +44,7 @@ boundary is what a message can make a worker do:
 
 ## What is not in scope
 
-These are documented design positions, not oversights. Reporting one gets the
-link to this section.
+These are design positions, not vulnerabilities.
 
 - **Redis is trusted.** Anything with write access to the broker can enqueue
   any registered task with any arguments. Run Redis on a private network with

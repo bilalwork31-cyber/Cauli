@@ -1,9 +1,8 @@
 //! Per-entry dispatch: parse -> idempotency -> route -> execute -> finish.
 
 use crate::broker;
-// Absolute instants come from the redis anchored clock, never from this
-// host's own: expiry deadlines and delayed scores are compared across
-// workers, and this file writes both. See clock.rs.
+// Redis anchored clock: expiry deadlines and delayed scores are compared
+// across workers (clock.rs).
 use crate::clock::now_ms;
 use crate::ctx::{Ctx, DecrGuard, InflightEntry, Outcome};
 use crate::envelope::{self, Envelope, ErrorJson};
@@ -11,31 +10,39 @@ use crate::exec;
 use serde_json::value::RawValue;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use tokio::sync::OwnedSemaphorePermit;
 use tracing::{debug, error, warn};
 
-/// Entry point used by the fetch loop and the recovery loop.
-/// `raw` is the value of stream field `e` (None if the field was missing).
+/// Called by the fetch and recovery loops. `raw` is stream field `e`.
+///
+/// The io slot is taken here, before the spawn, not when the task starts:
+/// the loops size their next read from the free slot count, and a slot taken
+/// later let one process read twice its capacity and park the surplus.
 pub fn spawn_dispatch(ctx: Arc<Ctx>, queue: String, stream_id: String, raw: Option<String>) {
     ctx.counters.fetched.fetch_add(1, Ordering::Relaxed);
     ctx.counters.inflight_total.fetch_add(1, Ordering::SeqCst);
+    let slot = ctx.io_sem.clone().try_acquire_owned().ok();
     tokio::spawn(async move {
-        // Panic-safe (MEM-3/H3): a panic anywhere in `process` must still
-        // release this slot, or `inflight_total` never reaches 0 and every
-        // shutdown burns the full --drain-timeout.
+        // Both guards release on a panicking unwind too.
         let _guard = DecrGuard(&ctx.counters.inflight_total);
-        // Held for exactly as long as this process owns the entry, so the
-        // section 4.4 recovery loop cannot reclaim (and eventually dead
-        // letter) work this very worker is still holding. Panic safe for
-        // the same reason as the counter guard above.
         let _held = InflightEntry::track(&ctx, &queue, &stream_id);
-        process(&ctx, &queue, &stream_id, raw).await;
+        let slot = match slot {
+            Some(s) => s,
+            // The other loop took the last slot first.
+            None => ctx
+                .io_sem
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("io semaphore closed"),
+        };
+        process(&ctx, &queue, &stream_id, raw, slot).await;
     });
 }
 
-/// Task id charset per PROTOCOL §2 ("32 char lowercase hex"). Rejecting
-/// anything else worker-side (audit M1) stops a crafted `id` from colliding
-/// with / overwriting another task's `cauli:result:{id}` key, from carrying
-/// cluster hash-tags (`{...}`), or from being a key-size DoS.
+/// PROTOCOL §2: 32 char lowercase hex. Stops a crafted `id` from
+/// overwriting another task's result key, carrying cluster hash tags, or
+/// being a key size DoS.
 fn valid_task_id(id: &str) -> bool {
     id.len() == 32
         && id
@@ -43,20 +50,9 @@ fn valid_task_id(id: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-/// PROTOCOL §2: `args` must be a JSON array or null, `kwargs` must be a JSON
-/// object or null. A wrongly shaped `kwargs` (e.g. a list) used to reach
-/// `fn(*args, **kwargs)` and fail there with a retryable TypeError, burning
-/// max_retries+1 executions before landing in the DLQ under the wrong
-/// reason. Checked here, after a successful parse, rather than inside
-/// `Envelope`'s `Deserialize` (which would fail the whole parse): the id is
-/// perfectly fine in this case, so it stays recoverable and a caller
-/// blocked in `AsyncResult.get()` still gets a real answer instead of
-/// hanging, the same as the `v` version check just below.
-///
-/// The two fields are raw JSON text the worker never parses into a tree, so
-/// the shape is read off the first byte, and `parses_as_tree` keeps the two
-/// refusals the tree parse used to make: those envelopes dead letter as
-/// malformed, exactly as before.
+/// PROTOCOL §2: `args` an array or null, `kwargs` an object or null.
+/// Checked after the parse, not in `Deserialize`, so the id survives and a
+/// caller in `AsyncResult.get()` gets "Malformed" instead of hanging.
 fn args_kwargs_shape_ok(env: &Envelope) -> bool {
     let fits = |raw: &Option<Box<RawValue>>, open: u8| {
         raw.as_deref()
@@ -65,21 +61,16 @@ fn args_kwargs_shape_ok(env: &Envelope) -> bool {
     fits(&env.args, b'[') && fits(&env.kwargs, b'{')
 }
 
-/// Deepest `args`/`kwargs` nesting a parse used to accept, counting the field
-/// itself as one level: serde_json allows 127 levels per document and the
-/// envelope object is the first of them.
+/// serde_json's 127 level limit minus the envelope object itself.
 const MAX_ARG_NESTING: usize = 126;
 
-/// False for what serde_json's raw capture lets through but its tree parse
-/// refused: nesting past `MAX_ARG_NESTING`, and a `\u` escape that is half a
-/// surrogate pair. `json` is otherwise valid (serde_json checked it), so a
-/// bracket or quote inside a string is the only thing to skip.
+/// False for what a raw capture accepts but a tree parse refuses: nesting
+/// past `MAX_ARG_NESTING`, or half a `\u` surrogate pair. `json` is
+/// otherwise valid, so only strings need skipping.
 fn parses_as_tree(json: &str) -> bool {
     let b = json.as_bytes();
-    // Neither refusal is possible with this few brackets and no escape at
-    // all, which is almost every payload. Counting into a u8 per 255 byte
-    // chunk is what lets the compiler vectorize it; the scan below is the
-    // byte at a time one.
+    // Fast path for almost every payload. A u8 count per 255 byte chunk is
+    // what lets the compiler vectorize it.
     let opens: usize = b
         .chunks(255)
         .map(|c| {
@@ -130,20 +121,23 @@ fn parses_as_tree(json: &str) -> bool {
     true
 }
 
-async fn process(ctx: &Arc<Ctx>, queue: &str, sid: &str, raw: Option<String>) {
+async fn process(
+    ctx: &Arc<Ctx>,
+    queue: &str,
+    sid: &str,
+    raw: Option<String>,
+    slot: OwnedSemaphorePermit,
+) {
     let raw = match raw {
         Some(r) => r,
         None => {
-            // Silent before: a stream entry with no `e` field dead lettered
-            // with no log line at any level. Every terminal reason below is
-            // now visible at the DEFAULT level, because a producer/worker
-            // skew that dead letters a whole queue must not need `debug` to
-            // be seen.
+            // Every terminal reason warns at the default level: a version
+            // skew that dead letters a whole queue must not need `debug`.
             warn!(queue, entry = %sid, "stream entry has no \"e\" field -> DLQ");
             return dlq_terminal(ctx, queue, sid, "", "malformed", None).await;
         }
     };
-    // M2: bound parse/amplification cost before serde ever sees the payload.
+    // Bound parse cost before serde sees the payload.
     if raw.len() > ctx.args.max_envelope_bytes {
         let preview = envelope::safe_truncate(&raw, 4096);
         warn!(
@@ -170,9 +164,7 @@ async fn process(ctx: &Arc<Ctx>, queue: &str, sid: &str, raw: Option<String>) {
             return dlq_terminal(ctx, queue, sid, &raw, "malformed", None).await;
         }
         Ok(e) if !e.id.is_empty() && !e.task.is_empty() && valid_task_id(&e.id) => e,
-        // Catch-all: unparseable JSON, empty id, empty task, or an id that
-        // fails the section 2 charset gate. Logged with the same bounded
-        // preview the DLQ write already computes, never the whole payload.
+        // Unparseable, empty id or task, or bad id charset. Bounded preview.
         _ => {
             warn!(
                 queue, entry = %sid,
@@ -182,41 +174,21 @@ async fn process(ctx: &Arc<Ctx>, queue: &str, sid: &str, raw: Option<String>) {
             return dlq_terminal(ctx, queue, sid, &raw, "malformed", None).await;
         }
     };
-    // Borrowed, not `.cloned()`: the clone existed only to read two
-    // immutable fields and heap allocated a fresh `kind` String on every
-    // single dispatch. The borrow ends with this statement, so nothing
-    // downstream is constrained by it.
     let Some((is_cpu, is_async)) = ctx
         .registry
         .get(&env.task)
         .map(|spec| (spec.kind == "cpu", spec.is_async))
     else {
-        // warn, not debug: this is the shape a producer/worker version skew
-        // takes, and at the default log level it used to produce no output
-        // at all while a whole queue was destroyed.
         warn!(task = %env.task, id = %env.id, "unregistered task -> DLQ");
         return dlq_terminal(ctx, queue, sid, &raw, "unregistered", None).await;
     };
 
-    // §9.1 expiry, checked at DISPATCH — the single enforcement point, and
-    // deliberately so. It sits here rather than at enqueue (which cannot know
-    // how long the entry will actually wait), in the delayed mover (which only
-    // sees delayed entries, not backlogged ready ones) or in the fetch loop
-    // (which has not parsed the envelope yet). Dispatch is the one place every
-    // path converges: a fresh delivery, a mover hand-off, a scheduled retry
-    // and a §4.4 crash reclaim all arrive here, so "expired work never runs"
-    // holds for all of them with one check. It is also the only placement that
-    // needs nothing from the broker, which is what lets a future SQS or
-    // RabbitMQ backend inherit expiry for free.
-    //
-    // Before the idempotency claim: an expired task must not burn the
-    // idempotency key and lock out a later, still-valid task with the same one.
+    // §9.1 expiry is enforced only here: fresh deliveries, mover hand offs,
+    // retries and §4.4 reclaims all converge on dispatch. Before the
+    // idempotency claim, so an expired task cannot burn the key.
     if let Some(deadline) = env.expiry_deadline_ms(ctx.queue_ttl_ms(queue)) {
         let now = now_ms();
         if now > deadline {
-            // warn, not debug: a clock skewed client or a queue_ttl shorter
-            // than the work takes discards 100% of its own tasks here, and
-            // that used to be invisible at the default level.
             warn!(
                 task = %env.task, id = %env.id, deadline, now,
                 late_ms = now.saturating_sub(deadline),
@@ -239,24 +211,17 @@ async fn process(ctx: &Arc<Ctx>, queue: &str, sid: &str, raw: Option<String>) {
         }
     }
 
-    // §4.5 idempotency guard, claimed at execution start. The envelope's own
-    // timeout_ms goes with it: the claim's real TTL is derived from the
-    // execution it guards, not from ctx.idemp_ttl alone (broker::claim_ttl_s).
+    // §4.5 claim. Its TTL also depends on timeout_ms (broker::claim_ttl_s).
     if let Some(key) = env.idempotency_key.clone() {
         let mut conn = ctx.redis.clone();
         match broker::idemp_claim(&mut conn, &key, &env.id, ctx.idemp_ttl, env.timeout_ms).await {
             Ok(broker::IdempClaim::Fresh) | Ok(broker::IdempClaim::MineAgain) => {}
             Ok(broker::IdempClaim::Duplicate { claimant }) => {
-                // The claim is deliberately never released, not even after
-                // the claimant is dead lettered (partial side effects make
-                // suppression the safer default), so the claimant's id is
-                // the suppressed caller's only route to the real outcome.
+                // Never released, even after the claimant is dead lettered
+                // (partial side effects make suppression safer).
                 debug!(id = %env.id, claimant = %claimant, "idempotency key held -> duplicate");
                 let rj = envelope::result_duplicate(now_ms(), &claimant);
                 let store = env.store_result.then_some(rj.as_str());
-                // Gated the same way, and for the same reason, as the
-                // success branch in `finish` below: a write failure must
-                // not be counted as if it happened.
                 match broker::finish_duplicate(
                     &ctx.acks,
                     queue,
@@ -269,10 +234,6 @@ async fn process(ctx: &Arc<Ctx>, queue: &str, sid: &str, raw: Option<String>) {
                 {
                     Ok(()) => {
                         ctx.counters.ok.fetch_add(1, Ordering::Relaxed);
-                        // Also counted separately: a suppressed duplicate is
-                        // not an executed task, and folding it into `ok`
-                        // alone made a badly derived idempotency_key look
-                        // like healthy throughput.
                         ctx.counters.duplicate.fetch_add(1, Ordering::Relaxed);
                     }
                     Err(e) => {
@@ -282,20 +243,21 @@ async fn process(ctx: &Arc<Ctx>, queue: &str, sid: &str, raw: Option<String>) {
                 return;
             }
             Err(e) => {
-                // Fail open: at-least-once semantics allow execution; log it.
-                // (PROTOCOL §4.5 documents this as an explicit, deliberate choice.)
+                // Fail open, as PROTOCOL §4.5 specifies.
                 warn!(id = %env.id, "idempotency SET failed ({e}); executing anyway");
             }
         }
     }
 
-    // Route by registry kind (registry authoritative over envelope kind).
+    // The registry kind wins over the envelope kind.
     let outcome = if is_cpu {
+        // cpu tasks are bounded by the cpu pool, not the io slots.
+        drop(slot);
         exec::run_cpu_task(ctx, &env).await
     } else if is_async {
-        exec::run_async_task(ctx, &env).await
+        exec::run_async_task(ctx, &env, slot).await
     } else {
-        exec::run_sync_task(ctx, &env).await
+        exec::run_sync_task(ctx, &env, slot).await
     };
     finish(ctx, queue, sid, env, outcome).await;
 }
@@ -305,9 +267,6 @@ async fn finish(ctx: &Arc<Ctx>, queue: &str, sid: &str, mut env: Envelope, outco
     let now = now_ms();
     match outcome {
         Outcome::Success(v) => {
-            // Built only when it is actually stored: serializing a result the
-            // caller has opted out of receiving is pure cost, and it scales
-            // with the size of whatever the task returned.
             let rj = env.store_result.then(|| envelope::result_success(&v, now));
             let store = rj.as_deref();
             match broker::finish_success(&ctx.acks, queue, sid, &env.id, store, ctx.result_ttl)
@@ -317,12 +276,8 @@ async fn finish(ctx: &Arc<Ctx>, queue: &str, sid: &str, mut env: Envelope, outco
                     ctx.counters.ok.fetch_add(1, Ordering::Relaxed);
                 }
                 Err(e) => {
-                    // A write failure must not count as ok, or as any of
-                    // its counterparts in the duplicate, final failure,
-                    // terminal dlq and expiry branches: the stats line is
-                    // the operator's first signal, and folding this in
-                    // would hide a broker write failure behind a healthy
-                    // number.
+                    // Every finish branch counts only a write that landed,
+                    // or the stats line hides a broker failure.
                     error!(id = %env.id, "success finish write failed: {e}");
                     ctx.counters.failed.fetch_add(1, Ordering::Relaxed);
                 }
@@ -333,8 +288,6 @@ async fn finish(ctx: &Arc<Ctx>, queue: &str, sid: &str, mut env: Envelope, outco
                 let cd_ms = countdown.map(|s| (s.max(0.0) * 1000.0).round() as u64);
                 schedule_retry(ctx, queue, sid, &mut env, cd_ms).await;
             } else {
-                // A forced retry is inherently retryable; reaching here at
-                // all means the budget ran out, never that it was refused.
                 final_failure(ctx, queue, sid, &env, &err, now, "max_retries").await;
             }
         }
@@ -342,11 +295,7 @@ async fn finish(ctx: &Arc<Ctx>, queue: &str, sid: &str, mut env: Envelope, outco
             if retryable && env.retries < env.max_retries {
                 schedule_retry(ctx, queue, sid, &mut env, None).await;
             } else {
-                // PROTOCOL §4.2: "max_retries" names the case where the
-                // retry budget ran out specifically. A `retryable: false`
-                // failure never had a budget to run out, however many
-                // retries are left, so it gets its own reason instead of
-                // borrowing that one.
+                // PROTOCOL §4.2: "max_retries" only when the budget ran out.
                 let reason = if retryable {
                     "max_retries"
                 } else {
@@ -358,18 +307,12 @@ async fn finish(ctx: &Arc<Ctx>, queue: &str, sid: &str, mut env: Envelope, outco
     }
 }
 
-/// Ceiling on how far out a retry may be scheduled, mirroring
-/// `MAX_TIMEOUT_MS` in envelope.rs: clamped rather than rejected, since an
-/// extreme value plausibly means "as long as possible". The delay is bounded
-/// rather than the resulting instant, deliberately: `fire_at = now + delay`
-/// passes any `fire_at < now + horizon` check when the local clock itself is
-/// wrong, because both sides carry the same broken clock.
+/// Retry delay clamp. The delay is bounded, not the instant: a check on
+/// `fire_at < now + horizon` passes whenever the clock itself is wrong.
 const MAX_RETRY_DELAY_MS: u64 = 30 * 86_400_000; // 30 days
 
-/// Delay before the next attempt: `cauli.Retry(countdown=...)` if the task
-/// named one (task controlled), otherwise the computed backoff (envelope
-/// controlled through `backoff_max_ms`). Neither input is bounded anywhere
-/// else, so the clamp belongs here, where both paths meet.
+/// `Retry(countdown=...)` or the computed backoff, both unbounded at their
+/// source, so the clamp lives where they meet.
 fn retry_delay_ms(env: &Envelope, countdown_ms: Option<u64>) -> u64 {
     countdown_ms
         .unwrap_or_else(|| {
@@ -394,17 +337,10 @@ async fn schedule_retry(
 ) {
     env.retries += 1;
     let d_ms = retry_delay_ms(env, countdown_ms);
-    // saturating_add: H3 — an attacker-chosen backoff_max_ms/countdown near
-    // u64::MAX must not wrap fire_at to a tiny score (which would fire the
-    // retry immediately, hot-looping until max_retries).
+    // Saturating: a wrapped score would fire immediately and hot loop.
     let fire_at = now_ms().saturating_add(d_ms);
-    // Infallible: `env` round-tripped through serde_json moments ago (parsed
-    // from valid JSON, so no NaN/Infinity survived), so re-serializing it
-    // cannot fail.
+    // Parsed from valid JSON moments ago, so it cannot fail.
     let ej = serde_json::to_string(env).expect("envelope serialize");
-    // Gated on the write, like every sibling branch in `finish`: an
-    // unconditional increment made `retried=` climb at full rate through a
-    // redis brownout in which nothing was actually scheduled.
     match broker::finish_retry(&ctx.acks, queue, sid, &ej, fire_at).await {
         Ok(()) => {
             debug!(id = %env.id, retries = env.retries, delay_ms = d_ms, "scheduled retry");
@@ -416,8 +352,7 @@ async fn schedule_retry(
     }
 }
 
-/// Final failure: DLQ `reason` ("max_retries" or "not_retryable", see
-/// `finish` above) + failure result (if store_result).
+/// DLQ with `reason` ("max_retries" or "not_retryable") plus a failure result.
 async fn final_failure(
     ctx: &Arc<Ctx>,
     queue: &str,
@@ -427,14 +362,11 @@ async fn final_failure(
     now: u64,
     reason: &str,
 ) {
-    // Infallible: same reasoning as schedule_retry above.
     let ej = serde_json::to_string(env).expect("envelope serialize");
     let rj = envelope::result_failure(err, now);
     let result = env
         .store_result
         .then_some((env.id.as_str(), rj.as_str(), ctx.result_ttl));
-    // Gated the same way, and for the same reason, as the success branch in
-    // `finish` above: a write failure must not be counted as if it happened.
     match broker::finish_dlq(&ctx.acks, queue, sid, &ej, reason, Some(err), result).await {
         Ok(()) => {
             ctx.counters.failed.fetch_add(1, Ordering::Relaxed);
@@ -446,30 +378,23 @@ async fn final_failure(
     }
 }
 
-/// Best effort task id recovery for a terminal DLQ write: bounded to the
-/// same preview cap as the oversize path (`safe_truncate`, 4096 bytes), so a
-/// hostile huge `raw_e` can never turn this into the parse that §M2 exists
-/// to avoid. A small envelope that is only oversize relative to a low
-/// --max-envelope-bytes, or one already fully read (unregistered,
-/// redelivery_limit), still parses inside that cap and its id comes back.
+/// Best effort id for a terminal DLQ write, parsed from a 4096 byte preview
+/// so a huge hostile payload is never fully parsed.
 fn recover_id(raw_e: &str) -> Option<String> {
-    // Only the id, not a full Envelope: an envelope is malformed precisely
-    // because some other field failed to parse, and that must not also cost
-    // the caller blocked on its result the answer.
+    // Only the id: some other field is what failed to parse. `raw_e` is
+    // already bounded: an oversize envelope arrives here as its preview.
     #[derive(serde::Deserialize)]
     struct IdOnly {
         id: String,
     }
-    let preview = envelope::safe_truncate(raw_e, 4096);
-    match serde_json::from_str::<IdOnly>(preview) {
+    match serde_json::from_str::<IdOnly>(raw_e) {
         Ok(e) if valid_task_id(&e.id) => Some(e.id),
         _ => None,
     }
 }
 
-/// Synthetic error for a task that never ran: no Python exception exists,
-/// so a type distinguishable from a real one (mirrors `result_expired`'s
-/// "Expired") lets a caller's `except TaskFailedError` tell them apart.
+/// Error for a task that never ran, typed so callers can tell it from a
+/// real exception.
 fn dlq_error(reason: &str) -> ErrorJson {
     let type_ = match reason {
         "malformed" => "Malformed",
@@ -483,14 +408,8 @@ fn dlq_error(reason: &str) -> ErrorJson {
     )
 }
 
-/// Terminal DLQ for malformed / unregistered / redelivery_limit entries: no
-/// retry. When a task id can be recovered from `raw_e` (see `recover_id`), a
-/// failure result is written too, so a caller blocked in
-/// `AsyncResult.get()` with no timeout gets an answer instead of waiting on
-/// a `cauli:result:{id}` key that would otherwise never exist. Where no id
-/// can be recovered there is nothing to key a result on, so none is
-/// written, same as before. Error field in the DLQ stream entry is still
-/// the empty string when `err` is None.
+/// Terminal DLQ, no retry. When an id is recoverable a failure result is
+/// written too, so `AsyncResult.get()` without a timeout does not hang.
 pub async fn dlq_terminal(
     ctx: &Arc<Ctx>,
     queue: &str,
@@ -510,8 +429,6 @@ pub async fn dlq_terminal(
         (Some(id), Some(rj)) => Some((id.as_str(), rj.as_str(), ctx.result_ttl)),
         _ => None,
     };
-    // Gated the same way, and for the same reason, as the success branch in
-    // `finish` above: a write failure must not be counted as if it happened.
     match broker::finish_dlq(&ctx.acks, queue, sid, raw_e, reason, err, store).await {
         Ok(()) => {
             ctx.counters.dlq.fetch_add(1, Ordering::Relaxed);
@@ -536,10 +453,6 @@ mod tests {
         serde_json::from_str(json).unwrap()
     }
 
-    /// The exact shape from the bug report: a JSON array for kwargs used to
-    /// parse fine and only blow up much later inside fn(*args, **kwargs)
-    /// with a retryable TypeError, burning max_retries+1 executions before
-    /// landing in the DLQ under the wrong reason.
     #[test]
     fn args_kwargs_shape_ok_accepts_array_object_or_null() {
         assert!(args_kwargs_shape_ok(&env_with(r#"{"id":"a","task":"t"}"#)));
@@ -573,10 +486,7 @@ mod tests {
         )));
     }
 
-    /// The nesting bound is exactly the one the old full parse enforced:
-    /// whatever envelope a `Value` parse accepts passes, and the first one it
-    /// refuses is dead lettered, for args and kwargs alike. Brackets and
-    /// escaped quotes inside strings do not count.
+    /// Must accept exactly what a `Value` parse accepts.
     #[test]
     fn args_kwargs_nesting_bound_matches_the_full_parse_it_replaced() {
         let nested = |open: &str, close: &str, depth: usize| {
@@ -611,10 +521,6 @@ mod tests {
         }
     }
 
-    /// The same equivalence for `\u` escapes: a full surrogate pair passes,
-    /// and every half pair the tree parse refused (in a value or in a key,
-    /// in args or in kwargs) is dead lettered, while an escaped backslash
-    /// followed by `ud800` is ordinary text.
     #[test]
     fn surrogate_escapes_are_refused_exactly_where_the_full_parse_refused_them() {
         let cases = [
@@ -648,14 +554,9 @@ mod tests {
         assert!(!valid_task_id(&"a".repeat(31))); // too short
         assert!(!valid_task_id(&"A".repeat(32))); // uppercase rejected
         assert!(!valid_task_id(&"g".repeat(32))); // right length, non-hex letter
-                                                  // right length, one invalid char (hash-tag injection attempt)
         assert!(!valid_task_id(&format!("{{{}", "a".repeat(31))));
     }
 
-    /// Both inputs are unbounded at their source: `backoff_max_ms` travels in
-    /// the envelope and `Retry(countdown=...)` comes from task code. Without
-    /// the clamp a retry lands past every result TTL, DLQ retention and alert
-    /// window that would let anyone notice it.
     #[test]
     fn retry_delay_is_clamped_at_thirty_days() {
         let env = env_with(
@@ -664,7 +565,6 @@ mod tests {
         );
         assert_eq!(retry_delay_ms(&env, None), MAX_RETRY_DELAY_MS);
         assert_eq!(retry_delay_ms(&env, Some(u64::MAX)), MAX_RETRY_DELAY_MS);
-        // Ordinary delays are untouched, including one just under the cap.
         assert_eq!(retry_delay_ms(&env, Some(1_500)), 1_500);
         assert_eq!(
             retry_delay_ms(&env, Some(MAX_RETRY_DELAY_MS - 1)),
@@ -690,17 +590,19 @@ mod tests {
         );
     }
 
+    /// An unregistered task with large args is dead lettered before it runs;
+    /// its caller still needs the failure result. Oversize envelopes never
+    /// reach here whole: the size check passes only a preview.
     #[test]
-    fn recover_id_none_when_the_id_is_past_the_preview_cap() {
-        // A hostile oversize payload never gets its id back: the preview
-        // cap (4096 bytes) lands inside the padding, well before the id
-        // field or the closing brace, so this can never become the
-        // unbounded parse §M2 exists to avoid.
+    fn recover_id_from_an_envelope_larger_than_any_preview() {
         let raw = format!(
             r#"{{"pad":"{}","id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","task":"t"}}"#,
             "x".repeat(5000)
         );
-        assert_eq!(recover_id(&raw), None);
+        assert_eq!(
+            recover_id(&raw),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
+        );
     }
 
     #[test]

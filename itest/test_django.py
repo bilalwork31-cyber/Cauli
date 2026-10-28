@@ -11,10 +11,9 @@ Proves the four Django-facing behaviors end to end:
      (max_retries=0, so a stale cached connection cannot hide behind a
      retry).
 
-Infrastructure: throwaway redis on port 6395 (suite family 639x; ad-hoc
-debugging should use 6460-6480 instead) and a throwaway user-owned Postgres
-started via initdb/pg_ctl on port 54329 (crash-restartable without root).
-Skips if django/psycopg or the postgres server binaries are unavailable.
+Infrastructure: throwaway redis on port 6395 and a user owned Postgres
+via initdb/pg_ctl on port 54329 (crash restartable without root). Skips if
+django/psycopg or the postgres server binaries are unavailable.
 """
 
 import glob
@@ -166,10 +165,8 @@ def _worker_env(appname, conn_max_age, hooklog):
 
 
 def _spawn_worker(queues, appname, conn_max_age, hooklog, logfile):
-    # --io-threads 1 / --cpu-workers 1: every sync task reuses ONE pool thread
-    # and every cpu task ONE child, so a cached stale connection CANNOT be
-    # dodged by landing on a fresh thread/child — the lifecycle hooks are the
-    # only thing standing between a DB restart and a task failure.
+    # One pool thread and one cpu child, so a stale cached connection cannot
+    # be dodged by landing on a fresh thread or child.
     return subprocess.Popen(
         [
             BIN,
@@ -408,11 +405,11 @@ def test_conn_max_age_0_closes_after_every_task(stack, pg):
 
 
 def test_db_restart_survival_all_three_paths(stack, pg):
-    """THE defect this integration exists to fix: cached thread-local
-    connections going stale across a database restart. Every path first
-    caches a live connection, Postgres crash-restarts, and then the FIRST
-    attempt of each follow-up task must succeed (max_retries=0 — a retry
-    cannot mask a stale-connection failure)."""
+    """Cached connections must not go stale across a Postgres crash restart.
+
+    Each path caches a connection, Postgres restarts, and the first attempt
+    of each follow up task must succeed (max_retries=0, so no retry masks it).
+    """
     t = _tasks()
     suffix = uuid.uuid4().hex[:8]
     assert t.db_add.delay(f"pre-s-{suffix}").get(timeout=30)["count"] == 1

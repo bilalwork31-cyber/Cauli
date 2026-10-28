@@ -1,6 +1,6 @@
 use clap::Parser;
 
-const ADVANCED: &str = "Advanced tuning (derived from -c; see docs/CONFIGURATION.md)";
+const ADVANCED: &str = "Advanced tuning (derived from -c; see docs/configuration.md)";
 
 /// cauli-worker: Rust worker runtime for cauli Python task queues (PROTOCOL §7).
 #[derive(Parser, Debug, Clone)]
@@ -80,16 +80,11 @@ pub struct Args {
     #[arg(long, default_value_t = 1, help_heading = ADVANCED)]
     pub cpu_child_threads: usize,
 
-    /// Extra cpu requests pre-staged in each child's socket buffer beyond the
-    /// ones it is executing. Keeps a child from idling for a full IPC round
-    /// trip between tasks; its next read returns immediately. 0 disables.
-    ///
-    /// Measured drain rate, 6 children on 6 cores: for ~0.5ms tasks depth 64
-    /// is 4.1x depth 0; for ~2ms tasks depth 16 is 1.13x depth 3; for ~51ms
-    /// tasks every depth is within noise (the task dwarfs the round trip).
-    /// Deeper is not free: a child death fails everything staged behind it as
-    /// retryable WorkerLost, and a staged task waits out the tasks ahead of
-    /// it, so raise this for small tasks and leave it low for long ones.
+    /// Extra cpu requests staged in each child beyond the ones it is
+    /// running, so a child never idles for an IPC round trip. 0 disables.
+    /// Raise it for sub millisecond tasks; keep it low for long ones: a child
+    /// death fails everything staged behind it as retryable WorkerLost, and a
+    /// staged task waits out the tasks ahead of it.
     #[arg(long, default_value_t = 4, help_heading = ADVANCED)]
     pub cpu_prefetch: usize,
 
@@ -110,13 +105,10 @@ pub struct Args {
     #[arg(long, default_value_t = false, help_heading = ADVANCED)]
     pub no_fork_server: bool,
 
-    /// XREADGROUP COUNT per fetch. Must be at least 1. A fetch never takes
-    /// more than the free io slots. For sub millisecond tasks a larger batch
-    /// drains faster (noop tasks, one process: 128 was about 1.35x sync and
-    /// 1.10x async; 256 with --cpu-prefetch 16 took noop cpu tasks from 85k/s
-    /// to 134k/s), but fetched cpu entries wait for a cpu slot inside the
-    /// worker with their recovery clock running, so raise it only for short
-    /// tasks.
+    /// XREADGROUP COUNT per fetch, at least 1; a fetch never takes more than
+    /// the free io slots. Raise it only for sub millisecond tasks: fetched cpu
+    /// entries wait for a cpu slot inside the worker with their recovery clock
+    /// running.
     #[arg(long, default_value_t = 64, help_heading = ADVANCED)]
     pub batch: usize,
 
@@ -161,10 +153,8 @@ pub struct Args {
     pub ack_flush_ms: u64,
 }
 
-/// Concrete per-process execution settings after applying the -c/--procs
-/// derivation. One derivation site: the process that resolves this (the
-/// supervisor, or a standalone worker) passes the values on explicitly, so a
-/// supervised child never re-derives with a different procs divisor.
+/// Per process settings after the -c/--procs derivation, resolved once and
+/// passed to children explicitly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Resolved {
     pub procs: usize,
@@ -173,46 +163,21 @@ pub struct Resolved {
     pub cpu_workers: usize,
 }
 
-/// Auto procs target: one worker process per this many concurrency slots,
-/// never more than the cores. Small -c on a shared box (the Django + Redis +
-/// worker colocation everyone actually runs) stays a single process; a large
-/// -c on a dedicated box fans across every core, one GIL each (bench3 on 4
-/// pinned cores: 1→4 procs was +74% throughput at lower p99). The 64 is a
-/// defensible target, not yet a swept one — pin it when a wider box exists.
+/// One process per this many slots, capped at the cores: small -c on a
+/// shared box stays one process, large -c fans out one GIL per core. 64 is a
+/// chosen target, not a swept one.
 const SLOTS_PER_PROC: usize = 64;
 
-/// Derivation rules (thresholds measured, bench2/bench3; docs/CONFIGURATION.md):
-/// - procs: explicit, else min(cores, c/SLOTS_PER_PROC) with -c, else 1
-///   (standalone behavior unchanged).
+/// Derivation (docs/configuration.md). An explicit flag always wins.
+/// - procs: min(cores, c/SLOTS_PER_PROC) with -c, else 1.
+/// - io_concurrency: c/procs with -c, else 256.
+/// - io_threads: min(c, 512)/procs with -c, capped at the gate (a thread
+///   above it never gets work), else 64. Past about 1000 threads per process
+///   sync throughput and latency both fall.
+/// - cpu_workers: cores/procs, never more than c/procs.
 ///
-/// Every per-process division below FLOORS. `-c` is a ceiling on what the
-/// whole worker will hold, not a per-process target: each supervised child
-/// receives the same resolved flags, so a remainder cannot be handed to one
-/// child alone, and rounding each child up overshot the number the operator
-/// asked for -- `-c 65` derived 2 x 33 = 66, `-c 512` derived 6 x 86 = 516.
-/// Overshoot is the dangerous direction: `-c` is what an operator sizes a
-/// database connection pool against, so exceeding it can breach a limit that
-/// lives outside this process. Undershooting by less than one slot per
-/// process only leaves a little capacity on the table.
-///
-/// - io_concurrency: explicit, else c/procs with -c, else 256. The gate is
-///   the bound for async tasks (a slot costs ~4 KB). The standalone 256 sits
-///   above every band this repo has measured; the flag's own help carries the
-///   numbers and the unresolved stall, so `--help` warns before a user tunes
-///   past them.
-/// - io_threads: explicit, else min(c, 512)/procs with -c, else 64. Capped at
-///   the gate (a thread above it never receives work) and at 512 total: the
-///   sync knee is ~1000 threads/proc and past it throughput and latency fall
-///   together, so the derived default stays 1x the gate up to the cap rather
-///   than oversubscribing (oversubscription trades task p99 for throughput —
-///   an explicit choice, not a default).
-/// - cpu_workers: explicit, else cores/procs but never more than -c's share:
-///   more children than cores buys nothing, and more than c would make
-///   `-c 8` on a pdf-convert queue mean something other than 8. Floored for
-///   the same reason as the io lanes, and here the old div_ceil broke the
-///   stated rule outright: at `-c 200` on 6 cores it derived 4 procs x 2
-///   children = 8 children for 6 cores, the exact oversubscription the rule
-///   exists to prevent.
+/// Every division floors: `-c` is what operators size a database pool
+/// against, so the totals must never exceed it (or the cores, for cpu).
 pub fn resolve(args: &Args, cores: usize) -> Resolved {
     let cores = cores.max(1);
     let procs = args
@@ -256,10 +221,8 @@ pub fn resolve(args: &Args, cores: usize) -> Resolved {
 }
 
 impl Args {
-    /// The app spec, for every consumer downstream of the --print-plan early
-    /// return in main. clap keeps -A mandatory unless --print-plan is set,
-    /// and that path exits before any caller here runs, so None at this
-    /// point is a control flow bug rather than bad input.
+    /// Only called after the --print-plan early return, where clap has made
+    /// -A mandatory.
     pub fn app_spec(&self) -> &str {
         self.app
             .as_deref()
@@ -314,8 +277,7 @@ mod tests {
         assert_eq!(a.ack_flush_ms, 2);
     }
 
-    /// Behaviour change: cpu children recycle by default now. 0 has to stay
-    /// accepted, because it is the documented way to opt back out.
+    /// 0 is the documented opt out of recycling.
     #[test]
     fn cpu_recycle_defaults_to_10000_with_zero_as_the_opt_out() {
         assert_eq!(parse(&[]).cpu_max_tasks_per_child, 10_000);
@@ -384,9 +346,7 @@ mod tests {
         assert_eq!(a.ack_flush_ms, 1);
     }
 
-    /// docs/CONFIGURATION.md states --print-plan needs no app and no Redis.
-    /// clap made -A unconditionally required, so the documented invocation
-    /// exited 2 on a usage error instead of printing the plan.
+    /// docs/configuration.md states --print-plan needs no app and no Redis.
     #[test]
     fn print_plan_alone_needs_no_app() {
         let a = Args::try_parse_from(["cauli-worker", "--print-plan"])
@@ -395,8 +355,6 @@ mod tests {
         assert_eq!(a.app, None);
     }
 
-    /// The other half of the same contract: -A stays mandatory for every
-    /// invocation that will actually import an app and connect to Redis.
     #[test]
     fn app_is_still_required_without_print_plan() {
         assert!(Args::try_parse_from(["cauli-worker", "-c", "50"]).is_err());
@@ -432,8 +390,7 @@ mod tests {
 
     #[test]
     fn resolve_small_c_stays_one_proc() {
-        // The shared box case (Django + Redis + worker colocated): a queue
-        // worker at -c 50 must not fan out across the machine.
+        // A shared box at -c 50 must not fan out across the machine.
         let r = resolve(&parse(&["-c", "50"]), 6);
         assert_eq!(
             r,
@@ -463,17 +420,14 @@ mod tests {
             Resolved {
                 procs: 16, // 1000 / SLOTS_PER_PROC, under the 32 cores
                 io_threads: 32,
-                io_concurrency: 62, // 16 x 62 = 992; ceiling gave 1008 > 1000
+                io_concurrency: 62, // 16 x 62 = 992, never above 1000
                 cpu_workers: 2,
             }
         );
     }
 
-    /// The two invariants the per-process rounding exists to hold, swept
-    /// rather than sampled. Both were violated by the old div_ceil rounding
-    /// at points no single-value test happened to cover: `-c 65` on 6 cores
-    /// derived 2 x 33 = 66 slots for a 65 slot budget, and `-c 200` derived
-    /// 4 procs x 2 = 8 cpu children onto 6 cores.
+    /// Swept, not sampled: rounding up breaks these at points like `-c 65`
+    /// and `-c 200` on 6 cores.
     #[test]
     fn resolved_totals_never_exceed_c_or_the_cores() {
         for cores in [1usize, 2, 4, 6, 8, 16, 32, 64] {

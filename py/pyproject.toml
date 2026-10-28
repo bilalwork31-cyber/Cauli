@@ -29,48 +29,21 @@ classifiers = [
 ]
 dependencies = [
     "redis>=5.0.1",
-    # Required, not an accelerator. cauli has no stdlib json fallback: two
-    # backends meant two sets of semantics (they disagreed on lone surrogates,
-    # dict-key coercion and exception types), and a fallback lets the slow path
-    # survive unnoticed in production. See py/cauli/_codec.py.
+    # Required: there is no stdlib json fallback (see py/cauli/_codec.py).
     "msgspec>=0.18",
-    # zoneinfo (stdlib) reads a system tz database, and cauli.schedules refuses
-    # to guess a timezone: a CrontabSchedule raises at app import when the name
-    # cannot be resolved. Windows ships no database at all, and neither do the
-    # container bases people actually deploy on -- Alpine and distroless carry
-    # no /usr/share/zoneinfo unless you add tzdata yourself. A sys_platform
-    # marker drops the wheel on exactly those Linux images, so there is no
-    # marker here: ~450 KB of data beats an import time crash on a correct
-    # timezone name.
+    # Unconditional: Windows, Alpine and distroless have no system tz database,
+    # and a CrontabSchedule with an unresolvable zone raises at import.
     "tzdata",
-    # `pip install cauli` has to leave the user with a worker they can RUN, so
-    # the client pulls the prebuilt binary rather than leaving it a second step
-    # people skip and then file a bug about. The marker is not caution, it is
-    # the exact set of wheels that exist: Linux only (the worker arms
-    # PR_SET_PDEATHSIG and binds a UnixListener), x86_64 and aarch64 only, and
-    # CPython 3.10 through 3.14, which is the release matrix. Off that set the
-    # marker DROPS the requirement instead of failing the install, so the
-    # client still installs on a macOS laptop, on Windows, on PyPy and on a
-    # CPython newer than the matrix: enqueue keeps working, only the worker is
-    # absent. Raise the python_version bound when the matrix gains a version.
-    #
-    # Two gaps the marker CANNOT close, because PEP 508 has no marker for
-    # either: musl (Alpine) and the free threaded 3.13t build (3.14t has a
-    # cp314t worker wheel). Both look like supported platforms to the marker,
-    # no compatible wheel exists, and pip therefore fails the whole install
-    # rather than dropping the requirement.
-    # Use the enqueue only command below there, or build the worker from
-    # source. See PROTOCOL.md section 13.4.
-    #
-    # Enqueue-only deployments (a FastAPI or Django web dyno never runs the
-    # worker) can skip the binary; the recipe is PROTOCOL.md section 13.4.
+    # The marker matches exactly the published worker wheels (Linux x86_64 and
+    # aarch64, CPython 3.10 to 3.14); elsewhere it drops the requirement and the
+    # client installs enqueue only. Raise python_version with the release
+    # matrix. musl and 3.13t look supported to PEP 508 but have no wheel, so pip
+    # fails there: use the enqueue only recipe (PROTOCOL.md section 13.4).
     "cauli-worker==0.1.0; sys_platform == 'linux' and platform_python_implementation == 'CPython' and (platform_machine == 'x86_64' or platform_machine == 'aarch64') and python_version < '3.15'",
 ]
 
 [project.scripts]
-# The scheduler is a Python entry point, not a Rust binary and not a worker
-# flag -- see PROTOCOL.md section 10.7 for the reasoning. `python -m cauli.beat`
-# is equivalent.
+# PROTOCOL.md section 10.7 says why beat is not a worker flag.
 cauli-beat = "cauli.beat:main"
 
 [project.urls]
@@ -84,23 +57,16 @@ dev = [
     # Same pin as .github/workflows/ci.yml. Newer ruff enables more rules by default.
     "ruff==0.15.22",
 ]
-# Opt-in Django integration (cauli.contrib.django, TaskDef.delay_on_commit).
-# Core never imports django; this extra just pins a floor for users who do.
 django = [
     "django>=4.2",
 ]
-# `speed` is retained as an empty alias so `pip install 'cauli[speed]'` from
-# older docs or pinned scripts keeps working; msgspec moved into the required
-# dependencies above and is no longer optional.
+# Empty: msgspec is required now; kept so `cauli[speed]` still installs.
 speed = []
 
 [tool.setuptools]
 packages = ["cauli", "cauli.contrib"]
-# The project is dual licensed and both license texts live at the repository
-# root, one level above this build directory. setuptools refuses to glob
-# outside the project directory, so `py/LICENSE-*` are byte identical copies of
-# the root originals, listed here so the wheel and sdist carry them in
-# .dist-info (Apache-2.0 section 4(a) requires shipping the license).
+# Byte identical copies of the root licenses: setuptools cannot glob outside
+# py/, and Apache-2.0 section 4(a) requires shipping the license.
 license-files = ["LICENSE-MIT", "LICENSE-APACHE"]
 
 [tool.setuptools.package-data]

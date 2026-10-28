@@ -1,1157 +1,132 @@
 # Benchmark results
 
-This measures the claims in [CLAIMS.md](CLAIMS.md), not "cauli vs Celery" in
-general. Every number below maps to one of those four claims. Where cauli
-loses or the result is inconclusive, that is reported too — a suite that only
-shows wins is assumed rigged, and should be.
+One session, one machine, every benchmark. Method and commands:
+[README.md](README.md).
 
 ## Environment
 
-- Hardware: WSL2 (Ubuntu 24.04), 6 shared vCPUs, 11 GiB RAM, no memory cap.
-  **This is a shared, virtualized box, not bare metal with isolated cores.**
-  Every number below is directional for that reason; where it materially
-  changes a conclusion, a CPU-pinned re-measurement is called out explicitly
-  (see "CPU isolation" below) rather than silently assumed away.
-- Redis 7.0.15, dedicated bench instance on port 6395 (`--save '' --appendonly
-  no`), never the same instance as any other workload.
-- PostgreSQL 16, dedicated `bench` role/database, its own tables.
-- cauli: built fresh from commit `5b1e2033ed3fb03b3062aa6f9a3dde50bbae261e`
-  immediately before measurement (`cargo build --release --bin
-  cauli-worker`), not a stale binary from an earlier session.
-- uvloop: **PyPI release 0.22.1**, not GitHub main. Building main requires
-  Cython (fine) and libuv's `autogen.sh`, which needs autoconf/automake/
-  libtool; this environment's user has no passwordless sudo to install them,
-  and the tradeoff of asking for that access wasn't worth it for a
-  dependency version bump. Documented rather than silently downgraded to
-  "from main" in the claim.
-- Versions: Celery 5.6.3, taskiq 0.12.4 / taskiq-redis 1.2.3, arq 0.28.0,
-  dramatiq 2.2.0, redis-py 8.1.0, psycopg 3.3.4 / psycopg2-binary 2.9.12,
-  gevent 26.5.0, psycogreen 1.0.2. Full pins in [requirements.txt](requirements.txt).
-- Redis baseline (`redis-benchmark -t set,get,incr -n 200000 -c 50`): **INCR
-  76,628 ops/s, p50 0.303ms.** Read every dispatch-overhead number against
-  this ceiling, not in isolation — a framework number close to this is
-  measuring Redis, not itself.
-
-## Method
-
-**Throughput**: drain-rate, not a live producer racing the consumer. Preload
-N tasks with no worker running, start the worker, take the slope of
-completions between the 10th and 90th percentile of the run (excludes
-startup ramp-up and tail stragglers). A naive `tasks_processed / elapsed_time`
-metric goes invalid the moment the worker outpaces the enqueuer — measured
-early in this project at 12,892 tasks/s on a 6-core box with a ~12,000/s
-physical roofline. Every framework tuned to its own concurrency/prefetch/pool
-optimum, not left at library defaults (both ladders shown where the gap
-matters).
-
-**Latency**: open-loop load generation (`latency_producer.py`) — enqueue on
-a fixed wall-clock schedule regardless of completion, never enqueue-wait-
-enqueue. A closed-loop generator hides latency collapse under load
-(coordinated omission); this suite's own overload test proves the open-loop
-method catches it: p50 jumped to 9.7 **seconds** the moment load exceeded the
-worker's sustainable rate, instead of quietly reporting a flattering average.
-Percentiles via HdrHistogram (`latency_report.py`).
-
-**A real bug this method caught, worth naming**: an early version stamped
-`scheduled_ts` with `time.time()` (wall clock). WSL2 corrected its clock
-mid-run at least twice during this session (confirmed independently in
-`dmesg`: `"Time jumped backwards, rotating"`), producing impossible negative
-latencies. Fixed by switching every latency timestamp to `time.monotonic()`
-(CLOCK_MONOTONIC — safely comparable across the producer and worker
-processes since both run on the same live kernel, immune to wall-clock
-jumps). Mentioned because a benchmark that silently drops or clips negative
-outliers instead of finding their cause is exactly the kind of thing that
-should not be trusted.
-
-**Comparisons are PAIRED and interleaved, added 2026-08-24.** Running all reps
-of A and then all reps of B is not safe on this box. Measured directly: one
-binary, one config, one session drifted from 19,532 to 12,540 tasks per second
-while staying stable to 4% inside any five minute block. A block design hands
-that drift to whichever side runs second and reports it as a difference between
-frameworks. So the two sides of a comparison now run back to back, minutes
-apart, with the order flipped every pair, and the reported figure is the mean of
-per pair ratios with a 95% interval rather than a ratio of means. A row whose
-interval spans 1.0 is reported as indistinguishable from noise, not as a win.
-`campaign_paired.py` implements this; `campaign.py` remains for single lane
-runs.
-
-**Both sides must sit on the same filesystem.** An early paired run kept the
-baseline tree on ext4 and the comparison tree on a `/mnt` 9p mount. The import
-path difference alone produced a 12% swing and tripled the pair to pair
-variance. Filesystem is part of the configuration.
-
-**Every worker process must be dead before the next run starts.** Celery
-answers `SIGTERM` with a warm shutdown that waits on prefetched tasks and can
-simply never finish; one such pool ran for 2.4 hours and competed for cores
-with every measurement taken after it. `ceiling.py` now enumerates surviving
-worker processes both before and after each run and reports any it has to kill.
-
-**Where the CPU went is part of the result.** `ceiling.py` samples per process
-CPU for the worker, Postgres and Redis over the same window the throughput
-slope is taken from, and labels each row `framework-bound`, `redis-bound`,
-`postgres-bound` or `box-bound`. On a 6 vCPU machine shared with the broker,
-the database and the harness, `box-bound` is the common and honest answer, and
-a "ceiling" measured on a saturated box is a property of the box. Saying so is
-the difference between a ceiling and a number.
-
-**Instrument bugs found and fixed while producing this document**, listed
-because each one produced a plausible wrong answer before it was caught: a
-block design on a drifting box (fake 12% regression), a cross filesystem
-comparison (same fake regression, different cause), a runner that did not set
-`PYTHONPATH` for the embedded interpreter (cauli measured at 0 tasks/s), and
-leaked Celery pools (silently contaminated every later row). All four came from
-reimplementing something `run.sh` or `monitor.py` already did correctly. The
-harness now cross checks itself: Celery prefork measured 826/s against this
-document's previously published 850.6/s, within 3%, and that agreement is what
-makes the rest of the table credible.
-
-## Claim 1: memory per unit of concurrency
-
-RSS is NOT the right metric for Celery here and using it would have quietly
-biased the whole comparison in cauli's favor: Celery prefork forks after
-importing the app, so every child shares copy-on-write interpreter/module
-pages with its siblings — summing RSS across children counts those shared
-pages once per child, inflating the total. Used **PSS** (proportional set
-size, via `/proc/<pid>/smaps_rollup`) instead, which divides shared pages
-among sharers — the fair "real physical cost" number. cauli's own multiple
-`--procs` are spawned fresh (not forked), so PSS costs nothing extra there
-and is already close to RSS.
-
-Workload: N tasks that `sleep(3600)`, held in flight simultaneously, PSS
-summed across every worker OS process.
-
-**Update**: the original version of this section tested Celery prefork
-only. A reviewer correctly flagged that as understating Celery's real
-memory story — no experienced Celery operator runs 1,000-way I/O
-concurrency on prefork; they reach for `-P gevent` or `-P threads`, one
-process, N greenlets/threads. All three are reported below.
-
-**Second update**: the first cauli numbers in this table were measured
-against a fixed flag set carried over from the *throughput* tuning pass
-(`--procs 8 --io-concurrency 96`), applied at every N including N=100 —
-the same config regardless of regime. That's the exact mistake this
-document calls out everywhere else ("compare methods at each one's own
-optimum, or do not compare" — see Claim 2). Re-measured using cauli's own
-single-knob interface, `-c N`, and letting it auto-derive processes/
-threads/io-concurrency per `--print-plan` — no hand-picked flags, just
-the documented default path. Numbers below are the corrected ones.
-
-| N in flight | cauli async (`-c N`, own optimum) | Celery prefork | Celery gevent | Celery threads |
-|---:|---:|---:|---:|---:|
-| 100 | 58.8 MiB | 2,036.7 MiB (**35x more**) | **46.7 MiB — gevent wins** | **45.7 MiB — threads wins** |
-| 300 | — | ~6.2 GiB (extrapolated: confirmed 20.89 MiB/process, consistent with the N=100 measurement's 20.57 MiB/process; a full 300-process run was not confirmed complete within the measurement window) | — | — |
-| 1,000 | 156.9 MiB | **not attempted — ~20 GiB extrapolated, exceeds this box's 11 GiB RAM entirely** | **68.2 MiB — gevent wins** | **72.3 MiB — threads wins** |
-| 5,000 | 183.2 MiB | not attempted, same reason | 164.4 MiB — gevent still ahead | **193.5 MiB — cauli wins (barely)** |
-| 10,000 | 215.7 MiB | not attempted, same reason | 282.9 MiB — **cauli wins** | 341.3 MiB — **cauli wins clearly** |
-
-(Celery gevent/threads readings: single process confirmed via `ps`, one
-worker, `-c` set to the greater of N or 1,000 so every held task has a
-free slot; all readings taken with `memory_report.py`'s `pgrep -x` match
-— see the fixed-bug note below. cauli readings sum PSS across its
-supervisor + all worker processes, matched on `cauli-worker`.)
-
-Retuning to cauli's own optimum closed some of the gap (58.8 vs the
-original 67.7 MiB at N=100; 215.7 vs 225.1 at N=10,000) but did not flip
-the story: **gevent and threads are still cheaper than cauli up to
-roughly N≈4,500-6,000**, and cauli only pulls ahead past that because its
-marginal cost per held task (~6.6 KiB/task, sub-linear) is lower than
-either single-process pool's (~19-30 KiB/task). The crossover is real,
-not a tuning artifact — chasing it further would mean changing cauli's
-architecture, not its flags, which is out of scope for a benchmark
-suite's black-box methodology.
-
-**Why the gap doesn't close: this is arguably the price of a crash-
-isolation guarantee, not waste** — stated as a documented architectural
-fact, not a fresh measurement (Claim 4's segfault test covered cauli,
-Celery *prefork*, arq and Dramatiq; gevent/threads were not put through
-a kill test, so this paragraph is inference, flagged as such rather than
-dressed up as a result). cauli's floor is higher at low N because its
-design always runs a supervisor process plus one-or-more worker
-processes, each embedding its own CPython interpreter — real memory,
-spent on purpose, with `--procs 3+` recovering a crashed child in ~200ms
-losing zero tasks (measured, Claim 4). Celery's auto-respawn-on-crash
-(billiard) is specific to the **prefork** pool — gevent and threads are
-each a single OS process with no built-in supervisor, so a segfault in
-either takes the whole worker and everything it was holding with it,
-same as cauli's own deliberately-minimal `--procs 1` case (also measured
-losing everything, Claim 4). Whether that trade is worth cauli's extra
-low-N memory is a judgment call, not something this benchmark can settle
-— publishing the loss and the honest reason for it, rather than quietly
-keeping the prefork-only table, is the standard this document holds
-itself to. A gevent/threads kill test is added to "Not yet done" below
-so this stays a stated inference, not a silent assumption.
-
-**Bug found and fixed while running this**: `memory_report.py` used
-`pgrep -f <pattern>`, which matches on full command line, not process
-name — so it self-matched any wrapper shell whose own script text
-happened to contain the pattern (e.g. a driver script that literally runs
-the word "celery" as part of a longer command), phantom-counting that
-shell as a worker process. This is the same pgrep pitfall already
-documented and fixed once before in this suite (`segfault_driver.py`,
-`chaos_driver.py`) — just missed in this file. Fixed to `pgrep -x` (exact
-comm name), confirmed against a clean `ps` snapshot showing exactly one
-`celery` process during a gevent run. Impact on already-published prefork
-numbers above is negligible (a stray ~1-3 MiB shell against multi-GB
-totals) and doesn't change any conclusion; it mattered here because
-gevent's single-process totals are small enough for a phantom entry to
-move the number by single-digit percent.
-
-## Claim 2: dispatch overhead is small and roughly constant
-
-No-op task (one `redis.incr`, nothing else) — isolates enqueue + fetch +
-dispatch + ack from any real work. Both stacks swept to their own optimum;
-the gap between a framework's default and its tuned optimum is reported
-too, since defaults are what most deployments actually run.
-
-| Lane | Best config | Throughput | vs default |
-|---|---|---:|---|
-| arq (async) | `poll_delay=0.01, max_jobs=200` (WorkerSettings attrs — no CLI flag exists) | 248.2/s, still timed out at N=20,000/60s | **default `poll_delay=0.5s`/`max_jobs=10` gave 26.9/s — a 9.2x swing**, and even tuned this remains far below every other framework here; not fully root-caused (see note below), reported as measured rather than chased further |
-| Celery (sync) | `-c 4 -P prefork --prefetch-multiplier=1` | 850.6/s (±0.4%, 3 runs) | prefetch=4 (default) gave 676/s — tuning is a **26% swing**, not noise |
-| dramatiq (sync) | `--processes 12 --threads 8` (or `6 procs / 32 threads`, statistically tied) | 12,843.6/s, clean | `6 procs / 8 threads` gave 9,490.7/s — **35% swing** from thread count alone |
-| taskiq (async) | `--workers 8 --max-async-tasks 100 --max-prefetch 100` | 9,622/s (±0.2%, 2 runs) | |
-| cauli (sync) | `--procs 12 --io-threads 80 --io-concurrency 80` | 21,713/s (±0.5%, 2 runs) | `-c` alone at `--procs 6` (one proc per core) gave 14,557/s — **oversubscribing past the core count by 2x was faster**, not slower (see "Reliability cliffs") |
-| cauli (async) | `--procs 8 --io-concurrency 96` | 30,438/s (±1.6%, 2 runs) | |
-| **raw asyncio + redis, no framework** | batch=16 (matches cauli's own `--batch 16` default), concurrency 64 | **79,792/s**, clean mid-80%-slope measurement | batch=1 (naive, one round trip per task) gave only 4,958/s — **slower than every framework above it**, proof that an unbatched "ceiling" is a strawman, not a ceiling |
-
-**Ratios**: cauli sync is **25.5x** Celery sync and **1.7x** Dramatiq (the
-strongest sync competitor measured); cauli async is **3.2x** taskiq and
-**123x** arq (see caveat below). At cauli's own default batch depth, the raw
-no-framework ceiling is 79,792/s — cauli's async lane (30,438/s) captures
-about **38%** of that ceiling; the rest is real framework overhead (envelope
-building, JSON encode/decode, retry/idempotency bookkeeping, consumer-group
-ack) that a hand-rolled loop skips entirely. That 38%, not the raw ceiling
-number itself, is the honest measure of "how much does the framework cost."
-
-**arq caveat, stated plainly**: arq's default `poll_delay=0.5s` is a severe,
-easy-to-miss trap — it caps throughput near `max_jobs / poll_delay`
-regardless of how fast the task itself runs, confirmed by isolating the
-same `ProcessPoolExecutor` + `asyncio.run_in_executor` pattern outside of
-arq entirely (568/s and 555/s respectively, both near the physical ceiling)
-and finding the bottleneck disappears — it is specific to arq's own
-dispatch loop, not this suite's task bodies. Tuning `poll_delay` down 50x
-recovered 9.2x of that (26.9/s → 248.2/s), but did not close the remaining
-gap to celery/dramatiq/taskiq, and the worker's own log shows a large,
-roughly-constant per-job `delayed=` value (time since enqueue, not
-execution time — jobs execute in 0.00s once picked up) suggesting a
-further bottleneck upstream of task execution that was not isolated further
-in the time available. The **123x ratio against arq should be read as "arq
-needs deeper tuning or is a poor fit for this harness's redis-list-broker
-pattern," not as a clean architectural comparison** — unlike every other
-ratio in this document, which is measured at each side's genuine optimum.
-
-Batch=32/64 pushed the ceiling higher still (up to 451,695/s naive_rate) but
-the drain completed in under 1.4s at N=200,000 — too fast for this harness's
-20ms-interval sampler to produce a reliable mid-80% slope. Reported as a
-measurement-resolution limit, not a real number, rather than publishing a
-number the method can't actually stand behind.
-
-**Celery gevent, no-op throughput**: swept `-c` in {100, 500, 1000, 2000}.
-Result: **flat 77-84/s at every concurrency level** — the knob measurably
-does nothing. Confirmed with `-l info` tracing: zero interleaving, every
-task's `received` → `succeeded` (~7-10ms) completes before the next
-message is even read off the broker. Root cause, not a harness bug:
-gevent only yields control to other greenlets on a socket call that
-would actually block. This queue always has backlog, so `BRPOP` returns
-immediately every time, the hub scheduler is never invoked to run the
-spawned task greenlets concurrently, and the whole worker degrades to
-one core doing one task's full round trip at a time — worse than
-prefork's `-c 4` real OS parallelism (850.6/s), because prefork gets
-genuine multi-core overlap and gevent here gets none. This is a correct,
-structural property of cooperative concurrency, not a defect: gevent
-buys overlap only when tasks spend real wall-clock time *waiting* on
-I/O (slow HTTP calls, DB queries with real latency), which a near-instant
-Redis `INCR` doesn't have. It is the wrong tool for this specific claim
-and the right one for Claim 1's memory workload above, where tasks are
-genuinely idle rather than fast. Not chased further for a "tuned" number
-because there is no concurrency setting that fixes a workload with no
-wait time to overlap — that's the finding.
-
-**Celery threads (`-P threads`), no-op throughput**: swept `-c` in {4, 16,
-50, 100, 200, 500}. Result: **flat ~580-620/s at every concurrency
-level**, but unlike gevent, every run actually completed (no timeout).
-Real OS threads do get real overlap here — redis-py releases the GIL
-during the actual socket syscall, so multiple worker threads can
-genuinely be in-flight on I/O at once — but Celery's own per-task
-Python-level work (tracing, signal dispatch, ack bookkeeping) still runs
-serialized under the GIL, and that fixed per-task cost dominates for a
-near-instant Redis call. Below prefork's real multi-core parallelism
-(850.6/s) and far below cauli/dramatiq/taskiq, but a clean, believable
-number — not the pathological zero-scaling gevent showed above.
-
-### Reliability cliffs (not in the throughput table, but load-bearing)
-
-> **Correction, 2026-10-28.** Both cliffs below were the harness. Every
-> `bench/tasks_*.py` module built its redis-py client with the default pool
-> of 100 connections, so slot 101 onward raised `MaxConnectionsError` in the
-> task body and, with `max_retries=0`, was dead lettered. The completion
-> counter never reached N, which read as a hang. Reproduced at one process:
-> at `--io-concurrency 128`, 6,725 of 60,000 tasks never completed and every
-> dead letter entry kept (1,001, the stream cap) was `MaxConnectionsError`; with `REDIS_POOL_MAX` in `common.py` the same run at 128,
-> 256 and 512 left none. The sync lane at `--io-threads 128` showed the same
-> error, and none with the fix.
-> The text below is kept as recorded.
-
-cauli's throughput does not degrade gracefully past a per-process resource
-limit — it falls off a cliff into near-total stall:
-
-- **Sync, `--io-threads`**: peak at 80 threads/proc (~16.6k/s @ `--procs 6`).
-  At 112+ threads/proc, the run finishes 99.9% and then **hangs** for the
-  remaining fraction until timeout (60s), rather than slowing down smoothly.
-- **Async, `--io-concurrency`**: peak at 96/proc (~23.9k/s @ `--procs 6`,
-  ~30.4k/s once `--procs` was also pushed past the core count — see below).
-  At 104+, the same pattern: 91-99% done, then stalls. At 512, only 11% of
-  the run completes before a 60s timeout.
-- **`--procs` beyond the physical core count helps, and this box only has 6
-  cores.** Sync throughput rose from 14.6k/s (`--procs 6`) to 21.7k/s
-  (`--procs 12`, i.e. 2x the core count) before plateauing ~12-14 procs.
-  Async rose from 24.9k/s (`--procs 6`) to 30.4k/s (`--procs 8`) and stayed
-  flat through `--procs 16` (2.7x the core count) with no measured decline.
-  This was not assumed, it was swept explicitly because the intuition
-  "don't oversubscribe cores" turned out to be wrong on this workload.
-
-**Practical takeaway**: this suite's own tuned configs stay comfortably
-inside these limits (80 threads/proc, 96 io-concurrency/proc), but a
-deployment that reaches for higher values expecting a smooth throughput
-curve will instead hit a wall that looks like a hang, not a slowdown. Worth
-fixing or at minimum loudly documenting upstream.
-
-## Claim 3: true multicore for CPU-bound work
-
-Lanes: cauli (`kind="cpu"`, forked children), Celery prefork (native),
-taskiq (`--use-process-pool`, since its default thread pool GIL-serializes a
-busy loop same as any other Python threads), Dramatiq (native
-`--processes`), and arq (`ProcessPoolExecutor` via `run_in_executor` — arq
-has no built-in cpu-pool concept, this is the standard pattern its own
-users reach for). Task size sweep 0.5/2/10/50ms, `workloads.cpu_burn` (a
-calibrated busy-loop, timed by `perf_counter` so duration is reproducible
-across machines rather than CPU-speed-dependent). All five at 6
-processes/workers, matching this box's core count — CPU-bound work is
-fundamentally core-limited, not I/O-bound where the earlier oversubscription
-finding applies, so an extensive process-count sweep like Claim 2's isn't
-the right lever here.
-
-| Task size | cauli | Celery | taskiq | Dramatiq | arq |
-|---:|---:|---:|---:|---:|---:|
-| 0.5ms | **2,664.8/s** | 778.4/s | 810.5/s | 1,539.5/s | ~567/s* |
-| 2ms | **1,776.6/s** | 693.2/s | 763.2/s | 1,188.7/s | ~551/s* |
-| 10ms | **516.5/s** | 413.0/s | 515.6/s (statistical tie) | 473.3/s | 335.1/s |
-| 50ms | 115.3/s | 110.8/s | 117.6/s | 117.3/s | 119.0/s — **all five within noise** |
-
-Exactly the physics-driven trend predicted before running this: per-task
-dispatch overhead is a shrinking fraction of total time as the task itself
-grows, so the gap should compress toward parity as task size grows — and it
-does, cleanly. At 50ms all five frameworks converge (110.8-119.0/s, no
-framework meaningfully ahead — the physical CPU is the bottleneck, not
-dispatch); at 0.5ms cauli's lead is largest (1.7x over the next-best,
-Dramatiq; 3.4x over Celery). This is also the one claim where cauli does
-**not** win at every size — taskiq statistically ties it at 10ms.
-
-*arq's numbers are `naive_rate` (elapsed/count), not the mid-80%-slope
-method used everywhere else in this document: `mid80_rate` came back `null`
-even on runs that completed without timing out. Cause, read directly from
-the worker's own log (see Claim 2's arq caveat): arq's completions arrive in
-one late burst rather than a steady stream — often nearly the whole run
-finishes in a single 20ms poll window — which breaks the interpolation
-method's assumption of gradual progression through the 10th-90th percentile
-of completions. Reported as the best-available honest number for a
-framework whose throughput profile doesn't fit this suite's primary
-methodology, not silently smoothed into a number the method can't actually
-back up.
-
-## Claim 4: mixed workload survivability and honest failure modes
-
-### Adversarial mixed: I/O + CPU burst
-
-100 light I/O tasks/s (open-loop) + one 50ms CPU-burst "poison" task
-injected every 3s, for 20s (2,000 light + 7 poison tasks). Measures light-
-task p99 latency in the window right after each poison burst vs baseline.
-
-| Lane | near-burst p99 | baseline p99 | ratio |
-|---|---:|---:|---:|
-| cauli async, **naive** (poison runs inline, shares the GIL with every light task) | 54-57ms | 3ms | **18-19x** |
-| cauli async, **fixed** (poison routed to `kind="cpu"`, off the shared loop) | 12ms | 3ms | **4.0x** |
-| Celery prefork | 58ms | 4ms | **14.5x** |
-
-**The original hypothesis was wrong, and the data says so rather than the
-hypothesis winning by default.** Celery prefork was assumed structurally
-immune (one OS process per task, no shared GIL) — it was not; it landed
-close to cauli's *naive*, GIL-sharing failure mode, not the "structurally
-safe" baseline expected. Working theory: this is a 6-core box where Celery's
-processes, Redis, Postgres and the harness itself all compete for the same
-cores, so a CPU burst can starve OS scheduler fairness across processes even
-without a shared GIL — a different mechanism, similar symptom. **Tested**:
-see "CPU isolation" below — the stall persists (12.0x) even with Redis
-pinned to separate cores from the workers, so it is not primarily a
-Redis-contention artifact of sharing this box. cauli's fixed config (4.0x)
-remains the best-measured result of the three.
-
-### Correctness under a hard crash
-
-`kill -9` a worker mid-run (no graceful drain), restart it fresh, and count
-what comes out the other side: 500 uniquely tagged tasks, killed at 160/500
-executed.
-
-| Lane | Lost (permanent) | Duplicates | Recovery time |
-|---|---:|---:|---:|
-| cauli (always at-least-once by design — Redis Streams consumer group + visibility-timeout reclaim) | **0** | 0 | 34.0s |
-| Celery, `acks_late=True` + `visibility_timeout=5` (properly configured for at-least-once) | **0** | 0 | 103.2s — **3x slower than cauli** |
-| Celery, **plain default** (`acks_early` — what most deployments actually run) | **80/500 (16%), permanent, no recovery even after 60s** | 0 | N/A |
-
-Root cause of the slow-but-eventually-correct `acks_late` number, verified
-by reading kombu's actual redis-transport source rather than guessing:
-`kombu.transport.redis.QoS.restore_visible` restores **at most 10 stale
-messages per scan**, and the scan itself only fires on 1-in-10 invocations
-(`interval=10`) — a hard-throttled recovery path, not a misconfiguration on
-this suite's part. The plain-default number is the one that matters most in
-practice: it is what Celery does out of the box, and it silently loses one
-in six in-flight tasks on a crash with no path back.
-
-### Segfault blast radius
-
-A task calls `ctypes.string_at(0)` (reliable null-pointer read, real SIGSEGV
-— confirmed independently via `dmesg` kernel crash-capture entries and
-`subprocess.Popen.poll()` returning `-11`, not inferred). 10 innocent
-`sleep(3600)` tasks held in flight alongside it.
-
-| Config | Blast radius | Recovery |
-|---|---|---|
-| cauli, naive, `kind="io"`, **`--procs 1`** (no supervisor layer exists at this setting) | Entire process dies (`returncode -11` at t=0.00s). All 10 in-flight tasks lost with it. | **None** — nothing is left alive to restart it |
-| cauli, naive, `kind="io"`, **`--procs 3`** (the realistic shape — `-c N` derives multiple procs by default) | Only the one crashed proc's tasks are affected | **Automatic, ~200ms.** Supervisor log, verbatim: `"worker proc 1 exited unexpectedly (signal: 11 (SIGSEGV) (core dumped)); restarting"` → `"worker proc 1 restarted (pid 7929)"` |
-| cauli, **fixed**, `kind="cpu"` (poison isolated to a forked child) | Only that one forked child dies | Automatic (fork-server pattern), **zero of the 10 in-flight tasks lost**, not just eventually recovered |
-| Celery prefork | Only the one process handling that task dies | Automatic — confirmed via worker log: `"Process 'ForkPoolWorker-6' pid:6692 exited with 'signal 11 (SIGSEGV)'"`, billiard respawns it |
-
-The only real data-loss scenario is the deliberately-minimal `--procs 1`
-case, which is not how cauli is meant to be deployed (`-c N` derives
-multiple procs automatically). Any realistic multi-proc deployment already
-has supervisor-level auto-recovery on par with Celery's, and routing
-crash-risk code to `kind="cpu"` is strictly better than either: zero tasks
-lost on that process, not just eventually redelivered.
-
-A methodology note this test caught in itself: an early version of this
-driver used `pgrep -x <name>` to detect whether a process had died, and it
-was fooled — a dead child becomes a zombie that still matches its old
-name/PID until reaped by its parent, producing a false "still alive"
-reading for every lane including the one that had actually crashed at
-t=0.00s. Fixed by using `subprocess.Popen.poll()` (the real exit status,
-`-11` meaning "killed by signal 11") as ground truth instead of process-name
-matching.
-
-### arq and Dramatiq under the same three tests
-
-Same adversarial-mixed, kill -9, and segfault tests, run against arq and
-Dramatiq using the same task shapes. Not tuned for recovery the way Celery
-got a second, properly-configured pass (`acks_late`) — these are each
-framework's first-attempt/default reliability configuration, stated
-explicitly so the numbers aren't read as more authoritative than they are.
-
-**Adversarial mixed** (same 100 light/s + 50ms poison every 3s, 20s):
-
-| Lane | near-burst p99 | baseline p99 | ratio |
-|---|---:|---:|---:|
-| arq | 61ms | 14ms | **4.4x** |
-| Dramatiq | 91ms | 18ms | **5.1x** |
-
-**Stated plainly so this isn't misread as a cauli loss: cauli's
-*recommended* config already wins this comparison.** Ranked best to
-worst: cauli-fixed (4.0x) < arq (4.4x) < Dramatiq (5.1x) < Celery
-prefork (12-14.5x) < cauli-**naive** (18-19x). Only cauli's unrecommended
-default loses to arq/Dramatiq; the config this suite would actually tell
-someone to run beats both. Naive is kept in the table on purpose — it's
-the number you get if you don't route CPU-bound work to `kind="cpu"`,
-and a reader deploying cauli needs to know that failure mode exists — but
-it should not be read as "the" cauli result.
-
-Both arq and Dramatiq land well below Celery's 12-14.5x and cauli-naive's
-18-19x — plausibly
-because Dramatiq's `--threads 8` still shares a GIL *within* each of its 6
-processes (a poison task only stalls 1/6 of total capacity, diluting the
-effect vs. Celery's coarser per-process granularity), and arq's baseline is
-already elevated (14ms vs Celery's 4ms, cauli's 3ms) from its own dispatch
-characteristics documented in Claim 2/3. Not fully explained, reported as
-measured.
-
-**kill -9 correctness** (500 tagged tasks, killed at whatever fraction each
-framework reached by the time the earlier lanes hit theirs):
-
-| Lane | Lost (permanent) | Duplicates | Recovery time |
-|---|---:|---:|---:|
-| arq | **400/500 (80%)** | 0 | timed out at 60s |
-| Dramatiq | 85/500 (17%) | 0 | timed out at 60s |
-
-arq's loss is worse than even Celery's careless default (16%), and the lost
-tags are **not just the tail of the run** — `tag-0` and `tag-1` were among
-the lost set despite only 100/500 tasks having executed before the kill,
-which would put them first in a FIFO drain. Not investigated further in the
-time available; noted because it means the loss pattern isn't simply
-"whatever hadn't started yet," which would be the benign explanation.
-Dramatiq's 17% loss is in the same range as Celery's *default* (unconfigured)
-number — consistent with the same story: frameworks default to
-weaker-than-at-least-once delivery unless someone opts in, and Dramatiq
-wasn't given that opt-in tuning here (unexplored — see "Not yet done").
-
-**Segfault blast radius** (10 `hold` tasks + 1 segfaulting task):
-
-| Lane | Blast radius |
+| | |
 |---|---|
-| arq | Entire process dies (single asyncio loop, no process isolation) — same architecture class as cauli's naive async lane. All 10 in-flight tasks lost, no auto-respawn observed. |
-| Dramatiq | Top-level process survives (`--processes 6`, same structural class as Celery prefork) |
+| Machine | Intel i7-9750H, 5 cores / 10 threads, 11 GB, WSL2 (kernel 6.18.33), shared with Redis, Postgres and the load generator |
+| Python | CPython 3.12.3; free threaded rows CPython 3.14.5t |
+| Redis | 7.0.15, no persistence |
+| PostgreSQL | 16.15 |
+| cauli commit | c899bce; memory and web re-run at 8db5c91 after two harness fixes (hold task Redis pool, web readiness wait) |
+| Framework versions | Celery 5.6.3, taskiq 0.12.4, Dramatiq 2.2.0, arq 0.28.0, Django 6.0.7, FastAPI 0.162.0; all pins in [requirements.txt](requirements.txt), [requirements-arq.txt](requirements-arq.txt) |
 
-Methodology note kept honest rather than smoothed over: the auxiliary
-"child pool" pgrep tracking used `-x python3` for Dramatiq, which is too
-broad — it matched unrelated python3 processes on the box (including this
-suite's own long-running soak-test driver), so the "children that
-disappeared/appeared" reading for Dramatiq is noise, not signal. The
-**primary** result (top-level process survived, via `Popen.poll()` on the
-exact process this driver spawned) is unaffected by that and is trustworthy.
+Cores are of a 10 thread box. A Redis near 1.0 core would mean the row
+measured Redis; none does.
 
-## Claim 5: real framework code (Django ORM, SQLAlchemy async) still dispatches fast
+## dispatch
 
-Every I/O number elsewhere in this document is a raw psycopg3 call. Real
-task bodies go through an ORM. Two lanes added: a Django ORM insert
-(`Model.objects.create()`, mapped onto the same `bench_io` table every
-other PG lane writes to) for the sync/Celery-flagship comparison, and a
-SQLAlchemy 2.0 async ORM insert (`AsyncSession` + `session.commit()`) for
-the async/taskiq-flagship comparison FastAPI apps most often reach for.
+No-op task (one Redis INCR), every framework at its best measured
+configuration, 6 paired rounds. `python -m bench dispatch`
 
-**This is also where a real bug got found and fixed, not just benchmarked
-around.** Building the Django lane surfaced a reproducible memory-corruption
-crash in cauli-worker at higher process counts: `double free or corruption
-(fasttop)`, glibc's allocator catching a use-after-free. It fired at
-shutdown, after every task had already completed and been acked — a
-corrupted heap reported as a clean drain, which is worse than a hard crash.
-Black-box bisection (procs 1 through 12, io-threads 8 through 80) localized
-it to needing multiple worker processes; a specialized agent then found the
-actual cause by reading the source: `std::process::exit()` runs libc atexit
-handlers (specifically `OPENSSL_cleanup`, pulled in by the Postgres driver's
-libssl) while sync io-pool threads and embedded-interpreter daemon threads
-are still alive, racing the global OpenSSL teardown against per-thread
-teardown on the way out. Fixed by switching to `libc::_exit()`, which skips
-atexit handlers entirely (every resource with an owner outside the process
-was already released explicitly before both exit points, so nothing
-depended on them running). Verified with 23 clean runs at configs that
-previously corrupted reliably, plus the full Rust test suite green. Every
-number below was measured against the fixed binary — publishing a crash
-discovery is more valuable than the crash never being visible in the first
-place, and every number in this section only exists because this got fixed
-first rather than benchmarked around.
+| lane | tasks/s | vs cauli async | 95% interval | worker cores | redis cores |
+|---|---:|---:|---|---:|---:|
+| cauli async, 8 processes | 35,128 | 1.000 | | 7.80 | 0.83 |
+| cauli sync, 12 processes | 22,917 | 0.652 | 0.640 to 0.665 | 8.34 | 0.71 |
+| Dramatiq, 12 processes x 8 threads | 11,938 | 0.340 | 0.327 to 0.353 | 7.56 | 0.83 |
+| taskiq, 8 workers | 10,360 | 0.295 | 0.288 to 0.301 | 7.56 | 0.54 |
+| Celery, 8 solo nodes | 4,476 | 0.127 | 0.122 to 0.133 | 6.22 | 0.82 |
+| arq | 1,055 | 0.030 | 0.030 to 0.030 | 1.00 | 0.16 |
 
-### Django ORM, sync
+cauli async is 2.9x Dramatiq, 3.4x taskiq and 7.8x Celery here. Every row
+except arq uses most of the box, so this is throughput per box, not a
+framework ceiling.
 
-**Correction made mid-session, kept visible rather than quietly fixed:**
-the numbers first published here used a bare `django.setup()`, not
-cauli's own `cauli.contrib.django.django_app()` integration — the wrong
-baseline for "does cauli work fast with real Django code," since it skips
-the exact fixup (`close_old_connections()` before/after every task,
-Celery-fixup parity) cauli ships and documents in the main README for
-this. Rebuilt on the real integration; all four rows below are needed to
-tell the honest story, not just the best number.
+## cpu
 
-| Lane | Config | Throughput |
-|---|---|---:|
-| cauli, raw psycopg3, direct Postgres | `--procs 4 --io-threads 80` | 2,554.9/s |
-| cauli, raw psycopg3, via pgbouncer | same config | 3,272.7/s |
-| cauli, Django ORM, **naive** (bare `django.setup()`, `CONN_MAX_AGE=0`), throughput config | `--procs 12 --io-threads 80` | **`FATAL: sorry, too many clients already`** |
-| cauli, Django ORM, naive, connection-safe config | `--procs 4 --io-threads 16` | 2,210.6/s |
-| cauli, Django ORM, **official `django_app()` fixup**, `CONN_MAX_AGE=0`, throughput config | `--procs 12 --io-threads 80` | 223.9/s — no exhaustion, but `CONN_MAX_AGE=0` forces the fixup to open a fresh connection every task |
-| cauli, Django ORM, official fixup, `CONN_MAX_AGE=60`, direct Postgres, throughput config | `--procs 12 --io-threads 80` | **still exhausts Postgres's connection limit** |
-| cauli, Django ORM, **official fixup, `CONN_MAX_AGE=60`, via pgbouncer**, throughput config | `--procs 12 --io-threads 80` | **3,171.7/s — the correct number** |
-| Celery prefork, Django ORM | `-c 4 -P prefork --prefetch-multiplier=1` | 162.4/s |
+`cpu_burn` busy loop, cauli `kind="cpu"` against Celery prefork, both at 6
+processes, 6 paired rounds. `python -m bench cpu`
 
-**What each row actually proves, since the shape of this table matters
-more than any single number in it:**
-- cauli's own `close_old_connections()` fixup (matching Celery's) is real
-  and does its documented job — it manages connection *staleness*, and
-  once installed the naive integration's silent data-loss-adjacent crash
-  (a `FATAL` error mid-run) never recurs, at any `CONN_MAX_AGE`.
-- It does **not**, and by design cannot, cap the *number* of simultaneous
-  connections — that governs `max_connections`, and Django has no
-  built-in pool. Proven directly: the fixup alone, correctly installed,
-  still exhausts Postgres's connection limit at `--io-threads 80` unless
-  something in front of Postgres multiplexes connections. This isn't a
-  cauli gap; it's true of Django behind *any* sufficiently parallel
-  worker, cauli or Celery.
-- The fix is the same one the raw lane already benefits from: pgbouncer.
-  Once both pieces are in place — the official fixup for correctness,
-  pgbouncer for capacity — Django's ORM reaches **3,171.7/s**, nearly
-  matching the raw driver (3,272.7/s) and **19.5x** Celery prefork at
-  Celery's own matched config, using cauli's real throughput-tuned
-  config rather than a deliberately scaled-down one.
-- Django's `CONN_MAX_AGE` matters independently of cauli: `0` is safe but
-  needlessly slow once the fixup runs on every task (a fresh connection
-  every time); Django's own documented positive-value recommendation
-  lets the fixup do its real job — evict genuinely stale connections,
-  reuse warm ones otherwise.
-
-### SQLAlchemy async ORM, the FastAPI-shaped comparison
-
-**CORRECTED 2026-08-24. This section previously reported that taskiq beat
-cauli 733.6/s to 378.6/s, and explained the gap with SQLAlchemy's greenlet
-based async engine. Both the number and the explanation were wrong. The
-original text is preserved in git history.**
-
-What was wrong, in order of size:
-
-1. **`sqla_models.make_engine` built the pool as `pool_size=2,
-   max_overflow=pool_max - 2`.** That reads like "up to `pool_max`
-   connections" and is not. SQLAlchemy pools exactly `pool_size` connections
-   and CLOSES every overflow connection when it is returned, so above two
-   concurrent tasks nearly every insert paid a fresh TCP connect and SCRAM
-   handshake. The raw psycopg lanes it was being compared against use
-   `AsyncConnectionPool(min_size=2, max_size=pool_max)`, where `min_size` is
-   an idle floor rather than a cap. The two parameters were translated by
-   name, and they do not correspond.
-2. **The configs were not matched, though the write up said they were.**
-   cauli ran 4 processes against taskiq's 8.
-3. **The pool sweep that ruled out connection availability could not have
-   detected it.** Sweeping "pool size 2 through 100" varied `max_overflow`
-   while `pool_size` stayed the literal `2`, so every point in the sweep had
-   the same two pooled connections. A flat line was read as evidence that
-   connections were not the bottleneck; it was evidence that the sweep was
-   not changing the thing it named.
-
-The tell was that cauli, taskiq and a framework free probe all landed within a
-few percent of the same number. Three systems agreeing that closely are
-usually all waiting on a fourth.
-
-Corrected measurement, both frameworks on 8 processes, 40 concurrent tasks per
-process and a 40 connection pool per process (320 total against Postgres's 400
-limit), paired and interleaved with the order alternating every pair:
-
-| Lane | Config | Throughput |
-|---|---|---:|
-| cauli, raw psycopg3-async, direct Postgres | `--procs 4 --io-concurrency 500` | 3,783.7/s |
-| cauli, raw psycopg3-async, **via pgbouncer** | same config | **4,577.5/s** |
-| **cauli, SQLAlchemy async ORM** | `--procs 8 --io-concurrency 40` | **1,627/s** |
-| taskiq, SQLAlchemy async ORM | `--workers 8 --max-async-tasks 40` | 1,425/s |
-
-Ratio of per pair ratios: **1.145, 95% CI 1.078 to 1.211, cauli ahead in 6 of
-6 pairs.** cauli wins this lane by 14.5%.
-
-Both frameworks moved by roughly 2x once the pool was fixed, which is the
-signature of a harness bottleneck being lifted rather than either framework
-changing. Neither number says anything about the previous ones except that
-they measured connection churn.
-
-Two lessons this cost, recorded so the next person does not repay them:
-
-- A sweep that produces a flat line is a claim about the sweep before it is a
-  claim about the system. Verify the swept parameter actually changes what it
-  names.
-- When several independent systems report the same throughput, suspect a
-  shared bottleneck outside all of them rather than a coincidence.
-
-### Operational finding, summarized: Django needs a pooler in front of Postgres, regardless of task queue
-
-Fully covered by the table and its explanation above — restated in one
-place for anyone skimming: Django's ORM opens one persistent connection
-per thread and never pools them, cauli's `close_old_connections()` fixup
-(Celery-fixup parity) manages staleness but not connection *count*, and
-neither is a substitute for a real pooler once concurrency is high enough
-to approach `max_connections`. Not a cauli-specific gap — Celery with
-enough prefork workers hits the identical wall. pgbouncer in front of
-Postgres is the production-correct fix, not a benchmark workaround.
-
-### Second bug found and fixed while running this: pgbouncer + psycopg3's server-side prepared statements
-
-The first pgbouncer attempt made every lane *slower* — the raw psycopg3
-sync lane dropped from 2,554.9/s direct to ~140/s through pgbouncer, a
-regression, not an improvement. Chased through three wrong theories
-before finding the real cause, each one checked and ruled out rather
-than assumed: not pgbouncer's own pool size (raising `default_pool_size`
-60 → 300 → 350 changed nothing); not pgbouncer being CPU-bound (measured
-at 2.4% CPU during the stall); not Postgres itself (backends sat idle,
-0% CPU) or a connection-wait bottleneck (`SHOW STATS` avg_wait_time did
-drop 15x after pre-warming the pool, from ~1.9s to ~122ms, while
-throughput barely moved — proof wait time was never the actual
-bottleneck). Isolating the exact client code path outside cauli entirely
-(`psycopg_pool.ConnectionPool`, real OS threads, direct against
-pgbouncer) surfaced the real error: `psycopg.errors.
-InvalidSqlStatementName: prepared statement "_pg3_0" does not exist`.
-
-psycopg3 automatically promotes repeated identical queries to
-server-side prepared statements. A prepared statement lives on whichever
-physical backend connection created it; pgbouncer's `transaction`
-pooling mode hands each new transaction whichever backend connection is
-free, which is frequently a different one — so the prepare silently
-doesn't exist on the connection psycopg3 tries to reuse it against, the
-query fails, and (invisibly, no error surfaces in cauli's own log at
-`-l warn`) something in the retry path burns the wall-clock time this
-symptom showed. Fix: `prepare_threshold=None` in the pool's connection
-kwargs, disabling automatic server-side prepares — the standard,
-documented fix for any psycopg3 client that might run behind pgbouncer's
-transaction pooling. Cost measured directly: ~3% slower than prepared
-statements against Postgres directly (1253.0/s → 1210.8/s in an isolated
-thread-pool test), negligible next to the 9x this fix recovered through
-pgbouncer (140/s → 1279/s in the same isolated test; 3,272.7/s in the
-full cauli-worker run). Applied to both raw PG task files
-(`tasks_cauli_sync_pg.py`, `tasks_cauli_async_pg.py`) unconditionally, so
-they're correct whether pointed at Postgres directly or through a
-pooler — not left as a footgun for whoever points `BENCH_PG_DSN` at
-pgbouncer next.
-
-**Reproducing this section requires pgbouncer** (`pool_mode = transaction`,
-pointed at the same `bench` Postgres role/db) in addition to the base
-`setup.sh` environment — see `bench/README.md` for the config used here.
-
-## Ceiling sweeps with CPU attribution (2026-08-24)
-
-Everything above this section was measured with a block design and is retained
-as recorded. This section is a re-measurement with the paired protocol, the
-orphan checks, and per process CPU sampling described in Method. Where the two
-disagree, prefer this one, and prefer the ratios over the absolutes: the box
-drifts ~35% across a session, so a ratio measured inside one session is worth
-more than an absolute measured in another.
-
-The question these sweeps answer is not "how fast" but "what stopped it".
-Every row carries the CPU cores consumed by the worker, Postgres and Redis over
-the same window the throughput slope came from.
-
-### Harness cross check
-
-Celery prefork measured **826/s** here against the **850.6/s** this document
-published from an independent earlier run: agreement within 3%. That is the
-anchor that makes the rest of the table trustworthy, and it is the reason
-these numbers are published while four earlier attempts were discarded.
-
-### Dispatch, no database, no ORM, no web framework
-
-Task body is one `redis.incr`. Single runs, so read the ratios, not the peaks.
-
-| Config | tasks/s | worker cores | redis cores | Limit |
+| task size | cauli tasks/s | Celery tasks/s | Celery vs cauli | 95% interval |
 |---|---:|---:|---:|---|
-| cauli async `--procs 6 --io-concurrency 96` | 27,060 | 4.71 | 0.60 | box (5.3/6) |
-| cauli async `--procs 4` | 20,582 | 4.61 | 0.63 | box (5.2/6) |
-| cauli async `--procs 8` | 20,012 | 4.64 | 0.59 | box (5.2/6) |
-| cauli async `--procs 2` | 17,994 | 3.05 | 0.56 | **framework** |
-| cauli sync `--procs 12 --io-threads 80` | 19,299 | 4.80 | 0.53 | box (5.3/6) |
-| cauli sync `--procs 6 --io-threads 80` | 17,656 | 4.93 | 0.52 | box (5.4/6) |
-| taskiq `--workers 6 --max-async-tasks 100` | 7,812 | 4.54 | 0.40 | **framework** |
-| taskiq `--workers 8` | 7,694 | 4.95 | 0.38 | box (5.3/6) |
-| celery prefork `-c 4 --prefetch 1` | 826 | 1.13 | 0.17 | **framework** |
-| celery prefork `-c 8 --prefetch 4` | 816 | 1.11 | 0.17 | **framework** |
+| 0.5 ms | 7,597 | 856 | 0.113 | 0.112 to 0.113 |
+| 2 ms | 2,607 | 802 | 0.307 | 0.303 to 0.312 |
+| 10 ms | 582 | 545 | 0.936 | 0.930 to 0.941 |
+| 50 ms | 119 | 117 | 0.987 | 0.984 to 0.990 |
 
-**Redis is not the constraint for anyone**: 0.63 cores at the highest point,
-about 10% of the box. Nobody in this table is broker bound.
+At 0.5 and 2 ms Celery runs into its single node consumer, which tops out
+near 870 tasks/s whatever the process count (the dispatch table scales Celery
+by nodes instead), so those two rows measure that ceiling as much as CPU work.
+At 10 ms and above both are bound by the cores and differ by a few percent.
 
-**Celery is framework bound at 1.13 cores** and leaves four of six cores idle.
-It cannot convert more hardware into more throughput on this workload. That,
-rather than the raw ratio, is the structural difference worth understanding:
-cauli saturates the machine, Celery saturates itself.
+## memory
 
-**cauli's own ceiling is not visible on this box.** Every cauli row except
-`--procs 2` is box bound at 4.6 to 4.9 cores while sharing six cores with
-Redis, the driver and the monitor. A ceiling measured on a saturated box is a
-property of the box, so the honest statement is "at least 27,060/s while using
-4.71 cores", not "cauli's maximum is 27,060/s".
+N tasks sleeping at once, PSS summed over the worker's process tree after
+every task has reported itself started. `python -m bench memory`
 
-Ratios at best observed config: cauli async is **3.5x taskiq** and **32.8x
-one Celery prefork node**.
-
-> **Correction, 2026-10-28.** 32.8x compares six cauli processes with one
-> Celery node. One Celery node does not scale with `-c`, but more nodes do: on
-> 10 vCPUs, 8 nodes at `-P solo --prefetch-multiplier=32` reached 4,233
-> tasks/s against 32,798 for cauli async at `--procs 8 --io-concurrency 96`,
-> a ratio of 7.7x. Quote that one. "Celery cannot convert more hardware into
-> more throughput" below is true per node and false per box.
-
-### Django ORM, sync tasks
-
-One Django ORM `objects.create()` per task. Postgres made cheap first
-(UNLOGGED, `synchronous_commit=off`) so the row measures the framework.
-
-| Config | tasks/s | worker cores | pg cores | Limit |
-|---|---:|---:|---:|---|
-| **cauli sync `--procs 6 --io-threads 24`** | **4,256** | 3.92 | 0.76 | framework |
-| cauli sync `--procs 8 --io-threads 32` | 3,246 | 3.93 | 0.69 | framework |
-| cauli sync `--procs 4 --io-threads 16` | 2,870 | 3.69 | 0.66 | framework |
-| **celery prefork `-c 16`** | **247** | 3.24 | 0.16 | framework |
-| celery prefork `-c 32` | 231 | 3.30 | 0.16 | framework |
-
-**Both sides are framework bound with Postgres under one core**, which is the
-condition this sweep exists to create. cauli is **17.2x** Celery prefork here.
-
-The column that explains it is worker cores: Celery spends 3.24 cores to
-produce 247 tasks/s, cauli spends 3.92 to produce 4,256. Nearly the same CPU,
-seventeen times the output.
-
-No connection exhaustion appeared at this sizing (6 x 24 = 144 connections
-against a 400 limit). The pgbouncer finding elsewhere in this document stands,
-but it was hit at `--procs 12 --io-threads 80`, which asks for 960.
-
-### SQLAlchemy async ORM, async tasks (the FastAPI shape)
-
-| Config | tasks/s | worker cores | pg cores | Limit |
-|---|---:|---:|---:|---|
-| cauli async `--procs 6 --io-concurrency 40` | 2,268 | 4.86 | 0.69 | box (5.7/6) |
-| cauli async `--procs 8` | 2,099 | 4.88 | 0.66 | box (5.7/6) |
-| **cauli async `--procs 4 --io-concurrency 32`** | **2,032** | **3.88** | 0.59 | **framework** |
-| taskiq `--workers 8 --max-async-tasks 40` | 1,958 | 5.08 | 0.58 | box (5.8/6) |
-| taskiq `--workers 6` | 1,956 | 5.10 | 0.58 | box (5.8/6) |
-| **taskiq `--workers 4 --max-async-tasks 32`** | **1,736** | **3.88** | 0.45 | **framework** |
-
-The two bolded rows are the cleanest comparison in this document: both
-framework bound, both consuming **exactly 3.88 cores**, cauli **1.17x** ahead.
-
-That figure was produced by a different method than the paired campaign in
-Claim 5, which measured **1.145 (95% CI 1.078 to 1.211, 6 of 6 pairs)**. Two
-independent methods landing within 3% of each other is the strongest evidence
-in this file.
-
-## Claims 1, 3 and 4 re-measured (2026-08-24)
-
-The three tables above were produced with a block design before the paired
-protocol existed. All three are re-measured here on 10 vCPU, and all three
-changed. Where they disagree with the older sections, prefer these.
-
-Three independent cross checks say the harness is sound: Celery prefork
-measured 826/s against this document's previously published 850.6/s; Celery
-gevent's memory reproduced within 2 to 5% at four separate concurrencies; and
-cauli at `--procs 6` holding 10,000 tasks measured 227.1 MiB against a
-published 215.7. Agreement on three unrelated measurements is what makes the
-disagreements below worth acting on.
-
-### Claim 1 re-measured: memory is decided by `--procs`, not by task count
-
-N tasks that `sleep(3600)` held simultaneously, PSS summed across the process
-group. Celery prefork is not re-run: one OS process per slot means 1,000
-interpreters, and its 2,036.7 MiB at 100 slots is not in dispute.
-
-| Tasks in flight | cauli, `--procs` auto | cauli, `--procs 6` | Celery gevent |
-|---:|---:|---:|---:|
-| 100 | 59.7 MiB (3 procs) | — | 49.2 MiB |
-| 1,000 | 245.6 MiB (11 procs) | — | 70.8 MiB |
-| 5,000 | 277.4 MiB (11 procs) | — | 166.9 MiB |
-| 10,000 | 317.1 MiB (11 procs) | **227.1 MiB (7 procs)** | 285.4 MiB |
-
-The older table reported cauli winning past roughly 4,500 to 6,000 in flight.
-That was true at the 6 vCPU it was measured on and is not a property of cauli:
-`-c` derives `procs` from the core count, so the same `-c 10000` that produced
-6 worker processes there produces 10 here, and each one embeds its own CPython.
-
-Decomposed: **~22.6 MiB per worker process** ((317.4 - 227.1) / 4 extra
-processes, measured directly at 10,000 held with `--procs` pinned to 6 and to
-10), plus ~6.6 KiB per held task. Celery gevent is a single process, so it pays
-the interpreter floor exactly once regardless of concurrency, and that is the
-whole shape of this comparison.
-
-Operational consequence, which the old table did not state: **pin `--procs`
-when memory is the binding constraint.** The auto-derivation optimises for
-throughput.
-
-### Claim 3 re-measured: CPU bound, paired
-
-Both stacks at 6 worker processes, both pinned to CPU 2-9, Celery at prefetch 1
-(the analogue of cauli's cpu prefetch, per the fairness rule in Method). Three
-pairs per size, interleaved, order alternating.
-
-| Task size | cauli | Celery prefork | Ratio | 95% CI |
-|---:|---:|---:|---:|---|
-| 0.5ms | 3,770.6/s | 875.9/s | 4.31x | 3.76 - 4.86 |
-| 2ms | 2,580.9/s | 871.8/s | 2.96x | 2.87 - 3.05 |
-| 10ms | 580.6/s | 546.5/s | 1.06x | 1.06 - 1.07 |
-| 50ms | 118.9/s | 117.6/s | 1.01x | 1.01 - 1.01 |
-
-Same shape as the block-design table, higher absolutes on both sides from the
-extra cores. One refinement worth recording: the old table called 50ms "within
-noise". Paired, the 1% gap is statistically detectable (the interval excludes
-1.0) and operationally meaningless. Both statements can be true, and the
-precise one is better.
-
-### Claim 4 re-measured: crash correctness, and Celery's loss is a formula
-
-500 uniquely tagged tasks, `kill -9` at 160 executed, fresh worker, count what
-comes out. cauli at `--procs 2 --io-threads 8`; Celery at `-c 4 -P prefork
---prefetch-multiplier=1` unless stated.
-
-| Lane | Lost permanently | Duplicates | Recovery |
+| worker | 100 in flight | 1,000 | 10,000 |
 |---|---:|---:|---:|
-| cauli | 0 | 0 | 10.8s (reproduced: 10.77, 10.78) |
-| Celery, `acks_late=True`, `visibility_timeout=5` | 0 | 0 | 91.3s |
-| Celery, plain default | 8 at this config, see below | 0 | never |
+| cauli async, 1 process | 51.0 MiB | 68.9 MiB | 155.7 MiB |
+| cauli async, `-c N` (processes derived) | 110.4 MiB (3) | 456.7 MiB (11) | 557.4 MiB (11) |
+| Celery gevent | 50.5 MiB | 75.4 MiB | 324.8 MiB |
+| taskiq, 1 worker | 64.7 MiB | 68.5 MiB | 118.3 MiB |
+| Celery prefork | 2,345.0 MiB (101) | | |
 
-The old table reported 80 of 500 for the default lane. Both numbers are right,
-and the reason is that **the loss is deterministic, not sampled**: a crashed
-Celery default worker loses exactly what it had prefetched into memory.
+Parentheses: process count. `-c` derives one process per 64 slots up to the
+core count, which buys throughput with memory: about 23 MiB per process. For
+memory, run one process with `--io-concurrency N`: then cauli is below
+Celery gevent at every size, and taskiq is smaller at 10,000.
 
-| Celery default config | `concurrency x (prefetch + 1)` | Measured lost |
-|---|---:|---:|
-| `-c 4 --prefetch-multiplier=1` | 8 | 8 |
-| `-c 4 --prefetch-multiplier=4` | 20 | 20 |
-| `-c 16 --prefetch-multiplier=4` | 80 | 80 |
+## chaos
 
-Predicted exactly at all three points, and it reconciles the 80: that row was
-measured at a higher concurrency. Publishing the formula rather than one draw
-is strictly better, and it exposes the part that matters: prefetch is Celery's
-primary throughput knob, so **tuning Celery faster increases what it loses on
-a crash, linearly.**
+500 tagged tasks, `kill -9` at 160 executed, fresh worker, count lost and
+duplicated tags. `python -m bench chaos`
 
-cauli's recovery improved from 34.0s to 10.8s in this cycle, from
-`--mover-interval` moving 250ms to 50ms; the reclaim path waits on that tick.
-The `acks_late` gap widened from a published 3x to 8.5x for the same reason,
-against an unchanged kombu throttle (`QoS.restore_visible` restores at most 10
-stale messages per scan, scanning on 1 invocation in 10).
+| lane | lost | duplicated | recovered |
+|---|---:|---:|---|
+| cauli | 0 | 0 | 29.9 s |
+| Celery `acks_late`, `visibility_timeout` 5 | 0 | 0 | 101.1 s |
+| Celery default | 8 | 0 | not within 120 s |
+| Dramatiq | 24 | 0 | not within 120 s |
+| arq | 60 | 0 | not within 120 s |
 
-**Batched acks (PROTOCOL 4.1) cost nothing here.** A crash can in principle
-redeliver up to one unflushed buffer per queue; measured at this configuration
-it produced 0 duplicates in both runs. At `--io-threads 8` the 2ms timer flushes
-almost immediately, so the buffer is rarely deep when the kill lands. A crash at
-30,000 tasks/s would exercise the bound far harder, and that is not measured.
+One segfaulting task among 10 sleeping ones, observed for 20 s:
 
-## Backlog drain (1M tasks)
+| lane | top level process | processes died |
+|---|---|---:|
+| cauli async, 1 process | exited (SIGSEGV) | 1 |
+| cauli async, 3 processes | alive, supervisor restarts the process | 1 |
+| cauli, segfault in a `kind="cpu"` task | alive | 1 |
+| Celery prefork | alive | 1 |
+| Dramatiq | exited (code 1) | 3 |
+| arq | exited (SIGSEGV) | 1 |
 
-Preload 1,000,000 no-op tasks with no worker running, then start it: this is
-the drain-rate method itself at the scale it needs to hold up at, not a new
-technique. cauli sync (`--procs 12 --io-threads 80 --io-concurrency 80`,
-fresh build): **1,000,000/1,000,000 completed, no timeout, sustained
-18,994 tasks/s across the full 52.6s drain** (slightly below the 21,713/s
-measured at N=100,000 — plausibly a longer-run steady-state effect rather
-than the more favorable end of short-run variance; not investigated
-further). Enqueue itself took 167.6s (~5,966/s) — separate from the measured
-number, since drain-rate timing starts only once the worker begins
-consuming.
+## web
 
-Celery's equivalent run was not executed: at its measured ~850/s it would
-need roughly 1,176s (~20 minutes) and the result is already fully
-predictable from the steady-state throughput number in Claim 2 — running it
-would cost significant wall-clock for no new information. Flagged here
-rather than silently skipped.
+Per arm: closed loop saturation, 64 clients, no worker running; drain with
+the worker; open loop at 500 requests/s with the worker live. 3 reps,
+medians. `python -m bench web`
 
-## CPU isolation
-
-This box has 6 shared vCPUs; Redis, Postgres, every worker under test, and
-the harness driving all of it compete for the same cores throughout most of
-this document. One disambiguation was run: Redis pinned to cores 0-1
-(`taskset -pc 0,1 <redis pid>`, live affinity change, no restart), the
-Celery-mixed-workload retest run with the worker and harness confined to
-cores 2-5 (`taskset -c 2-5 ...`, Postgres not involved in this specific
-workload so not pinned — and not pinnable without root, since it runs under
-a different OS user than this harness).
-
-**Result: 12.0x near-burst/baseline p99, versus 14.5x unpinned — the stall
-persists.** Celery prefork's assumed structural immunity to a CPU-burst
-neighbor is not primarily a Redis-contention artifact of sharing this box;
-it holds up with Redis isolated onto its own cores. Caveat kept explicit
-rather than smoothed over: the harness driver (the light-task producer and
-poison-injector threads) still shares the same 2-5 core set as the four
-Celery worker processes in this pass, so it is not yet a fully clean
-isolated-driver measurement — that is the next refinement, not a reason to
-discount the result, since a genuine cross-process effect and a smaller
-residual driver-contention effect are not mutually exclusive and the
-magnitude (12x, not 2x) argues for the former dominating.
-
-## Soak test (killed by an environment outage, not completed)
-
-Started with a 48h target, cauli async (`--procs 8 --io-concurrency 96`,
-the same config measured in Claim 2), on a dedicated Redis instance (port
-6396) at 2,000 tasks/s open-loop, PSS sampled every 5 minutes to
-`soak_memory.csv`. Early samples were healthy: flat-trending PSS, zero
-failures, tens of millions of tasks processed over several hours.
-
-**It didn't finish, and the data didn't survive.** The WSL VM this
-harness runs under went down for an extended period mid-run (confirmed
-via `journalctl --list-boots`: the boot the soak was running under ended
-hours into the run; the next boot started roughly 23 hours later) — an
-environment-level outage, not a cauli failure. Everything not written to
-disk died with it: the dedicated redis:6396 instance (no persistence
-configured, matching every other Redis instance in this suite — `--save
-'' --appendonly no`, intentional for the *primary* benchmark Redis, an
-oversight for a multi-hour unattended soak) and the driver process both
-gone on the next boot. `soak_memory.csv` was searched for across the
-whole filesystem after the fact and not found — it was never confirmed
-written to a path that survived the outage, so even the partial run's
-CSV trail is lost, not just the tail end.
-
-**Reported as failed-to-complete, not as data supporting the claim.**
-The early healthy samples are anecdotal at best — not enough hours to
-distinguish "flat" from "climbing very slowly," which is the entire
-point of a 48h soak. Redoing this needs two changes, not just a rerun:
-`appendonly yes` (or equivalent) on the soak's dedicated Redis instance
-so a host interruption doesn't erase the in-progress data, and running
-it somewhere that survives a multi-hour unattended window (this
-environment's WSL VM does not, by default, and nothing here currently
-detects or alerts on that kind of silent kill). Listed in "Not yet done"
-below rather than left implied by a stale "in progress" heading.
-
-## docker-compose packaging
-
-`Dockerfile` and `docker-compose.yml` are written (python:3.12-slim base —
-satisfies cauli-worker's `--enable-shared` CPython requirement per the main
-README — builds cauli-worker fresh, installs pinned deps, wires
-`BENCH_REDIS_URL`/`BENCH_PG_DSN` to the compose service hostnames). **Not
-validated**: Docker Desktop's daemon is not functional on this development
-machine (CLI present, engine not running), confirmed and then explicitly
-deprioritized rather than spending further time working around a local
-environment problem unrelated to the benchmark itself. Whoever runs this
-next should treat `docker compose up --build` as untested until it's been
-run once for real.
-
-## Web integration: enqueue inside real Django and FastAPI requests (2026-10-28)
-
-Harness: `bench/web/campaign.py`. WSL2 Ubuntu 24.04, 10 vCPU, 11 GB, Redis
-7.0.15, PostgreSQL 16, k6 as the load generator, all on one box. Django 6.0.7
-under gunicorn (4 gthread workers x 8 threads) and under uvicorn (4 workers),
-FastAPI under uvicorn (4 workers, uvloop). Every request inserts one row
-through the ORM; the enqueue arms hand its id to a task that increments the
-row's `processed` column, so after a drain `processed = 0` is a lost task and
-`processed > 1` a duplicated one.
-
-Per arm and rep: closed loop saturation with 64 clients and no worker
-running (the request rate is the web tier's alone), then a drain with the
-worker started, then an open loop at 500 requests/s with the worker live,
-giving request latency at a fixed load and end to end latency from request
-start to task end. Arm order is shuffled every rep. 3 reps, medians; the
-before and after columns are separate sessions, not interleaved pairs, so
-read the throughput columns as within run to run drift unless the gap is
-large.
-
-| arm | sat req/s | e2e p50 ms | e2e p99 ms | lost / dup / dlq, 0.1.0 | lost / dup / dlq, fixed |
-|---|---:|---:|---:|---|---|
-| Django WSGI, insert only | 1,272 / 1,028 | | | | |
-| Django WSGI, `delay_on_commit` | 1,081 / 1,060 | 2.2 / 2.2 | 18.9 / 16.4 | 0 / 0 / 0 | 0 / 0 / 0 |
-| Django WSGI, async task with async ORM | 854 / 851 | n/a / 2.9 | n/a / 39.7 | **106,499** / 0 / 1,001 | 0 / 0 / 0 |
-| Django WSGI, Celery `.delay` on commit (producer only) | 880 / 880 | | | | |
-| Django ASGI, insert only | 279 / 285 | | | | |
-| Django ASGI, enqueue | 266 / 285 | 824 / 1,477 | 1,573 / 3,286 | 0 / 0 / 0 | 0 / 0 / 0 |
-| FastAPI, insert only | 2,242 / 2,156 | | | | |
-| FastAPI, `adelay` | 1,944 / 1,823 | 4.3 / 4.4 | 471.1 / 33.1 | 0 / 0 / 0 | 0 / 0 / 0 |
-| FastAPI, blocking `.delay` in `async def` | 1,850 / 1,842 | 4.4 / 4.5 | 311.0 / 24.1 | 0 / 0 / 0 | 0 / 0 / 0 |
-
-Cells with two numbers are 0.1.0 / fixed.
-
-- **Lost tasks.** On 0.1.0 every `async def` task using Django's async ORM
-  dead lettered (asgiref 3.13 incompatibility in `cauli.contrib.django`).
-- **FastAPI tail.** The p99 came from `sqlalchemy_app()`'s engine: SQLAlchemy's
-  default pool keeps 5 connections and closes each overflow connection on
-  return, so above 5 concurrent tasks nearly every task opened a new
-  connection. Keeping the same 15 connections pooled took p99 from 564 ms to
-  31 ms in a single run sweep, 471 to 33 ms in the 3 rep campaign.
-- **Enqueue cost per request.** Django WSGI: cauli `delay_on_commit` costs
-  15% of the insert only rate in the 0.1.0 session and Celery's producer 31%;
-  FastAPI `adelay` 13%. These are single session ratios on a shared box.
-- **Django ASGI is Django bound.** Its insert only arm tops out near 280
-  requests/s, so the 500 requests/s open loop overloads it by design and its
-  latency columns describe Django under overload, not cauli. Under ASGI,
-  `CONN_MAX_AGE` must be 0: with 60, the server climbed to 385 of 400
-  Postgres connections in 15 s and starved the worker.
-
-## Free threaded CPython 3.14t against GIL 3.12 (2026-10-28)
-
-Harness: `bench/free_threaded.py`, tasks in `bench/tasks_cauli_threads.py`.
-Same worker source built twice, once against CPython 3.12.3 and once against
-3.14.5t, run with `PYTHON_GIL=0`. One worker process (`--procs 1`), drain rate
-over the middle 80% of the tasks, 3 interleaved pairs, medians. Box: Intel
-i7-9750H, 5 physical cores with 2 hyperthreads each (10 vCPU), so CPU bound
-Python tops out near 5 cores: plain threads with no cauli involved reach 2.88
-cores at 5 threads and 4.71 at 10 on the same box. The burn body is 2.44 ms on
-3.12 and 2.01 ms on 3.14t; cores = rate x body time.
-
-| lane | GIL 3.12 | free threaded 3.14t | ratio | cores, GIL / free threaded |
+| arm | saturation req/s | e2e p50 ms | e2e p99 ms | lost / duplicated / dead letters |
 |---|---:|---:|---:|---|
-| noop with a redis INCR, sync, 10 threads | 2,477/s | 14,070/s | 5.68x | |
-| CPU bound body, sync, 10 threads | 299/s | 1,429/s | 4.78x | 0.73 / 2.87 |
-| CPU bound body, cpu lane, 10 processes | 1,532/s | 1,932/s | 1.26x | 3.74 / 3.88 |
+| Django WSGI, insert only | 1,262 | | | |
+| Django WSGI, cauli `delay_on_commit` | 1,087 | 2.2 | 11.5 | 0 / 0 / 0 |
+| Django WSGI, cauli async task with the async ORM | 1,072 | 3.0 | 43.8 | 0 / 0 / 0 |
+| Django WSGI, Celery `.delay` on commit (producer only) | 870 | | | |
+| Django ASGI, insert only | 293 | | | |
+| Django ASGI, cauli `adelay` | 284 | 1,700 | 3,544 | 0 / 0 / 0 |
+| FastAPI, insert only | 2,133 | | | |
+| FastAPI, cauli `adelay` | 1,823 | 4.7 | 31.0 | 0 / 0 / 0 |
+| FastAPI, cauli `.delay` inside `async def` | 1,788 | 4.3 | 22.8 | 0 / 0 / 0 |
 
-- On the GIL build the sync lane runs CPU bound work on 0.73 cores whatever
-  `--io-threads` is, which is why `kind="cpu"` exists. On 3.14t the same lane
-  reaches 2.87 cores, 74% of what the forked cpu lane gets, without forking.
-- The noop row is the GIL's handoff cost on blocking I/O: ten threads that
-  each do one Redis round trip queue for one lock on 3.12.
-- The cpu lane gains only the interpreter's own speedup (the body is 18%
-  faster on 3.14); its parallelism came from processes already.
-- Not measured: `--procs` above 1, async lanes, and 3.13t (no wheel).
+Enqueue cost per request: Django WSGI 14% of the insert only rate with
+cauli, 31% with Celery's producer; FastAPI 15%. Django ASGI tops out near 290
+requests/s on Django's side, so the 500 requests/s open loop overloads it by
+design and its latency columns describe Django under overload.
 
-## Not yet done
+## free-threaded
 
-Listed explicitly rather than silently absent, per the standard this suite
-holds itself to:
+The same worker source built against CPython 3.12 and 3.14t, one process,
+6 paired rounds. `python -m bench free-threaded`
 
-- **Celery gevent lanes — done** for Claims 1 (memory-per-concurrency) and
-  2 (no-op throughput), both above. **Not done**: a gevent mixed-workload
-  (Claim 4) lane — skipped by inference, not measurement: the throughput
-  result already shows gevent has zero concurrency overlap for fast
-  Redis calls, and a CPU-bound poison burst would monopolize the single
-  OS thread with no yield point at all, so the outcome (a GIL-sharing-style
-  stall, at least as bad as cauli's naive async lane) is predictable from
-  a mechanism already demonstrated rather than worth a full test run.
-  Flagged here instead of silently assumed.
-- **Celery `-P threads` lane — done** for Claims 1 and 2, both above.
-  **Not done**: a threads mixed-workload lane, skipped for the same
-  reason as gevent's — threads run under one GIL too, so a CPU-bound
-  poison burst has no more headroom to overlap than gevent's does.
-- **kill -9 test for Celery gevent/threads**: not run. Claim 1's crash-
-  isolation argument (gevent/threads have no built-in process supervisor,
-  unlike cauli or Celery prefork) is currently an architectural inference
-  from how the pools work, not a fresh measurement — stated as such where
-  it's used, but belongs on this list until it's actually tested.
-- **Original (pre-fix) cauli async memory numbers, re-audited**: the
-  Claim 1 re-measurement used cauli's own `-c N`-derived config instead of
-  a carried-over throughput flag set; whether the *original* published
-  numbers came from that throughput config specifically, or something
-  else, was never recorded at the time and couldn't be reconstructed —
-  flagged so the discrepancy isn't silently attributed to noise.
-- **Published latency-results section**: p50/p99/p99.9 enqueue→start and
-  enqueue→complete at 25/50/75/90% of each lane's measured capacity. The
-  `latency_producer.py`/`latency_report.py` harness exists and works; the
-  results table doesn't exist yet.
-- **Non-localhost Redis RTT sweep** (toxiproxy, 0.5/1/2/5ms + jitter): not
-  started. Every number in this document is same-box, near-zero-RTT Redis.
-- **Duplicate-delivery test** (`kill -STOP` past visibility timeout,
-  `kill -CONT`, count executions per tag): not started. Called out as
-  effectively mandatory before this project's numbers should be read by
-  anyone building a payments-adjacent system.
-- **Redis durability lane** (`appendonly yes` everysec/always) + a
-  Redis-restart-mid-run chaos test: not started.
-- **Producer-path benchmark**: pipelined/batched enqueue cost, and
-  `.delay()`'s added p99 under simulated FastAPI/Django request load: not
-  started.
-- **Redis memory / stream-trimming risk for the running soak test**: not
-  yet tracked. cauli's Redis Streams may not XTRIM/XDEL consumed entries;
-  at the soak's measured rate this could accumulate into an OOM risk
-  before the soak completes. Worker-side PSS is being sampled; Redis's own
-  memory is not, yet.
-- **Retry sweep** (1%/10%/50% failing tasks with backoff), **ETA/scheduled
-  tasks**, **result round-trip latency**, **graceful shutdown** (SIGTERM
-  with load in flight), **backpressure** (Redis maxmemory), **sustained
-  overload** beyond the single 9.7s datum that exists, **multi-worker
-  contention**: none started.
-- **Polish set**: pipelined `redis-benchmark` baseline, CPU-seconds/100k
-  tasks, RQ/huey lanes, cold-start comparison, confidence intervals via
-  ~10x reruns of the headline numbers, eventual bare-metal validation —
-  none started.
-- **CPU-pinned re-measurement of everything else in this document** — only
-  the mixed-workload Celery anomaly has been re-tested under partial
-  isolation so far (see "CPU isolation"); throughput, memory, chaos, segfault
-  and CPU-bound numbers above are all still shared-box measurements.
-- **Fully isolated driver** for the mixed-workload pinned re-test (currently
-  the harness driver shares cores with the workers under test).
-- **Payload size sweep** (1KB/10KB/100KB/1MB args and results): explicitly
-  cut from this pass by user decision — a real question given how much of
-  production traffic isn't a bare no-op, just not this pass's.
-- **Soak test**: attempted, killed by a WSL VM outage partway through, no
-  data survived (see above). Needs a durable Redis config and a host that
-  survives a multi-hour unattended window before it's worth attempting
-  again.
-- **cauli-worker crash fix landed mid-session** (see Claim 5): a real
-  `double free or corruption` bug at shutdown, found while building the
-  Django ORM lane, root-caused and fixed (`process::exit` → `libc::_exit`,
-  `worker/src/main.rs`), merged to `main`, rebuilt, verified. Everything
-  measured before this fix in an earlier pass of this document was
-  measured against configs/workloads that never happened to trigger it
-  (it needs multiple worker processes plus a C-extension-backed sync I/O
-  library, e.g. psycopg3, to manifest) — but it was real and unnoticed
-  until this session, which is itself worth stating plainly rather than
-  implying every prior number was already validated against it.
-- **SQLAlchemy async ORM's greenlet-bridge bottleneck — root-caused, not
-  fixed**: Claim 5 isolated the cauli-vs-taskiq gap to SQLAlchemy's async
-  engine itself (Core bypass showed the same flat throughput as the full
-  ORM, ruling out ORM overhead and the transaction-mode theory this list
-  used to carry). Not chased further because it's SQLAlchemy's own
-  library characteristic in this environment, not something this
-  benchmark's task code or cauli can fix.
-- **Dramatiq redelivery tuning**: only tested at default reliability config
-  (17% loss on a hard crash); unlike Celery, never given a properly-tuned
-  second pass to see if a Celery-style `acks_late` equivalent closes the gap.
-- **arq's 80%-loss root cause**: measured and reported, not root-caused —
-  the lost tags weren't just the tail of the run, which rules out the benign
-  explanation but wasn't investigated further.
-- **docker-compose validation**: written, not run (see above).
+| lane | GIL tasks/s | free threaded tasks/s | ratio | 95% interval |
+|---|---:|---:|---:|---|
+| noop, sync, 10 threads | 2,453 | 10,897 | 4.44 | 4.31 to 4.58 |
+| pure Python CPU body, sync, 10 threads | 300 | 1,366 | 4.55 | 4.48 to 4.63 |
+| pure Python CPU body, cpu lane, 10 processes | 1,544 | 1,959 | 1.27 | 1.25 to 1.29 |
+
+On 3.14t the sync lane runs CPU bound work on 7.5 cores against 1.2 with the
+GIL, without forking; the cpu lane gains only the interpreter's own speedup.

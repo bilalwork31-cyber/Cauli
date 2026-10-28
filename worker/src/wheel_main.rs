@@ -1,12 +1,6 @@
-//! `cauli-worker-bin`: the identical runtime under the name the published
-//! wheel installs.
-//!
-//! The wheel puts a Python console script at `cauli-worker` in the venv's bin
-//! directory (worker/wheel-data/scripts/cauli-worker); it points the dynamic
-//! loader at the running interpreter's libpython and then execs this binary,
-//! so the two cannot share one file name. Same program as `src/main.rs`, same
-//! `cauli_worker::run`; only the produced file name differs, and the
-//! `dev-bin` / `wheel-bin` features decide which one a build produces.
+//! `cauli-worker-bin`: the same runtime under the name the wheel installs. The
+//! wheel's `cauli-worker` console script (worker/wheel-data/scripts) points the
+//! loader at libpython and execs this, so the two cannot share a file name.
 
 fn main() -> ! {
     cauli_worker::run()

@@ -5,11 +5,9 @@ use rand::Rng;
 /// `attempt` is the NEW retries value (1-based).
 pub fn base_backoff_ms(attempt: u32, base_ms: u64, factor: f64, max_ms: u64) -> f64 {
     let a = attempt.max(1);
-    // A factor at or below 1.0 (zero, negative, or a fraction) would shrink
-    // or collapse the delay as attempts grow instead of backing off, exactly
-    // when a downstream dependency is already struggling. Floor it at 1.0:
-    // that is the one value for which factor^(a-1) can never drop below 1,
-    // so the delay can never fall below base_ms ("no growth", not "no wait").
+    // A factor below 1.0 would shrink the delay as attempts grow, exactly when
+    // a dependency is struggling. Floored at 1.0 the delay never drops below
+    // base_ms.
     let factor = factor.max(1.0);
     let d = (base_ms as f64) * factor.powi((a - 1) as i32);
     let maxf = max_ms as f64;
@@ -44,7 +42,6 @@ mod tests {
 
     #[test]
     fn exact_no_jitter_sequence() {
-        // base 500ms, factor 2.0, max 60000
         assert_eq!(compute_backoff_ms(1, 500, 2.0, 60_000, false), 500);
         assert_eq!(compute_backoff_ms(2, 500, 2.0, 60_000, false), 1_000);
         assert_eq!(compute_backoff_ms(3, 500, 2.0, 60_000, false), 2_000);
@@ -54,13 +51,11 @@ mod tests {
 
     #[test]
     fn non_integer_factor() {
-        // 100 * 1.5^2 = 225
         assert_eq!(compute_backoff_ms(3, 100, 1.5, 60_000, false), 225);
     }
 
     #[test]
     fn clamp_applies_before_jitter() {
-        // attempt high enough that raw value >> max; jitter range must be [0.5*max, max]
         for _ in 0..500 {
             let d = compute_backoff_ms(20, 500, 2.0, 10_000, true);
             assert!(d >= 5_000, "jittered {d} below 0.5*max");
@@ -81,7 +76,6 @@ mod tests {
             min_seen = min_seen.min(d);
             max_seen = max_seen.max(d);
         }
-        // with 2000 samples we should see spread across the range
         assert!(
             min_seen < 1_200,
             "min_seen {min_seen} suggests jitter not spreading low"
@@ -100,9 +94,6 @@ mod tests {
 
     #[test]
     fn zero_or_negative_factor_is_floored_to_no_growth() {
-        // A factor of 0 (or less) must never collapse the delay below
-        // base_ms as attempts grow: it is floored to 1.0, i.e. a constant
-        // base_ms delay, not a shrinking or zero one.
         assert_eq!(compute_backoff_ms(2, 500, 0.0, 60_000, false), 500);
         assert_eq!(compute_backoff_ms(5, 500, 0.0, 60_000, false), 500);
         assert_eq!(compute_backoff_ms(5, 500, -3.0, 60_000, false), 500);

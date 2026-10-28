@@ -1,13 +1,10 @@
-//! Two operational events that used to leave a worker alive and useless.
+//! Two events that leave a worker alive and useless.
 //!
-//! 1. A wedged asyncio loop (a blocking call inside an `async def`) ends every
-//!    async task in the process for as long as it lives, with every field in
-//!    the stats line reading normal. The worker must notice and exit so a
-//!    supervisor restarts it, and must NOT exit for a loop that is merely
-//!    slow.
-//! 2. A redis that comes back EMPTY loses the consumer group, and NOGROUP used
-//!    to be a generic warning retried every 500ms forever. The worker must
-//!    recreate the group, say what was lost, and resume.
+//! 1. A wedged asyncio loop (a blocking call in an `async def`) stops every
+//!    async task while the stats line reads normal. The worker must exit so a
+//!    supervisor restarts it, and must not exit for a loop that is only slow.
+//! 2. A redis that comes back empty loses the consumer group. The worker must
+//!    recreate it, say what was lost, and resume.
 
 mod common;
 
@@ -18,8 +15,7 @@ use std::time::{Duration, Instant};
 
 /// Its own broker: this one gets flushed out from under the worker.
 const RESET_PORT: u16 = 6422;
-/// Shared by the two wedge tests, which use separate queues and separate
-/// worker processes and never write to each other's keys.
+/// Shared by the two wedge tests, which use separate queues and processes.
 const WEDGE_PORT: u16 = 6423;
 
 /// `loops::WEDGE_EXIT_CODE`.
@@ -74,8 +70,7 @@ fn wedge_redis() {
 struct Worker(Child);
 
 impl Worker {
-    /// The e2e fixture app on `port`, with its stdout (where tracing writes)
-    /// captured to `log`.
+    /// The fixture app on `port`, stdout (where tracing writes) captured to `log`.
     fn spawn(port: u16, queues: &str, extra: &[&str], log: &Path) -> Worker {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_cauli-worker"));
         cmd.current_dir(common::fixtures_dir())
@@ -143,11 +138,9 @@ async fn conn(port: u16) -> redis::aio::MultiplexedConnection {
         .unwrap()
 }
 
-/// The wedge itself. `fx.async_block` sleeps synchronously inside an `async
-/// def`, so with `--io-loops 1` the first one owns the only loop thread for
-/// its whole duration and the two behind it are Tasks the loop will never
-/// start, let alone complete. Nothing in the process can take that thread
-/// back, so the worker has to exit and let its supervisor restart it.
+/// `fx.async_block` sleeps synchronously in an `async def`; with `--io-loops 1`
+/// it owns the only loop thread and the two behind it never start. Only an
+/// exit and restart recovers that.
 #[tokio::test]
 async fn a_wedged_async_loop_exits_the_process() {
     wedge_redis();
@@ -178,12 +171,9 @@ async fn a_wedged_async_loop_exits_the_process() {
     let _ = std::fs::remove_file(&log);
 }
 
-/// The other half of the property, and the reason the verdict needs two
-/// signals: the same blocking call, bounded. Eight one second blocks hold the
-/// only loop thread for longer than the whole detection window put together,
-/// but a task completes between each of them, so this is a slow worker and
-/// not a dead one. It must still be running, and it must still be reporting
-/// the lag it measured.
+/// Why the verdict needs two signals: eight bounded one second blocks hold
+/// the loop longer than the detection window, but tasks complete between them.
+/// Slow, not dead: still running and reporting its lag.
 #[tokio::test]
 async fn a_slow_async_loop_keeps_running() {
     wedge_redis();
@@ -217,10 +207,8 @@ async fn a_slow_async_loop_keeps_running() {
     let _ = std::fs::remove_file(&log);
 }
 
-/// A redis restarted with no persistence (the ElastiCache default), evicted,
-/// restored from backup or simply FLUSHALLed: the stream and the consumer
-/// group are gone while the connection stays up. XREADGROUP then answers
-/// NOGROUP forever, and the worker used to log that as an ordinary retry.
+/// A redis restarted without persistence, evicted, restored or FLUSHALLed:
+/// stream and group gone, connection up, XREADGROUP answers NOGROUP forever.
 #[tokio::test]
 async fn an_emptied_redis_is_named_and_recovered_from() {
     start_redis(RESET_PORT);

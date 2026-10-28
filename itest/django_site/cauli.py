@@ -14,9 +14,8 @@ from cauli.contrib.django import autodiscover_tasks, django_app
 app = django_app("django_site.settings")
 autodiscover_tasks(app)
 
-# Extra file-marker hooks so test_django.py can PROVE the lifecycle hooks fire
-# in the same thread/process as the task itself, on all three execution paths
-# (sync pool thread, asyncio loop thread, forked cpu child).
+# Marker hooks: test_django.py checks they fire in the task's own thread or
+# process on all three execution paths.
 _hooklog = os.environ.get("CAULI_ITEST_HOOKLOG")
 if _hooklog:
 

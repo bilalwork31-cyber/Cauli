@@ -1,112 +1,79 @@
-# cauli benchmark suite
+# Benchmarks
 
-This measures specific, falsifiable claims about cauli against Celery,
-taskiq, arq and Dramatiq — not a generic "which is faster" contest.
-Covers raw dispatch, memory, CPU-bound work, crash/reliability behavior,
-and real framework code (Django's ORM, SQLAlchemy's async ORM), not just
-a bare no-op. Start here:
+Each benchmark backs one claim about cauli against the Python task queues
+people choose between: Celery, taskiq, Dramatiq and arq. Numbers live in
+[RESULTS.md](RESULTS.md).
 
-1. **[CLAIMS.md](CLAIMS.md)** — the claims under test. If a number in this
-   directory doesn't map to one of these, it doesn't belong here.
-2. **[RESULTS.md](RESULTS.md)** — the measurements, methodology, environment,
-   and an explicit "not yet done" section. Read this before trusting any
-   number, including the ones that favor cauli.
+| Benchmark | Claim it tests |
+|---|---|
+| `dispatch` | Per task overhead (fetch, dispatch, execute, ack) is lower than every competitor, each at its best measured configuration |
+| `cpu` | `kind="cpu"` tasks use every core: CPU bound throughput at 0.5, 2, 10 and 50 ms per task, against Celery prefork |
+| `memory` | N concurrent I/O tasks cost less RAM than one process per slot: PSS at 100, 1,000 and 10,000 in flight |
+| `chaos` | A `kill -9` loses no task. A segfault takes down only the process it happens in |
+| `web` | Enqueueing inside a real Django or FastAPI request is cheap, and every request's task runs exactly once |
+| `free-threaded` | On free threaded CPython the sync lane runs CPU bound work in parallel without forking |
 
-## Reproduce it
+Not claimed: that cauli wins every workload. At 50 ms CPU bound tasks every
+framework is bound by the cores, and the table says so.
+
+## Run
+
+From the repository root, on Linux:
 
 ```bash
-./setup.sh          # builds cauli-worker fresh, pinned venv, dedicated redis/pg
-python3 campaign_paired.py --suite dispatch --pairs 8
+python -m bench dispatch        # paired rounds, 95% interval per lane
+python -m bench cpu
+python -m bench memory --sizes 100,1000,10000
+python -m bench chaos
+python -m bench web             # needs k6
+python -m bench free-threaded   # needs a second interpreter and worker build
 ```
 
-**Use `campaign_paired.py`, not `campaign.py`, for anything you intend to
-publish.** A block design (all reps of A, then all reps of B) is not safe on a
-shared box. Measured here: one binary and one config drifted from 19,532 to
-12,540 tasks per second across a single session while staying stable to 4%
-inside any five minute block. A block design hands that drift to whichever side
-runs second and reports it as a difference between frameworks; it produced a
-false 12% regression before it was caught. `campaign_paired.py` interleaves the
-two sides, alternates their order every pair, and reports the mean of per pair
-ratios with a 95% interval, calling a row noise when the interval spans 1.0.
+Every command prints a Markdown table. `--help` on any of them lists its size
+knobs; `--scale 0.1 --rounds 2` gives a quick smoke run of the drain
+benchmarks.
 
-Two more rules the harness now encodes, both learned from a wrong published
-number: **both sides must sit on the same filesystem** (an ext4 baseline against
-a `/mnt` 9p subject swings 12% on the import path alone), and **every worker
-process must be dead before the next run starts** (Celery answers `SIGTERM`
-with a warm shutdown that can never finish; one leaked pool ran for 2.4 hours
-and competed with every measurement after it).
+## Method
 
-Requires Linux (cauli-worker's constraint, not this harness's), Redis,
-PostgreSQL, and Rust/Cargo. `setup.sh` never touches a Redis or Postgres
-instance you already run — everything here is on its own port/role/database.
+- **Drain rate.** Preload N tasks with no worker running, start the worker,
+  take the completion slope between 10% and 90% done. A live producer racing
+  the consumer stops measuring the worker once the worker is faster.
+- **Paired rounds.** Every lane runs once per round, in a rotated order, and
+  each is reported as the mean of its per round ratio to the first lane with
+  a 95% interval. One config on this shared box drifted from 19,532 to 12,540
+  tasks/s within a session, so a block design reports drift as a difference.
+- **CPU columns.** Cores used by the worker's process tree and by Redis over
+  the same window as the rate. A Redis near 1.0 core means the row measured
+  Redis.
+- **PSS, not RSS.** Forked children share pages; RSS counts them once per child.
+- **Every worker process dies before the next run.** Processes run in their
+  own sessions and are SIGKILLed as a tree. Celery's warm shutdown on SIGTERM
+  can wait forever, and one leaked pool skews every later run.
 
-**Claim 5's pgbouncer-backed numbers need one extra step**, not covered by
-`setup.sh`: a pgbouncer instance in front of the same Postgres role/db,
-`pool_mode = transaction`, pointed at from `BENCH_PG_DSN` when running
-those specific lanes. Config used for the numbers in RESULTS.md:
+## Prerequisites
 
-```ini
-[databases]
-bench = host=127.0.0.1 port=5432 dbname=bench
+- Linux (cauli-worker), Redis on port 6395 started for the bench only:
+  `redis-server --port 6395 --save '' --appendonly no --daemonize yes`.
+  Every run flushes it.
+- PostgreSQL with role and database `bench`, password `bench`, for `web`.
+- k6 on `PATH` (or `K6_BIN`) for `web`.
+- A release worker: `cargo build --release --bin cauli-worker` in `worker/`.
+- Two venvs. arq pins `redis<6`, which conflicts with the rest:
 
-[pgbouncer]
-listen_addr = 127.0.0.1
-listen_port = 6433
-auth_type = plain
-auth_file = userlist.txt   # one line: "bench" "bench"
-pool_mode = transaction
-max_client_conn = 3000
-default_pool_size = 350
-min_pool_size = 250
+```bash
+uv venv ~/bench-venv && uv pip install --python ~/bench-venv/bin/python -e py -r bench/requirements.txt
+uv venv ~/arq-venv && uv pip install --python ~/arq-venv/bin/python -r bench/requirements-arq.txt
 ```
 
-If you point a psycopg3-based lane at pgbouncer, also pass
-`prepare_threshold=None` in the connection kwargs — see RESULTS.md's
-"Second bug found and fixed" note under Claim 5 for why (server-side
-prepared statements and transaction-pooling mode don't mix). Already
-applied in `tasks_cauli_sync_pg.py` / `tasks_cauli_async_pg.py`.
+| Variable | Default | Used by |
+|---|---|---|
+| `CAULI_WORKER_BIN` | `cauli-worker` | every benchmark |
+| `ARQ_PYTHON` | required | `dispatch`, `chaos` |
+| `GIL_PYTHON`, `GIL_WORKER`, `FT_PYTHON`, `FT_WORKER` | required | `free-threaded`: each interpreter with a worker built against it |
+| `BENCH_REDIS_URL` | `redis://127.0.0.1:6395/0` | every benchmark |
+| `BENCH_PG_DSN` | `postgresql://bench:bench@127.0.0.1:5432/bench` | `web` |
+| `BENCH_WEB_PORT` | `8100` | `web` |
+| `BENCH_LOG_DIR` | `/tmp` | worker logs, one file per benchmark |
 
-## What's in here
-
-| File | Purpose |
-|---|---|
-| `common.py` | Shared Redis URL / key constants every lane imports |
-| `workloads.py` | Shared task bodies (`cpu_burn`, Postgres insert SQL) so every framework runs identical work |
-| `tasks_<framework>_<workload>.py` | One task module per (framework, workload) combination |
-| `enqueue.py` | Preloads N tasks for a lane with no worker running (drain-rate setup) |
-| `monitor.py` | Polls a completion counter, computes the mid-80%-slope drain rate |
-| `run.sh` | Orchestrates one measurement: flush, enqueue, start worker, monitor, clean up |
-| `campaign.py` | Runs the pinned final configs from RESULTS.md, N reps, block design. Fine for a single lane; do NOT use it to compare two things |
-| `campaign_paired.py` | The comparison runner: interleaved, order alternating, reports ratios with a 95% interval. Use this one |
-| `ceiling.py` | Sweeps a framework to its own peak and says WHAT STOPPED IT, sampling per process CPU for the worker, Postgres and Redis over the same window the slope comes from, and labelling each row framework-bound, redis-bound, postgres-bound or box-bound |
-| `latency_producer.py` / `latency_report.py` | Open-loop load generation + HdrHistogram percentiles |
-| `mixed_driver.py` / `mixed_report.py` | Adversarial I/O + CPU-burst workload and its analysis |
-| `chaos_driver.py` | `kill -9` mid-run, measure data loss / duplicates / recovery time |
-| `segfault_driver.py` | Segfault blast-radius: what dies, what survives, what auto-recovers |
-| `memory_report.py` | Sums PSS (not RSS — see RESULTS.md for why) across a process group |
-| `soak_driver.py` | Sustained load + periodic PSS sampling for the 24-48h soak test |
-| `raw_asyncio_enqueue.py` / `raw_asyncio_worker.py` | The no-framework ceiling every lane is bounded by |
-| `djapp/` / `django_settings.py` | Minimal Django app (unmanaged model onto the shared `bench_io` table) for the Django ORM lane |
-| `web/` | Enqueue inside real Django (WSGI and ASGI) and FastAPI requests under k6 load: request rate, end to end task latency, and an exactly once check per request. `python3 -m web.campaign --reps 3`; needs k6, Postgres and the bench venv plus fastapi, uvicorn and gunicorn |
-| `free_threaded.py` / `tasks_cauli_threads.py` | GIL build against free threaded build of the same worker: sync threads vs cpu processes on a CPU bound body. Needs two venvs and two worker builds; see the docstring |
-| `sqla_models.py` | SQLAlchemy 2.0 declarative model onto the same table, for the async ORM lane (Core and ORM both go through this) |
-| `tasks_cauli_sync_pg.py` / `tasks_cauli_async_pg.py` | Raw psycopg3 PG lanes — also the pgbouncer-safe reference, `prepare_threshold=None` set unconditionally |
-| `Dockerfile` / `docker-compose.yml` / `docker-init.sql` | One-command reproduction (unvalidated on this dev machine — see RESULTS.md) |
-
-## Methodology, in one paragraph
-
-Throughput is drain-rate (preload with no worker running, then measure —
-never a live producer racing the consumer, which goes invalid the moment the
-worker outpaces it). Latency is open-loop (fixed send schedule regardless of
-completion — a closed-loop generator hides collapse under load). Every
-framework is tuned to its own optimum, not left at defaults, with the
-default-vs-tuned gap reported where it's large enough to matter. Delivery
-guarantees are compared at matched configuration, not across guarantee
-levels — Celery's default (early-ack) and a properly-configured version
-(`acks_late`) are both reported, labeled, rather than picking whichever one
-makes the comparison flattering. Full detail in RESULTS.md.
-
-## Status
-
-Actively being extended. See RESULTS.md's "Not yet done" section for what's
-missing and why, rather than treating silence as "already covered."
+Run the harness with the bench venv's Python. Workers get the clone's `py/`
+ahead of any installed cauli, so the code under test is the code in the tree.

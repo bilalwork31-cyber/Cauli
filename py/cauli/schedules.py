@@ -1,28 +1,12 @@
 """Schedule types for cauli's periodic scheduler (PROTOCOL.md section 10).
 
-Two kinds:
+:func:`interval` fires every N seconds; :func:`crontab` is a POSIX cron
+schedule in an explicit IANA timezone (default ``"UTC"``).
 
-- :func:`interval` -- fire every N seconds, on the phase established by the
-  first slot (so a beat restart does not shift the cadence).
-- :func:`crontab` -- POSIX cron-style wall-clock schedule in an explicit IANA
-  timezone.
-
-Every schedule is a **pure function from one absolute instant to the next**:
-``next_after(slot_ms) -> slot_ms'`` with ``slot_ms' > slot_ms``, in unix epoch
-MILLISECONDS. Nothing in this module reads the clock, and no schedule carries
-mutable state.
-
-That purity is load-bearing, not stylistic. It is what makes exactly-once
-firing across beat replicas possible: two replicas whose clocks disagree still
-compute the *same* next slot from the same previous slot, so the
-compare-and-set in :mod:`cauli.beat` (advance the stored slot from S to S'
-only if it is still S) can only ever let one of them win. If the next slot
-depended on ``now()``, two replicas would compute two different S' values and
-the CAS would stop being a mutual exclusion.
-
-Timezones are explicit. A crontab has an IANA timezone name (default
-``"UTC"``); wall-clock arithmetic happens in that zone via :mod:`zoneinfo`,
-and only the resulting absolute instant is ever stored or compared.
+Every schedule is a pure function ``next_after(slot_ms) -> slot_ms'`` over
+epoch milliseconds and never reads the clock. Beat replicas whose clocks
+disagree must compute the same next slot, or the compare and set in
+:mod:`cauli.beat` stops being a mutual exclusion and a slot fires twice.
 """
 
 from __future__ import annotations
@@ -72,25 +56,16 @@ _DOW_NAMES = {
     n: i for i, n in enumerate(["sun", "mon", "tue", "wed", "thu", "fri", "sat"])
 }
 
-# Bound on CrontabSchedule's forward day scan. Eight years covers the worst
-# legitimate expression (Feb 29 lands at most 8 years out across a century
-# boundary, e.g. 2096 -> 2104); anything past it is an expression that can
-# never match at all, such as "0 0 30 2 *" (February 30th).
+# Feb 29 can be 8 years out (2096 -> 2104); past that the expression can
+# never match, such as "0 0 30 2 *".
 _MAX_SCAN_DAYS = 366 * 8
 
-# Bound on the missed-slot fast-forward loop in `advance_past`. A crontab slot
-# is at least one minute wide, so this covers ~7 days of beat downtime before
-# the loop gives up and jumps straight to `next_after(now)`.
+# About 7 days of one minute slots; past it advance_past jumps to next_after(now).
 _MAX_ADVANCE_STEPS = 10_000
 
 
 def _canonical(spec: dict[str, Any]) -> str:
-    """Deterministic text form of a schedule spec, for :meth:`Schedule.rev`.
-
-    Uses ``sort_keys`` (which ``cauli._codec`` deliberately does not offer:
-    it encodes wire payloads, where key order is not semantic). This string
-    never reaches the wire -- it is hashed and thrown away.
-    """
+    """Deterministic text form of a spec, hashed by :meth:`Schedule.rev`."""
     return json.dumps(spec, sort_keys=True, separators=(",", ":"))
 
 
@@ -108,13 +83,9 @@ class Schedule:
     def advance_past(self, slot_ms: int, now_ms: int) -> int:
         """First slot strictly after BOTH ``slot_ms`` and ``now_ms``.
 
-        This is the "missed ticks" primitive (PROTOCOL.md section 10.4): after
-        downtime the scheduler fires the due slot **once** and then fast
-        forwards past the present, rather than replaying every slot it slept
-        through. Subclasses may override with closed-form arithmetic; the
-        default steps and is bounded by :data:`_MAX_ADVANCE_STEPS`, after which
-        it jumps directly (a jump can only ever *skip* slots, never duplicate
-        one, so the bound is safe).
+        After downtime beat fires the due slot once and then fast forwards
+        past the present (PROTOCOL.md section 10.4). Past the step bound it
+        jumps, which can only skip slots, never duplicate one.
         """
         return self.advance_past_with_missed(slot_ms, now_ms)[0]
 
@@ -123,10 +94,8 @@ class Schedule:
     ) -> tuple[int, int | None]:
         """:meth:`advance_past`, plus how many slots the fast forward swallowed.
 
-        The count is the occurrences strictly after ``slot_ms`` and no later
-        than ``now_ms``: scheduled work that will never run, which beat has to
-        announce rather than drop quietly. It is ``None`` when the step bound
-        was reached, because the true number is then unknown.
+        The count covers ``(slot_ms, now_ms]``, so beat can report work that
+        will never run. ``None`` when the step bound was hit.
         """
         nxt = self.next_after(slot_ms)
         missed = 0
@@ -138,12 +107,7 @@ class Schedule:
         return nxt, missed
 
     def rev(self) -> str:
-        """Stable 16-hex-char fingerprint of this schedule's definition.
-
-        The beat loop reseeds an entry's next-fire slot when its rev changes,
-        which is how an edited schedule (in code or via a future admin view)
-        takes effect without a restart.
-        """
+        """Stable 16 hex char fingerprint; beat reseeds the next slot when it changes."""
         return hashlib.sha1(_canonical(self.to_spec()).encode("utf-8")).hexdigest()[:16]
 
     def __eq__(self, other: object) -> bool:
@@ -176,9 +140,7 @@ class IntervalSchedule(Schedule):
     def advance_past_with_missed(
         self, slot_ms: int, now_ms: int
     ) -> tuple[int, int | None]:
-        # Closed form: no loop, so an interval schedule recovers from arbitrary
-        # downtime in O(1) (a 1-second interval down for a day would otherwise
-        # step 86_400 times).
+        # Closed form: a 1 second interval down for a day would step 86_400 times.
         slot_ms = int(slot_ms)
         if now_ms < slot_ms:
             return slot_ms + self.every_ms, 0
@@ -211,11 +173,9 @@ def _parse_field(
 ) -> frozenset[int]:
     """Parse one cron field into the set of values it matches.
 
-    Accepted: ``*``, ``*/step``, ``a``, ``a-b``, ``a-b/step``, ``a/step``
-    (vixie extension: ``a`` through ``hi`` by ``step``), comma-separated lists
-    of any of those, plus three-letter names for month and day-of-week. An
-    ``int``, or any iterable of the above, is also accepted so schedules can be
-    written as ``crontab(minute=[0, 30])``.
+    Accepts ``*``, ``*/step``, ``a``, ``a-b``, ``a-b/step``, ``a/step`` (``a``
+    to ``hi``), comma lists, month and weekday names, an ``int``, or an
+    iterable such as ``[0, 30]``.
     """
     if expr is None:
         expr = "*"
@@ -267,28 +227,15 @@ def _parse_field(
 class CrontabSchedule(Schedule):
     """POSIX cron-style wall-clock schedule in one explicit IANA timezone.
 
-    Semantics deliberately follow ``cron(8)``, not Celery:
+    Follows ``cron(8)``, not Celery:
 
-    - **day_of_month / day_of_week are OR'd** when BOTH are restricted (a field
-      counts as restricted unless it is exactly ``*``). ``0 3 1 * mon`` fires
-      on the 1st of the month *and* on every Monday. Celery ANDs them; POSIX
-      cron ORs them, and an expression written in crontab syntax should mean
-      what crontab means.
-    - ``day_of_week`` is ``0``-``6`` with ``0`` = Sunday; ``7`` is accepted as
-      Sunday too.
-
-    DST is handled by construction rather than by special cases, because every
-    slot is stored as an absolute instant and :meth:`next_after` is required to
-    return an instant strictly greater than its argument:
-
-    - **Fall back** (a wall time happens twice): a fixed wall time fires at
-      its first occurrence (``fold=0``) only. A job whose minute or hour field
-      starts with ``*`` fires in the repeated hour too, as ``cron(8)`` does.
-    - **Spring forward** (a wall time never happens): ``zoneinfo`` resolves the
-      nonexistent time using the pre-transition offset, so e.g. a 02:30 job on
-      the skipped day fires at the same instant that 02:30 standard time would
-      have been -- 03:30 by the new wall clock. It fires once; it is not
-      silently dropped.
+    - ``day_of_month`` and ``day_of_week`` are ORed when both are restricted
+      (not exactly ``*``): ``0 3 1 * mon`` fires on the 1st and every Monday.
+    - ``day_of_week`` is ``0`` to ``6`` with ``0`` Sunday; ``7`` is Sunday too.
+    - Fall back: a fixed wall time fires once, at its first occurrence. A job
+      whose minute or hour field starts with ``*`` also fires in the repeated hour.
+    - Spring forward: a skipped wall time resolves through the old offset, so
+      a 02:30 job fires once, at 03:30 new wall time.
     """
 
     def __init__(
@@ -322,18 +269,14 @@ class CrontabSchedule(Schedule):
         dows = _parse_field(day_of_week, 0, 7, _DOW_NAMES)
         self.dows = frozenset(0 if d == 7 else d for d in dows)
 
-        # POSIX restriction flags: a field is unrestricted only when it is
-        # literally "*". "*/2" is a restriction.
+        # "*/2" counts as restricted; only a literal "*" does not.
         self._dom_restricted = self.dom_expr != "*"
         self._dow_restricted = self.dow_expr != "*"
-        # cron(8) runs a job whose minute or hour field starts with "*" again
-        # in a repeated fall back hour; only fixed wall times fire once.
         self._repeats_in_fold = self.minute_expr.startswith("*") or (
             self.hour_expr.startswith("*")
         )
 
         self._shifting_days: dict[_date, list[int]] = {}
-        # Sorted (hour, minute) slots for one day; the scan below bisects it.
         self._hm: list[tuple[int, int]] = sorted(
             (h, m) for h in self.hours for m in self.minutes
         )
@@ -342,7 +285,7 @@ class CrontabSchedule(Schedule):
         if d.month not in self.months:
             return False
         dom_ok = d.day in self.doms
-        # date.weekday(): Monday == 0 .. Sunday == 6. cron: Sunday == 0.
+        # weekday() has Monday == 0; cron has Sunday == 0.
         dow_ok = ((d.weekday() + 1) % 7) in self.dows
         if self._dom_restricted and self._dow_restricted:
             return dom_ok or dow_ok
@@ -370,15 +313,10 @@ class CrontabSchedule(Schedule):
     def _shifting_day_instants(self, d: _date) -> list[int]:
         """Every instant this schedule fires on a day whose offset changes.
 
-        Wall order equals instant order only while the offset holds still. On
-        a transition day it does not, because a nonexistent wall time resolves
-        through the offset in force BEFORE the jump: with a two hour spring
-        forward (Antarctica/Troll, +00 to +02) wall 02:30 lands at 02:30Z while
-        the real wall 03:30 lands at 01:30Z. So the whole day is resolved and
-        sorted, and the set collapses the ordinary one hour case, where the
-        phantom 02:30 and the real 03:30 are the same instant and fire once.
-        Memoized because a recovery fast forward asks for the same day once
-        per slot; the answer depends only on the definition and the day.
+        Wall order is not instant order on such a day: with a two hour spring
+        forward (Antarctica/Troll) wall 02:30 lands at 02:30Z, after wall 03:30
+        at 01:30Z. So the day is resolved, deduplicated and sorted. Memoized
+        because a recovery fast forward asks for the same day once per slot.
         """
         cached = self._shifting_days.get(d)
         if cached is not None:
@@ -402,9 +340,7 @@ class CrontabSchedule(Schedule):
             self.tz
         )
         day = local.date()
-        # Start scanning from the minute after the argument's wall-clock minute;
-        # the strict `> slot_ms` test below is what actually enforces progress,
-        # so an over-inclusive starting point is harmless.
+        # The strict `> slot_ms` test enforces progress; from_hm only prunes.
         from_hm = (local.hour, local.minute)
         for offset in range(_MAX_SCAN_DAYS):
             if self._date_matches(day) and self._offset_changes_during(day):
@@ -444,7 +380,7 @@ class CrontabSchedule(Schedule):
 
 
 def _expr_text(expr: Any) -> str:
-    """Normalize a field to its canonical text form (what gets stored/hashed)."""
+    """Canonical text of a field, as stored and hashed."""
     if expr is None:
         return "*"
     if isinstance(expr, bool):
@@ -473,18 +409,10 @@ def crontab(
 ) -> CrontabSchedule:
     """POSIX cron-style schedule. See :class:`CrontabSchedule`.
 
-    Only ``minute`` and ``hour`` may be passed positionally, and that is
-    deliberate. Celery's ``crontab`` takes ``(minute, hour, day_of_week,
-    day_of_month, month_of_year)``; cauli's fields are in ``cron(8)`` order,
-    ``(minute, hour, day_of_month, month, day_of_week)``. Positions 3 and 4 are
-    swapped between the two, and both spellings parse cleanly, so a copied
-    ``crontab(0, 4, 1)`` would silently mean "every Monday" in one and "the 1st
-    of the month" in the other. Everything past ``hour`` must therefore be
-    named. ``month_of_year=`` is accepted only to reject it by name.
-
-    Note also that cauli ORs ``day_of_month`` and ``day_of_week`` when both are
-    restricted, as ``cron(8)`` does; Celery ANDs them. See
-    :class:`CrontabSchedule`.
+    Only ``minute`` and ``hour`` are positional: Celery orders the fields
+    ``(minute, hour, day_of_week, day_of_month, month_of_year)``, cauli uses
+    ``cron(8)`` order, so a copied ``crontab(0, 4, 1)`` would silently change
+    meaning. ``month_of_year=`` exists only to be rejected by name.
     """
     if month_of_year is not None:
         raise TypeError(
@@ -507,22 +435,12 @@ def crontab(
 class ScheduleEntry:
     """One periodic schedule entry (PROTOCOL.md section 10.2).
 
-    This is the *definition* only -- what to run and when. Runtime state (the
-    next slot, the last firing, the run count) lives in Redis, owned by the
-    beat leader, and never in this object. That split is what lets a future
-    Django-admin view be an addition rather than a rewrite: the admin edits
-    definitions, beat owns state.
+    The definition only; runtime state (next slot, last firing, run count)
+    lives in Redis, owned by the beat leader.
 
-    ``on_missed`` / ``max_lateness`` are the documented answer to "beat was
-    down, what happens on recovery":
-
-    - ``max_lateness=None`` (default): a due slot always fires, however late.
-    - ``max_lateness=S`` with ``on_missed="skip"``: a slot more than ``S``
-      seconds late does not fire at all.
-    - ``on_missed="fire_once"`` (default): it fires.
-
-    Either way beat fast forwards past the present afterwards -- a slot backlog
-    is coalesced into a single firing, never replayed one by one.
+    After beat downtime a due slot fires once, however late, unless
+    ``max_lateness=S`` and ``on_missed="skip"`` and it is more than ``S``
+    seconds late. A backlog of slots is coalesced, never replayed.
     """
 
     __slots__ = (
@@ -566,9 +484,7 @@ class ScheduleEntry:
                 f"schedule entry {name!r}: on_missed must be one of {ON_MISSED}"
             )
         if max_lateness is not None and max_lateness < 0:
-            # lateness = now - slot is never negative for a due slot, so a
-            # negative max_lateness would make lateness > max_lateness_ms
-            # always true and the entry would never fire, silently.
+            # A negative bound would silently stop the entry from ever firing.
             raise ValueError(
                 f"schedule entry {name!r}: max_lateness must be >= 0 seconds, "
                 f"got {max_lateness!r}"
@@ -593,9 +509,7 @@ class ScheduleEntry:
     def rev(self) -> str:
         """Fingerprint of everything that affects WHEN this entry fires.
 
-        Only the schedule and enabled-ness are in scope: changing the task's
-        kwargs should not reset its next slot, but changing ``crontab(hour=3)``
-        to ``crontab(hour=4)`` must.
+        Schedule and enabled only: editing kwargs must not reset the next slot.
         """
         return hashlib.sha1(
             _canonical(
@@ -644,9 +558,8 @@ class ScheduleEntry:
 def schedule_from_spec(spec: Any) -> Schedule:
     """Rebuild a :class:`Schedule` from its :meth:`Schedule.to_spec` form.
 
-    Also accepts a bare number (seconds -> interval) and a
-    :class:`datetime.timedelta`, so a schedule entry stored in Redis by hand
-    can say ``"schedule": 300`` instead of the full object.
+    Also accepts seconds as a number or a :class:`datetime.timedelta`, so a
+    hand written Redis entry can say ``"schedule": 300``.
     """
     if isinstance(spec, Schedule):
         return spec

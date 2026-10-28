@@ -64,9 +64,8 @@ def counted(path):
     max_retries=5, backoff_base=0.05, backoff_factor=1.0, backoff_max=0.1, jitter=False
 )
 def flaky_idemp(path, fail_times):
-    # Same shape as `flaky`, used with an idempotency_key (C1 regression):
-    # the retry must actually execute, not resolve as "duplicate" against
-    # its own earlier claim.
+    # Used with an idempotency_key: the retry must run, not resolve as a
+    # duplicate of its own claim.
     with open(path, "a+") as f:
         f.seek(0)
         n = len(f.read())
@@ -78,11 +77,9 @@ def flaky_idemp(path, fail_times):
 
 @app.task(timeout=4, max_retries=0)
 def slow_idemp(path, seconds):
-    """Sleeps so a killed worker can be caught mid task; paired with an
-    idempotency_key in the crash redelivery test (the MineAgain half of the
-    C1 fix, as opposed to `flaky_idemp`'s scheduled retry half). Appends to
-    `path` on every invocation attempt, so the test can tell exactly how
-    many times the body was entered.
+    """Sleeps so a worker can be killed mid task (crash redelivery test).
+
+    Appends to `path` on every attempt, counting how often the body ran.
     """
     with open(path, "a") as f:
         f.write("x")
@@ -94,10 +91,7 @@ def slow_idemp(path, seconds):
 
 @app.task(max_retries=0, timeout=0.5)
 def redelivery_doomed(x):
-    """Never actually runs in the redelivery limit test: that test advances
-    this task's own delivery_count past its limit before any worker reads
-    it, so the recovery loop dead letters it on sight.
-    """
+    """Never runs: the redelivery limit test dead letters it on sight."""
     return x
 
 

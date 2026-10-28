@@ -1,15 +1,10 @@
-"""The documented cauli.contrib.sqlalchemy setup path, exercised for real
-by test_sqlalchemy.py:
+"""The documented cauli.contrib.sqlalchemy setup, run by test_sqlalchemy.py:
 
     engine = create_async_engine(dsn, ...)
     app = install_sqlalchemy_session(Cauli(...), engine)
 
-The worker runs `cauli-worker --app sqlalchemy_site:app`. Postgres coordinates
-come from CAULI_ITEST_PG_* env vars, mirroring the CAULI_ITEST_PG_* threading
-django_site/settings.py uses for its own DATABASES dict, so test_sqlalchemy.py
-can point one run's engine at a uniquely tagged application_name without
-editing this file. Defaults match the audit's own bench role/database on
-Postgres's default port, so this module also works stood up by hand.
+Postgres coordinates come from CAULI_ITEST_PG_* env vars; defaults are the
+"bench" role and database on the default port.
 """
 
 import os
@@ -35,10 +30,9 @@ app = install_sqlalchemy_session(Cauli(default_queue="sqlalchemy"), _engine)
 
 @app.task(max_retries=0)
 async def session_probe(hold_seconds: float):
-    """Holds its own session's connection for hold_seconds, then reports the
-    real Postgres backend that served it. max_retries=0: a pool exhausted by
-    a leaked session must surface as a failed task, not be quietly retried
-    into passing later, the same reasoning django_site/dapp/tasks.py uses.
+    """Holds its session's connection for hold_seconds, then reports its backend.
+
+    max_retries=0 so an exhausted pool fails the task instead of retrying.
     """
     session = get_session()
     await session.execute(text("select pg_sleep(:s)"), {"s": hold_seconds})

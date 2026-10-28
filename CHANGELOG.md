@@ -34,6 +34,18 @@ Redis, and each fix ships with a test that fails without it.
 
 Worker:
 
+- A fetch never takes more entries than the process has free io slots. A
+  dispatched task took its slot only when it started, so the loop fetched
+  again first: with `-c 200` and 200 sleeping tasks only 100 ran (two
+  processes held 100 entries each against 50 slots, two held none).
+- An async loop queues a burst up to the worker's io slots instead of a
+  fixed 4096: one process at `--io-concurrency 10000` failed 1,744 of 10,000
+  healthy tasks with `AsyncQueueFull`.
+- A dead lettered envelope over 4096 bytes (an unregistered task with large
+  args) gets its failure result, so `get()` returns instead of waiting
+  forever.
+- Recovery no longer logs `peek (pipelined XRANGE) failed: empty command`
+  at WARN on a healthy worker.
 - A Redis write refused during the completion flush (OOM under
   `maxmemory-policy noeviction`) no longer acks and deletes the entry. The
   task used to vanish: no retry, no dead letter, no result. Writes now go
@@ -154,7 +166,9 @@ handing over between threads, and runs 3.9x faster on free threaded 3.14t.
 - The Celery comparison uses Celery at its best measured configuration
   (8 solo nodes, 4,233 tasks/s): cauli is 7.7x on the async lane and 4.9x on
   the sync lane, not 32.8x against a single Celery node.
-- `docs/decisions/` is rewritten as short architecture decision records.
+- Documentation is consolidated: README, PROTOCOL (the specification), and
+  `docs/` holding configuration, architecture (with the design decisions) and
+  the Celery migration guide.
 - The Python the worker embeds needs msgspec importable from the app's
   environment (cauli depends on it). Without it the worker exits at startup
   with an error naming that environment.
@@ -168,10 +182,11 @@ handing over between threads, and runs 3.9x faster on free threaded 3.14t.
   runs a `cp314t` worker wheel, and CI runs the client suite and the cross
   component suite on 3.14t with the GIL off. Sync tasks on threads now run in
   parallel: a CPU bound body on 10 threads went from 0.73 cores on 3.12 to
-  2.87 cores on 3.14t (`bench/free_threaded.py`). 3.13t still has no wheel.
-- `bench/web/`: enqueue cost inside real Django (WSGI and ASGI) and FastAPI
+  2.87 cores on 3.14t (`python -m bench free-threaded`). 3.13t still has no wheel.
+- `python -m bench web`: enqueue cost inside real Django (WSGI and ASGI) and FastAPI
   requests, end to end task latency, and an exactly once check per request.
-- A multi node Celery lane in `bench/campaign.py`.
+- `python -m bench`: one entry point for the dispatch, cpu, memory, chaos, web
+  and free threaded benchmarks, with Celery at its best multi node setup.
 - `.gitattributes` (LF for every text file; a Windows checkout used to break
   the shell scripts), `CODE_OF_CONDUCT.md`, issue and pull request templates.
 
@@ -184,6 +199,7 @@ handing over between threads, and runs 3.9x faster on free threaded 3.14t.
 ## 0.1.0 (2026-08-31)
 
 First public release. Features, supported platforms, known limitations and
-upgrade notes are in [docs/RELEASE_NOTES_v0.1.0.md](docs/RELEASE_NOTES_v0.1.0.md);
+upgrade notes are in the
+[v0.1.0 release](https://github.com/bilalwork31-cyber/Cauli/releases/tag/v0.1.0);
 the full change list for this release is the
 [CHANGELOG at v0.1.0](https://github.com/bilalwork31-cyber/Cauli/blob/v0.1.0/CHANGELOG.md).

@@ -1,19 +1,15 @@
-"""cauli exceptions.
+"""cauli exceptions (PROTOCOL.md sections 4.2, 6 and 8).
 
-See PROTOCOL.md sections 4.2, 6 and 8. ``Retry`` and ``SoftTimeLimitExceeded``
-are part of the wire contract: the Rust worker matches them by the classes
-exposed as ``cauli.Retry`` / ``cauli.SoftTimeLimitExceeded``.
+The worker matches ``cauli.Retry`` and ``cauli.SoftTimeLimitExceeded`` by class.
 """
 
 from __future__ import annotations
 
 
 class Retry(Exception):
-    """Raise inside a task to force a retry with an explicit delay.
+    """Raise inside a task to retry it after ``countdown`` seconds.
 
-    The worker recognizes this exception class and reads its ``.countdown``
-    attribute (float seconds, or ``None`` to use the computed backoff).
-    Still bounded by the task's ``max_retries``.
+    ``None`` uses the computed backoff. Still bounded by ``max_retries``.
     """
 
     countdown: float | None
@@ -27,38 +23,29 @@ class Retry(Exception):
 
 
 class SoftTimeLimitExceeded(Exception):
-    """Raised when a task's soft time limit expires, so it can stop early.
+    """Signals that a task's soft time limit expired, so it can stop early.
 
-    A task may catch this to do cleanup and return normally; if it propagates,
-    the task is treated as failed (retryable).
+    Catch it to clean up and return normally; if it propagates, the task
+    fails (retryable).
 
-    **The two io lanes signal the soft mark differently.** In a ``def`` task
-    this class is raised into the running thread, so ``except
-    SoftTimeLimitExceeded`` inside the body works and can return a value. An
-    ``async def`` task is cancelled at the soft mark instead, because asyncio
-    has no way to throw an arbitrary exception into a coroutine at its await
-    point: the body observes ``asyncio.CancelledError`` and its ``finally``
-    blocks run, while an ``except SoftTimeLimitExceeded`` inside that body
-    never fires.
+    In a ``def`` task this class is raised into the running thread, so
+    ``except SoftTimeLimitExceeded`` works. An ``async def`` task is
+    cancelled instead: the body observes ``asyncio.CancelledError`` and its
+    ``finally`` blocks run, but ``except SoftTimeLimitExceeded`` never fires.
 
-    The failure cauli reports is ``SoftTimeLimitExceeded`` on both lanes, so
-    callers, the DLQ and the result document agree. See the ``soft_timeout``
-    row in docs/CONFIGURATION.md.
+    The failure cauli reports is ``SoftTimeLimitExceeded`` on both lanes. See
+    the ``soft_timeout`` row in docs/configuration.md.
     """
 
 
 class TaskFailedError(Exception):
-    """Raised by :meth:`cauli.AsyncResult.get` when a task finished with status failure.
+    """Raised by :meth:`cauli.AsyncResult.get` for a failed task.
 
-    Attributes mirror the error JSON from PROTOCOL.md section 8:
-    ``type`` (exception class name), ``message``, ``traceback`` (may be truncated),
-    and ``origin``.
-
-    ``origin`` says who minted the error: ``"worker"`` for cauli machinery
-    (a time limit, a dead letter, a shim failure), ``"task"`` for an exception
-    that propagated out of your own code, and ``"client"`` for one this
-    package synthesized locally, such as ``InvalidResult``. It is ``None``
-    when unknown, which is what a worker predating the field reports.
+    Attributes mirror the error JSON (PROTOCOL.md section 8): ``type``,
+    ``message``, ``traceback`` (may be truncated) and ``origin``:
+    ``"worker"`` (time limit, dead letter, shim failure), ``"task"`` (raised
+    by your code), ``"client"`` (synthesized locally, such as
+    ``InvalidResult``) or ``None`` (unknown).
     """
 
     def __init__(
@@ -68,9 +55,7 @@ class TaskFailedError(Exception):
         traceback_: str | None = None,
         origin: str | None = None,
     ) -> None:
-        # origin is deliberately kept out of the base args: ``.args`` and the
-        # repr built from it stay the same 3-tuple they were, so adding the
-        # field cannot change what an existing caller sees.
+        # origin stays out of .args so .args and repr keep their 3 tuple shape.
         super().__init__(type_, message, traceback_)
         self.type = type_
         self.message = message

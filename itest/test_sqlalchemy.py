@@ -1,31 +1,17 @@
 """Async SQLAlchemy integration e2e: real cauli-worker + real Postgres.
 
-Proves, end to end, the three claims cauli.contrib.sqlalchemy's module
-docstring makes about session and connection lifecycle, the ones its own
-test docstring (py/tests/test_contrib_sqlalchemy.py) admits were only ever
-checked by a manual run against pg_stat_activity, not a committed test:
-  1. concurrent tasks each get their own AsyncSession/connection, never one
-     shared between two tasks in flight at once;
-  2. the number of simultaneous Postgres backends stays bounded by
-     SQLAlchemy's pool ceiling (pool_size 5 + max_overflow 10 = 15, the
-     stock defaults, left untouched here) under a task count well past that
-     ceiling, rather than growing with the task count;
-  3. connections are returned to the pool between tasks instead of
-     accumulating: the backend count comes back down to pool_size (5) once
-     a burst finishes, and every task in the burst still completes even
-     though the burst is twice the pool's ceiling.
+Proves:
+  1. concurrent tasks each get their own AsyncSession and connection;
+  2. Postgres backends stay within the pool ceiling (pool_size 5 +
+     max_overflow 10 = 15) under twice that many tasks;
+  3. connections return to the pool: the count settles back to 5 and every
+     task in the burst completes.
 
-Infrastructure: throwaway redis on port 6419 (639x/64xx families are in use
-by concurrent audit work) and the audit's own already-running Postgres,
-role and database both "bench", on the default port (CAULI_ITEST_PG_* env
-vars override host/port/db/user/password). That Postgres is shared with
-other work on this box, so every measurement below filters
-pg_stat_activity by a unique application_name generated fresh for this run
-and threaded into the worker via CAULI_ITEST_APPNAME, rather than trusting
-an absolute count; a baseline of the bench role's total connection count is
-also taken before the worker starts, for the one assertion that looks at
-the role's total instead of just this run's tag.
-Skips if sqlalchemy/psycopg or the cauli-worker binary or a reachable
+Infrastructure: throwaway redis on port 6419 and an already running
+Postgres, role and database "bench", on the default port (CAULI_ITEST_PG_*
+override). That Postgres is shared, so measurements filter pg_stat_activity
+by a per run application_name (CAULI_ITEST_APPNAME), plus one baseline of
+the role's total. Skips if sqlalchemy/psycopg, the worker binary or the
 bench Postgres is unavailable.
 """
 
@@ -57,12 +43,7 @@ PG_USER = os.environ.get("CAULI_ITEST_PG_USER", "bench")
 PG_PASSWORD = os.environ.get("CAULI_ITEST_PG_PASSWORD", "bench")
 PG_DSN = f"postgresql://{PG_USER}:{PG_PASSWORD}@{PG_HOST}:{PG_PORT}/{PG_DB}"
 
-# Fresh every run: the one thing that lets every pg_stat_activity query
-# below tell this worker's own connections apart from other bench-role
-# connections already on this box (or opened by other work while this test
-# runs), without needing an absolute count anywhere except the one baseline
-# assertion, which subtracts what was already there before the worker
-# started.
+# Fresh every run, so pg_stat_activity queries see only this worker.
 APPNAME = f"cauli-itest-sqlalchemy-{uuid.uuid4().hex[:8]}"
 
 pytestmark = pytest.mark.skipif(
@@ -103,13 +84,9 @@ def _worker_env():
 
 
 def _spawn_worker():
-    # --procs 1: one process, one engine, one pool -- the connection count
-    # arithmetic in the sqlalchemy.py module docstring stays procs * ceiling
-    # with procs pinned at 1, so the ceiling itself is what's under test.
-    # --io-loops 1: the module's own hazard, pins the pool to one loop.
-    # --io-concurrency 32 is well above the 15 connection pool ceiling on
-    # purpose, so cauli's own admission gate is never the bottleneck being
-    # measured -- the SQLAlchemy pool is.
+    # One process and one loop so the pool ceiling is what is under test;
+    # --io-concurrency 32 is above that ceiling so the pool, not cauli's
+    # admission gate, is the bottleneck.
     return subprocess.Popen(
         [
             BIN,
@@ -187,9 +164,7 @@ def stack():
             time.sleep(0.1)
     r.flushall()
 
-    # Client side env BEFORE importing sqlalchemy_site: the test process is the
-    # "web app" here, it only enqueues (delay() talks to redis, never to
-    # Postgres), but it still needs CAULI_REDIS_URL set for that.
+    # Before importing sqlalchemy_site, which reads CAULI_REDIS_URL.
     os.environ["CAULI_REDIS_URL"] = REDIS_URL
     import sqlalchemy_site  # noqa: F401  (registers session_probe against app)
 
@@ -213,10 +188,7 @@ def _probe():
 
 
 def test_concurrent_tasks_get_distinct_sessions(stack):
-    """Five tasks in flight at once, each holding its connection for half a
-    second, must show five distinct Postgres backends: proof, at the real
-    worker and real Postgres level, of the ContextVar isolation
-    py/tests/test_contrib_sqlalchemy.py already proves at the hook level."""
+    """Five concurrent tasks holding a connection show five distinct backends."""
     probe = _probe()
     n = 5
     started = time.monotonic()
@@ -225,31 +197,19 @@ def test_concurrent_tasks_get_distinct_sessions(stack):
     elapsed = time.monotonic() - started
 
     assert len(set(pids)) == n, f"expected {n} distinct sessions, saw {pids}"
-    # Serialized (one connection reused/waited-on rather than five running
-    # at once) would take roughly n * 0.5s; concurrent takes roughly one
-    # hold period plus scheduling slack.
+    # Serialized would take about n * 0.5s.
     assert elapsed < n * 0.5, (
         f"{n} probes took {elapsed:.2f}s, looks serialized rather than concurrent"
     )
 
 
 def test_connections_stay_bounded_and_are_returned_under_concurrency(stack):
-    """The property this module exists for. pool_size=5 and max_overflow=10
-    are SQLAlchemy's stock defaults, left untouched here on purpose: 30
-    tasks is twice the 15-connection ceiling they imply, so if a session
-    ever leaked instead of returning to the pool, the connections behind it
-    would never free up, later probes' session.execute() would block on an
-    exhausted pool and then raise (max_retries=0 in sqlalchemy_site.py turns
-    that into a failed .get() instead of a retry quietly hiding it), and
-    the backend count would keep climbing instead of settling back down.
-    That is what makes every assertion below able to fail for real, not
-    just on "no exception raised".
+    """30 tasks against a 15 connection pool: a leaked session would exhaust
+    the pool and fail a probe (max_retries=0), and the backend count would
+    not settle back down.
     """
     _, _, baseline_total = stack
-    # At most pool_size (5) here, not 0: an earlier test in this session may
-    # have already filled the pool's base slots, and those stay pooled
-    # (open, idle) rather than closing between tests. That is expected
-    # steady state, not a leak; anything above 5 would not be.
+    # Up to pool_size, not 0: earlier tests leave the base slots pooled.
     starting = _run_backend_count()
     assert starting <= 5, (
         f"{starting} backend(s) already open for this run before the burst "

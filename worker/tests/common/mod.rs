@@ -76,11 +76,8 @@ impl Worker {
         Self::spawn_ex(queues, extra, &[], None)
     }
 
-    /// Like `spawn`, plus extra environment variables and, when `log_path` is
-    /// given, stdout redirected to that file instead of discarded -- that is
-    /// where tracing writes (see main.rs's `exit_now` doc comment), so a test
-    /// that needs to read the stats line back has to capture it there, not
-    /// stderr.
+    /// Like `spawn`, plus extra env vars and, when `log_path` is given, stdout
+    /// (where tracing writes) redirected to that file.
     pub fn spawn_ex(
         queues: &str,
         extra: &[&str],
@@ -91,10 +88,8 @@ impl Worker {
         cmd.current_dir(fixtures_dir())
             .args(["--app", "fixture_app:app", "--queues", queues])
             .args(["--redis-url", &redis_url()]);
-        // clap rejects a scalar flag passed twice ("cannot be used multiple
-        // times"), so only add each default when `extra` doesn't already
-        // specify it -- this lets a test override e.g. --io-threads via
-        // `extra` without colliding with the default below.
+        // clap rejects a scalar flag passed twice, so a default is added only when
+        // `extra` does not set it.
         let has = |flag: &str| extra.contains(&flag);
         if !has("--io-threads") {
             cmd.args(["--io-threads", "8"]);
@@ -157,10 +152,8 @@ impl Drop for Worker {
 
 static SEQ: AtomicU64 = AtomicU64::new(1);
 
-/// 32-char lowercase hex id, unique per test run.
-/// Poll `path` for a `stats:` line where the `field` key (e.g. `"cpu_backlog="`)
-/// is present with a value > 0, up to `secs`. Returns that full line, or
-/// None on timeout.
+/// Poll `path` for a `stats:` line where `field` (e.g. `"cpu_backlog="`) is
+/// above 0, up to `secs`.
 pub async fn wait_stats_field_nonzero(path: &Path, field: &str, secs: u64) -> Option<String> {
     let deadline = Instant::now() + Duration::from_secs(secs);
     loop {
@@ -293,4 +286,20 @@ pub async fn wait_group(c: &mut redis::aio::MultiplexedConnection, queue: &str, 
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     panic!("consumer group on {queue} never appeared");
+}
+
+/// Entries delivered and not yet acked on `queue` (XPENDING summary count).
+pub async fn xpending_count(c: &mut redis::aio::MultiplexedConnection, queue: &str) -> i64 {
+    let v: redis::Value = redis::cmd("XPENDING")
+        .arg(format!("cauli:q:{queue}"))
+        .arg("cauli")
+        .query_async(c)
+        .await
+        .unwrap();
+    match v {
+        redis::Value::Array(items) => items
+            .first()
+            .map_or(0, |n| redis::from_redis_value_ref::<i64>(n).unwrap_or(0)),
+        _ => 0,
+    }
 }

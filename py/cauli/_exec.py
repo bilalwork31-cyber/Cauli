@@ -1,37 +1,16 @@
 """cauli._exec: the cpu child process (PROTOCOL.md section 5.1).
 
-Two modes, one request/response line protocol:
+Fork server mode (default): the parent imports the app, runs ``gc.freeze()``
+so children share the import image copy on write, and answers ``{"cmd":
+"fork"}`` control lines with ``{"forked": pid}``. Each child connects to the
+worker's unix socket and serves up to M requests at once, matched by ``id``.
 
-**Fork-server mode** (the worker's default):
-``{python} -m cauli._exec --app module:attr --fork-server --connect <unix
-socket path> [--child-threads M]``. The PARENT imports the app once, runs
-``gc.collect()`` + ``gc.freeze()`` (so forked children share the warmed
-import image copy-on-write and the GC never dirties frozen pages), then
-serves fork requests over its stdin/stdout control channel: one
-``{"cmd": "fork"}`` line in, one ``{"forked": <pid>}`` line out. It reaps
-children via SIGCHLD, exits 0 on stdin EOF, and sets PR_SET_PDEATHSIG so it
-dies with the worker. Each forked CHILD connects to the worker's unix socket
-listener, sends ``{"ready": true, "pid": N, "concurrency": M}`` on that
-connection, then serves requests on it -- up to M in flight at once
-(responses matched by ``id``, may be out of order). Soft timeouts: SIGALRM
-when M == 1, a shared watchdog thread + PyThreadState_SetAsyncExc when
-M > 1 (SIGALRM only ever fires in the main thread).
+Stdio mode (``--no-fork-server``): one request per stdin line, one response
+per stdout line, one in flight.
 
-**Stdio mode** (fallback, ``--no-fork-server`` worker flag): spawned as
-``{python} -m cauli._exec --app module:attr``. Prints exactly one ready line
-``{"ready": true, "pid": N}`` on stdout, then reads one JSON request per
-line from stdin and writes one JSON response per line to stdout, one request
-in flight, flushing after every line. stderr is passthrough logging.
-
-Robustness notes:
-- In stdio mode fd 1 is re-pointed at stderr right after startup and the
-  original stdout pipe is kept on a private fd, so task-level ``print()``
-  (or even C-level writes to fd 1) cannot corrupt the line protocol. The
-  fork-server parent does the same for its control channel; forked children
-  additionally point fd 0 at /dev/null and close the inherited control fd.
-- The child never crashes on task exceptions; it reports them. EOF on
-  stdin/socket exits 0. Import/startup errors exit nonzero before the
-  ready/server line.
+fd 1 is pointed at stderr and the protocol stream kept on a private fd, so a
+task's ``print()`` cannot corrupt the protocol. Task errors are reported,
+never fatal; EOF exits 0; startup errors exit nonzero before the ready line.
 """
 
 from __future__ import annotations
@@ -59,19 +38,14 @@ from cauli._context import make_context, reset_current_task, set_current_task
 from cauli._hooks import run_hooks
 from cauli.exceptions import SoftTimeLimitExceeded
 
-_TRACEBACK_CAP = 8192  # max chars of formatted traceback kept in error JSON (section 8)
+_TRACEBACK_CAP = 8192
 
-# The cpu lane's wire id is "{envelope id}.{hex sequence}" (worker/src/exec.rs
-# builds it so one envelope's retries stay distinguishable on the child's
-# multiplexed connection). cauli.current_task() must report the bare envelope
-# id -- the one the enqueuing side holds as AsyncResult.id -- so the suffix is
-# stripped, and only when the tail really is that generated hex counter.
+# The cpu wire id is "{envelope id}.{hex seq}"; current_task() must report the
+# bare envelope id the caller holds as AsyncResult.id.
 _WIRE_SUFFIX_RE = re.compile(r"\.[0-9a-f]+\Z")
 
-# The worker serializes `id` first (worker/src/exec.rs CpuRequest), so a line
-# the codec rejects (an integer past 4300 digits, 1e400) still names the
-# request it answers. Without the id the worker drops the response and the
-# task holds its cpu slot until the hard timeout SIGKILLs the child.
+# The worker writes `id` first, so a line the codec rejects still names its
+# request; without the id the task would hold its slot until the hard timeout.
 _REQUEST_ID_RE = re.compile(r'\{"id":"([^"\\]*)"')
 
 _set_async_exc = ctypes.pythonapi.PyThreadState_SetAsyncExc
@@ -85,11 +59,7 @@ def _format_traceback(exc: BaseException) -> str:
 
 
 def _error_json(exc: BaseException, origin: str = "task") -> dict[str, Any]:
-    # PROTOCOL.md section 8 `origin`, same rule as worker/src/shim.py: "task"
-    # whenever a real exception ended the task invocation, which includes a
-    # propagated SoftTimeLimitExceeded (the child injected it, but it did
-    # leave user code). "worker" is passed explicitly where cauli itself
-    # synthesized the error with no task exception behind it.
+    # PROTOCOL.md section 8: "worker" only where cauli synthesized the error.
     return {
         "type": type(exc).__name__,
         "message": str(exc),
@@ -103,16 +73,7 @@ def _on_alarm(signum: int, frame: Any) -> None:
 
 
 def _is_retry(exc: BaseException) -> bool:
-    """Duck-typed retry recognition (audit M6): an exception class named
-    exactly "Retry" exposing a ``.countdown`` attribute is treated as a
-    forced retry. This mirrors worker/src/shim.py's `_is_retry` exactly (by
-    name, not `isinstance`), so cpu and io tasks agree on the SAME rule
-    regardless of which `Retry` class raised it -- the app's own `cauli.Retry`,
-    or an embedded duck-type in a test fixture with no cauli import at all.
-    Previously this module used `isinstance(exc, cauli.exceptions.Retry)`,
-    which silently disagreed with the shim's name-based rule and with the
-    Rust cpu-mapping (ctx.rs), which only ever sees the type name string.
-    """
+    """By name, not isinstance: must match shim.py and ctx.rs, which see names."""
     return type(exc).__name__ == "Retry" and hasattr(exc, "countdown")
 
 
@@ -139,19 +100,10 @@ def _load_app(spec: str) -> Any:
 
 
 class _SoftTimeoutWatchdog:
-    """Shared soft-timeout watchdog for threaded children (M > 1).
+    """Soft timeouts for threaded children (M > 1); SIGALRM reaches only the main thread.
 
-    SIGALRM is only ever delivered to a process's main thread, so the M=1
-    setitimer scheme cannot arm per-request soft timeouts once M worker
-    threads execute concurrently. This mirrors the worker shim's pattern
-    (worker/src/shim.py, audit MEM-4/M3): ONE daemon thread services a
-    min-heap of ``(deadline, tid, generation)`` and injects
-    ``SoftTimeLimitExceeded`` via ``PyThreadState_SetAsyncExc``; a per-thread
-    generation counter fences stale deadlines so one can never land inside a
-    LATER request on the same worker thread. The residual race (a deadline
-    firing between the task returning and its ``finally`` disarm) is
-    inherent to async-exc injection, exactly as documented for the io path
-    in PROTOCOL.md section 4.6.
+    The per thread generation stops a stale deadline landing in a later
+    request. The residual race is documented in PROTOCOL.md section 4.6.
     """
 
     def __init__(self) -> None:
@@ -197,22 +149,14 @@ class _SoftTimeoutWatchdog:
     def _inject(self, tid: int, gen: int) -> None:
         with self._gen_lock:
             if self._gen.get(tid, 0) != gen:
-                return  # that request already finished: stale deadline
+                return
         _set_async_exc(ctypes.c_ulong(tid), ctypes.py_object(SoftTimeLimitExceeded))
 
 
 async def _run_hooks_async(hooks: Any, where: str) -> None:
-    """:func:`cauli._hooks.run_hooks` for a coroutine context.
+    """:func:`cauli._hooks.run_hooks` that awaits a hook returning an awaitable.
 
-    A hook may return an awaitable (the Django contrib's
-    ``close_old_connections`` hook does, via ``sync_to_async(...,
-    thread_sensitive=True)``, so the cleanup lands on the very thread
-    asgiref runs the task's sync ORM work in); it is awaited on the loop
-    thread. Sync hooks behave exactly as on the other paths, and a raising
-    hook is still reported and skipped. Mirrors worker/src/shim.py's
-    ``_run_hooks_async`` on the io async lane -- kept local to this module
-    rather than in ``cauli._hooks`` for the same reason the shim carries its
-    own copy: the sync helper must stay importable with no asyncio context.
+    The Django hook returns one so cleanup runs on asgiref's ORM thread.
     """
     for hook in hooks:
         try:
@@ -233,23 +177,11 @@ async def _run_async_task(
     watchdog: _SoftTimeoutWatchdog | None,
     use_alarm: bool,
 ) -> Any:
-    """Run one ``async def`` cpu task with its hooks INSIDE the event loop.
+    """Run one ``async def`` cpu task with its hooks inside the event loop.
 
-    An async task's body runs on an event loop, so its before/after hooks
-    have to run there too: a hook that branches on
-    ``asyncio.get_running_loop()`` (the Django contrib's does) would
-    otherwise take its sync branch on this thread while the body's
-    thread-sensitive ORM work executes on asgiref's executor thread, and
-    Django connections are thread-local -- the connection the body opened
-    would be closed by neither hook. Same shape as the io async lane in
-    worker/src/shim.py.
-
-    The soft timeout is armed after the before hooks and disarmed before the
-    after hooks, exactly as on the sync path: hook time is not charged
-    against the task's soft budget and an injection cannot land in a hook.
-    The loop this runs on is the calling thread's own persistent loop (see
-    ``_thread_event_loop``), so both the SIGALRM and the watchdog scheme still
-    target the right thread.
+    A hook that branches on a running loop (Django's does) must see what the
+    body sees, or the body's thread local connection is closed by neither.
+    The soft timeout covers the body only, never a hook.
     """
     await _run_hooks_async(getattr(app, "_before_task_hooks", ()), "before_task")
     try:
@@ -272,24 +204,11 @@ _loops = threading.local()
 
 
 def _thread_event_loop() -> asyncio.AbstractEventLoop:
-    """The persistent event loop belonging to THIS execution thread.
+    """The persistent event loop of this thread; ``asyncio.run`` per task is costly.
 
-    Replaces a per-request ``asyncio.run``. Standing a loop up and tearing it
-    down again costs 122.7us against 10.1us to drive a coroutine on a loop
-    that already exists: more, per task, than the entire unix socket round
-    trip that delivered the request. The io async lane already works this way
-    (worker/src/shim.py keeps its loops for the process lifetime), so this
-    also makes the two async lanes agree.
-
-    One loop per thread, not one per child: ``run_until_complete`` runs on the
-    calling thread, and both soft timeout schemes (SIGALRM in single mode, the
-    watchdog's ``PyThreadState_SetAsyncExc`` in threaded mode) target that
-    same thread. ``asyncio.set_event_loop`` is part of the contract, not
-    decoration -- ``asgiref`` and Django read the thread's current loop.
-
-    The pid guard is for the fork server: a ``threading.local`` survives
-    ``fork()`` on the forking thread, so without it a child could inherit and
-    reuse the parent's loop, whose epoll fd the parent still holds.
+    Per thread because both soft timeout schemes target the calling thread.
+    ``set_event_loop`` matters: asgiref and Django read it. The pid guard
+    stops a forked child reusing the parent's loop and its epoll fd.
     """
     loop = getattr(_loops, "loop", None)
     if loop is None or loop.is_closed() or getattr(_loops, "pid", None) != os.getpid():
@@ -301,17 +220,10 @@ def _thread_event_loop() -> asyncio.AbstractEventLoop:
 
 
 def _cancel_orphans(loop: asyncio.AbstractEventLoop) -> None:
-    """Cancel whatever the task body left running, as ``asyncio.run`` did.
+    """Cancel tasks the body left running, as ``asyncio.run`` would.
 
-    ``asyncio.run`` cancelled every still-pending task before closing its
-    loop, so a body that fired off ``asyncio.create_task(...)`` and returned
-    without awaiting it could never outlive its own request. This loop
-    survives between requests, so without this an orphan would keep running
-    inside the NEXT task on this thread, holding whatever it captured -- a
-    database connection included.
-
-    Between requests the loop is idle, so on every well behaved task this is
-    one scan of an empty set.
+    The loop outlives the request, so an orphan would otherwise run inside
+    the next task on this thread.
     """
     pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
     if not pending:
@@ -324,18 +236,10 @@ def _cancel_orphans(loop: asyncio.AbstractEventLoop) -> None:
 def _execute(
     app: Any, request: dict[str, Any], watchdog: _SoftTimeoutWatchdog | None = None
 ) -> dict[str, Any]:
-    """Run one task request and build the response dict. Never raises for task errors.
-
-    Soft timeout: SIGALRM/setitimer when ``watchdog`` is None (single-threaded
-    execution in the main thread), else the shared watchdog thread.
-    """
+    """Run one task request and build the response dict. Never raises for task errors."""
     request_id = request.get("id")
     task_name = request.get("task")
-    # The bare envelope id for cauli.current_task(): `request_id` carries the
-    # per-attempt wire suffix the worker adds (`{envelope id}.{seq}`,
-    # worker/src/exec.rs) and must keep it in every response, but a task that
-    # asks for its own id has to get back the id the caller holds as
-    # AsyncResult.id.
+    # Responses keep the wire suffix; current_task() gets the bare id.
     bare_id = request_id
     if isinstance(bare_id, str):
         bare_id = _WIRE_SUFFIX_RE.sub("", bare_id)
@@ -345,12 +249,8 @@ def _execute(
 
     task = getattr(app, "_tasks", {}).get(task_name)
     if task is None:
-        # Same error.type string as the worker's own pre dispatch registry
-        # check (worker/src/dispatch.rs, PROTOCOL.md section 8), and
-        # "retryable": False so this fails on this one attempt instead of
-        # burning the full backoff schedule on something that can never
-        # succeed: worker/src/ctx.rs's parse_pyresp honors an explicit
-        # "retryable" field over its own default.
+        # Same type as the worker's own registry check (PROTOCOL.md section 8);
+        # not retryable, since it can never succeed.
         return {
             "id": request_id,
             "ok": False,
@@ -367,20 +267,9 @@ def _execute(
         bool(soft_timeout_ms) and watchdog is None and hasattr(signal, "setitimer")
     )
     use_watchdog = bool(soft_timeout_ms) and watchdog is not None
-    # Per-task lifecycle hooks (PROTOCOL.md section 4.8): before hooks run on
-    # THIS thread before the soft timeout is armed (hook time is not charged
-    # against the task's soft budget, and an injection cannot land inside a
-    # hook); after hooks run in the outer finally, after the disarm, on every
-    # outcome path (success, task exception, forced retry).
-    #
-    # cauli.current_task() is installed first, so the hooks see the same id the
-    # task body will, and released in that same outer finally: a cpu child
-    # reuses its worker threads across requests, and a leaked context would
-    # show the next task on the thread the previous task's id.
-    #
-    # An `async def` cpu task takes both hook phases into `_run_async_task`
-    # instead, so they run on the event loop the body runs on (a hook that
-    # branches on a running loop must see the same answer the body would).
+    # Hooks run outside the soft timeout, on every outcome (PROTOCOL.md 4.8).
+    # The context is reset in the outer finally: threads are reused, and a
+    # leak would show the next task the previous task's id.
     is_async = bool(getattr(task, "is_async", False))
     ctx_token = set_current_task(make_context(request, task_id=bare_id))
     try:
@@ -417,7 +306,7 @@ def _execute(
                         signal.setitimer(signal.ITIMER_REAL, 0.0)
                     elif use_watchdog:
                         watchdog.disarm()
-        except BaseException as exc:  # the child must never crash on task errors
+        except BaseException as exc:
             if _is_retry(exc):
                 cd = getattr(exc, "countdown", None)
                 if cd is not None:
@@ -432,10 +321,8 @@ def _execute(
                     "countdown": cd,
                     "error": _error_json(exc),
                 }
-            # Stamped, exactly as shim.py's `_finish_exc` stamps the io lanes:
-            # left absent, ctx.rs falls back to a name based default that makes
-            # a user exception class named "SerializationError" terminal here
-            # and retryable on io, for the same task and the same exception.
+            # Stamped as on the io lanes; ctx.rs's name based default would
+            # make a user "SerializationError" terminal here only.
             return {
                 "id": request_id,
                 "ok": False,
@@ -470,7 +357,7 @@ def _handle_request_line(
         }
     try:
         return _execute(app, request, watchdog=watchdog)
-    except BaseException as exc:  # e.g. a soft timeout landing at the task boundary
+    except BaseException as exc:  # a soft timeout landing at the task boundary
         request_id = request.get("id") if isinstance(request, dict) else None
         return {
             "id": request_id,
@@ -481,15 +368,7 @@ def _handle_request_line(
 
 
 def _serialize_response_bytes(payload: dict[str, Any]) -> bytes:
-    """Serialize one protocol line as UTF-8 bytes (no trailing newline).
-
-    A non JSON serializable result degrades to a SerializationError response
-    for the same request id (section 5.1).
-
-    Bytes, not str: this is the socket path's serializer and ``sendall`` wants
-    bytes. Producing str here cost a full transcode of every single response
-    (see ``_codec.encode_bytes``).
-    """
+    """One protocol line as UTF-8 bytes; an unencodable result becomes a SerializationError."""
     try:
         return _codec.encode_bytes(payload)
     except _codec.ENCODE_ERRORS as exc:
@@ -497,25 +376,19 @@ def _serialize_response_bytes(payload: dict[str, Any]) -> bytes:
             "type": "SerializationError",
             "message": f"task result is not JSON serializable: {exc}",
             "traceback": _format_traceback(exc),
-            # The task itself succeeded and returned; the codec is what
-            # failed, so this error object is cauli's, not the task's.
             "origin": "worker",
         }
-        # Stamped rather than left to the reader's name based default, which
-        # is only a fallback for older children (PROTOCOL.md section 8).
         return _codec.encode_bytes(
             {"id": payload.get("id"), "ok": False, "retryable": False, "error": error}
         )
 
 
 def _serialize_response(payload: dict[str, Any]) -> str:
-    """:func:`_serialize_response_bytes` as text, for the stdio fallback mode's
-    text-mode protocol stream (not a hot path; the socket path uses bytes)."""
+    """:func:`_serialize_response_bytes` as text, for stdio mode."""
     return _serialize_response_bytes(payload).decode("utf-8")
 
 
 def _write_line(out: TextIO, payload: dict[str, Any]) -> None:
-    """Serialize and emit one protocol line, always flushing."""
     out.write(_serialize_response(payload) + "\n")
     out.flush()
 
@@ -525,12 +398,7 @@ def _log(msg: str) -> None:
 
 
 def _set_pdeathsig() -> None:
-    """Best-effort PR_SET_PDEATHSIG=SIGKILL (Linux): die with our parent.
-
-    Cleared by fork(), so the fork-server parent AND every forked child each
-    arm it for themselves (parent dies with the worker; children die with
-    the parent). No-op on platforms without prctl.
-    """
+    """PR_SET_PDEATHSIG=SIGKILL where prctl exists. fork() clears it, so each process arms it."""
     try:
         libc = ctypes.CDLL(None, use_errno=True)
         libc.prctl(1, signal.SIGKILL, 0, 0, 0)  # PR_SET_PDEATHSIG == 1
@@ -539,13 +407,9 @@ def _set_pdeathsig() -> None:
 
 
 def _ignore_stop(signum: int, frame: Any) -> None:
-    """A stop signal is the worker's to act on, not this process's.
+    """Ignore a group wide Ctrl+C or SIGTERM; the worker drains and ends this process.
 
-    A tty Ctrl+C or systemd's KillMode=control-group signals every process,
-    so a default disposition killed the cpu task mid run while the worker
-    was gracefully draining it. The worker ends this process itself (stdin
-    EOF, SIGKILL, PR_SET_PDEATHSIG). A handler rather than SIG_IGN, because
-    SIG_IGN survives exec and a task's own subprocesses would inherit it.
+    A handler, not SIG_IGN, because SIG_IGN survives exec into a task's subprocesses.
     """
 
 
@@ -557,18 +421,12 @@ def _restore_stop() -> None:
 def _guard_stop_signals() -> None:
     signal.signal(signal.SIGINT, _ignore_stop)
     signal.signal(signal.SIGTERM, _ignore_stop)
-    # A Python handler survives fork, so a task's own os.fork() or
-    # multiprocessing child would ignore Process.terminate() too. The
-    # fork server's own task children call this again right after forking.
+    # Or a task's own forked child would ignore Process.terminate().
     os.register_at_fork(after_in_child=_restore_stop)
 
 
 def _rss_kb() -> tuple[int | None, int | None]:
-    """(VmRSS kB, private (dirty+clean) kB) from /proc; Nones off-Linux.
-
-    Report-only numbers: the private figure is what a forked child actually
-    adds on top of the shared parent image (the CoW win gc.freeze protects).
-    """
+    """(VmRSS kB, private kB) from /proc for the startup log; Nones off Linux."""
     rss = private = None
     try:
         with open("/proc/self/status") as f:
@@ -588,21 +446,11 @@ def _rss_kb() -> tuple[int | None, int | None]:
     return rss, private
 
 
-# --------------------------------------------------------------------------
-# fork-server mode
-# --------------------------------------------------------------------------
-
-
 def _reap_children(signum: int, frame: Any) -> None:
-    """SIGCHLD handler in the fork-server parent: reap every exited child.
+    """SIGCHLD: reap children and log abnormal exits.
 
-    Logs WIFSIGNALED and the signal number for an abnormal exit. cpu.rs
-    learns of a child's death from EOF on that child's own socket
-    connection, which cannot carry a reason: the process is already gone by
-    the time EOF is observed, so it cannot self report why. Only this
-    parent's waitpid() status, once reaped, can tell a segfault, an OOM
-    kill, or any other unprompted signal death apart from a plain nonzero
-    exit. A normal exit (status 0) stays silent, same as before.
+    The worker sees only EOF; only this waitpid status can tell a segfault
+    or OOM kill apart.
     """
     while True:
         try:
@@ -626,8 +474,6 @@ def _reap_children(signum: int, frame: Any) -> None:
 
 def _fork_server_main(app_spec: str, sock_path: str, child_threads: int) -> int:
     """The fork-server PARENT: import once, freeze, serve fork requests."""
-    # Reserve the real stdout for control replies; stray prints from the app
-    # import (or anything else) go to stderr, exactly like stdio mode.
     proto_fd = os.dup(1)
     os.dup2(2, 1)
     proto = os.fdopen(proto_fd, "w", encoding="utf-8", newline="\n")
@@ -639,32 +485,20 @@ def _fork_server_main(app_spec: str, sock_path: str, child_threads: int) -> int:
 
     _set_pdeathsig()
     _guard_stop_signals()
-    app = _load_app(app_spec)  # import errors: nonzero exit before the server line
+    app = _load_app(app_spec)
 
-    # Process-init hooks run in the parent BEFORE the first fork (PROTOCOL.md
-    # section 4.8): resources opened as an import side effect (e.g. a Django
-    # DB connection created by a module-level query) must be closed here, or
-    # every forked child would inherit the SAME underlying socket fd and two
-    # children writing to it would corrupt the stream. Each forked child runs
-    # them again after fork (belt and suspenders; a no-op when the parent
-    # already cleaned up).
+    # Before the first fork: a connection opened at import would otherwise be
+    # one socket fd shared by every child, corrupting its stream.
     run_hooks(getattr(app, "_process_init_hooks", ()), "process_init")
 
-    # The CoW payoff: collect import-time garbage once, then freeze every
-    # object created so far into the permanent generation. Children fork from
-    # this warmed image; their (default, enabled) GC never scans -- and so
-    # never CoW-dirties the refcount/gc-header pages of -- frozen objects.
+    # Children's GC never scans frozen objects, so never copies their pages.
     gc.collect()
     gc.freeze()
 
     signal.signal(signal.SIGCHLD, _reap_children)
 
-    # FS-9 diagnostic: forking a multi-threaded process is a classic footgun
-    # (only the forking thread survives in the child; a lock held by any
-    # other thread at fork time stays locked forever in every child). The
-    # app import above is the only thing that could have started a
-    # background thread before this point -- warn loudly rather than let it
-    # surface later as an unexplained per-child deadlock.
+    # Only the forking thread survives fork; a lock another thread holds
+    # stays locked forever in every child.
     if threading.active_count() > 1:
         _log(
             f"cauli._exec: WARNING: {threading.active_count()} threads active "
@@ -682,7 +516,7 @@ def _fork_server_main(app_spec: str, sock_path: str, child_threads: int) -> int:
 
     while True:
         line = sys.stdin.readline()
-        if line == "":  # EOF: the worker closed the control channel
+        if line == "":
             break
         line = line.strip()
         if not line:
@@ -717,31 +551,22 @@ def _forked_child_main(
     app: Any, parent_proto_fd: int, sock_path: str, child_threads: int
 ) -> int:
     """A forked CHILD: connect to the worker's unix socket and serve requests."""
-    # Drop the parent's control channel: close the inherited control-stdout
-    # dup (so a parent exit yields clean EOF for the worker) and point fd 0
-    # at /dev/null (so task code reading stdin cannot eat control bytes).
-    # fd 1 already points at stderr -- the parent re-pointed it pre-fork.
+    # Closing the control fd gives the worker a clean EOF on parent exit;
+    # /dev/null on fd 0 stops task code eating control bytes.
     os.close(parent_proto_fd)
     devnull = os.open(os.devnull, os.O_RDONLY)
     os.dup2(devnull, 0)
     os.close(devnull)
 
-    # FS-9: every child forked from the same warmed parent otherwise inherits
-    # the IDENTICAL `random` module state, so unseeded `random` calls (jitter,
-    # sampling, non-crypto ids) produce the SAME sequence in every sibling.
-    # Reseed from OS entropy right after fork, before any task can run.
-    # secrets/uuid4 are unaffected either way (both read urandom directly).
+    # Or every sibling inherits the same `random` state and sequence.
     random.seed()
 
-    _set_pdeathsig()  # fork cleared it; re-arm against the fork-server parent
+    _set_pdeathsig()
     if os.getppid() == 1:
-        return 0  # the parent died inside the fork window; nothing to serve
+        return 0  # the parent died inside the fork window
     signal.signal(signal.SIGCHLD, signal.SIG_DFL)
 
-    # Process-init hooks, again, in THIS child (PROTOCOL.md section 4.8):
-    # the parent already ran them pre-fork, so anything reaching this call is
-    # a resource created between then and the fork — or a hook that is simply
-    # idempotent (the Django contrib's connections.close_all() is).
+    # Again, for resources created between the parent's run and the fork.
     run_hooks(getattr(app, "_process_init_hooks", ()), "process_init")
 
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -758,7 +583,7 @@ def _forked_child_main(
             return _serve_socket_single(app, sock)
         return _serve_socket_threaded(app, sock, child_threads)
     except (BrokenPipeError, ConnectionResetError):
-        return 0  # the worker went away mid-write; normal on kill paths
+        return 0
 
 
 def _safe_handle_and_respond(
@@ -769,15 +594,8 @@ def _safe_handle_and_respond(
 ) -> None:
     """`_handle_request_line` + `writer.write_response`, guarded end to end.
 
-    FS-5: a soft-timeout injection can land between `_handle_request_line`
-    returning and the response actually being written (during
-    `_serialize_response`'s json.dumps, or inside `sendall`) -- that window
-    is outside `_handle_request_line`'s own BaseException guard. Left
-    unguarded, it silently kills the calling thread (M > 1: one of the M
-    worker threads, with its in-flight request never answered until the
-    caller's own hard timeout) or the whole child (M == 1). Mirrors the
-    defensive `except BaseException` shim.py already uses around every
-    Python-visible completion path on the io side.
+    A soft timeout injected while the response is serialized or sent would
+    otherwise kill the thread or the child, leaving the request unanswered.
     """
     try:
         resp = _handle_request_line(app, line, watchdog=watchdog)
@@ -791,19 +609,13 @@ def _safe_handle_and_respond(
     try:
         writer.write_response(resp)
     except BaseException as exc:
-        # Connection likely gone; the caller's read-EOF check ends serving.
-        # Not silent, though: a response lost here is a task the worker will
-        # only learn about when its own hard timeout fires, so say which one
-        # and why on stderr (the child's passthrough logging channel).
+        # The worker will only learn of this task at its hard timeout.
         _log(
             "cauli._exec: response write failed for request "
             f"{resp.get('id')!r}: {exc!r}"
         )
     if watchdog is not None:
-        # Belt-and-suspenders: make sure this thread's generation has moved
-        # on before it picks up another request, even on the exception path
-        # above (narrows the residual same-generation race a hair further;
-        # see PROTOCOL.md section 4.6).
+        # Move the generation on even on the exception path (PROTOCOL.md 4.6).
         watchdog.disarm()
 
 
@@ -815,7 +627,6 @@ class _SocketWriter:
         self._lock = threading.Lock()
 
     def write_response(self, payload: dict[str, Any]) -> None:
-        # Straight to bytes: no str round trip, one concat, one sendall.
         data = _serialize_response_bytes(payload) + b"\n"
         with self._lock:
             self._sock.sendall(data)
@@ -830,7 +641,7 @@ def _serve_socket_single(app: Any, sock: socket.socket) -> int:
     rfile = sock.makefile("r", encoding="utf-8", errors="replace", newline="\n")
     while True:
         line = rfile.readline()
-        if line == "":  # worker closed the connection
+        if line == "":
             return 0
         line = line.strip()
         if not line:
@@ -839,9 +650,7 @@ def _serve_socket_single(app: Any, sock: socket.socket) -> int:
 
 
 def _serve_socket_threaded(app: Any, sock: socket.socket, threads: int) -> int:
-    """M > 1: up to M requests in flight on M worker threads; responses may
-    leave out of order and are matched by id. Soft timeouts via the shared
-    watchdog (SIGALRM cannot serve worker threads)."""
+    """M > 1: M worker threads; responses leave out of order, matched by id."""
     writer = _SocketWriter(sock)
     writer.write_response({"ready": True, "pid": os.getpid(), "concurrency": threads})
     watchdog = _SoftTimeoutWatchdog()
@@ -860,16 +669,11 @@ def _serve_socket_threaded(app: Any, sock: socket.socket, threads: int) -> int:
     rfile = sock.makefile("r", encoding="utf-8", errors="replace", newline="\n")
     while True:
         line = rfile.readline()
-        if line == "":  # EOF: daemon worker threads die with the process
+        if line == "":
             return 0
         line = line.strip()
         if line:
             requests.put(line)
-
-
-# --------------------------------------------------------------------------
-# stdio mode (fallback) + entry point
-# --------------------------------------------------------------------------
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -911,8 +715,6 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         return _fork_server_main(ns.app, ns.connect, max(1, ns.child_threads))
 
-    # Reserve the real stdout pipe for protocol lines; point fd 1 at stderr so
-    # stray prints from tasks (or C extensions) go to passthrough logging.
     proto_fd = os.dup(1)
     os.dup2(2, 1)
     proto = os.fdopen(proto_fd, "w", encoding="utf-8", newline="\n")
@@ -924,10 +726,7 @@ def main(argv: list[str] | None = None) -> int:
         pass
 
     _guard_stop_signals()
-    app = _load_app(ns.app)  # import errors propagate: nonzero exit before ready line
-
-    # Process-init hooks (PROTOCOL.md section 4.8): once per stdio child,
-    # after the app import, before any task can execute.
+    app = _load_app(ns.app)
     run_hooks(getattr(app, "_process_init_hooks", ()), "process_init")
 
     if hasattr(signal, "SIGALRM"):
@@ -937,7 +736,7 @@ def main(argv: list[str] | None = None) -> int:
 
     while True:
         line = sys.stdin.readline()
-        if line == "":  # EOF: parent closed the pipe, exit cleanly
+        if line == "":
             break
         line = line.strip()
         if not line:

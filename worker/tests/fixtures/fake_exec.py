@@ -177,7 +177,7 @@ def child_main(sock_path, threads):
                 continue
             req = json.loads(line)
             if req.get("task") == "fx.cpu_ghost":
-                # Audit regression fixture (worker/src/cpu.rs
+                # Regression fixture (worker/src/cpu.rs
                 # serve_child_conn's "response with unknown or missing id"):
                 # send one unsolicited line whose id never matches a pending
                 # request, carrying a marker string in place of real task

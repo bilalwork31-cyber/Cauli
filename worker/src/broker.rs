@@ -21,109 +21,20 @@ pub fn dlq_key(queue: &str) -> String {
 pub fn result_key(id: &str) -> String {
     format!("cauli:result:{id}")
 }
-/// Round constants for `sha256_block`, the first 32 bits of the fractional
-/// parts of the cube roots of the first 64 primes (FIPS 180-4 §4.2.2).
-#[rustfmt::skip]
-const SHA256_K: [u32; 64] = [
-    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
-    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
-    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
-    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
-    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
-];
-
-/// One FIPS 180-4 §6.2.2 compression round over a 64-byte block.
-fn sha256_block(h: &mut [u32; 8], block: &[u8; 64]) {
-    let mut w = [0u32; 64];
-    for (wi, chunk) in w.iter_mut().zip(block.as_chunks::<4>().0) {
-        *wi = u32::from_be_bytes(*chunk);
-    }
-    for i in 16..64 {
-        let a = w[i - 15];
-        let b = w[i - 2];
-        let s0 = a.rotate_right(7) ^ a.rotate_right(18) ^ (a >> 3);
-        let s1 = b.rotate_right(17) ^ b.rotate_right(19) ^ (b >> 10);
-        w[i] = w[i - 16]
-            .wrapping_add(s0)
-            .wrapping_add(w[i - 7])
-            .wrapping_add(s1);
-    }
-    // Working state a..h as one array, rotated each round, so the eight
-    // registers stay readable without eight single-letter bindings.
-    let mut s = *h;
-    for (k, wi) in SHA256_K.iter().zip(w.iter()) {
-        let s1 = s[4].rotate_right(6) ^ s[4].rotate_right(11) ^ s[4].rotate_right(25);
-        let ch = (s[4] & s[5]) ^ (!s[4] & s[6]);
-        let t1 = s[7]
-            .wrapping_add(s1)
-            .wrapping_add(ch)
-            .wrapping_add(*k)
-            .wrapping_add(*wi);
-        let s0 = s[0].rotate_right(2) ^ s[0].rotate_right(13) ^ s[0].rotate_right(22);
-        let maj = (s[0] & s[1]) ^ (s[0] & s[2]) ^ (s[1] & s[2]);
-        let t2 = s0.wrapping_add(maj);
-        s.rotate_right(1); // h<-g, g<-f, ... b<-a; s[0] and s[4] set below
-        s[0] = t1.wrapping_add(t2);
-        s[4] = s[4].wrapping_add(t1);
-    }
-    for (hv, sv) in h.iter_mut().zip(s) {
-        *hv = hv.wrapping_add(sv);
-    }
-}
-
-/// SHA-256 (FIPS 180-4) of `data`. Implemented here rather than pulled in as
-/// a dependency: it is one call site on a path already dominated by a redis
-/// round trip, and the worker's dependency set is deliberately small.
+/// SHA-256 through ring, the implementation rustls already links.
 fn sha256(data: &[u8]) -> [u8; 32] {
-    let mut h: [u32; 8] = [
-        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
-        0x5be0cd19,
-    ];
-    let (blocks, rem) = data.as_chunks::<64>();
-    for block in blocks {
-        sha256_block(&mut h, block);
-    }
-    // Padding: 0x80, zeros, then the message length in BITS as a big-endian
-    // u64. One extra block when the remainder leaves no room for both.
-    let mut tail = [0u8; 128];
-    tail[..rem.len()].copy_from_slice(rem);
-    tail[rem.len()] = 0x80;
-    let tail_len = if rem.len() + 9 <= 64 { 64 } else { 128 };
-    let bits = (data.len() as u64).wrapping_mul(8);
-    tail[tail_len - 8..tail_len].copy_from_slice(&bits.to_be_bytes());
-    for block in tail[..tail_len].as_chunks::<64>().0 {
-        sha256_block(&mut h, block);
-    }
-    let mut out = [0u8; 32];
-    for (slot, word) in out.as_chunks_mut::<4>().0.iter_mut().zip(h) {
-        *slot = word.to_be_bytes();
-    }
-    out
+    ring::digest::digest(&ring::digest::SHA256, data)
+        .as_ref()
+        .try_into()
+        .expect("SHA-256 is 32 bytes")
 }
 
-/// Deterministic digest of an app-supplied idempotency_key, hex-encoded.
-/// Folds an arbitrary-length, arbitrary-charset string (attacker/app
-/// controlled per audit M1) into a bounded, redis-key-safe token:
-/// neutralizes cluster hash-tag injection (`{...}`) and unbounded key-size
-/// DoS.
-///
-/// SHA-256 truncated to 128 bits, NOT a fast non-cryptographic hash. A
-/// collision here is not a hash-table nuisance, it is silent task loss: the
-/// colliding task takes the `Duplicate` branch, gets acked, XDELed and
-/// written a duplicate result, and never runs. FNV-1a 64-bit (what this used
-/// to be) is trivially invertible, so anyone who can influence one
-/// idempotency_key could suppress another tenant's task on demand, and even
-/// without an adversary the birthday bound puts accidental collisions in
-/// reach of a busy deployment. 128 bits keeps both out of reach while the
-/// key stays a fixed 32 hex chars.
+/// An untrusted idempotency_key as a fixed 32 hex char token: no hash tag
+/// injection, no key size DoS. Must stay cryptographic (SHA-256, 128 bits): a
+/// collision silently resolves another task as a duplicate, and an
+/// invertible hash lets anyone suppress a chosen task.
 fn idemp_digest_hex(s: &str) -> String {
-    // Nibble table, not `write!(out, "{b:02x}")`. The formatting machinery cost
-    // 391.7ns for these 16 bytes against 31.4ns for the table, i.e. core::fmt
-    // was more expensive than the SHA-256 it formats (376ns for a 36 byte key).
-    // Byte for byte identical output; this is purely how the digest is spelled.
+    // A nibble table, because core::fmt costs more than the SHA-256 itself.
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let d = sha256(s.as_bytes());
     let mut out = Vec::with_capacity(32);
@@ -191,22 +102,16 @@ pub async fn run_mover(
     Ok(n)
 }
 
-/// True if `e` is Redis Cluster's CROSSSLOT. This is a permanent property of
-/// a script's declared keys (here, `delayed_key` and `q_key` never share a
-/// hash tag), not a transient condition: the same script fails the same way
-/// on every future call, so a caller must not log or retry it like an
-/// ordinary redis error.
+/// Redis Cluster CROSSSLOT: permanent for this script's keys, so not to be
+/// retried like a transient error.
 pub fn is_crossslot(e: &anyhow::Error) -> bool {
     e.downcast_ref::<redis::RedisError>()
         .is_some_and(|re| re.kind() == redis::ErrorKind::Server(redis::ServerErrorKind::CrossSlot))
 }
 
-/// True if `e` is Redis's NOGROUP: the consumer group named in the command
-/// does not exist, because the group or the whole stream key is gone. Matched
-/// on the error CODE, not on message text and not by widening the caller's
-/// generic error arm: a NOGROUP means the broker dataset was reset under a
-/// live connection, and it is the one XREADGROUP failure that never clears by
-/// waiting (see `loops::recreate_groups`).
+/// NOGROUP, matched on the error code: the dataset was reset under a live
+/// connection, the one XREADGROUP failure waiting never clears
+/// (`loops::recreate_groups`).
 pub fn is_nogroup(e: &redis::RedisError) -> bool {
     e.code() == Some("NOGROUP")
 }
@@ -214,34 +119,19 @@ pub fn is_nogroup(e: &redis::RedisError) -> bool {
 /// §4.5 idempotency guard outcome.
 #[derive(Debug, PartialEq, Eq)]
 pub enum IdempClaim {
-    /// Fresh claim: no one held the key. Execute.
+    /// Nobody held the key.
     Fresh,
-    /// The key is already held by THIS task's own id (a retry re-enqueues the
-    /// same id, and a crash-redelivered claim per §4.4 does too). This is our
-    /// own earlier claim, not someone else's: proceed with execution (fixes
-    /// audit C1 — without this, a task's own retry finds its own claim and
-    /// silently resolves as "duplicate" forever, so retry + idempotency_key
-    /// could never be used together).
+    /// Held by this task's own id (a retry or a §4.4 redelivery): execute.
+    /// Otherwise retry plus idempotency_key would resolve as a duplicate.
     MineAgain,
-    /// The key is held by a DIFFERENT task id: a genuine duplicate.
-    /// `claimant` is that id, carried back so a suppressed caller can look up
-    /// the claimant's own outcome. Empty only in the race where the key
-    /// expired between the failed SET and the GET of its holder.
+    /// Held by another id. `claimant` is empty only if the key expired
+    /// between the failed SET and the GET.
     Duplicate { claimant: String },
 }
 
-/// §4.5 idempotency guard. Atomic via a single Lua script: `SET NX`, and on
-/// failure `GET` the existing value to distinguish "my own claim" (proceed)
-/// from "someone else's claim" (duplicate) — see `IdempClaim`.
-///
-/// The PEXPIRE in the "mine again" branch is what extends the lease across a
-/// retry or a §4.4 crash redelivery: without it the window stays anchored at
-/// the FIRST claim, so a retry chain outlives the key it claimed.
-///
-/// Returns `{code, holder}`: the holder's task id travels back with the
-/// duplicate verdict, since nothing else ever tells a suppressed caller which
-/// execution took the key. Empty in the branches that have no other holder to
-/// name, so the reply is always a two element array.
+/// §4.5 guard: `SET NX`, else `GET` to tell this task's own claim from another's.
+/// The PEXPIRE extends the lease on a retry or redelivery, or a retry chain
+/// outlives its key. Returns `{code, holder}`, holder empty unless duplicate.
 const IDEMP_CLAIM_LUA: &str = r#"
 local ok = redis.call('SET', KEYS[1], ARGV[1], 'NX', 'EX', ARGV[2])
 if ok then
@@ -255,12 +145,8 @@ end
 return {0, cur or ''}
 "#;
 
-/// TTL a claim is actually written with, derived from the execution it
-/// guards rather than taken as configured. `idemp_ttl` is one global number
-/// and `timeout_ms` is per task, so a plain `idemp_ttl` shorter than the
-/// task's own timeout expires the key mid execution and the next attempt
-/// claims Fresh, which is exactly the duplicate concurrent run the key
-/// exists to prevent. Do not simplify this back to `idemp_ttl`.
+/// Never plain `idemp_ttl`: one shorter than the task's timeout expires the
+/// key mid execution and the next attempt runs concurrently.
 fn claim_ttl_s(idemp_ttl_s: u64, timeout_ms: u64) -> u64 {
     let execution_s = timeout_ms
         .saturating_add(crate::exec::BACKSTOP_GRACE_MS)
@@ -268,9 +154,7 @@ fn claim_ttl_s(idemp_ttl_s: u64, timeout_ms: u64) -> u64 {
     idemp_ttl_s.max(execution_s)
 }
 
-/// Built once, not per task. `redis::Script::new` computes the script's SHA1
-/// on construction, so building it inside `idemp_claim` re-hashed the source
-/// on every single idempotent task before the EVALSHA could even be sent.
+/// Built once: `Script::new` hashes the source.
 static IDEMP_CLAIM_SCRIPT: std::sync::LazyLock<redis::Script> =
     std::sync::LazyLock::new(|| redis::Script::new(IDEMP_CLAIM_LUA));
 
@@ -297,80 +181,39 @@ pub async fn idemp_claim(
     })
 }
 
-/// One buffered completion: the caller's own writes (result SET, retry ZADD,
-/// DLQ XADD), the entry to ack, and the channel its flush outcome travels
-/// back on. Built by the `finish_*` functions below, drained by `flusher`.
+/// One buffered completion: its own writes, the entry to ack, and the reply
+/// channel.
 struct AckReq {
     stream_id: String,
     extra: Vec<redis::Cmd>,
     done: oneshot::Sender<FlushOutcome>,
 }
 
-/// Shared per-flush result: one pipeline serves up to `--ack-batch`
-/// completions, so its single error has to be cloneable to every waiter.
+/// Cloneable: one flush answers every waiter in the batch.
 type FlushOutcome = std::result::Result<(), Arc<redis::RedisError>>;
 
-/// §4.1 completion buffers, one flusher task per queue.
+/// §4.1 completion buffers, one flusher per queue. A flush is one batch
+/// XACK plus one batch XDEL, sent at `--ack-batch` completions or
+/// `--ack-flush-ms` after the oldest; a crash loses at most one buffer of
+/// acks per queue (redelivered, §4.4). `finish_*` return only once flushed.
 ///
-/// Every completion (success, duplicate, retry, DLQ) used to pay redis one
-/// round trip of four commands (MULTI + XACK + XDEL + EXEC). Measured on the
-/// bench box, the per-round-trip work (socket read, parse, reply build,
-/// write) costs redis's single command-execution thread ~10x the commands
-/// themselves, and that thread was the whole system's throughput ceiling.
-/// Buffering completions per queue and flushing them as ONE pipeline with
-/// ONE multi-id XACK and ONE multi-id XDEL (batching an XACK is 6.2x
-/// cheaper per id than acking ids singly, and XDEL batches the same way)
-/// cuts redis main-thread CPU per task by ~3-5x. The XDEL stays per-flush,
-/// not per-entry, and it stays AT ALL — an earlier revision of this design
-/// dropped it and left removal to the §4.1 trim alone, whose boundary is
-/// the group's oldest PENDING id: one slow task then retained every
-/// completed entry behind it (throughput x that task's duration — 30k/s
-/// under a default 300s timeout_ms is nine million entries, gigabytes of
-/// redis memory). The batched XDEL frees each completed entry at its own
-/// flush, whatever else is still running. No MULTI wraps the pair: the old
-/// per-entry MULTI existed because a torn XACK/XDEL stranded the entry
-/// forever, and `loops::trim_loop` now reclaims exactly that orphan shape,
-/// so a tear costs one trim tick of residue instead of a transaction per
-/// completion.
-///
-/// A flush fires at whichever comes first: `--ack-batch` buffered
-/// completions, or `--ack-flush-ms` since the OLDEST buffered one. The
-/// window is the at-least-once cost of this design and it is bounded: a
-/// worker killed mid-window loses only unflushed acks, at most one buffer
-/// per queue, and those entries are simply redelivered (§4.4) and resolved
-/// by the §4.5 idempotency guard like any other crash duplicate. It is not
-/// a durability cost: `finish_*` do not return until their flush has been
-/// answered, so a completion the worker has reported (counters, drain) is
-/// on the broker.
-///
-/// Command order inside one flush is a correctness property, not a layout
-/// choice: every caller's own writes (result SET, retry ZADD, DLQ XADD) go
-/// out and are answered BEFORE the batch XACK is sent, and only entries
-/// whose writes all succeeded are acked (`flush_batch`), so a connection torn mid-flush
-/// can apply a task's writes without its ack (redelivered, then resolved as
-/// a duplicate) but never the ack without the writes (which would drop a
-/// retry or a dead letter on the floor). The batch XDEL comes LAST, after
-/// the XACK: torn between them, the entries are acked-but-undeleted, which
-/// the trim reclaims. The other order would delete entries still in the
-/// PEL, and a pending entry whose payload is gone can never be peeked,
-/// claimed or acked by §4.4 — it pins XPENDING forever. `flush_batch` owns
-/// this order; `ack_precedes_del_on_the_wire` and
-/// `a_refused_write_never_lets_its_ack_land` pin it.
+/// Order is correctness: writes are answered before the XACK, and only
+/// entries whose writes landed are acked (an ack without its retry or dead
+/// letter loses the task). XDEL comes after XACK: the reverse could delete
+/// a pending entry, which pins XPENDING forever. The XDEL must stay: trim
+/// alone lets one slow task retain every completed entry behind it.
 #[derive(Clone)]
 pub struct AckBufs {
     senders: Arc<HashMap<String, mpsc::Sender<AckReq>>>,
 }
 
 impl AckBufs {
-    /// One buffer + flusher task per queue. Must be called on a tokio
-    /// runtime. `batch`/`flush_ms` come from `--ack-batch`/`--ack-flush-ms`.
+    /// Must be called on a tokio runtime.
     pub fn start(conn: &ConnectionManager, queues: &[String], batch: usize, flush_ms: u64) -> Self {
         let batch = batch.max(1);
         let mut senders = HashMap::new();
         for q in queues {
-            // Capacity bounds worker memory if redis stalls; senders then
-            // wait in `submit`, exactly where they used to wait on their own
-            // completion round trip.
+            // Bounds memory if redis stalls; senders then wait in `submit`.
             let (tx, rx) = mpsc::channel(batch.saturating_mul(4).max(256));
             tokio::spawn(flusher(conn.clone(), q.clone(), rx, batch, flush_ms));
             senders.insert(q.clone(), tx);
@@ -380,14 +223,10 @@ impl AckBufs {
         }
     }
 
-    /// Queue one completion and wait for the flush that carries it. The
-    /// caller is not done until this returns: the §4.7 drain counts a task
-    /// in flight until its ack is on the broker.
+    /// Waits for the flush: §4.7 drain counts a task until its ack lands.
     async fn submit(&self, queue: &str, stream_id: &str, extra: Vec<redis::Cmd>) -> Result<()> {
         let Some(tx) = self.senders.get(queue) else {
-            // Unreachable in the worker (queues are fixed at startup and the
-            // fetch loop only reads them), but a completion must never be
-            // silently dropped, so refuse loudly instead of panicking.
+            // Unreachable (queues are fixed), but never drop silently.
             return Err(anyhow!("no completion buffer for queue {queue}"));
         };
         let (done, rx) = oneshot::channel();
@@ -406,11 +245,8 @@ impl AckBufs {
     }
 }
 
-/// Drain one queue's completion buffer: collect up to `max_batch` requests
-/// or until `flush_ms` has passed since the first one, then write them as
-/// one pipeline and answer every waiter. Exits when every sender is gone
-/// (process teardown); nothing is dropped on the way out, because `submit`
-/// holds its sender alive until its own flush is answered.
+/// Exits when every sender is gone; `submit` keeps its sender alive until
+/// answered, so nothing is dropped.
 async fn flusher(
     mut conn: ConnectionManager,
     queue: String,
@@ -421,8 +257,7 @@ async fn flusher(
     loop {
         let Some(first) = rx.recv().await else { return };
         let mut batch = vec![first];
-        // The deadline anchors on the OLDEST buffered completion, so no ack
-        // ever waits more than one window regardless of arrival pattern.
+        // Anchored on the oldest, so no ack waits more than one window.
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(flush_ms);
         while batch.len() < max_batch {
             match tokio::time::timeout_at(deadline, rx.recv()).await {
@@ -434,13 +269,9 @@ async fn flusher(
     }
 }
 
-/// Write one batch in two round trips: every request's own writes first,
-/// each reply read, then one XACK and one XDEL naming only the entries whose
-/// writes ALL landed. One pipeline cannot keep that promise: redis runs a
-/// pipeline's XACK even after an earlier command in it was refused, and OOM
-/// under `noeviction` refuses ZADD, XADD and SET but not XACK or XDEL, so a
-/// retry, a dead letter or a result that was never written got acked and
-/// deleted. A refused entry stays pending and is redelivered (section 4.4).
+/// Two round trips, never one pipeline: OOM under `noeviction` refuses ZADD,
+/// XADD and SET but still runs a later XACK and XDEL, which would ack work
+/// never written. A refused entry stays pending for §4.4.
 async fn flush_batch(conn: &mut ConnectionManager, queue: &str, batch: Vec<AckReq>) {
     let mut writes = redis::pipe();
     let mut owner = Vec::new();
@@ -468,8 +299,6 @@ async fn flush_batch(conn: &mut ConnectionManager, queue: &str, batch: Vec<AckRe
         }
     }
     let (written, refused): (Vec<_>, Vec<_>) = reqs.into_iter().partition(|r| r.2.is_ok());
-    // A receiver gone before the answer means its dispatch task was torn
-    // down (process exit); there is no one left to inform.
     for (_, done, outcome) in refused {
         let _ = done.send(outcome);
     }
@@ -485,8 +314,7 @@ async fn flush_batch(conn: &mut ConnectionManager, queue: &str, batch: Vec<AckRe
     }
 }
 
-/// The ack half of one flush: one XACK naming every entry, then one XDEL
-/// naming the same entries. See the ordering note on `AckBufs`.
+/// XACK then XDEL, never the reverse (see `AckBufs`).
 fn ack_pipeline<'a>(queue: &str, stream_ids: impl Iterator<Item = &'a str>) -> redis::Pipeline {
     let qk = q_key(queue);
     let mut xack = redis::cmd("XACK");
@@ -536,9 +364,7 @@ pub async fn finish_duplicate(
     finish_success(bufs, queue, stream_id, task_id, result_json, result_ttl_s).await
 }
 
-/// §4.2 retry: ZADD delayed + batched XACK + XDEL (no result key). The ZADD
-/// rides the same flush as the ack, answered before it is sent
-/// (`flush_batch`), so the ack can never land without the reschedule.
+/// §4.2 retry: ZADD delayed + batched XACK + XDEL.
 pub async fn finish_retry(
     bufs: &AckBufs,
     queue: &str,
@@ -553,40 +379,17 @@ pub async fn finish_retry(
     bufs.submit(queue, stream_id, vec![zadd]).await
 }
 
-/// Cap on each DLQ stream (`cauli:dlq:{queue}`), enforced with approximate
-/// XADD MAXLEN below. Unbounded, a long lived worker under a sustained
-/// trickle of failures grows the stream forever until Redis runs out of
-/// memory, which takes down every queue in the deployment, not just the
-/// failing one. 1000 keeps enough recent history to see a failure trend
-/// (hours to days at realistic failure rates) while bounding the worst case,
-/// every entry near --max-envelope-bytes (default 1 MiB), to roughly 1 GB
-/// per queue instead of unbounded. Past the cap the oldest dead letters are
-/// dropped: see PROTOCOL.md section 1's key table.
+/// DLQ length cap (approximate MAXLEN): unbounded, a trickle of failures
+/// eventually OOMs Redis for every queue. Worst case about 1 GB per queue at
+/// 1 MiB envelopes. See PROTOCOL §1.
 const DLQ_MAXLEN: u64 = 1000;
 
-/// Retention on each DLQ stream key, refreshed by every dead letter write
-/// below (`EXPIRE`, so the clock restarts at the most recent failure and a
-/// queue that keeps failing keeps its history).
-///
-/// `DLQ_MAXLEN` alone bounds the stream by COUNT, never by AGE: a queue that
-/// dead lettered a handful of tasks once and then went quiet kept the full
-/// args and kwargs of every one of them in Redis forever. Those are the same
-/// payloads `result_ttl` (default 3600s) expires within the hour, so an
-/// operator reading the retention story off `result_ttl` was wrong by
-/// several orders of magnitude, and the leftover memory was never reclaimed
-/// by anything.
-///
-/// 7 days rather than `result_ttl`: a dead letter is evidence for a human,
-/// and it has to outlive a weekend plus the Monday morning it is read on.
-/// The two bounds are complementary — count for a queue failing constantly,
-/// age for a queue that failed once — so neither one alone can be dropped.
-/// Retention semantics are in PROTOCOL.md section 1's key table.
+/// DLQ retention, refreshed by every dead letter. Count bounds a queue that
+/// fails constantly, age one that failed once; both are needed. 7 days so a
+/// dead letter outlives a weekend. See PROTOCOL §1.
 const DLQ_TTL_S: u64 = 7 * 24 * 60 * 60;
 
-/// DLQ write (final failure §4.2, malformed/unregistered §4, redelivery §4.4):
-/// XADD dlq + [SET result]? + batched XACK + XDEL. The dead letter rides the same
-/// flush as the ack, answered before it is sent (`flush_batch`), so the ack
-/// can never land without the dead letter.
+/// DLQ write (§4.2, §4, §4.4): XADD dlq + [SET result]? + batched XACK + XDEL.
 pub async fn finish_dlq(
     bufs: &AckBufs,
     queue: &str,
@@ -615,7 +418,6 @@ pub async fn finish_dlq(
         .arg("error")
         .arg(error_field);
     extra.push(xadd);
-    // Bound the stream by AGE as well as by count: see DLQ_TTL_S.
     let mut expire = redis::cmd("EXPIRE");
     expire.arg(&dk).arg(DLQ_TTL_S);
     extra.push(expire);
@@ -627,34 +429,14 @@ pub async fn finish_dlq(
     bufs.submit(queue, stream_id, extra).await
 }
 
-/// §4.1 trim boundary: the id below which EVERY entry in `cauli:q:{queue}`
-/// is acked, so `trim_acked` may remove it. None when nothing is safely
-/// below anything (no group yet, or nothing ever delivered).
-///
-/// The boundary is the group's oldest pending id, or, when the PEL is
-/// empty, one sequence past its last-delivered-id. Proof that nothing
-/// pending or undelivered is ever below the returned id, including against
-/// concurrent delivery, acking, claiming, and a second process trimming:
-///
-/// * ids enter the PEL only via XREADGROUP `>`, which delivers strictly
-///   ascending ids, so once `P` = oldest-pending is observed, every id that
-///   is pending NOW or LATER is >= `P` (acks only remove; new deliveries are
-///   above the last-delivered-id, which `P`'s own delivery already bounded);
-///   XCLAIM moves ownership of an existing PEL id, it never adds one below.
-/// * with the PEL observed empty, any entry pending later was delivered
-///   after that observation, so its id is strictly above last-delivered-id
-///   as read BEFORE the PEL probe — which is why this function reads XINFO
-///   first and XPENDING second. Do not swap them: read the other way, a
-///   delivery landing between the two reads sits below the boundary while
-///   pending, and the trim would destroy it. That is silent task loss.
-/// * undelivered ids are strictly above last-delivered-id at all times.
-///
-/// A second worker trimming concurrently computes its own boundary under
-/// the same invariants, and XTRIM MINID only ever removes ids strictly
-/// below a valid boundary, so concurrent trims are idempotent and safe.
+/// §4.1 trim boundary: every entry below it is acked. The oldest pending id,
+/// or with an empty PEL one past last-delivered-id; None with no group or no
+/// delivery. Safe against concurrent delivery and a second trimmer because
+/// XREADGROUP `>` delivers ascending ids.
 pub async fn acked_below(conn: &mut ConnectionManager, queue: &str) -> Result<Option<String>> {
     let key = q_key(queue);
-    // XINFO before XPENDING — see the ordering proof above.
+    // XINFO before XPENDING. Swapped, a delivery between the two reads sits
+    // below the boundary while pending and the trim destroys it.
     let info: redis::streams::StreamInfoGroupsReply = redis::cmd("XINFO")
         .arg("GROUPS")
         .arg(&key)
@@ -672,13 +454,8 @@ pub async fn acked_below(conn: &mut ConnectionManager, queue: &str) -> Result<Op
     Ok(stream_id_after(&group.last_delivered_id))
 }
 
-/// The id one sequence number after `id` (`"5-3"` -> `"5-4"`): the smallest
-/// id an XTRIM MINID boundary can carry that also removes `id` itself.
-/// None for anything that is not `<ms>-<seq>`. At `seq == u64::MAX` it
-/// returns the id unchanged (one entry retained, never one destroyed):
-/// unreachable in practice, but the conservative direction costs one entry
-/// of memory where the other direction would need `ms+1` reasoning for no
-/// benefit.
+/// `"5-3"` -> `"5-4"`, so MINID also removes `id`. At `seq == u64::MAX` the
+/// id is returned unchanged: one entry retained, never one destroyed.
 fn stream_id_after(id: &str) -> Option<String> {
     let (ms, seq) = crate::ctx::parse_stream_id(id)?;
     Some(match seq.checked_add(1) {
@@ -687,13 +464,8 @@ fn stream_id_after(id: &str) -> Option<String> {
     })
 }
 
-/// §4.1 bulk removal of acked entries: `XTRIM cauli:q:{queue} MINID
-/// {boundary}` with a boundary from `acked_below`. Replaces the per-entry
-/// XDEL the completion path used to pay: entries below the boundary are all
-/// acked (or the acked-without-XDEL orphans the old MULTI'd pair existed to
-/// prevent — the trim now cleans those too), and MINID removes ids strictly
-/// below the boundary, so the pending entry the boundary names survives.
-/// Returns the number of entries removed.
+/// §4.1 backstop for acked but undeleted entries (a flush torn between XACK
+/// and XDEL). MINID removes ids strictly below `boundary`. Returns the count.
 pub async fn trim_acked(conn: &mut ConnectionManager, queue: &str, boundary: &str) -> Result<u64> {
     let n: u64 = redis::cmd("XTRIM")
         .arg(q_key(queue))
@@ -704,9 +476,7 @@ pub async fn trim_acked(conn: &mut ConnectionManager, queue: &str, boundary: &st
     Ok(n)
 }
 
-/// Entry id of the group's oldest pending (delivered, unacked) entry, or
-/// None when the pending entries list is empty. One `XPENDING key group - +
-/// 1`, the same command family the recovery loop already uses.
+/// Oldest delivered, unacked entry id, or None with an empty PEL.
 pub async fn oldest_pending_id(
     conn: &mut ConnectionManager,
     queue: &str,
@@ -722,13 +492,8 @@ pub async fn oldest_pending_id(
     Ok(r.into_iter().next().map(|(id, ..)| id))
 }
 
-/// Entry id of the oldest entry the group has NOT delivered yet (pure
-/// backlog), or None when the group is caught up.
-///
-/// Deliberately anchored on the group's `last-delivered-id` rather than on
-/// the stream head: an entry behind that id is either pending (covered by
-/// `oldest_pending_id`) or an orphan left behind by an XACK whose XDEL never
-/// landed, and an orphan must not be reported as outstanding work forever.
+/// Oldest undelivered entry id. Anchored on last-delivered-id, not the
+/// stream head, so an acked but undeleted orphan never reads as backlog.
 pub async fn oldest_undelivered_id(
     conn: &mut ConnectionManager,
     queue: &str,
@@ -742,7 +507,6 @@ pub async fn oldest_undelivered_id(
     let Some(group) = info.groups.iter().find(|g| g.name == "cauli") else {
         return Ok(None); // group gone: the fetch loop's NOGROUP path owns this
     };
-    // Exclusive range: the first entry strictly after the last one delivered.
     let r: redis::streams::StreamRangeReply = redis::cmd("XRANGE")
         .arg(&key)
         .arg(format!("({}", group.last_delivered_id))
@@ -754,12 +518,9 @@ pub async fn oldest_undelivered_id(
     Ok(r.ids.into_iter().next().map(|e| e.id))
 }
 
-/// §4.4 extended XPENDING page: (entry_id, consumer, idle_ms, delivery_count).
-/// `start` pages through the PEL: `"-"` for the first page, then `"(<last>"`
-/// (exclusive range, XRANGE syntax) to resume after a page's final entry —
-/// the recovery loop must not restart from `"-"` within one tick, or entries
-/// it skipped (still legitimately running per their own timeout) would make
-/// the drain loop spin on the same page forever.
+/// §4.4 XPENDING page: (entry_id, consumer, idle_ms, delivery_count).
+/// `start` is `"-"`, then `"(<last>"`: restarting at `"-"` within a tick
+/// would spin forever on entries skipped as still running.
 pub async fn xpending_idle(
     conn: &mut ConnectionManager,
     queue: &str,
@@ -785,21 +546,19 @@ fn raw_e_field(map: &std::collections::HashMap<String, redis::Value>) -> Option<
         .and_then(|v| redis::from_redis_value_ref::<String>(v).ok())
 }
 
-/// §4.4 (H1) non-destructive peek at pending entries' envelopes, one
-/// pipelined round trip for the whole page: XRANGE by exact id does not
-/// touch the PEL (no idle-time reset, no delivery_count bump, no ownership
-/// change) — unlike XCLAIM. Used to read each entry's own `timeout_ms`
-/// BEFORE deciding whether it is actually stuck (idle long enough relative
-/// to ITS OWN timeout, not just the visibility_timeout floor) so a
-/// legitimately still-running long task is never reclaimed out from under
-/// itself. Per entry: None if it no longer exists (already acked/claimed
-/// elsewhere); Some(None) if it exists but has no `e` field.
+/// §4.4 peek: XRANGE leaves the PEL untouched, unlike XCLAIM, so each
+/// entry's own `timeout_ms` is read before deciding it is stuck. Per entry:
+/// None if gone, Some(None) if it has no `e` field.
 pub async fn peek_entries(
     conn: &mut ConnectionManager,
     queue: &str,
     entry_ids: &[String],
 ) -> Result<Vec<Option<Option<String>>>> {
     use redis::streams::StreamRangeReply;
+    // redis-rs refuses an empty pipeline ("empty command").
+    if entry_ids.is_empty() {
+        return Ok(Vec::new());
+    }
     let qk = q_key(queue);
     let mut pipe = redis::pipe();
     for id in entry_ids {
@@ -819,10 +578,8 @@ pub async fn peek_entries(
         .collect())
 }
 
-/// §4.4 XCLAIM a batch of entries, one pipelined round trip; per entry,
-/// returns the envelope field `e` if the claim succeeded and the entry still
-/// exists (None means someone else won or the entry vanished). The raw
-/// payload is returned even if it is not valid JSON.
+/// §4.4 XCLAIM, one round trip. Per entry: `e` if claimed, None if another
+/// worker won or the entry vanished.
 pub async fn xclaim_entries(
     conn: &mut ConnectionManager,
     queue: &str,
@@ -859,12 +616,8 @@ pub async fn xclaim_entries(
 mod tests {
     use super::*;
 
-    /// The wire value itself, against digests computed by an independent
-    /// implementation (`hashlib.sha256(k).hexdigest()[:32]`). The
-    /// deterministic/bounded test below only compares keys to other keys, so
-    /// it passes just as happily against a wrong digest or a wrong hex
-    /// encoder, and both of those are silent BREAKING changes: keys written
-    /// by an older worker stop matching and an idempotent task runs twice.
+    /// Wire values from `hashlib.sha256(k).hexdigest()[:32]`. Any change is
+    /// breaking: older keys stop matching and an idempotent task runs twice.
     #[test]
     fn idemp_digest_matches_reference_sha256() {
         assert_eq!(
@@ -884,13 +637,9 @@ mod tests {
 
     #[test]
     fn idemp_key_is_deterministic_and_bounded() {
-        // M1: same input -> same key, always, regardless of process/host
-        // (idempotency must agree across workers).
         assert_eq!(idemp_key("order-42"), idemp_key("order-42"));
         assert_ne!(idemp_key("order-42"), idemp_key("order-43"));
 
-        // Bounded length regardless of input size or content (neutralizes
-        // key-size DoS and cluster hash-tag injection via `{...}`).
         let huge = "x".repeat(1_000_000);
         let hostile = "{tag}".repeat(1000);
         for input in ["", "a", "order-42", &huge, &hostile] {
@@ -912,12 +661,7 @@ mod tests {
         }
     }
 
-    /// The digest under `idemp_key` must be real SHA-256, not something that
-    /// merely looks like hex. A collision is silent task loss (the colliding
-    /// task resolves as a duplicate and never runs), so this pins the
-    /// implementation against FIPS 180-4 vectors: the empty message, the
-    /// single-block "abc" case, and a multi-megabyte input that exercises
-    /// the multi-block path and both padding branches.
+    /// FIPS 180-4 vectors, multi block input and both padding branches.
     #[test]
     fn idemp_digest_is_sha256_not_a_fast_hash() {
         let hex = |d: [u8; 32]| d.iter().map(|b| format!("{b:02x}")).collect::<String>();
@@ -937,9 +681,7 @@ mod tests {
             hex(sha256(&b"x".repeat(1_000_000))),
             "1b977e9f84f1b26b6ed7f68b0498faee2385ea4125bd29adce4a7d9106ba3134"
         );
-        // Lengths straddling both padding boundaries (55/56 = the length
-        // field just fits / just does not, 63/64/65 = block edges), the
-        // arithmetic most hand written SHA-256 gets wrong.
+        // 55/56: length field fits or not. 63/64/65: block edges.
         for (n, want) in [
             (
                 55,
@@ -973,7 +715,6 @@ mod tests {
             assert_eq!(hex(sha256(&b"y".repeat(n))), want, "length {n}");
         }
 
-        // And the key really is the first 128 bits of that digest.
         assert_eq!(
             idemp_key("order-42"),
             format!("cauli:idemp:{}", &hex(sha256(b"order-42"))[..32])
@@ -984,22 +725,19 @@ mod tests {
     #[test]
     fn claim_ttl_never_expires_before_the_execution_it_guards() {
         let grace = crate::exec::BACKSTOP_GRACE_MS;
-        // Whichever of the two independent numbers is longer wins.
         assert_eq!(claim_ttl_s(86_400, 300_000), 86_400);
         assert_eq!(
             claim_ttl_s(60, 300_000),
             (300_000 + grace).div_ceil(1000),
             "a 300s task under a 60s idemp_ttl must claim for its execution"
         );
-        // Rounds up, never down: a claim one tick short of its own execution
-        // is the window this derivation exists to close.
+        // Rounds up, never down.
         assert_eq!(claim_ttl_s(0, 1_500), (1_500 + grace).div_ceil(1000));
         assert_eq!(claim_ttl_s(u64::MAX, u64::MAX), u64::MAX);
     }
 
-    /// A throwaway redis-server this test owns, on a port dedicated to
-    /// broker.rs's own tests: never :6392 (worker/tests/common), :6391
-    /// (py/itest), :6390 (redis_response_timeout.rs), and never :6379.
+    /// Ports owned by these tests only: never 6392 (worker/tests/common),
+    /// 6391 (py/itest), 6390 (redis_response_timeout.rs) or 6379.
     struct ThrowawayRedis {
         port: u16,
     }
@@ -1022,10 +760,8 @@ mod tests {
             ];
             if cluster {
                 let dir = std::env::temp_dir().join(format!("cauli-test-cluster-{port}"));
-                // A stale nodes.conf from an earlier run already claims
-                // every slot, and CLUSTER ADDSLOTSRANGE refuses to reclaim
-                // an already assigned slot: start genuinely blank every
-                // time, not just a fresh process.
+                // A stale nodes.conf claims every slot and ADDSLOTSRANGE
+                // refuses assigned slots.
                 let _ = std::fs::remove_dir_all(&dir);
                 std::fs::create_dir_all(&dir).expect("cluster test dir");
                 let conf = dir.join("nodes.conf");
@@ -1048,22 +784,9 @@ mod tests {
                     .unwrap_or(false)
                 {
                     if cluster {
-                        // Single node cluster: claim every slot so ordinary
-                        // commands work, then the crossslot check under test
-                        // comes purely from KEYS spanning two of them.
-                        //
-                        // CLUSTER ADDSLOTSRANGE is issued from inside the wait
-                        // loop, and the loop reads CLUSTER INFO rather than
-                        // redis-cli's exit status, because redis-cli exits 0
-                        // even when the server replies with an error. A node
-                        // that has just answered PING can still be too early
-                        // to accept the command, and under the load of the
-                        // full parallel suite it frequently is: the exit
-                        // status then says success while no slot was assigned,
-                        // and cluster_state stays "fail" forever no matter how
-                        // long the loop waits. Retrying until
-                        // cluster_slots_assigned reports the full range is
-                        // what actually closes that race.
+                        // Retry ADDSLOTSRANGE until CLUSTER INFO shows every
+                        // slot: redis-cli exits 0 on a server error, and a node
+                        // that just answered PING can still refuse it.
                         let mut became_ok = false;
                         let mut last_info = String::new();
                         for _ in 0..300 {
@@ -1116,11 +839,7 @@ mod tests {
         }
     }
 
-    /// F1 reproduction. Forces the SECOND operation (XADD, now ordered
-    /// first) to error the way the live reproduction did: WRONGTYPE on the
-    /// target key. Asserts the actual property that matters: the entry
-    /// survives rather than vanishing. Under the old ZREM-then-XADD order
-    /// this test fails, the entry is gone from both the set and the stream.
+    /// A failing XADD (WRONGTYPE) must leave the entry in the delayed set.
     #[tokio::test]
     async fn mover_lua_creates_before_destroying_on_xadd_error() {
         let redis = ThrowawayRedis::start(6409, false);
@@ -1140,7 +859,6 @@ mod tests {
             .query_async(&mut conn)
             .await
             .expect("seed delayed entry");
-        // The stream key now holds the wrong type: XADD against it errors.
         let _: () = redis::cmd("SET")
             .arg(q_key(queue))
             .arg("not-a-stream")
@@ -1170,11 +888,7 @@ mod tests {
         );
     }
 
-    /// F2 reproduction: a genuine single node cluster-enabled redis, CRC16
-    /// verified to put cauli:q:myqueue and cauli:delayed:myqueue in
-    /// different slots (416 and 439). Asserts the error is both real
-    /// CROSSSLOT and correctly classified as non-transient, the two facts
-    /// mover_loop's loud-vs-quiet branch depends on.
+    /// cauli:q:myqueue and cauli:delayed:myqueue hash to slots 416 and 439.
     #[tokio::test]
     async fn mover_crossslot_is_detected_not_treated_as_transient() {
         let redis = ThrowawayRedis::start(6410, true);
@@ -1197,12 +911,6 @@ mod tests {
         );
     }
 
-    /// The two facts `loops::fetch_loop` splits its error arm on: a broker
-    /// that lost the consumer group answers XREADGROUP with a NOGROUP that
-    /// `is_nogroup` recognizes, and `ensure_groups` makes the very same call
-    /// succeed again afterwards. Driven against a real redis rather than a
-    /// synthetic error, since the point is that the code survives the round
-    /// trip through the client.
     #[tokio::test]
     async fn nogroup_is_detected_and_ensure_groups_clears_it() {
         let redis = ThrowawayRedis::start(6422, false);
@@ -1239,8 +947,6 @@ mod tests {
              (code {:?})",
             err.code()
         );
-        // Another failure of the very same call must NOT take that branch:
-        // to the generic handler every one of them is "XREADGROUP failed".
         let _: () = redis::cmd("SET")
             .arg(q_key(&queues[0]))
             .arg("not a stream")
@@ -1262,11 +968,6 @@ mod tests {
         read(&mut conn).await.expect("group exists again");
     }
 
-    /// The property the derived TTL exists for: a task whose timeout_ms is
-    /// far longer than idemp_ttl still holds its claim for the whole
-    /// execution, and a second attempt under the same id (a §4.2 retry or a
-    /// §4.4 redelivery) pushes the lease out again instead of inheriting
-    /// what the first claim had left.
     #[tokio::test]
     async fn claim_outlives_a_long_execution_and_refreshes_on_mine_again() {
         let redis = ThrowawayRedis::start(6420, false);
@@ -1277,8 +978,8 @@ mod tests {
 
         let key = "order-77";
         let task_id = "a".repeat(32);
-        let timeout_ms: u64 = 600_000; // a ten minute task
-        let idemp_ttl_s: u64 = 60; // one minute, if the claim took it as configured
+        let timeout_ms: u64 = 600_000;
+        let idemp_ttl_s: u64 = 60;
 
         assert_eq!(
             idemp_claim(&mut conn, key, &task_id, idemp_ttl_s, timeout_ms)
@@ -1296,8 +997,6 @@ mod tests {
             "claim expires in {pttl}ms, before the {timeout_ms}ms execution it guards"
         );
 
-        // Burn the lease down to what a plain idemp_ttl claim would have had
-        // left mid execution, then re-enter as the same task id.
         let _: () = redis::cmd("PEXPIRE")
             .arg(idemp_key(key))
             .arg(5_000)
@@ -1321,12 +1020,6 @@ mod tests {
         );
     }
 
-    /// A dead letter carries the task's full args and kwargs, and nothing
-    /// ever read them back out. `DLQ_MAXLEN` bounds the stream by count
-    /// only, so a queue that failed a few times and then went quiet used to
-    /// hold those payloads in Redis forever. The write must therefore leave
-    /// the key with a finite TTL, refreshed by each new dead letter, and the
-    /// XACK/XDEL half of the pipeline must still land.
     #[tokio::test]
     async fn dlq_write_bounds_the_stream_by_age_not_only_by_count() {
         let redis = ThrowawayRedis::start(6424, false);
@@ -1348,7 +1041,6 @@ mod tests {
             .query_async(&mut conn)
             .await
             .expect("seed entry");
-        // Deliver it: XACK only removes entries that are actually pending.
         let _: Option<redis::streams::StreamReadReply> = redis::cmd("XREADGROUP")
             .arg("GROUP")
             .arg("cauli")
@@ -1389,7 +1081,6 @@ mod tests {
             .await
             .expect("xlen");
         assert_eq!(len, 1, "the dead letter itself must still be written");
-        // The EXPIRE must not have displaced the ack half of the flush.
         let pending: Vec<(String, String, u64, u64)> = redis::cmd("XPENDING")
             .arg(q_key(queue))
             .arg("cauli")
@@ -1401,8 +1092,6 @@ mod tests {
             .expect("xpending");
         assert!(pending.is_empty(), "entry must be acked: {pending:?}");
 
-        // A queue that keeps failing keeps its history: the next dead letter
-        // pushes the expiry back out rather than inheriting what was left.
         let _: () = redis::cmd("EXPIRE")
             .arg(dlq_key(queue))
             .arg(30)
@@ -1431,10 +1120,6 @@ mod tests {
         );
     }
 
-    /// A suppressed caller has to be able to find the execution that took the
-    /// key. Nothing ever releases a claim, so once the claimant has been dead
-    /// lettered every resubmission is suppressed too, and the id in the
-    /// verdict is the only route back to what actually happened.
     #[tokio::test]
     async fn duplicate_verdict_names_the_claimant() {
         let redis = ThrowawayRedis::start(6421, false);
@@ -1463,14 +1148,6 @@ mod tests {
         );
     }
 
-    /// The ordering rules a flush pipeline lives by: every request's own
-    /// writes (result SET, retry ZADD, DLQ XADD) are queued BEFORE the
-    /// single batch XACK, the single batch XDEL comes AFTER the XACK, and
-    /// both name every entry in the batch. Torn before the XACK: writes
-    /// without the ack, redelivered and resolved as a duplicate. Torn
-    /// between XACK and XDEL: acked-but-undeleted, reclaimed by the trim.
-    /// The reverse order would delete entries still in the PEL, which §4.4
-    /// can then never peek, claim or ack — an entry pinned forever.
     #[test]
     fn ack_precedes_del_on_the_wire() {
         let pipe = ack_pipeline("q", ["1-1", "2-2", "3-3"].into_iter());
@@ -1503,11 +1180,6 @@ mod tests {
         );
     }
 
-    /// End to end proof of one success completion under the buffered path:
-    /// the result key lands with its TTL, the entry leaves the PEL, and the
-    /// flush's own batched XDEL removes it from the stream immediately —
-    /// stream residence must never depend on the trim (whose boundary a
-    /// long-running task can pin) for ordinary completions.
     #[tokio::test]
     async fn finish_success_acks_writes_the_result_and_deletes() {
         let redis = ThrowawayRedis::start(6425, false);
@@ -1529,8 +1201,6 @@ mod tests {
             .query_async(&mut conn)
             .await
             .expect("seed entry");
-        // Deliver it so the entry is genuinely in the PEL, the state a real
-        // completion acks out of.
         let _: Option<redis::streams::StreamReadReply> = redis::cmd("XREADGROUP")
             .arg("GROUP")
             .arg("cauli")
@@ -1585,13 +1255,8 @@ mod tests {
         );
     }
 
-    /// THE regression this file's trim exists to avoid reintroducing: one
-    /// slow task pins the group's oldest-pending id, and stream residence of
-    /// COMPLETED entries must not depend on it. One entry is delivered and
-    /// held (never acked) while 500 later entries are delivered and
-    /// completed through the buffered path; XLEN must come back to the one
-    /// held entry, not grow with the completed count. Under trim-only
-    /// removal this reads 501.
+    /// One slow pending task must not retain the 500 completed entries
+    /// behind it; trim only removal reads 501.
     #[tokio::test]
     async fn a_long_pending_task_does_not_retain_completed_entries() {
         let redis = ThrowawayRedis::start(6433, false);
@@ -1606,7 +1271,6 @@ mod tests {
             .expect("groups");
         let bufs = AckBufs::start(&conn, &[queue.to_string()], 64, 1);
 
-        // The slow task: delivered, in the PEL, never acked in this test.
         let _: String = redis::cmd("XADD")
             .arg(q_key(queue))
             .arg("*")
@@ -1628,7 +1292,6 @@ mod tests {
             .await
             .expect("deliver slow");
 
-        // The fast churn behind it.
         for i in 0..500 {
             let sid: String = redis::cmd("XADD")
                 .arg(q_key(queue))
@@ -1676,9 +1339,7 @@ mod tests {
         assert_eq!(pending.len(), 1, "the slow task is still pending");
     }
 
-    /// Ack WITHOUT delete: the orphan shape a flush torn between its XACK
-    /// and its XDEL leaves behind, and exactly what the trim backstop
-    /// exists to reclaim.
+    /// The orphan a flush torn between XACK and XDEL leaves.
     async fn raw_ack(conn: &mut ConnectionManager, queue: &str, sid: &str) {
         let _: u64 = redis::cmd("XACK")
             .arg(q_key(queue))
@@ -1689,15 +1350,6 @@ mod tests {
             .expect("raw xack");
     }
 
-    /// The correctness bar of the trim backstop, live against redis: the
-    /// boundary must never name an id at or below a pending or undelivered
-    /// entry, whatever mix of acked-undeleted orphans, pending and
-    /// undelivered the stream holds, so `XTRIM MINID` can never destroy
-    /// work. Orphans are manufactured with `raw_ack` (ack, no delete — the
-    /// torn-flush shape); a normal completion's own XDEL never reaches the
-    /// trim at all. Walks the exact states: orphan-behind-a-pending-entry
-    /// (retained until the boundary passes, harmless), pending (kept),
-    /// undelivered backlog (kept), then full drain.
     #[tokio::test]
     async fn trim_never_removes_a_pending_or_undelivered_entry() {
         let redis = ThrowawayRedis::start(6406, false);
@@ -1722,7 +1374,6 @@ mod tests {
                 .expect("seed");
             sids.push(sid);
         }
-        // Deliver the first three; the last two stay undelivered backlog.
         let _: Option<redis::streams::StreamReadReply> = redis::cmd("XREADGROUP")
             .arg("GROUP")
             .arg("cauli")
@@ -1747,8 +1398,6 @@ mod tests {
             !r.ids.is_empty()
         }
 
-        // Ack #0 and #2. #1 stays pending, so the boundary is #1: the trim
-        // removes #0 and MUST retain #2 (acked, but above a pending id).
         raw_ack(&mut conn, queue, &sids[0]).await;
         raw_ack(&mut conn, queue, &sids[2]).await;
         let boundary = acked_below(&mut conn, queue)
@@ -1766,8 +1415,6 @@ mod tests {
         assert!(exists(&mut conn, &sids[3]).await, "undelivered: kept");
         assert!(exists(&mut conn, &sids[4]).await, "undelivered: kept");
 
-        // Ack #1: PEL is now empty, so the boundary moves to one past
-        // last-delivered (#2), and the undelivered backlog must survive.
         raw_ack(&mut conn, queue, &sids[1]).await;
         let boundary = acked_below(&mut conn, queue)
             .await
@@ -1783,7 +1430,6 @@ mod tests {
         assert!(!exists(&mut conn, &sids[2]).await, "acked: gone");
         assert!(exists(&mut conn, &sids[3]).await, "undelivered: kept");
 
-        // Drain the backlog: deliver, ack, trim -> empty stream.
         let _: Option<redis::streams::StreamReadReply> = redis::cmd("XREADGROUP")
             .arg("GROUP")
             .arg("cauli")
@@ -1811,9 +1457,6 @@ mod tests {
         assert_eq!(len, 0, "fully acked stream trims to empty");
     }
 
-    /// The boundary's own edge states: no group at all (None, the fetch
-    /// loop's NOGROUP path owns that), and a group that has never delivered
-    /// (None: nothing is provably acked, so nothing may be trimmed).
     #[tokio::test]
     async fn trim_boundary_is_none_without_a_group_or_a_delivery() {
         let redis = ThrowawayRedis::start(6413, false);
@@ -1823,7 +1466,6 @@ mod tests {
             .expect("connection manager");
 
         let queue = "trimedge";
-        // Stream exists, group does not.
         let _: String = redis::cmd("XADD")
             .arg(q_key(queue))
             .arg("*")
@@ -1837,8 +1479,6 @@ mod tests {
             None,
             "no consumer group: nothing may be trimmed"
         );
-        // Group exists, nothing ever delivered: the seeded entry is pure
-        // backlog and must not be trimmable.
         ensure_groups(&mut conn, &[queue.to_string()])
             .await
             .expect("groups");
@@ -1849,12 +1489,6 @@ mod tests {
         );
     }
 
-    /// Concurrent trimming against live acking, the way two worker
-    /// processes overlap in production: while entries are being delivered
-    /// and acked one at a time, a second connection trims in a loop. Before
-    /// each ack, the still-pending entry must exist; at the end, everything
-    /// acked must be trimmable to an empty stream. Any trim of a pending
-    /// entry fails the mid-loop existence check.
     #[tokio::test(flavor = "multi_thread")]
     async fn concurrent_trim_never_eats_the_entry_being_worked() {
         let redis = ThrowawayRedis::start(6418, false);
@@ -1869,7 +1503,6 @@ mod tests {
             .expect("groups");
         let bufs = AckBufs::start(&conn, &[queue.to_string()], 8, 1);
 
-        // The rival: trims as fast as it can for the whole run.
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let rival_stop = stop.clone();
         let mut rival_conn = conn.clone();
@@ -1902,8 +1535,6 @@ mod tests {
                 .query_async(&mut conn)
                 .await
                 .expect("deliver");
-            // Pending: whatever the rival has trimmed, THIS entry must
-            // still be here, or the trim destroyed in-flight work.
             let r: redis::streams::StreamRangeReply = redis::cmd("XRANGE")
                 .arg(q_key(queue))
                 .arg(&sid)
@@ -1922,7 +1553,6 @@ mod tests {
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         rival.await.expect("rival task");
 
-        // Everything is acked: one final trim empties the stream.
         if let Some(boundary) = acked_below(&mut conn, queue).await.expect("boundary") {
             trim_acked(&mut conn, queue, &boundary).await.expect("trim");
         }
@@ -1934,12 +1564,6 @@ mod tests {
         assert_eq!(len, 0, "all 100 acked entries trim away, none early");
     }
 
-    /// The two flush triggers, each proven to fire without the other: a
-    /// full batch flushes immediately under a window that would otherwise
-    /// park it for ten seconds, and a lone completion is answered within
-    /// its window rather than waiting for a batch that never fills. The
-    /// second half is what makes §4.7's drain bounded: nothing buffered is
-    /// ever held past `--ack-flush-ms`.
     #[tokio::test(flavor = "multi_thread")]
     async fn flush_fires_on_a_full_batch_and_on_the_window() {
         let redis = ThrowawayRedis::start(6444, false);
@@ -1977,8 +1601,6 @@ mod tests {
             .await
             .expect("deliver");
 
-        // Batch of 4 under a 10s window: four submits must complete on the
-        // count trigger, far inside the window.
         let bufs = AckBufs::start(&conn, &[queue.to_string()], 4, 10_000);
         let t0 = std::time::Instant::now();
         let mut waits = Vec::new();
@@ -1997,8 +1619,6 @@ mod tests {
             "a full batch must flush on count, not wait out the window"
         );
 
-        // The fifth, alone in a buffer whose batch (1000) will never fill,
-        // must be answered by its 200ms window, not parked forever.
         let lone = AckBufs::start(&conn, &[queue.to_string()], 1000, 200);
         let t0 = std::time::Instant::now();
         finish_success(&lone, queue, &sids[4], "f4", None, 60)
@@ -2021,13 +1641,19 @@ mod tests {
         assert!(pending.is_empty(), "all five acked: {pending:?}");
     }
 
-    /// A broker refusing writes (OOM under `maxmemory-policy noeviction`, the
-    /// policy PROTOCOL section 4 recommends) refuses ZADD, XADD and SET but
-    /// still accepts XACK and XDEL. The retry's ZADD must therefore never be
-    /// sent in the same round trip as its ack: otherwise the ack lands, the
-    /// entry is deleted, and the task exists nowhere. Expected: the retry
-    /// write fails, the entry stays pending for section 4.4, and a completion
-    /// with no writes of its own in the same batch still succeeds.
+    /// Recovery peeks every scan, often with nothing idle enough to reclaim.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn peeking_no_entries_is_not_an_error() {
+        let redis = ThrowawayRedis::start(6402, false);
+        let client = redis::Client::open(redis.url()).expect("client");
+        let mut conn = ConnectionManager::new(client)
+            .await
+            .expect("connection manager");
+        let peeked = peek_entries(&mut conn, "peekq", &[]).await.expect("peek");
+        assert!(peeked.is_empty());
+    }
+
+    /// OOM under `noeviction` refuses the ZADD but would accept the XACK.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_refused_write_never_lets_its_ack_land() {
         let redis = ThrowawayRedis::start(6401, false);
@@ -2072,8 +1698,6 @@ mod tests {
             .await
             .expect("force OOM");
 
-        // Both completions ride ONE flush: batch of 2, a window far longer
-        // than the test.
         let bufs = AckBufs::start(&conn, &[queue.to_string()], 2, 10_000);
         let (retry, plain) = tokio::join!(
             finish_retry(&bufs, queue, &sids[0], r#"{"id":"o0"}"#, 1),

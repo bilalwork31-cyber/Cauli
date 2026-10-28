@@ -5,16 +5,9 @@ name: release
 #   cauli          pure-Python client, one py3-none-any wheel + an sdist
 #   cauli-worker   the Rust worker, one wheel per (CPython minor, arch)
 #
-# The worker needs a wheel per CPython minor version because it EMBEDS the
-# interpreter (pyo3 `auto-initialize`), so its binary carries
-# `NEEDED: libpython3.X.so` and will not start against any other version.
-# Wheel tags express that exactly, and installing into the user's virtualenv
-# makes "which interpreter does the worker embed" answer itself: pip drops the
-# binary in that venv's own bin/. See worker/pyproject.toml.
-#
-# Nothing is uploaded until a wheel has been installed into a clean venv and
-# has passed the real integration suite (`verify`). A release that cannot run
-# is worse than a late one.
+# The worker embeds CPython (NEEDED libpython3.X.so), hence a wheel per minor,
+# installed into the user's venv. Nothing uploads until a wheel has passed the
+# integration suite from a clean venv (`verify`).
 
 on:
   push:
@@ -29,31 +22,14 @@ on:
 permissions:
   contents: read
 
-# Oldest glibc the worker wheels target: 2.35, which is Ubuntu 22.04, Debian
-# 12 and RHEL 9 or newer, and every current python:3.x-slim image.
-#
-# The floor is set by the RUNNER each wheel is built on, not by a manylinux
-# container, because those two requirements are in direct conflict here. The
-# worker embeds CPython and must link it dynamically, and the manylinux_2_28
-# images ship a CPython with no shared libpython, so pyo3 refuses to build
-# against them:
-#
-#   error: The `auto-initialize` feature is enabled, but your python
-#   installation only supports embedding the Python interpreter statically.
-#
-# That is not theoretical. It failed every run from 2026-07-29 onward, so no
-# worker wheel was ever produced. A 2.28 floor that cannot build is worth
-# less than a 2.35 floor that ships, and Ubuntu 20.04 and RHEL 8 are past the
-# point where a new async Python worker needs to target them. Lowering the
-# floor again means finding a build environment that has BOTH an old glibc
-# and a shared CPython, for every version in the matrix.
+# glibc floor 2.35 (Ubuntu 22.04, Debian 12, RHEL 9, python:3.x-slim), set by
+# the runner, not manylinux: manylinux_2_28 CPython has no shared libpython and
+# pyo3 auto-initialize refuses static embedding. A lower floor needs a build
+# environment with both an old glibc and a shared CPython for every version.
 
-# The supported CPython list is spelled out in the `worker`, `verify` and
-# `verify-bare` matrices below rather than once here, because GitHub does not
-# expose the `env` context to `jobs.<id>.strategy`: a variable here would be read
-# as a literal string and would silently produce a one entry matrix. Adding a
-# CPython version means editing all three, plus the classifiers and the
-# `python_version` bound on the `cauli-worker` pin in py/pyproject.toml.
+# The CPython list is repeated in the `worker`, `verify` and `verify-bare`
+# matrices: `env` is not available in `jobs.<id>.strategy`. Adding a version
+# means all three, the classifiers and the `cauli-worker` pin in py/pyproject.toml.
 
 jobs:
   version:
@@ -102,23 +78,19 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # The interpreter the worker will embed. setup-python ships CPython
-      # built with --enable-shared, which is the property the manylinux
-      # images lack and the readelf assertion below depends on.
+      # setup-python's CPython is built with --enable-shared, which the readelf
+      # assertion below depends on.
       - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python }}
 
-      # Native build per architecture rather than a cross container, for the
-      # same reason: a cross image would put a static CPython back in the way.
+      # Native per arch: a cross image would bring back a static CPython.
       - uses: PyO3/maturin-action@v1
         with:
           working-directory: worker
           target: ${{ matrix.target }}
-          # container off builds on the runner itself, where CPython is
-          # shared. manylinux auto still tags the wheel by the glibc the
-          # binary actually needs, so it uploads as manylinux_2_35_* rather
-          # than a bare linux_* tag, which PyPI refuses.
+          # Built on the runner, where CPython is shared; manylinux auto still tags
+          # manylinux_2_35_*, which PyPI accepts and bare linux_* it refuses.
           container: off
           manylinux: auto
           args: >-
@@ -126,15 +98,9 @@ jobs:
             --interpreter python${{ matrix.python }}
             --no-default-features --features wheel-bin
 
-      # The one property that cannot be allowed to regress silently.
-      #
-      # pyo3 links libpython statically when the build interpreter has no
-      # shared library, and some manylinux images ship a static-only CPython.
-      # A statically linked worker would carry its OWN interpreter, whose
-      # sys.prefix points at the build container's /opt/python/... path. On a
-      # user's machine that either dies looking for a stdlib or, far worse,
-      # starts an interpreter that has never heard of their virtualenv and so
-      # cannot import their tasks. Fail the build here instead of shipping it.
+      # A statically linked worker carries its own interpreter with the build's
+      # sys.prefix: on a user's machine it dies looking for a stdlib or cannot
+      # import their tasks. Fail the build instead.
       - name: assert the worker links libpython dynamically
         run: |
           set -euo pipefail
@@ -160,12 +126,9 @@ jobs:
           fi
           echo "ok: dynamically linked against libpython${{ matrix.python }}"
 
-          # The console script is what users actually invoke: it repairs the
-          # loader's libpython search path and then execs the binary above.
-          # pip copies the mode straight out of the wheel, and this repo is
-          # developed on a filesystem where git records no exec bit, so a
-          # wheel carrying a mode 644 script would install something the
-          # shell cannot run. Cheap to assert, impossible to notice otherwise.
+          # The console script repairs the libpython search path, then execs the
+          # binary. pip copies the wheel's mode and git here records no exec bit, so
+          # assert it.
           scripts=(_probe/*.data/scripts/cauli-worker)
           if [ ${#scripts[@]} -ne 1 ] || [ ! -x "${scripts[0]}" ]; then
             echo >&2
@@ -200,9 +163,8 @@ jobs:
       - name: Install redis-server
         run: sudo apt-get update && sudo apt-get install -y redis-server
 
-      # Two explicit downloads rather than one brace pattern: only the wheel
-      # built for THIS CPython version may be present, or pip would happily
-      # resolve a different one and the verification would prove nothing.
+      # Two downloads, not a brace pattern: only this CPython's wheel may be
+      # present, or pip resolves another and proves nothing.
       - uses: actions/download-artifact@v8
         with:
           name: dist-client
@@ -212,51 +174,40 @@ jobs:
           name: dist-worker-x86_64-cp${{ matrix.python }}
           path: artifacts
 
-      # A venv built the way a user's would be, holding only what pip resolved
-      # from the artifacts we are about to publish. No editable install, no
-      # source tree on sys.path.
+      # A user's venv: only what pip resolved from the artifacts, no source tree.
       - name: install the built wheels into a clean venv
         run: |
           set -euo pipefail
           ls -l artifacts
           python -m venv .relvenv
           .relvenv/bin/pip install --upgrade pip
-          # Named by path, not by requirement: cauli and cauli-worker can then only
-          # be the files we are about to publish, while their third party
-          # dependencies resolve from the index exactly as a user's pip fetches
-          # them. --no-index cannot do this job; cauli needs redis and msgspec,
-          # and neither is in the artifact directory.
+          # By path: cauli and cauli-worker are the files to be published, while
+          # third party deps resolve from the index as a user's pip does.
           .relvenv/bin/pip install artifacts/cauli-*.whl \
             artifacts/cauli_worker-*.whl
           .relvenv/bin/pip install pytest
           test -x .relvenv/bin/cauli-worker
           test -x .relvenv/bin/cauli-beat
-          # Asked of the INSTALLED artifacts, not the source tree: the two
-          # halves that a user ends up with must be the same release.
+          # Asked of the installed artifacts: both halves must be the same release.
           worker_v=$(.relvenv/bin/cauli-worker --version | awk '{print $2}')
           client_v=$(.relvenv/bin/python -c "import cauli; print(cauli.__version__)")
           echo "worker $worker_v / client $client_v"
           test "$worker_v" = "$client_v"
 
-      # The property the whole install story rests on: a user types
-      # `pip install cauli` and gets a worker binary they can run. It is one
-      # metadata line away from silently regressing, and no other step here
-      # can catch that, because they all install the two wheels BY PATH.
+      # `pip install cauli` alone must yield a runnable worker; every other step
+      # installs the wheels by path, so only this one checks the metadata.
       - name: plain `pip install cauli` lands a working worker
         run: |
           set -euo pipefail
           python -m venv .onecmd
           .onecmd/bin/pip install --upgrade pip
-          # Third party dependencies first, from the index, so the resolve
-          # below can be --no-index: cauli and cauli-worker then have exactly
-          # one possible source, the artifacts we are about to publish, and
-          # cannot quietly come from an older release already on PyPI.
+          # Third party deps from the index first, so the --no-index resolve can only
+          # pick the artifacts about to be published.
           .onecmd/bin/pip install "redis>=5.0.1" "msgspec>=0.18" tzdata
           .onecmd/bin/pip install --no-index --find-links artifacts cauli
           .onecmd/bin/pip show cauli-worker >/dev/null
           test -x .onecmd/bin/cauli-worker
-          # Installed is not the same as runnable. --print-plan needs no Redis
-          # and no app, so it is the cheapest proof that the binary starts.
+          # --print-plan needs no Redis and no app: proof the binary starts.
           .onecmd/bin/cauli-worker --print-plan
 
       # The published artifact runs the real cross-component suite: a real
@@ -277,13 +228,9 @@ jobs:
       matrix:
         python: ["3.10", "3.11", "3.12", "3.13", "3.14", "3.14t"]
     steps:
-      # Deliberately NO actions/setup-python. It exports LD_LIBRARY_PATH
-      # pointing at its own libpython, which is why every other job in this
-      # file is structurally blind to the failure this one exists to catch:
-      # the worker binary carries NEEDED libpython3.X.so.1.0 and no RUNPATH,
-      # so on an interpreter whose libpython is neither in the ldconfig cache
-      # nor on LD_LIBRARY_PATH it dies inside the dynamic loader, before main,
-      # and even `cauli-worker --version` fails.
+      # No actions/setup-python: its LD_LIBRARY_PATH hides that the binary has no
+      # RUNPATH. Without a libpython the loader finds, it dies before main, even
+      # on `cauli-worker --version`.
       - uses: actions/download-artifact@v8
         with:
           name: dist-client
@@ -293,18 +240,14 @@ jobs:
           name: dist-worker-x86_64-cp${{ matrix.python }}
           path: artifacts
 
-      # docker run, not a job level `container:`, so nothing from the runner
-      # environment leaks in. A uv managed CPython is the reproduction: it
-      # ships libpython in its own lib directory, which no ldconfig knows
-      # about. It also covers minimal containers, conda and pyenv, which fail
-      # the same way for the same reason.
+      # docker run, not `container:`, so no runner environment leaks in. uv's
+      # CPython keeps libpython where no ldconfig looks, like conda and pyenv.
       - name: install and RUN the wheel on a bare ubuntu 24.04 with uv
         run: |
           set -euo pipefail
           cat > bare.sh <<'SH'
           set -eu
-          # Guard the guard: if this ever inherits a libpython search path the
-          # leg proves nothing, so fail loudly instead of passing quietly.
+          # If this inherits a libpython search path the leg proves nothing.
           if [ -n "${LD_LIBRARY_PATH:-}" ]; then
             echo "FAIL: LD_LIBRARY_PATH is set ($LD_LIBRARY_PATH)." >&2
             echo "This job must run with no libpython on the search path." >&2
@@ -322,15 +265,11 @@ jobs:
           test -x /venv/bin/cauli-worker-bin
           test -x /venv/bin/cauli-beat
 
-          # Installing proves nothing here; the failure is at exec time. Run
-          # the binary, and run it the way a user does, through the console
-          # script that pip put on PATH.
+          # The failure is at exec time: run it through the console script, as a user does.
           /venv/bin/cauli-worker --version
           /venv/bin/cauli-worker --help >/dev/null
 
-          # And confirm the raw binary really is the broken one, so a future
-          # change that makes the wrapper a no op cannot pass this job by
-          # accident.
+          # The raw binary must really fail, so a no op wrapper cannot pass.
           if /venv/bin/cauli-worker-bin --version >/dev/null 2>&1; then
             echo "note: the raw binary starts unaided in this image" >&2
           else
@@ -362,10 +301,8 @@ jobs:
           path: wheels
           merge-multiple: true
 
-      # For anyone deploying the worker outside a Python virtualenv (a distro
-      # package, a scratch container). Same binary as the wheel; the file name
-      # carries the CPython version it is bound to, because that is not
-      # optional information for this binary.
+      # For deployments outside a virtualenv. The file name carries the CPython
+      # version the binary is bound to.
       - name: unpack each wheel into a named tarball
         run: |
           set -euo pipefail

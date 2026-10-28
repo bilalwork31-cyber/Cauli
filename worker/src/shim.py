@@ -1,7 +1,4 @@
-"""cauli worker embedded shim.
-
-Loaded once by the Rust worker via PyModule::from_code. Owns ALL Python-side
-complexity so the pyo3 surface stays "call function, pass strings, get strings".
+"""cauli worker embedded shim, loaded once by the Rust worker (worker/src/pyrt.rs).
 
 Contract with Rust:
   load_app(app_spec, extra_paths_json) -> app config JSON (startup only)
@@ -9,33 +6,19 @@ Contract with Rust:
   start_loops(n)                      -> spawn N daemon threads running asyncio loops
   set_callback(cb)                    -> register Rust completion callback cb(token, outcome)
   submit_async(token, name, args, kwargs, timeout_s, soft_timeout_s, meta)
-      -> schedules coroutine; completion is push-style via the registered
-      callback (no polling).
-  heartbeat()                         -> per loop (lag_ms, pending, completed),
-      stamping each loop through call_soon_threadsafe on the way (wedge
-      detection and the stats line's loop_lag_ms; worker/src/loops.rs).
+      -> schedules coroutine; completion is pushed through the callback.
+  heartbeat()                         -> per loop (lag_ms, pending, completed)
 
-`meta` on both execution entry points is the envelope tuple
-`(id, retries, max_retries, queue)` that backs `cauli.current_task()`, or
-None when the caller does not report it (older worker, unit test). It is one
-tuple rather than four scalars so the per-task pyo3 call does not grow four
-argument slots on the hottest path in the process; see `_enter_context`.
-
-Task arguments reach `run_sync`/`submit_async` as Python objects that Rust
-decoded from the envelope's JSON text with `_decode`, and Rust encodes the
-outcome dict's result with `_encode` (worker/src/pyrt.rs). Both are msgspec,
-the codec the client (py/cauli/_codec.py) and the cpu child use, so a value
-means the same thing on every side of the wire. `load_app`'s config is the
-one other JSON payload, and it crosses exactly once at startup.
+`meta` is the envelope tuple `(id, retries, max_retries, queue)` behind
+`cauli.current_task()`, or None. One tuple, not four scalars, to keep the
+per task pyo3 call small. Args arrive decoded with `_decode` and results are
+encoded with `_encode`, both msgspec, the client's codec.
 
 Outcome dict shapes:
   {"ok": True,  "result": <any JSON-representable value>}
   {"ok": False, "retry": True, "countdown": <float|None>, "error": {...}}
   {"ok": False, "retryable": <bool>, "error": {"type": ..., "message": ...,
                                                "traceback": ..., "origin": ...}}
-
-A result that cannot be represented as JSON is rejected on the Rust side and
-becomes a non-retryable SerializationError, as it does in the cpu child.
 """
 
 import asyncio
@@ -61,12 +44,7 @@ try:  # pragma: no cover - only when the real cauli package is importable
 except Exception:
 
     class SoftTimeLimitExceeded(Exception):
-        """Soft time limit exceeded (local stand-in for cauli.SoftTimeLimitExceeded).
-
-        Derives from Exception (not BaseException) to match the real
-        cauli.SoftTimeLimitExceeded (audit L5): a task's `except Exception`
-        must catch this in the fallback case too.
-        """
+        """Stand-in for cauli.SoftTimeLimitExceeded; an Exception like the real one."""
 
 
 try:  # pragma: no cover - only when the real cauli package is importable
@@ -74,24 +52,14 @@ try:  # pragma: no cover - only when the real cauli package is importable
     from cauli._context import reset_current_task as _reset_ctx  # type: ignore
     from cauli._context import set_current_task as _set_ctx  # type: ignore
 except Exception:
-    # No importable cauli package in this interpreter (the shim is loaded
-    # standalone by the Rust unit tests). Then `cauli.current_task()` does not
-    # exist for the task to call either, so both io lanes simply skip the
-    # context rather than carrying a second copy of the ContextVar.
+    # No cauli here means no current_task() to serve, so the lanes skip it.
     _TaskContext = None
     _set_ctx = None
     _reset_ctx = None
 
 
 def _enter_context(name, meta):
-    """Install `cauli.current_task()` for this attempt; returns a reset token.
-
-    `meta` is the `(id, retries, max_retries, queue)` tuple Rust reads off the
-    envelope (worker/src/pyrt.rs). None means the caller did not report it, in
-    which case nothing is installed and `current_task()` keeps returning None
-    inside the task instead of handing it an invented id -- the behaviour
-    py/cauli/_context.py documents for a worker that does not plumb this.
-    """
+    """Install `cauli.current_task()` for this attempt; returns a reset token."""
     if meta is None or _TaskContext is None:
         return None
     task_id, retries, max_retries, queue = meta
@@ -99,12 +67,7 @@ def _enter_context(name, meta):
 
 
 def _leave_context(token):
-    """Undo `_enter_context`. A no-op when no context was installed.
-
-    Always paired in a `finally`: the sync lane's pool threads are reused, so
-    a leaked context would let the NEXT task on that thread read the previous
-    task's id.
-    """
+    """Undo `_enter_context`. Always in a `finally`: pool threads are reused."""
     if token is not None:
         _reset_ctx(token)
 
@@ -113,9 +76,7 @@ _registry = {}  # task name -> duck-typed TaskDef object
 _loops = []  # asyncio loops, one per dedicated daemon thread
 _loops_lock = threading.Lock()
 _rr = 0
-# One submission queue per loop, plus its lock. Dispatch appends here and only
-# wakes the loop when the queue was empty, so a burst of N tasks costs one
-# loop wakeup instead of N. See submit_async for the measured reason.
+# Per loop submission queue: a burst of N tasks costs one loop wakeup, not N.
 _pending = []
 _pending_locks = []
 _deadline_heaps = []  # per loop: _DeadlineHeap, touched only on that loop
@@ -123,42 +84,27 @@ _callback = None  # Rust completion callback: cb(token:int, outcome:dict)
 
 
 class AsyncQueueFull(RuntimeError):
-    """MEM-5: raised by submit_async when a loop's pending list is already at
-    _PENDING_CAP. A distinct type, not a bare RuntimeError, so pyrt.rs can
-    count these rejections by checking the exception itself rather than
-    parsing message text."""
+    """A loop's pending list is at its cap. Its own type so pyrt.rs can count it."""
 
 
-# MEM-5: hard cap on each loop's pending list. A blocking call inside an
-# async task (a synchronous HTTP request, time.sleep, a blocking database
-# driver) starves that loop's own callback processing forever; _drain then
-# never runs again and this list would otherwise grow without bound, keeping
-# real args and kwargs objects alive for the rest of the process lifetime.
-# MEM-1 already keeps the Rust side bookkeeping (pyrt.rs) from leaking on its
-# own backstop timer, which is exactly why that fix hides this one: the Rust
-# side pending completion map stays flat while this list keeps growing
-# underneath it. `async_rejected` counts what this cap rejects, and
-# `loop_lag_ms` (the heartbeat below) moves long before the cap is reached.
-# 4096 is 2x the highest --io-concurrency this codebase has measured (2048,
-# see the convoying note in pyrt.rs), so a legitimate burst should never
-# reach it; past the cap a submission fails fast instead of piling up
-# forever.
+# A blocking call in an async task stops _drain on that loop; the Rust
+# backstop then frees the io slots of the tasks stuck behind it, so without a
+# cap its pending list (holding args and kwargs) grows forever. A healthy loop
+# never holds more than the worker's io slots, so start_loops raises the cap
+# to that when it is above this floor.
 _PENDING_CAP = 4096
+_pending_cap = _PENDING_CAP
 _cap_warned = []  # per loop: already logged the cap hit warning once
 
-# Per loop liveness, read by the Rust wedge watchdog (worker/src/loops.rs).
-# One outstanding stamp per loop at a time: queueing a fresh stamp every few
-# seconds at a loop that is not running any of them would pile up callbacks
-# that all fire at once if it ever recovers.
+# Per loop liveness for the wedge watchdog (worker/src/loops.rs). One stamp
+# outstanding per loop, or a stalled loop piles up stamps that all fire later.
 _hb_sent = []  # monotonic of the stamp this loop has not run yet, or None
 _hb_lag = []  # ms the last stamp took from scheduled to run
 _hb_sub = []  # async tasks handed to this loop (submit side writes)
 _hb_done = []  # async tasks completed on this loop (only that loop writes)
 
-# Per-task lifecycle hooks (PROTOCOL §4.8), duck-read off the app object at
-# load_app time. These are references to the app's own LISTS, not copies, so
-# hooks registered after startup are still honored. Zero-arg callables; a
-# hook that raises is logged and skipped, never failing the task.
+# Lifecycle hooks (PROTOCOL §4.8): the app's own lists, not copies, so hooks
+# registered after startup still run. A hook that raises is logged and skipped.
 _before_hooks = ()
 _after_hooks = ()
 
@@ -176,10 +122,7 @@ def _run_hooks(hooks, where):
 
 
 async def _run_hooks_async(hooks, where):
-    # Async-path variant: a hook may return an awaitable (e.g. one built on
-    # asgiref's sync_to_async so it runs in the same executor thread Django's
-    # async ORM uses); it is awaited on the loop thread. Sync hooks behave
-    # exactly as on the other paths.
+    # A hook may return an awaitable (asgiref's sync_to_async, say).
     for hook in hooks:
         try:
             r = hook()
@@ -205,11 +148,8 @@ def _tb_of(exc):
 
 
 def _error_dict(exc, origin="task"):
-    # PROTOCOL section 8 `origin`: "task" whenever a real exception ended the
-    # task invocation, which includes a propagated SoftTimeLimitExceeded --
-    # the worker injected it, but it did leave user code, so it is not
-    # special cased. "worker" is passed explicitly where the shim itself,
-    # not the task, is the thing that failed.
+    # PROTOCOL §8 `origin`: an injected SoftTimeLimitExceeded left user code,
+    # so it is "task"; callers pass "worker" when the shim itself failed.
     return {
         "type": type(exc).__name__,
         "message": str(exc),
@@ -219,7 +159,6 @@ def _error_dict(exc, origin="task"):
 
 
 def _is_retry(exc):
-    # Duck-typed recognition per protocol: class named "Retry" with .countdown.
     return type(exc).__name__ == "Retry" and hasattr(exc, "countdown")
 
 
@@ -250,13 +189,10 @@ def load_app(app_spec, extra_paths_json):
         import site
 
         for sp in glob.glob(os.path.join(venv, "lib", "python*", "site-packages")):
-            # addsitedir (not sys.path.append) so .pth hooks run — editable
-            # installs (pip install -e) are invisible without them
+            # addsitedir, not sys.path.append: editable installs need .pth hooks.
             site.addsitedir(sp)
 
-    # Imported here, after the path setup above, for the same reason cauli
-    # itself is rebound below: a source built worker sees the app's
-    # environment only from this point on.
+    # Imported only now: the app's environment is on sys.path from here on.
     global _decode, _encode
     try:
         import msgspec.json
@@ -276,25 +212,15 @@ def load_app(app_spec, extra_paths_json):
     mod = importlib.import_module(module_name)
     app = getattr(mod, attr)
 
-    # The module body above may have failed to import cauli (see the try
-    # block at the top of this file): it runs before this function has set
-    # up sys.path and VIRTUAL_ENV, so a source built worker with no venv
-    # link finds nothing there yet. The app module we just imported pulls
-    # the real cauli in now that the paths exist, so rebind onto it when
-    # present, or a task's own except SoftTimeLimitExceeded clause compares
-    # against a different class object and never matches.
+    # The module level cauli import ran before sys.path was set up. Rebind to
+    # the real class, or a task's `except SoftTimeLimitExceeded` never matches.
     global SoftTimeLimitExceeded
     real_cauli = sys.modules.get("cauli")
     if real_cauli is not None and hasattr(real_cauli, "SoftTimeLimitExceeded"):
         SoftTimeLimitExceeded = real_cauli.SoftTimeLimitExceeded
 
-    # Same late-import story for the task context (py/cauli/_context.py): the
-    # module-level import above ran before sys.path existed, so without this
-    # rebind `cauli.current_task()` would return None inside every io task
-    # even though the app module has since imported the real cauli. The three
-    # names are bound together or not at all -- a half-bound set would set a
-    # context it cannot reset, and a leaked context on a reused sync pool
-    # thread shows the NEXT task the previous task's id.
+    # Same rebind for current_task(). All three names or none: a context that
+    # cannot be reset leaks the previous task's id onto a reused pool thread.
     global _TaskContext, _set_ctx, _reset_ctx
     real_ctx = sys.modules.get("cauli._context")
     if real_ctx is not None:
@@ -303,19 +229,12 @@ def load_app(app_spec, extra_paths_json):
             setter = real_ctx.set_current_task
             resetter = real_ctx.reset_current_task
         except AttributeError:
-            # A cauli too old to carry the context API. Leave the io lanes
-            # skipping the context entirely, which is what current_task()
-            # documents for a worker that does not report it.
             ctx_cls = setter = resetter = None
         _TaskContext, _set_ctx, _reset_ctx = ctx_cls, setter, resetter
 
-    # Lifecycle hooks (PROTOCOL §4.8), by getattr like everything else here:
-    # keep the app's list objects so post-startup registrations are seen.
     global _before_hooks, _after_hooks
     _before_hooks = getattr(app, "_before_task_hooks", ())
     _after_hooks = getattr(app, "_after_task_hooks", ())
-    # Process-init hooks run once in this (embedded) interpreter, before any
-    # task executes — the worker process is itself an execution context.
     _run_hooks(getattr(app, "_process_init_hooks", ()), "process_init")
 
     tasks_out = {}
@@ -337,9 +256,7 @@ def load_app(app_spec, extra_paths_json):
             "store_result": bool(getattr(td, "store_result", True)),
         }
 
-    # PROTOCOL §9.2 queue TTL: {queue: seconds}, key "*" is the fallback for
-    # queues with no explicit entry. Duck-read like every other app attribute
-    # so an app object predating this feature still loads.
+    # PROTOCOL §9.2 queue TTL: {queue: seconds}, "*" is the fallback.
     queue_ttl_out = {}
     try:
         for qname, seconds in dict(getattr(app, "queue_ttl", None) or {}).items():
@@ -347,19 +264,11 @@ def load_app(app_spec, extra_paths_json):
             if value > 0:
                 queue_ttl_out[str(qname)] = value
     except (TypeError, ValueError):
-        # Malformed config must not stop the worker from starting; it just
-        # means no TTL is enforced (the client-side `expires_at` stamp still
-        # applies to anything enqueued by a client that could read it).
+        # Malformed config must not stop startup; the client's `expires_at` still applies.
         queue_ttl_out = {}
 
-    # The same CoW/GC payoff the cpu fork parent takes (py/cauli/_exec.py):
-    # collect import-time garbage once, then freeze every object created so far
-    # into the permanent generation. Unfrozen, the whole app image stays in gen2
-    # forever and every gen2 collection rescans it -- while holding the GIL that
-    # all in-process io tasks share, so one pause stops every sync pool thread
-    # and every event loop in this process at once. Measured on a 300k object
-    # app image: gen2 pause 9.28ms -> 0.14ms. Placed here, after the app import
-    # and after the registry is built, so those objects are inside the freeze.
+    # Freeze the app image after import so gen2 collections stop rescanning
+    # it under the GIL every io lane shares. Must stay after the registry build.
     gc.collect()
     gc.freeze()
 
@@ -376,16 +285,11 @@ def load_app(app_spec, extra_paths_json):
 
 
 def cpu_child_python():
-    """The interpreter cpu children are spawned with: one that loads this same
-    libpython, so the app's C extensions import in them too.
+    """The interpreter for cpu children: one that loads this same libpython.
 
-    An embedded interpreter resolves `sys.executable` by looking "python3" up
-    on PATH, which can be a different CPython (a uv or pyenv build, a free
-    threaded one), so it is used only when it provably belongs to this
-    runtime: its binary lives in this runtime's BINDIR, or it is a venv whose
-    pyvenv.cfg `home` is that BINDIR. `$VIRTUAL_ENV`, which the wheel's
-    launcher exports, gets the same check. Failing both, the runtime's own
-    interpreter in BINDIR.
+    An embedded `sys.executable` comes from PATH and can be another CPython,
+    so it (or `$VIRTUAL_ENV`) is used only when its binary or pyvenv.cfg
+    `home` is this runtime's BINDIR; otherwise BINDIR's own interpreter.
     """
     import sysconfig
 
@@ -420,21 +324,11 @@ def cpu_child_python():
     return own if os.path.isfile(own) else (sys.executable or None)
 
 
-# --------------------------------------------------------------------------
-# sync execution (called on the Rust-owned sync io thread pool, GIL held on
-# entry; CPython releases the GIL itself during blocking I/O in the task)
-# --------------------------------------------------------------------------
-
 _gen_lock = threading.Lock()
 _thread_gen = {}  # tid -> generation fencing stale soft-timeout injections
 
-# MEM-4: one shared watchdog thread services every soft_timeout deadline via a
-# min-heap of (deadline, tid, gen), instead of spawning a dedicated
-# threading.Timer (and its own OS thread) per sync task call. At hot-path
-# rates (hundreds of tasks/s with soft_timeout set) that was thousands of
-# thread creations per second; a single background thread sleeping until the
-# next deadline scales to however many tasks are in flight with no per-call
-# thread spawn/teardown cost.
+# One watchdog thread for every sync soft deadline: a threading.Timer per task
+# is an OS thread per task.
 _watchdog_heap = []  # heap of (deadline_monotonic, tid, gen)
 _watchdog_cond = threading.Condition()
 _watchdog_started = False
@@ -476,24 +370,9 @@ def _schedule_soft_timeout(tid, gen, soft_timeout_ms):
 
 
 def _inject_soft(tid, gen):
-    # M3 stale-timer guard: a deadline scheduled for a PREVIOUS task on this
-    # pool thread fires (from the watchdog heap) after that task already
-    # finished. Only inject if this thread is still on the generation that
-    # armed it -- otherwise the exception would land inside whatever task the
-    # thread has since moved on to. The watchdog does not (and structurally
-    # cannot cheaply) remove heap entries early, so EVERY scheduled deadline
-    # reaches this check; the generation compare is what makes that safe.
-    #
-    # The injection happens INSIDE the lock, not after it. Releasing the lock
-    # between the compare and the injection reopens exactly the hole the
-    # generation counter exists to close: the pool thread reaches its disarm
-    # (bump generation, clear pending exception) in that gap, and this
-    # injection then lands on a thread that has already moved on -- so the
-    # NEXT task run on it dies of a SoftTimeLimitExceeded it never armed.
-    # Under the GIL that gap needed an eval-loop thread switch to land in and
-    # was merely improbable; on a free-threaded build the two threads run at
-    # once and nothing makes it improbable any more. Holding the lock across
-    # both makes check-and-arm atomic against bump-and-disarm.
+    # Heap entries are never removed early, so every deadline reaches this
+    # generation check, or it would hit the thread's next task. Inject inside
+    # the lock: free threaded builds can otherwise disarm between check and inject.
     with _gen_lock:
         if _thread_gen.get(tid, 0) != gen:
             return
@@ -501,12 +380,7 @@ def _inject_soft(tid, gen):
 
 
 def run_sync(name, args, kwargs, soft_timeout_ms, meta=None):
-    """Run one sync task. `args`/`kwargs` arrive as Python objects (decoded by
-    Rust with `_decode`) and the outcome dict is returned as a Python object.
-
-    `meta` is the `(id, retries, max_retries, queue)` envelope tuple backing
-    `cauli.current_task()`, or None (see `_enter_context`).
-    """
+    """Run one sync task and return its outcome dict."""
     try:
         return _run_sync_inner(name, args, kwargs, soft_timeout_ms, meta)
     except BaseException as e:  # late soft-timeout injection race, anything else
@@ -540,15 +414,10 @@ def _run_sync_inner(name, args, kwargs, soft_timeout_ms, meta=None):
         }
     fn = getattr(td, "fn")
 
-    # `cauli.current_task()` is installed around the hooks as well as the task
-    # body: a before/after hook is the natural place to open a per-task log
-    # scope, and it must see the same id the body will.
+    # Hooks see current_task() too, so a per task log scope gets the same id.
     ctx_token = _enter_context(name, meta)
     try:
-        # Before hooks (PROTOCOL §4.8) run on THIS pool thread before the soft
-        # timeout is armed: hook time is not charged against the soft budget
-        # and an injection cannot land inside a hook. After hooks run after
-        # the disarm below, on every outcome path.
+        # Hooks run outside the armed soft timeout, so no injection lands in one.
         _run_hooks(_before_hooks, "before_task")
         tid = threading.get_ident()
         gen = _thread_gen.get(tid, 0)
@@ -561,20 +430,9 @@ def _run_sync_inner(name, args, kwargs, soft_timeout_ms, meta=None):
         except BaseException as e:
             out = _finish_exc(e)
         finally:
-            # Bump the generation (M3): fences off a watchdog deadline for THIS
-            # invocation (already scheduled above, if any) so it cannot land
-            # inside whatever task this thread picks up next. The residual
-            # window where the deadline fires after fn() returns but before
-            # this finally block runs -- flipping a successful execution into a
-            # SoftTimeLimitExceeded failure -- is inherent to
-            # PyThreadState_SetAsyncExc and not fixed by the generation counter
-            # (it is the SAME generation); documented in PROTOCOL.md §4.6.
-            #
-            # Skipped entirely when nothing was armed: with no deadline queued
-            # for this invocation there is no generation to fence and no
-            # injected exception to clear, while the lock + dict write + ctypes
-            # call cost 893ns of GIL held time on EVERY task, soft timeout or
-            # not. Tasks that declare no soft_timeout are the common case.
+            # The generation bump fences this call's deadline off the thread's
+            # next task. A deadline firing between fn() returning and here is
+            # inherent (PROTOCOL.md §4.6). Unarmed calls skip the cost.
             if armed:
                 with _gen_lock:
                     _thread_gen[tid] = gen + 1
@@ -585,32 +443,16 @@ def _run_sync_inner(name, args, kwargs, soft_timeout_ms, meta=None):
     return out
 
 
-# --------------------------------------------------------------------------
-# async execution (dedicated daemon threads running asyncio loops; completion
-# is pushed to Rust via the registered callback -> mpsc channel, no polling)
-# --------------------------------------------------------------------------
-
-
 def _loop_main(loop):
     asyncio.set_event_loop(loop)
     loop.run_forever()
 
 
 def _new_loop():
-    """Build one event loop, preferring uvloop when it is importable.
+    """Build one event loop: uvloop when importable, else stock asyncio.
 
-    uvloop is a libuv-backed drop in replacement whose timer heap and
-    callback scheduling are several times cheaper than the stock loop's;
-    on this worker the loop machinery was measured at 60-100us of a 220us
-    per-task budget, so the loop implementation is a first order cost, not
-    a taste choice. Everything this shim does with a loop --
-    call_soon_threadsafe, create_task, run_forever, wait_for -- is in the
-    subset uvloop implements.
-
-    CAULI_LOOP=asyncio forces the stock loop (the A/B control and the
-    escape hatch); CAULI_LOOP=uvloop makes uvloop mandatory, failing
-    loudly at startup instead of silently benchmarking the wrong loop.
-    Unset means: use uvloop when available, else stock.
+    CAULI_LOOP=asyncio forces the stock loop; CAULI_LOOP=uvloop makes uvloop
+    mandatory and fails at startup without it.
     """
     choice = os.environ.get("CAULI_LOOP", "").strip().lower()
     if choice not in ("", "asyncio", "uvloop"):
@@ -631,8 +473,10 @@ def _new_loop():
     return uvloop.new_event_loop(), "uvloop"
 
 
-def start_loops(n):
+def start_loops(n, pending_cap=_PENDING_CAP):
+    global _pending_cap
     n = max(1, int(n))
+    _pending_cap = max(_PENDING_CAP, int(pending_cap))
     impl = None
     with _loops_lock:
         for i in range(n):
@@ -651,8 +495,6 @@ def start_loops(n):
             _hb_sub.append(0)
             _hb_done.append(0)
     if impl is not None:
-        # One line, stderr: lands in the worker's log so a benchmark or an
-        # operator can see WHICH loop ran without introspecting the process.
         sys.stderr.write("cauli: %d asyncio loop(s), impl=%s\n" % (n, impl))
     return len(_loops)
 
@@ -669,20 +511,11 @@ def _hb_ack(idx, sent):
 
 
 def heartbeat():
-    """Stamp every loop and report it: one (lag_ms, outstanding, completed)
-    tuple per loop, in loop order.
+    """Stamp every loop; return (lag_ms, outstanding, completed) per loop.
 
-    Driven from Rust (worker/src/loops.rs wedge_loop) every few seconds with
-    the GIL held. `lag_ms` is the age of a stamp the loop has not run yet, or
-    the scheduled to run time of the last one it did, so it grows without
-    bound on a wedged loop and sits near zero on a healthy one, which also
-    makes it the cross lane GIL pressure reading in the stats line.
-    `outstanding` is submitted minus completed, which counts both submissions
-    still queued and Tasks the loop created and never got to run: a wedged
-    loop usually holds the second kind, since one drain can turn a whole
-    batch into Tasks before the first of them blocks the thread. `completed`
-    is that loop's finished async task count. A wedge is all three at once: a
-    stale stamp, work outstanding, and nothing finishing.
+    `lag_ms` is the age of an unrun stamp or the latency of the last one.
+    `outstanding` is submitted minus completed, so it includes Tasks created
+    but never run. A wedge is a stale stamp, work outstanding, nothing finishing.
     """
     now = time.monotonic()
     out = []
@@ -692,10 +525,8 @@ def heartbeat():
         sent = _hb_sent[idx]
         if sent is None:
             lag_ms = _hb_lag[idx]
-            # Recorded BEFORE scheduling, never after: the loop can run the
-            # callback and clear this slot before call_soon_threadsafe has
-            # even returned, and writing it afterwards would leave a stamp
-            # that reads as permanently outstanding.
+            # Before scheduling: the loop may ack before call_soon_threadsafe
+            # returns, and a later write would read as forever outstanding.
             _hb_sent[idx] = now
             try:
                 loop.call_soon_threadsafe(_hb_ack, idx, now)
@@ -703,9 +534,7 @@ def heartbeat():
                 _hb_sent[idx] = None  # loop closed under us
         else:
             lag_ms = int((now - sent) * 1000)
-        # Read in this order and floored at zero: the two counters are
-        # written by different threads, so a submission that completes
-        # between the two reads would otherwise show as negative work.
+        # Different writer threads: read in this order and floor at zero.
         submitted = _hb_sub[idx]
         completed = _hb_done[idx]
         out.append((lag_ms, max(0, submitted - completed), completed))
@@ -715,15 +544,7 @@ def heartbeat():
 if sys.version_info >= (3, 12):
 
     def _start_task(loop, coro):
-        """Start one `_arun` Task eagerly: its first step runs right here.
-
-        A body that finishes without suspending, the common short task,
-        completes inside this call instead of costing a trip through the
-        ready queue and a loop turn of its own. Starts stay in submission
-        order and each one still runs in its own Task and context copy.
-        Only these Tasks start eagerly; a task body's own create_task keeps
-        the loop's default scheduling.
-        """
+        """Start one `_arun` Task eagerly, so a body that never suspends skips a loop turn."""
         return asyncio.Task(coro, loop=loop, eager_start=True)
 
 else:
@@ -739,8 +560,7 @@ def _drain(idx, loop):
         batch = queue[:]
         del queue[:]
     for token, name, args, kwargs, timeout_s, soft_timeout_s, meta in batch:
-        # _arun is defensive (it converts every exception into an outcome and
-        # always invokes the callback), so a bare Task needs no result handle.
+        # _arun never raises and always calls back, so no result handle is kept.
         _start_task(
             loop,
             _arun(idx, token, name, args, kwargs, timeout_s, soft_timeout_s, meta),
@@ -748,25 +568,10 @@ def _drain(idx, loop):
 
 
 def submit_async(token, name, args, kwargs, timeout_s, soft_timeout_s=None, meta=None):
-    """Schedule one async task. `args`/`kwargs` are already Python objects
-    (decoded by Rust with `_decode`).
+    """Queue one async task on the next loop; raises AsyncQueueFull at the cap.
 
-    `timeout_s` is the hard deadline and `soft_timeout_s` (or None) the soft
-    one; they travel separately so `_arun` can enforce the pair rather than
-    collapsing them to their minimum (see `_await_with_soft_limit`). `meta` is
-    the `(id, retries, max_retries, queue)` envelope tuple backing
-    `cauli.current_task()`, or None (see `_enter_context`).
-
-    Submissions are queued per loop and the loop is woken only when its queue
-    was empty. asyncio.run_coroutine_threadsafe wakes the loop thread for
-    every single task, and that wakeup -- not the Task machinery -- is the
-    dominant cost of the async path: measured on this codebase's dispatch
-    shape, 46.2 us/task submitting one at a time against 4.4 us/task when the
-    queue is drained per wakeup (20k tasks, trivial body, one loop thread).
-    Ordering within a loop is preserved; a task submitted while a drain is in
-    flight simply schedules the next drain.
-
-    Raises AsyncQueueFull if that loop's queue is already at _PENDING_CAP.
+    The loop is woken only when its queue was empty: a wakeup per task, as
+    run_coroutine_threadsafe does, dominates the async path's cost.
     """
     global _rr
     with _loops_lock:
@@ -778,7 +583,7 @@ def submit_async(token, name, args, kwargs, timeout_s, soft_timeout_s=None, meta
         loop = _loops[idx]
 
     with _pending_locks[idx]:
-        if len(_pending[idx]) >= _PENDING_CAP:
+        if len(_pending[idx]) >= _pending_cap:
             if not _cap_warned[idx]:
                 _cap_warned[idx] = True
                 sys.stderr.write(
@@ -788,12 +593,12 @@ def submit_async(token, name, args, kwargs, timeout_s, soft_timeout_s=None, meta
                     "synchronous HTTP request, time.sleep, a blocking "
                     "database driver) in place of its non blocking "
                     "equivalent, which starves this loop of its own event "
-                    "loop turns.\n" % (idx, _PENDING_CAP)
+                    "loop turns.\n" % (idx, _pending_cap)
                 )
             raise AsyncQueueFull(
                 "cauli: async loop %d submission queue is full (cap=%d); "
                 "rejecting so the task can be retried instead of queued "
-                "forever" % (idx, _PENDING_CAP)
+                "forever" % (idx, _pending_cap)
             )
         _pending[idx].append(
             (token, name, args, kwargs, timeout_s, soft_timeout_s, meta)
@@ -814,24 +619,17 @@ def _fire_deadline(task, fired):
     task.cancel()
 
 
-# asyncio's own thresholds for rebuilding its timer heap once cancelled
-# entries are the majority (base_events._MIN_SCHEDULED_TIMER_HANDLES and
-# _MIN_CANCELLED_TIMER_HANDLES_FRACTION): memory stays within twice the live
-# deadlines however many tasks finish early.
+# asyncio's own heap compaction thresholds (base_events): memory stays within
+# twice the live deadlines.
 _DEADLINE_COMPACT_MIN = 100
 _DEADLINE_COMPACT_FRACTION = 0.5
 
 
 class _DeadlineHeap:
-    """Every task deadline on one loop, behind a single loop timer.
+    """Every task deadline on one loop behind a single loop timer.
 
-    A loop timer per task was a third of the loop thread's time on a short
-    async task: uvloop starts, stops and closes a libuv handle for each one.
-    Here a deadline is a heap entry, cancelling one only marks it, and the
-    one timer is moved only when a new deadline lands before the armed one.
-    Due entries fire in deadline order, ties in submission order, exactly as
-    one timer each would, with the same clock slack uvloop's whole
-    millisecond timers already have.
+    A uvloop timer per task costs a libuv handle each. Cancelling only marks
+    an entry; due entries fire in deadline order, ties in submission order.
     """
 
     __slots__ = ("_loop", "_heap", "_seq", "_cancelled", "_armed_at", "_timer")
@@ -893,16 +691,11 @@ class _DeadlineHeap:
 if sys.version_info >= (3, 12):
 
     async def _await_deadline(coro, timeout_s, deadlines):
-        """`asyncio.wait_for(coro, timeout_s)` exactly as 3.12+ implements it.
+        """3.12+ `asyncio.wait_for(coro, timeout_s)` semantics, deadline on `_DeadlineHeap`.
 
-        From 3.12 wait_for is a frame around `async with asyncio.timeout()`,
-        and this is the same cancel, uncancel and TimeoutError conversion
-        written out. What it drops is the scaffolding around that: a Timeout
-        object, two coroutine objects for `__aenter__`/`__aexit__` and the
-        wait_for frame: the shim's noop async task went from 8.0us to 6.6us,
-        all of it GIL held time. The deadline itself sits in the loop's
-        `_DeadlineHeap` rather than on a timer of its own. 3.10 and 3.11
-        keep the real wait_for, which is a different algorithm there.
+        Same cancel, uncancel and TimeoutError conversion as 3.12's wait_for,
+        without its Timeout object and extra frames. Older Pythons keep the
+        real wait_for, which is a different algorithm there.
         """
         task = asyncio.current_task()
         cancelling = task.cancelling()
@@ -926,30 +719,13 @@ else:
 
 
 async def _await_with_soft_limit(coro, soft_s, hard_s):
-    """Run one async task body under the §4.6 soft-then-hard deadline pair.
+    """Run one async task body under the §4.6 soft then hard deadline pair.
 
-    The soft mark raises `cauli.SoftTimeLimitExceeded` out of this coroutine,
-    exactly as the sync and cpu lanes do, and the hard deadline stays the
-    backstop behind it. What this replaced was a single
-    `asyncio.wait_for(coro, min(soft, hard))`, which meant an `async def`
-    task never saw `SoftTimeLimitExceeded` at all: the soft limit silently
-    became the whole budget and was reported as `TimeLimitExceeded`.
-
-    Lane difference worth knowing, and the reason this is not the sync lane's
-    mechanism: asyncio has no public way to throw an arbitrary exception into
-    a running coroutine at its await point (`PyThreadState_SetAsyncExc` has
-    no asyncio equivalent, and reaching into `Task._fut_waiter` to poison the
-    future a task is parked on breaks the callback that owns it). The stop
-    signal is therefore a `Task.cancel()`, so an async task body observes the
-    soft deadline as `asyncio.CancelledError` and its `finally` blocks run,
-    while an `except SoftTimeLimitExceeded` INSIDE the body does not fire.
-    The exception the worker reports for the task is `SoftTimeLimitExceeded`
-    either way, so callers, the DLQ and the result document all agree with
-    the other two lanes.
-
-    A body that swallows the cancellation and returns normally still returns
-    its value; a body that ignores it and burns the rest of the hard budget
-    times out as `TimeLimitExceeded`, which is what the hard limit means.
+    asyncio cannot throw an arbitrary exception into a coroutine, so the soft
+    stop is `Task.cancel()`: the body sees `asyncio.CancelledError`, and the
+    worker reports `SoftTimeLimitExceeded` as the other lanes do. A body that
+    swallows the cancel keeps its value; one that runs past the hard budget
+    times out as `TimeLimitExceeded`.
     """
     task = asyncio.ensure_future(coro)
     done, _ = await asyncio.wait((task,), timeout=soft_s)
@@ -959,11 +735,7 @@ async def _await_with_soft_limit(coro, soft_s, hard_s):
     remaining = hard_s - soft_s
     done, _ = await asyncio.wait((task,), timeout=remaining if remaining > 0 else 0)
     if not done:
-        # Cancellation ignored and the hard budget is gone: that is the hard
-        # limit firing, not the soft one. Cancel again, as wait_for does at its
-        # deadline, or the body runs on past the hard limit beside its own
-        # retry. Raised as the same TimeoutError `asyncio.wait_for` would have
-        # raised so _arun maps it identically.
+        # Hard limit. Cancel again, or the body runs on beside its own retry.
         task.cancel()
         raise asyncio.TimeoutError()
     if task.cancelled():
@@ -990,20 +762,10 @@ async def _arun(
             }
         else:
             fn = getattr(td, "fn")
-            # `cauli.current_task()` for this coroutine, installed before the
-            # hooks exactly as the sync lane does. A ContextVar set here is
-            # visible to the task body (`asyncio.wait_for` and
-            # `_await_with_soft_limit` both wrap the body in a Task, which
-            # copies the context at creation time) and, because each _arun is
-            # itself a Task with its own context copy, invisible to every
-            # other coroutine sharing this loop thread.
+            # Each _arun is its own Task with its own context copy, so this
+            # ContextVar reaches the body and no other coroutine on the loop.
             ctx_token = _enter_context(name, meta)
-            # Before/after hooks (PROTOCOL §4.8) on the loop thread, outside
-            # the wait_for window (hook time is not charged against the task
-            # timeout). Awaitable-returning hooks are awaited.
-            # Guarded, not called unconditionally: an await on a coroutine
-            # that immediately returns still costs ~3.5us of GIL time each
-            # way, which is real money against a small task body.
+            # Hooks run outside the timeout. Guarded: an empty await still costs GIL time.
             if _before_hooks:
                 await _run_hooks_async(_before_hooks, "before_task")
             deadline = asyncio.get_running_loop().time() + timeout_s
@@ -1018,10 +780,8 @@ async def _arun(
                     )
                 out = _finish_value(rv)
             except (asyncio.TimeoutError, TimeoutError) as e:
-                # From 3.11 the builtin and asyncio.TimeoutError are one class,
-                # so the clock is what separates the worker's own limit (it
-                # fires at or after the deadline) from a TimeoutError the task
-                # body raised itself, which is reported as the task's own.
+                # From 3.11 both TimeoutErrors are one class, so the clock tells
+                # the worker's limit from a TimeoutError the body raised itself.
                 if (
                     asyncio.get_running_loop().time()
                     < deadline - _DEADLINE_CLOCK_SLACK_S
@@ -1043,27 +803,18 @@ async def _arun(
             finally:
                 if _after_hooks:
                     await _run_hooks_async(_after_hooks, "after_task")
-    except BaseException as e:  # defensive: never lose a completion
-        # Origin worker, not task: the task body's own exceptions are caught
-        # inside, and hooks swallow theirs, so anything reaching here came
-        # out of the shim's dispatch machinery.
+    except BaseException as e:  # never lose a completion
+        # Body and hook exceptions are caught inside, so this is the shim's own.
         out = {"ok": False, "retryable": True, "error": _error_dict(e, "worker")}
     finally:
         _leave_context(ctx_token)
 
-    # This loop finished something. The wedge watchdog reads this counter as
-    # the corroborating signal its stale stamp needs: a loop that is merely
-    # slow keeps moving it, a wedged one never touches it again. Only this
-    # loop's own thread writes this slot.
+    # Tells a slow loop from a wedged one. Only this loop's thread writes it.
     _hb_done[idx] += 1
 
     cb = _callback
     if cb is not None:
         try:
-            # The outcome dict itself: Rust normalizes it and encodes the result
-            # in the callback (pyrt::outcome_from_py), which runs right here on
-            # this loop thread. A non-serializable result becomes a
-            # SerializationError there.
             cb(token, out)
         except Exception:
             traceback.print_exc()
