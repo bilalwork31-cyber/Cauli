@@ -5,6 +5,7 @@ use crate::ctx::{parse_pyresp, Ctx, DecrGuard, Outcome};
 use crate::envelope::{Envelope, ErrorJson};
 use crate::pyrt::{SyncJob, TaskMeta};
 use serde::Serialize;
+use serde_json::value::RawValue;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -12,14 +13,14 @@ use tokio::sync::oneshot;
 use tokio::time::timeout;
 use tracing::warn;
 
-/// The §5.1 cpu request line, serialized from borrowed envelope fields so the
-/// args/kwargs trees are never copied on the way to the child.
+/// The §5.1 cpu request line. args and kwargs are the caller's JSON text,
+/// copied onto the line as is: the child decodes them, nothing here does.
 #[derive(Serialize)]
 struct CpuRequest<'a> {
     id: &'a str,
     task: &'a str,
-    args: &'a serde_json::Value,
-    kwargs: &'a serde_json::Value,
+    args: &'a RawValue,
+    kwargs: &'a RawValue,
     soft_timeout_ms: Option<u64>,
 }
 
@@ -36,8 +37,8 @@ fn fail(type_: &str, msg: String) -> Outcome {
 }
 
 /// What the io lanes hand to the shim so a task can read `cauli.current_task()`
-/// (py/cauli/_context.py). Two short string clones per task, against args and
-/// kwargs trees that are already cloned whole on both of these paths.
+/// (py/cauli/_context.py). Two short string clones per task, next to the copy
+/// of the args and kwargs text both of these paths already make.
 fn task_meta(env: &Envelope) -> TaskMeta {
     TaskMeta {
         id: env.id.clone(),
@@ -69,10 +70,9 @@ pub async fn run_sync_task(ctx: &Arc<Ctx>, env: &Envelope) -> Outcome {
         .sync_pool
         .submit(SyncJob {
             name: env.task.clone(),
-            // Already-parsed values, not re-serialized JSON text: the pool
-            // thread converts straight into Python objects.
-            args: env.args_ref().clone(),
-            kwargs: env.kwargs_ref().clone(),
+            // The caller's JSON text, decoded by msgspec on the pool thread.
+            args: env.args_raw().get().into(),
+            kwargs: env.kwargs_raw().get().into(),
             soft_timeout_ms: env.soft_timeout_ms,
             meta: Some(Box::new(task_meta(env))),
             started: started_tx,
@@ -178,14 +178,14 @@ pub async fn run_async_task(ctx: &Arc<Ctx>, env: &Envelope) -> Outcome {
     // (envelope::async_timeouts_s).
     let (soft_s, hard_s) = env.async_timeouts_s();
     // Queued to the dedicated submitter thread: no GIL from here, no
-    // spawn_blocking. Args cross as parsed values and become Python objects
-    // inside the batch submit; no JSON text is produced on this path. A
-    // Python-side submit failure comes back through the oneshot as a normal
-    // retryable outcome (pyrt::submit_batch_under_gil).
+    // spawn_blocking. Args cross as the caller's JSON text and msgspec turns
+    // them into Python objects inside the batch submit. A Python-side submit
+    // failure comes back through the oneshot as a normal retryable outcome
+    // (pyrt::submit_batch_under_gil).
     let (token, rx) = ctx.pyrt.queue_submit(
         &env.task,
-        env.args_ref(),
-        env.kwargs_ref(),
+        env.args_raw().get(),
+        env.kwargs_raw().get(),
         hard_s,
         soft_s,
         Some(task_meta(env)),
@@ -230,22 +230,22 @@ pub async fn run_cpu_task(ctx: &Arc<Ctx>, env: &Envelope) -> Outcome {
     // always use the envelope id, never this.
     static CPU_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let wire_id = format!("{}.{:x}", env.id, CPU_SEQ.fetch_add(1, Ordering::Relaxed));
-    // Serialize straight from borrowed envelope fields. The previous `json!`
-    // form deep-copied args and kwargs TWICE per task: once in
-    // `args_value()`/`kwargs_value()` (an explicit `.clone()` of the Value
-    // tree) and again inside `json!`, whose expression rule is
-    // `to_value(&expr)` -- a second full rebuild. A borrowing Serialize impl
-    // copies neither; the bytes go from the parsed tree to the wire directly.
-    let req = serde_json::to_string(&CpuRequest {
+    let mut req = serde_json::to_string(&CpuRequest {
         id: &wire_id,
         task: &env.task,
-        args: env.args_ref(),
-        kwargs: env.kwargs_ref(),
+        args: env.args_raw(),
+        kwargs: env.kwargs_raw(),
         soft_timeout_ms: env.soft_timeout_ms,
     })
-    // Infallible: every field is either a &str or a Value already parsed from
-    // valid JSON (so no NaN/Infinity can be present).
+    // Infallible: every field is a &str, an Option<u64> or JSON text serde_json
+    // already validated.
     .expect("cpu request serialize");
+    // The request is one line. A raw newline in it can only be whitespace
+    // between tokens of the caller's own text (inside a JSON string it is
+    // always escaped), so it becomes a space and every value stays the same.
+    if req.contains('\n') {
+        req = req.replace('\n', " ");
+    }
     let (tx, rx) = oneshot::channel();
     let job = crate::cpu::CpuJob {
         id: wire_id,

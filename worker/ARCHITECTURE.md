@@ -71,7 +71,10 @@ against Redis Streams per PROTOCOL.md. Module map:
   injecting `SoftTimeLimitExceeded` via `PyThreadState_SetAsyncExc`, fenced by
   a per-thread generation counter so a timer that fires late (after its own
   task already finished) cannot land inside a later task on the same thread.
-  The job queue is a bounded crossbeam channel (capacity = `--io-concurrency`);
+  The job queue is bounded (capacity = `--io-concurrency`) and a job leaves it
+  only through a thread that already holds the GIL, with one parked thread
+  woken as standby while work remains, so a burst runs on one thread instead
+  of paying a GIL handoff per job, and a blocking job hands over at once;
   a queued job whose dispatcher already hard-timed-out is skipped rather than
   executed late ("zombie execution") when a thread reaches it, and a hard
   timeout spawns a replacement thread immediately so pool capacity is

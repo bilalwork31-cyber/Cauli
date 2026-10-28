@@ -21,13 +21,12 @@ None when the caller does not report it (older worker, unit test). It is one
 tuple rather than four scalars so the per-task pyo3 call does not grow four
 argument slots on the hottest path in the process; see `_enter_context`.
 
-Task arguments and outcomes cross as REAL PYTHON OBJECTS, not JSON strings.
-Rust converts in both directions (worker/src/pyjson.rs). This module therefore
-contains no per-task JSON codec at all: it used to carry its own copy of
-cauli._codec (a validator, a stdlib/msgspec switch, and an encoder), and every
-task paid two `json.loads` plus a validate-and-encode pass **while holding the
-GIL** that all in-process tasks share. `load_app`'s config is the one
-remaining JSON payload, and it crosses exactly once at startup.
+Task arguments reach `run_sync`/`submit_async` as Python objects that Rust
+decoded from the envelope's JSON text with `_decode`, and Rust encodes the
+outcome dict's result with `_encode` (worker/src/pyrt.rs). Both are msgspec,
+the codec the client (py/cauli/_codec.py) and the cpu child use, so a value
+means the same thing on every side of the wire. `load_app`'s config is the
+one other JSON payload, and it crosses exactly once at startup.
 
 Outcome dict shapes:
   {"ok": True,  "result": <any JSON-representable value>}
@@ -36,8 +35,7 @@ Outcome dict shapes:
                                                "traceback": ..., "origin": ...}}
 
 A result that cannot be represented as JSON is rejected on the Rust side and
-becomes a non-retryable SerializationError, the same classification the
-deleted encoder produced.
+becomes a non-retryable SerializationError, as it does in the cpu child.
 """
 
 import asyncio
@@ -54,6 +52,9 @@ import time
 import traceback
 
 _MAX_TB = 8192
+
+_decode = None  # msgspec.json.Decoder().decode, bound by load_app
+_encode = None  # msgspec.json.Encoder().encode, bound by load_app
 
 try:  # pragma: no cover - only when the real cauli package is importable
     from cauli import SoftTimeLimitExceeded  # type: ignore
@@ -117,6 +118,7 @@ _rr = 0
 # loop wakeup instead of N. See submit_async for the measured reason.
 _pending = []
 _pending_locks = []
+_deadline_heaps = []  # per loop: _DeadlineHeap, touched only on that loop
 _callback = None  # Rust completion callback: cb(token:int, outcome:dict)
 
 
@@ -251,6 +253,22 @@ def load_app(app_spec, extra_paths_json):
             # addsitedir (not sys.path.append) so .pth hooks run — editable
             # installs (pip install -e) are invisible without them
             site.addsitedir(sp)
+
+    # Imported here, after the path setup above, for the same reason cauli
+    # itself is rebound below: a source built worker sees the app's
+    # environment only from this point on.
+    global _decode, _encode
+    try:
+        import msgspec.json
+    except ImportError as exc:
+        raise ImportError(
+            "cauli-worker needs msgspec in the Python environment it runs "
+            "(%s): it decodes task arguments and encodes results with it, as "
+            "the cauli client does. Install cauli, which depends on it, or "
+            "msgspec itself into that environment." % (sys.prefix,)
+        ) from exc
+    _decode = msgspec.json.Decoder().decode
+    _encode = msgspec.json.Encoder().encode
 
     module_name, sep, attr = app_spec.partition(":")
     if not sep or not attr:
@@ -483,14 +501,8 @@ def _inject_soft(tid, gen):
 
 
 def run_sync(name, args, kwargs, soft_timeout_ms, meta=None):
-    """Run one sync task. `args`/`kwargs` arrive as real Python objects and the
-    outcome dict is returned as a real Python object.
-
-    No JSON is produced or parsed anywhere on this path. Rust converts in both
-    directions (src/pyjson.rs), because every instruction here holds the GIL
-    that all in-process tasks share -- the two `json.loads` calls and the
-    validate-plus-encode that used to live here were charged directly against
-    total io throughput.
+    """Run one sync task. `args`/`kwargs` arrive as Python objects (decoded by
+    Rust with `_decode`) and the outcome dict is returned as a Python object.
 
     `meta` is the `(id, retries, max_retries, queue)` envelope tuple backing
     `cauli.current_task()`, or None (see `_enter_context`).
@@ -632,6 +644,7 @@ def start_loops(n):
             _loops.append(loop)
             _pending.append([])
             _pending_locks.append(threading.Lock())
+            _deadline_heaps.append(_DeadlineHeap(loop))
             _cap_warned.append(False)
             _hb_sent.append(None)
             _hb_lag.append(0)
@@ -699,6 +712,26 @@ def heartbeat():
     return out
 
 
+if sys.version_info >= (3, 12):
+
+    def _start_task(loop, coro):
+        """Start one `_arun` Task eagerly: its first step runs right here.
+
+        A body that finishes without suspending, the common short task,
+        completes inside this call instead of costing a trip through the
+        ready queue and a loop turn of its own. Starts stay in submission
+        order and each one still runs in its own Task and context copy.
+        Only these Tasks start eagerly; a task body's own create_task keeps
+        the loop's default scheduling.
+        """
+        return asyncio.Task(coro, loop=loop, eager_start=True)
+
+else:
+
+    def _start_task(loop, coro):
+        return loop.create_task(coro)
+
+
 def _drain(idx, loop):
     """Turn one loop's queued submissions into Tasks. Runs ON that loop."""
     queue = _pending[idx]
@@ -708,14 +741,15 @@ def _drain(idx, loop):
     for token, name, args, kwargs, timeout_s, soft_timeout_s, meta in batch:
         # _arun is defensive (it converts every exception into an outcome and
         # always invokes the callback), so a bare Task needs no result handle.
-        loop.create_task(
-            _arun(idx, token, name, args, kwargs, timeout_s, soft_timeout_s, meta)
+        _start_task(
+            loop,
+            _arun(idx, token, name, args, kwargs, timeout_s, soft_timeout_s, meta),
         )
 
 
 def submit_async(token, name, args, kwargs, timeout_s, soft_timeout_s=None, meta=None):
     """Schedule one async task. `args`/`kwargs` are already Python objects
-    (converted in Rust); nothing on this path touches JSON.
+    (decoded by Rust with `_decode`).
 
     `timeout_s` is the hard deadline and `soft_timeout_s` (or None) the soft
     one; they travel separately so `_arun` can enforce the pair rather than
@@ -780,9 +814,85 @@ def _fire_deadline(task, fired):
     task.cancel()
 
 
+# asyncio's own thresholds for rebuilding its timer heap once cancelled
+# entries are the majority (base_events._MIN_SCHEDULED_TIMER_HANDLES and
+# _MIN_CANCELLED_TIMER_HANDLES_FRACTION): memory stays within twice the live
+# deadlines however many tasks finish early.
+_DEADLINE_COMPACT_MIN = 100
+_DEADLINE_COMPACT_FRACTION = 0.5
+
+
+class _DeadlineHeap:
+    """Every task deadline on one loop, behind a single loop timer.
+
+    A loop timer per task was a third of the loop thread's time on a short
+    async task: uvloop starts, stops and closes a libuv handle for each one.
+    Here a deadline is a heap entry, cancelling one only marks it, and the
+    one timer is moved only when a new deadline lands before the armed one.
+    Due entries fire in deadline order, ties in submission order, exactly as
+    one timer each would, with the same clock slack uvloop's whole
+    millisecond timers already have.
+    """
+
+    __slots__ = ("_loop", "_heap", "_seq", "_cancelled", "_armed_at", "_timer")
+
+    def __init__(self, loop):
+        self._loop = loop
+        self._heap = []
+        self._seq = 0
+        self._cancelled = 0
+        self._armed_at = None
+        self._timer = None
+
+    def add(self, when, task, fired):
+        self._seq += 1
+        entry = [when, self._seq, task, fired]
+        heapq.heappush(self._heap, entry)
+        if self._armed_at is None or when < self._armed_at:
+            self._arm(when)
+        return entry
+
+    def cancel(self, entry):
+        if entry[2] is None:  # already fired
+            return
+        entry[2] = entry[3] = None
+        self._cancelled += 1
+        if (
+            self._cancelled > _DEADLINE_COMPACT_MIN
+            and self._cancelled > _DEADLINE_COMPACT_FRACTION * len(self._heap)
+        ):
+            self._heap = [e for e in self._heap if e[2] is not None]
+            heapq.heapify(self._heap)
+            self._cancelled = 0
+
+    def _arm(self, when):
+        if self._timer is not None:
+            self._timer.cancel()
+        self._timer = self._loop.call_at(when, self._fire)
+        self._armed_at = when
+
+    def _fire(self):
+        self._timer = self._armed_at = None
+        heap = self._heap
+        due = self._loop.time() + _DEADLINE_CLOCK_SLACK_S
+        while heap and heap[0][0] <= due:
+            entry = heapq.heappop(heap)
+            task, fired = entry[2], entry[3]
+            if task is None:
+                self._cancelled -= 1
+                continue
+            entry[2] = entry[3] = None
+            _fire_deadline(task, fired)
+        while heap and heap[0][2] is None:
+            heapq.heappop(heap)
+            self._cancelled -= 1
+        if heap:
+            self._arm(heap[0][0])
+
+
 if sys.version_info >= (3, 12):
 
-    async def _await_deadline(coro, timeout_s):
+    async def _await_deadline(coro, timeout_s, deadlines):
         """`asyncio.wait_for(coro, timeout_s)` exactly as 3.12+ implements it.
 
         From 3.12 wait_for is a frame around `async with asyncio.timeout()`,
@@ -790,14 +900,14 @@ if sys.version_info >= (3, 12):
         written out. What it drops is the scaffolding around that: a Timeout
         object, two coroutine objects for `__aenter__`/`__aexit__` and the
         wait_for frame: the shim's noop async task went from 8.0us to 6.6us,
-        all of it GIL held time. 3.10 and 3.11 keep the real wait_for,
-        which is a different algorithm there.
+        all of it GIL held time. The deadline itself sits in the loop's
+        `_DeadlineHeap` rather than on a timer of its own. 3.10 and 3.11
+        keep the real wait_for, which is a different algorithm there.
         """
         task = asyncio.current_task()
-        loop = task.get_loop()
         cancelling = task.cancelling()
         fired = []
-        handle = loop.call_at(loop.time() + timeout_s, _fire_deadline, task, fired)
+        entry = deadlines.add(task.get_loop().time() + timeout_s, task, fired)
         cancelled = None
         try:
             return await coro
@@ -805,12 +915,14 @@ if sys.version_info >= (3, 12):
             cancelled = exc
             raise
         finally:
-            handle.cancel()
+            deadlines.cancel(entry)
             if fired and task.uncancel() <= cancelling and cancelled is not None:
                 raise TimeoutError from cancelled
 
 else:
-    _await_deadline = asyncio.wait_for
+
+    def _await_deadline(coro, timeout_s, deadlines):
+        return asyncio.wait_for(coro, timeout_s)
 
 
 async def _await_with_soft_limit(coro, soft_s, hard_s):
@@ -897,7 +1009,9 @@ async def _arun(
             deadline = asyncio.get_running_loop().time() + timeout_s
             try:
                 if soft_timeout_s is None:
-                    rv = await _await_deadline(fn(*args, **kwargs), timeout_s)
+                    rv = await _await_deadline(
+                        fn(*args, **kwargs), timeout_s, _deadline_heaps[idx]
+                    )
                 else:
                     rv = await _await_with_soft_limit(
                         fn(*args, **kwargs), soft_timeout_s, timeout_s
@@ -946,10 +1060,10 @@ async def _arun(
     cb = _callback
     if cb is not None:
         try:
-            # The outcome dict itself, not JSON text: Rust normalizes it in the
-            # callback (pyrt::outcome_from_py), which runs right here on this
-            # loop thread. A non-serializable result becomes SerializationError
-            # there, exactly as the old encode-and-catch did.
+            # The outcome dict itself: Rust normalizes it and encodes the result
+            # in the callback (pyrt::outcome_from_py), which runs right here on
+            # this loop thread. A non-serializable result becomes a
+            # SerializationError there.
             cb(token, out)
         except Exception:
             traceback.print_exc()

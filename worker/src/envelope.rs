@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 use serde_json::Value;
 use std::collections::BTreeMap;
+use std::sync::LazyLock;
 
 fn d_v() -> u32 {
     1
@@ -114,6 +116,10 @@ where
 
 /// Task envelope, PROTOCOL §2. Unknown fields are preserved across
 /// deserialize -> mutate -> serialize (retry re-enqueue) via the flattened map.
+///
+/// `args` and `kwargs` stay the caller's own JSON text: the worker never
+/// reads them, so it never builds a tree for them, and a retry writes them
+/// back out verbatim. Absent and `null` both read as `None`.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Envelope {
     #[serde(default = "d_v", deserialize_with = "deserialize_flexible_u32")]
@@ -121,9 +127,9 @@ pub struct Envelope {
     pub id: String,
     pub task: String,
     #[serde(default)]
-    pub args: Value,
+    pub args: Option<Box<RawValue>>,
     #[serde(default)]
-    pub kwargs: Value,
+    pub kwargs: Option<Box<RawValue>>,
     #[serde(default = "d_queue")]
     pub queue: String,
     #[serde(default = "d_kind")]
@@ -173,34 +179,21 @@ pub struct Envelope {
     pub extra: BTreeMap<String, Value>,
 }
 
-impl Envelope {
-    // `args_json()` / `kwargs_json()` are gone: nothing serializes task
-    // arguments to JSON text any more. Both execution paths hand the parsed
-    // values to `pyjson::json_to_py`, and the cpu path serializes borrowed
-    // values straight onto the wire.
+fn raw_literal(json: &str) -> Box<RawValue> {
+    RawValue::from_string(json.to_owned()).expect("a JSON literal")
+}
 
-    /// args as a BORROWED `Value` ("null" tolerated -> a shared empty array).
-    /// Callers that serialize (the cpu child request) go straight from the
-    /// parsed tree to the wire: no string round-trip and, unlike the previous
-    /// `args_value()`, no clone of the tree either.
-    pub fn args_ref(&self) -> &Value {
-        static EMPTY_ARRAY: std::sync::LazyLock<Value> =
-            std::sync::LazyLock::new(|| Value::Array(Vec::new()));
-        match &self.args {
-            Value::Null => &EMPTY_ARRAY,
-            v => v,
-        }
+impl Envelope {
+    /// args as the caller's JSON text, absent or null read as `[]`.
+    pub fn args_raw(&self) -> &RawValue {
+        static EMPTY_ARRAY: LazyLock<Box<RawValue>> = LazyLock::new(|| raw_literal("[]"));
+        self.args.as_deref().unwrap_or(&EMPTY_ARRAY)
     }
 
-    /// kwargs as a BORROWED `Value` ("null" tolerated -> a shared empty
-    /// object). See `args_ref`.
-    pub fn kwargs_ref(&self) -> &Value {
-        static EMPTY_OBJECT: std::sync::LazyLock<Value> =
-            std::sync::LazyLock::new(|| Value::Object(serde_json::Map::new()));
-        match &self.kwargs {
-            Value::Null => &EMPTY_OBJECT,
-            v => v,
-        }
+    /// kwargs as the caller's JSON text, absent or null read as `{}`.
+    pub fn kwargs_raw(&self) -> &RawValue {
+        static EMPTY_OBJECT: LazyLock<Box<RawValue>> = LazyLock::new(|| raw_literal("{}"));
+        self.kwargs.as_deref().unwrap_or(&EMPTY_OBJECT)
     }
 
     /// §4.6 async lane deadlines, as `(soft_s, hard_s)` in seconds.
@@ -286,20 +279,6 @@ impl ErrorJson {
 }
 
 /// Result key value builders, PROTOCOL §8.
-/// Borrowed result envelopes.
-///
-/// `serde_json::json!({... "result": result ...})` deep-clones `result` into a
-/// fresh `Value` tree and then serializes that tree, so a task returning a
-/// large structure paid for a full copy of it on the way out. Serializing a
-/// borrowing struct writes the same bytes straight from the original value.
-#[derive(serde::Serialize)]
-struct SuccessResult<'a> {
-    status: &'static str,
-    result: &'a Value,
-    error: (), // serializes as null
-    finished_at: u64,
-}
-
 #[derive(serde::Serialize)]
 struct FailureResult<'a> {
     status: &'static str,
@@ -308,14 +287,13 @@ struct FailureResult<'a> {
     finished_at: u64,
 }
 
-pub fn result_success(result: &Value, finished_at: u64) -> String {
-    serde_json::to_string(&SuccessResult {
-        status: "success",
-        result,
-        error: (),
-        finished_at,
-    })
-    .expect("result envelope is always serializable")
+/// `result_json` is JSON text the executor already encoded (msgspec, in the
+/// shim or the cpu child), embedded as is rather than parsed and written
+/// again.
+pub fn result_success(result_json: &str, finished_at: u64) -> String {
+    format!(
+        r#"{{"status":"success","result":{result_json},"error":null,"finished_at":{finished_at}}}"#
+    )
 }
 
 pub fn result_failure(error: &ErrorJson, finished_at: u64) -> String {
@@ -475,8 +453,8 @@ mod tests {
         assert_eq!(e.not_before, None);
         // null args/kwargs normalize to an empty array/object rather than
         // reaching a task as None.
-        assert_eq!(e.args_ref(), &Value::Array(vec![]));
-        assert_eq!(e.kwargs_ref(), &Value::Object(serde_json::Map::new()));
+        assert_eq!(e.args_raw().get(), "[]");
+        assert_eq!(e.kwargs_raw().get(), "{}");
     }
 
     #[test]
@@ -598,7 +576,7 @@ mod tests {
 
     #[test]
     fn result_json_shapes() {
-        let ok = result_success(&serde_json::json!({"a": 1}), 123);
+        let ok = result_success(r#"{"a":1}"#, 123);
         let v: Value = serde_json::from_str(&ok).unwrap();
         assert_eq!(v["status"], "success");
         assert_eq!(v["result"]["a"], 1);
@@ -665,13 +643,13 @@ mod tests {
     #[test]
     fn args_kwargs_absent_or_empty_still_normalize_correctly() {
         let absent: Envelope = serde_json::from_str(r#"{"id":"a","task":"t"}"#).unwrap();
-        assert_eq!(absent.args_ref(), &Value::Array(vec![]));
-        assert_eq!(absent.kwargs_ref(), &Value::Object(serde_json::Map::new()));
+        assert_eq!(absent.args_raw().get(), "[]");
+        assert_eq!(absent.kwargs_raw().get(), "{}");
 
         let empty: Envelope =
             serde_json::from_str(r#"{"id":"a","task":"t","args":[],"kwargs":{}}"#).unwrap();
-        assert_eq!(empty.args_ref(), &Value::Array(vec![]));
-        assert_eq!(empty.kwargs_ref(), &Value::Object(serde_json::Map::new()));
+        assert_eq!(empty.args_raw().get(), "[]");
+        assert_eq!(empty.kwargs_raw().get(), "{}");
     }
 
     // Bug: timeout_ms 0 guarantees a hard timeout on every attempt.
@@ -789,19 +767,49 @@ mod tests {
         assert!(serde_json::from_str::<Envelope>(r#"{"id":"a","task":"t","v":1.0}"#).is_ok());
     }
 
-    /// A Python task receives its kwargs, and every dict argument, in the
-    /// order the caller built them; dicts are ordered in Python. Sorting
-    /// keys on the way through the worker hands the task a different dict
-    /// than the one  was given, and a retry re-enqueues it sorted.
+    /// A retry re-enqueues args and kwargs as the exact text the caller
+    /// wrote: key order, integers past 64 bits, `-0.0`, escapes and
+    /// whitespace all survive, so the next attempt's task sees the same
+    /// values the first one did. The unknown field passthrough keeps its own
+    /// exact digits and key order too.
     #[test]
-    fn object_key_order_survives_parse_and_reserialize() {
-        let raw = r#"{"id":"a","task":"t","args":[{"zeta":1,"alpha":2}],"kwargs":{"z":1,"a":2}}"#;
-        let e: Envelope = serde_json::from_str(raw).unwrap();
-        let kw: Vec<&String> = e.kwargs.as_object().unwrap().keys().collect();
-        assert_eq!(kw, ["z", "a"]);
-        let arg: Vec<&String> = e.args[0].as_object().unwrap().keys().collect();
-        assert_eq!(arg, ["zeta", "alpha"]);
+    fn retry_reserialize_copies_args_and_kwargs_verbatim() {
+        let args = r#"[{"zeta":1,"alpha":2}, 338958331192819208857724424333372550912, -0.0, "caf\u00e9 \ud83d\ude00", [[[]]]]"#;
+        let kwargs = r#"{"z": 1e400, "a": "\u2028"}"#;
+        let raw = format!(
+            r#"{{"id":"a","task":"t","args":{args},"kwargs":{kwargs},"meta":{{"z":123456789012345678901234567890,"a":2}}}}"#
+        );
+        let mut e: Envelope = serde_json::from_str(&raw).unwrap();
+        assert_eq!(e.args_raw().get(), args);
+        assert_eq!(e.kwargs_raw().get(), kwargs);
+        e.retries += 1;
         let back = serde_json::to_string(&e).unwrap();
-        assert!(back.contains(r#""kwargs":{"z":1,"a":2}"#), "{back}");
+        assert!(
+            back.contains(&format!(r#""args":{args},"kwargs":{kwargs},"#)),
+            "{back}"
+        );
+        assert!(
+            back.contains(r#""meta":{"z":123456789012345678901234567890,"a":2}"#),
+            "{back}"
+        );
+        // ...and what goes back out is an envelope this worker reads again.
+        let again: Envelope = serde_json::from_str(&back).unwrap();
+        assert_eq!(again.args_raw().get(), args);
+        assert_eq!(again.retries, 1);
+    }
+
+    /// Absent and explicit null both go back out as `null`, which is what
+    /// the previous `Value` field wrote for them.
+    #[test]
+    fn null_or_absent_args_reserialize_as_null() {
+        for raw in [
+            r#"{"id":"a","task":"t"}"#,
+            r#"{"id":"a","task":"t","args":null,"kwargs":null}"#,
+        ] {
+            let e: Envelope = serde_json::from_str(raw).unwrap();
+            let back: Value = serde_json::from_str(&serde_json::to_string(&e).unwrap()).unwrap();
+            assert_eq!(back["args"], Value::Null);
+            assert_eq!(back["kwargs"], Value::Null);
+        }
     }
 }

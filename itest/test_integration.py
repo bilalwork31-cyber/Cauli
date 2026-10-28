@@ -553,6 +553,70 @@ def test_redelivery_limit_dead_letters_with_result(stack):
         _stop_worker(w)
 
 
+def _transit_payload():
+    deep = 0
+    for _ in range(119):
+        deep = [deep]  # args[2] is 120 levels deep, counting args itself
+    args = [
+        {"zeta": 1, "alpha": [2**100, -(2**70), 18446744073709551616]},
+        "café \U0001f600 \u2028 \x00",
+        deep,
+        -0.0,
+        1.5e-300,
+    ]
+    kwargs = {"z": None, "a": True, "m": {"y": -0.0, "b": "\ud7ff"}}
+    return args, kwargs
+
+
+def _await_result_doc(r, task_id, deadline_s=30):
+    deadline = time.time() + deadline_s
+    while time.time() < deadline:
+        raw = r.get(f"cauli:result:{task_id}")
+        if raw:
+            return raw
+        time.sleep(0.05)
+    raise AssertionError(f"no result for {task_id}")
+
+
+@pytest.mark.parametrize("lane", ["transit_sync", "transit_async", "transit_cpu"])
+def test_args_and_results_cross_every_lane_unchanged(stack, lane):
+    """What the task receives, and what the caller reads back, is exactly
+    what was sent: key order, integers past 64 bits, -0.0, astral and
+    control characters, 120 levels of nesting. Compared by repr, since ==
+    is blind to key order and to the sign of zero.
+
+    Sent twice: once by the client, and once as hand written envelope text
+    the way a foreign producer might write it, with \\u escapes (a surrogate
+    pair included) and newlines between tokens, which the cpu lane has to
+    keep off its line oriented child protocol.
+    """
+    import msgspec
+
+    from cauli.result import AsyncResult
+
+    r, _ = stack
+    m = _app()
+    task = getattr(m, lane)
+    args, kwargs = _transit_payload()
+    expect = [repr(tuple(args)), repr(kwargs), args, kwargs]
+
+    by_client = task.delay(*args, **kwargs).id
+    env, queue, _fire = m.app.make_envelope(task.name, args=(), task=task)
+    head = json.dumps({k: v for k, v in env.items() if k not in ("args", "kwargs")})
+    text = head[:-1] + ', "args": %s, "kwargs": %s}' % (
+        json.dumps(args, indent=1),
+        json.dumps(kwargs, indent=1),
+    )
+    assert "\\ud83d\\ude00" in text and "\n" in text
+    r.xadd(f"cauli:q:{queue}", {"e": text})
+
+    for task_id in (by_client, env["id"]):
+        got = AsyncResult(task_id, m.app).get(timeout=30)
+        assert repr(got) == repr(expect), task_id
+        doc = msgspec.json.decode(_await_result_doc(r, task_id))
+        assert repr(doc["result"]) == repr(expect), task_id
+
+
 def test_worker_survived_everything(stack):
     _, worker = stack
     assert worker.poll() is None

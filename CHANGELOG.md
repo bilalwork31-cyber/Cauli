@@ -110,11 +110,29 @@ Beat:
 
 ### Performance
 
-Worker CPU per task, single process, noop tasks, interleaved A/B against
-0.1.0 with a 95% interval: async 47.7 to 28.7 us, sync 131.1 to 77.2 us, cpu
-105.8 to 62.0 us. With a real task body the body dominates; a redis INCR
-body moves the sync lane 1.14x and the async lane not measurably.
+Worker CPU per task, single process, noop tasks, interleaved A/B with a 95%
+interval, 0.1.0 against this release: async 47.7 to 22.8 us (120k tasks/s),
+sync 131.1 to 22.1 us (114k tasks/s), cpu 105.8 to 57.4 us. With a real task
+body the body dominates: a sync task sleeping 1 ms is bound by the GIL
+handing over between threads, and runs 3.9x faster on free threaded 3.14t.
 
+- The global allocator is mimalloc: glibc malloc and its arena locks were
+  about 10% of the worker's Rust threads (sync 1.16x, cpu 1.07x the rate).
+- A sync pool thread takes a job off the queue only once it holds the GIL,
+  with one thread on standby: each job used to wake a thread that then
+  queued for the GIL behind the others (sync noop 3.63x the rate, a 1 ms
+  blocking body unchanged).
+- Async tasks start eagerly on their loop (Python 3.12 and newer), and every
+  async deadline shares one loop timer and a heap instead of one timer per
+  task (async noop 1.32x the rate together).
+
+- Task arguments and results cross the worker as the producer's JSON text.
+  The worker no longer parses them into a tree, converts that tree to Python
+  objects, or writes it out again for a cpu child: msgspec, the client's
+  codec, decodes and encodes them in Python. A 10,000 integer argument: async
+  lane 4,123 to 643 us of CPU per task (2.44x the rate), cpu lane 4,607 to
+  1,000 us (3.96x). Worker RSS with 30 in flight 1 MiB integer array
+  envelopes: 2,698 to 282 MB (async), 2,665 to 297 MB (sync).
 - `--batch` defaults to 64 (was 16): 4x fewer XREADGROUP round trips.
 - Sync pool threads take the GIL once per burst of queued jobs, not once per
   job, so they stop convoying on it.
@@ -137,6 +155,12 @@ body moves the sync lane 1.14x and the async lane not measurably.
   (8 solo nodes, 4,233 tasks/s): cauli is 7.7x on the async lane and 4.9x on
   the sync lane, not 32.8x against a single Celery node.
 - `docs/decisions/` is rewritten as short architecture decision records.
+- The Python the worker embeds needs msgspec importable from the app's
+  environment (cauli depends on it). Without it the worker exits at startup
+  with an error naming that environment.
+- io lane results are encoded by msgspec, as cpu lane results already were,
+  so a float is written the way the client writes it (`1e16`, was `1e+16`).
+  The value is the same.
 
 ### Added
 

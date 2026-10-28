@@ -85,52 +85,29 @@ impl Drop for FrozenRedis {
     }
 }
 
-/// The bug and the fix, proven back to back against the exact types
-/// main.rs constructs. `ConnectionManager::new` (no config: what main.rs
-/// called before this fix, and still the crate's own default when nobody
-/// sets a response_timeout) hangs a call against a frozen redis well past
-/// any real operation's latency, proof of the indefinite wait the audit
-/// found. `ConnectionManager::new_with_config` with response_timeout and
-/// connection_timeout set (what main.rs calls now) instead returns an Err,
-/// inside the configured bound, and that Err carries the IoError kind the
-/// crate's own reconnect_if_io_error! macro already treats as reconnect
-/// worthy, so once redis thaws, the SAME manager recovers on its own.
+/// `ConnectionManager::new_with_config` with response_timeout and
+/// connection_timeout set, the types main.rs constructs, returns an Err
+/// against a frozen redis inside the configured bound, and that Err carries
+/// the IoError kind the crate's reconnect path treats as reconnect worthy,
+/// so once redis thaws, the SAME manager recovers on its own.
 #[tokio::test(flavor = "multi_thread")]
-async fn frozen_redis_hangs_unconfigured_times_out_and_recovers_configured() {
+async fn frozen_redis_times_out_and_recovers_configured() {
     let redis_proc = FrozenRedis::start();
     let client = redis::Client::open(url()).unwrap();
 
-    // Both managers connect while redis is still healthy: this test targets
-    // an existing connection going silent mid steady state (the fetch loop,
-    // idemp_claim, the mover, recovery), not a cold connect.
-    let unconfigured = ConnectionManager::new(client.clone()).await.unwrap();
+    // Connected while redis is still healthy: this test targets an existing
+    // connection going silent mid steady state (the fetch loop, idemp_claim,
+    // the mover, recovery), not a cold connect.
     let configured = ConnectionManager::new_with_config(
         client,
         ConnectionManagerConfig::new()
-            .set_response_timeout(Duration::from_millis(700))
-            .set_connection_timeout(Duration::from_millis(700)),
+            .set_response_timeout(Some(Duration::from_millis(700)))
+            .set_connection_timeout(Some(Duration::from_millis(700))),
     )
     .await
     .unwrap();
 
     redis_proc.freeze();
-
-    // Before: no response_timeout configured, so PING against a frozen
-    // redis must not resolve at all within a bound that is ~600x a healthy
-    // PING's real latency (low single digit milliseconds). An indefinite
-    // wait cannot be literally waited out in a test; this generous bound is
-    // the accepted stand in (the same reasoning the audit's own 30s/35s D2
-    // measurement used).
-    let mut c = unconfigured.clone();
-    let hung = tokio::time::timeout(Duration::from_secs(3), async move {
-        let _: redis::RedisResult<String> = redis::cmd("PING").query_async(&mut c).await;
-    })
-    .await;
-    assert!(
-        hung.is_err(),
-        "PING against a frozen redis must not resolve at all with no \
-         response_timeout configured. This is the bug"
-    );
 
     // After: response_timeout=700ms configured, so the SAME kind of call
     // against the SAME frozen redis returns an Err, bounded, well inside
@@ -144,7 +121,7 @@ async fn frozen_redis_hangs_unconfigured_times_out_and_recovers_configured() {
         .await;
     let elapsed = t0.elapsed();
     let err = result
-        .expect("must return within the outer 3s bound, not hang like the unconfigured case")
+        .expect("must return within the outer 3s bound, not hang")
         .expect_err("must be an Err: redis is still frozen");
     assert!(
         elapsed < Duration::from_secs(2),

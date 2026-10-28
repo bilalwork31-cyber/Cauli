@@ -12,6 +12,9 @@
 //! target its own source file and compile the runtime once. See
 //! worker/Cargo.toml for the features that select between the two names.
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 mod backoff;
 mod broker;
 mod cli;
@@ -367,11 +370,10 @@ async fn run_worker(
     // path instead of leaving it dormant. Do not "simplify" this back to a
     // per call tokio::timeout; it silently breaks reconnection.
     let conn_cfg = ConnectionManagerConfig::new()
-        .set_factor(REDIS_RETRY_FACTOR)
-        .set_max_delay(REDIS_RETRY_MAX_DELAY_MS)
+        .set_max_delay(REDIS_RETRY_MAX_DELAY)
         .set_number_of_retries(REDIS_RETRIES)
-        .set_response_timeout(Duration::from_secs(args.redis_timeout))
-        .set_connection_timeout(Duration::from_secs(args.redis_timeout));
+        .set_response_timeout(Some(Duration::from_secs(args.redis_timeout)))
+        .set_connection_timeout(Some(Duration::from_secs(args.redis_timeout)));
     let mut write_conn =
         match ConnectionManager::new_with_config(client.clone(), conn_cfg.clone()).await {
             Ok(c) => c,
@@ -581,15 +583,12 @@ fn spawn_signal_task(shutdown_tx: watch::Sender<bool>, ctx: Arc<Ctx>) {
     });
 }
 
-/// Reconnect backoff for every redis connection. redis-rs 0.32 builds it
-/// with `backon`, whose delay starts at 1 s and multiplies by `factor`; the
-/// crate default factor of 100 jumps straight to backon's 60 s cap, so an
-/// unreachable redis at startup kept the worker silent for about 5 minutes
-/// per connection, and a redis restart at runtime stalled it up to a minute.
-/// Delays here are 1 s, then 2 s capped, plus jitter: startup gives up and
-/// says why after about 17 s (measured against a refused port).
-const REDIS_RETRY_FACTOR: u64 = 2;
-const REDIS_RETRY_MAX_DELAY_MS: u64 = 2_000;
+/// Reconnect backoff cap and retry count for every redis connection. The
+/// crate's delays double from 100 ms; uncapped, a redis restart at run time
+/// could leave a connection waiting out one long sleep after redis was back.
+/// Six retries put an unreachable redis at startup at a few seconds before
+/// the worker gives up and says why.
+const REDIS_RETRY_MAX_DELAY: Duration = Duration::from_secs(2);
 const REDIS_RETRIES: usize = 6;
 
 /// Operator override for the Redis Cluster startup refusal.
@@ -1189,11 +1188,11 @@ mod tests {
             redis::Client::open("rediss://user:pw@redis.example:6380/0").expect("rediss:// opens");
         assert!(
             matches!(
-                client.get_connection_info().addr,
+                client.get_connection_info().addr(),
                 redis::ConnectionAddr::TcpTls { .. }
             ),
             "rediss:// must resolve to a TLS transport, got {:?}",
-            client.get_connection_info().addr
+            client.get_connection_info().addr()
         );
     }
 
@@ -1204,7 +1203,7 @@ mod tests {
     fn redis_url_stays_plaintext() {
         let client = redis::Client::open("redis://127.0.0.1:6392/0").expect("redis:// opens");
         assert!(matches!(
-            client.get_connection_info().addr,
+            client.get_connection_info().addr(),
             redis::ConnectionAddr::Tcp(..)
         ));
     }

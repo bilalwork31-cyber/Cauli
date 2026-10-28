@@ -8,7 +8,7 @@ use crate::pyrt::{PyRuntime, SyncPool, TaskSpec};
 use crate::stats::Counters;
 use redis::aio::ConnectionManager;
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::value::RawValue;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -226,7 +226,8 @@ fn now_ms_from(since_epoch: Result<std::time::Duration, std::time::SystemTimeErr
 
 /// Executor completion, normalized from shim / cpu-child response JSON.
 pub enum Outcome {
-    Success(Value),
+    /// The task's return value as the JSON text the executor encoded.
+    Success(String),
     ForceRetry {
         countdown: Option<f64>,
         err: ErrorJson,
@@ -241,7 +242,7 @@ pub enum Outcome {
 struct PyResp {
     ok: bool,
     #[serde(default)]
-    result: Value,
+    result: Option<Box<RawValue>>,
     #[serde(default)]
     error: Option<ErrorJson>,
     #[serde(default)]
@@ -277,7 +278,10 @@ pub fn parse_pyresp(s: &str, from_cpu: bool) -> Outcome {
         }
     };
     if resp.ok {
-        return Outcome::Success(resp.result);
+        return Outcome::Success(resp.result.map_or_else(
+            || "null".to_owned(),
+            |raw| String::from(Box::<str>::from(raw)),
+        ));
     }
     let err = resp.error.unwrap_or_else(|| {
         ErrorJson::new("UnknownError", "executor reported failure without error")
@@ -337,9 +341,18 @@ mod tests {
 
     #[test]
     fn parses_success() {
-        match parse_pyresp(r#"{"ok":true,"result":{"a":1}}"#, false) {
-            Outcome::Success(v) => assert_eq!(v["a"], 1),
+        match parse_pyresp(
+            r#"{"ok":true,"result":{"z":1, "a":18446744073709551616}}"#,
+            false,
+        ) {
+            Outcome::Success(v) => assert_eq!(v, r#"{"z":1, "a":18446744073709551616}"#),
             _ => panic!("expected success"),
+        }
+        for line in [r#"{"ok":true,"result":null}"#, r#"{"ok":true}"#] {
+            match parse_pyresp(line, true) {
+                Outcome::Success(v) => assert_eq!(v, "null"),
+                _ => panic!("expected success"),
+            }
         }
     }
 

@@ -8,7 +8,7 @@ use crate::clock::now_ms;
 use crate::ctx::{Ctx, DecrGuard, InflightEntry, Outcome};
 use crate::envelope::{self, Envelope, ErrorJson};
 use crate::exec;
-use serde_json::Value;
+use serde_json::value::RawValue;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use tracing::{debug, error, warn};
@@ -52,9 +52,82 @@ fn valid_task_id(id: &str) -> bool {
 /// perfectly fine in this case, so it stays recoverable and a caller
 /// blocked in `AsyncResult.get()` still gets a real answer instead of
 /// hanging, the same as the `v` version check just below.
+///
+/// The two fields are raw JSON text the worker never parses into a tree, so
+/// the shape is read off the first byte, and `parses_as_tree` keeps the two
+/// refusals the tree parse used to make: those envelopes dead letter as
+/// malformed, exactly as before.
 fn args_kwargs_shape_ok(env: &Envelope) -> bool {
-    matches!(env.args, Value::Null | Value::Array(_))
-        && matches!(env.kwargs, Value::Null | Value::Object(_))
+    let fits = |raw: &Option<Box<RawValue>>, open: u8| {
+        raw.as_deref()
+            .is_none_or(|r| r.get().as_bytes()[0] == open && parses_as_tree(r.get()))
+    };
+    fits(&env.args, b'[') && fits(&env.kwargs, b'{')
+}
+
+/// Deepest `args`/`kwargs` nesting a parse used to accept, counting the field
+/// itself as one level: serde_json allows 127 levels per document and the
+/// envelope object is the first of them.
+const MAX_ARG_NESTING: usize = 126;
+
+/// False for what serde_json's raw capture lets through but its tree parse
+/// refused: nesting past `MAX_ARG_NESTING`, and a `\u` escape that is half a
+/// surrogate pair. `json` is otherwise valid (serde_json checked it), so a
+/// bracket or quote inside a string is the only thing to skip.
+fn parses_as_tree(json: &str) -> bool {
+    let b = json.as_bytes();
+    // Neither refusal is possible with this few brackets and no escape at
+    // all, which is almost every payload. Counting into a u8 per 255 byte
+    // chunk is what lets the compiler vectorize it; the scan below is the
+    // byte at a time one.
+    let opens: usize = b
+        .chunks(255)
+        .map(|c| {
+            c.iter()
+                .fold(0u8, |n, &x| n + u8::from(x == b'[' || x == b'{')) as usize
+        })
+        .sum();
+    if opens <= MAX_ARG_NESTING && !b.contains(&b'\\') {
+        return true;
+    }
+    let unit = |at: usize| {
+        b.get(at..at + 4)
+            .and_then(|h| std::str::from_utf8(h).ok())
+            .and_then(|h| u16::from_str_radix(h, 16).ok())
+    };
+    let trail = |u: u16| (0xDC00..0xE000).contains(&u);
+    let (mut depth, mut i, mut in_str) = (0usize, 0usize, false);
+    while i < b.len() {
+        match (in_str, b[i]) {
+            (true, b'\\') if b[i + 1] == b'u' => {
+                let u = unit(i + 2).expect("serde_json validated every \\u escape");
+                i += 6;
+                if trail(u) {
+                    return false;
+                }
+                if (0xD800..0xDC00).contains(&u) {
+                    if b.get(i..i + 2) != Some(b"\\u") || !unit(i + 2).is_some_and(trail) {
+                        return false;
+                    }
+                    i += 6;
+                }
+                continue;
+            }
+            (true, b'\\') => i += 1,
+            (true, b'"') => in_str = false,
+            (false, b'"') => in_str = true,
+            (false, b'[' | b'{') => {
+                depth += 1;
+                if depth > MAX_ARG_NESTING {
+                    return false;
+                }
+            }
+            (false, b']' | b'}') => depth -= 1,
+            _ => {}
+        }
+        i += 1;
+    }
+    true
 }
 
 async fn process(ctx: &Arc<Ctx>, queue: &str, sid: &str, raw: Option<String>) {
@@ -498,6 +571,73 @@ mod tests {
         assert!(!args_kwargs_shape_ok(&env_with(
             r#"{"id":"a","task":"t","args":"x"}"#
         )));
+    }
+
+    /// The nesting bound is exactly the one the old full parse enforced:
+    /// whatever envelope a `Value` parse accepts passes, and the first one it
+    /// refuses is dead lettered, for args and kwargs alike. Brackets and
+    /// escaped quotes inside strings do not count.
+    #[test]
+    fn args_kwargs_nesting_bound_matches_the_full_parse_it_replaced() {
+        let nested = |open: &str, close: &str, depth: usize| {
+            let mut s = open.repeat(depth - 1);
+            s.push_str(r#"["\"[{",1]"#);
+            s.push_str(&close.repeat(depth - 1));
+            s
+        };
+        for depth in [
+            MAX_ARG_NESTING - 1,
+            MAX_ARG_NESTING,
+            MAX_ARG_NESTING + 1,
+            5000,
+        ] {
+            let args = format!(
+                r#"{{"id":"a","task":"t","args":{}}}"#,
+                nested("[", "]", depth)
+            );
+            let kwargs = format!(
+                r#"{{"id":"a","task":"t","kwargs":{{"k":{}}}}}"#,
+                nested("[", "]", depth - 1)
+            );
+            for raw in [args, kwargs] {
+                let full_parse_ok = serde_json::from_str::<serde_json::Value>(&raw).is_ok();
+                assert_eq!(full_parse_ok, depth <= MAX_ARG_NESTING, "depth {depth}");
+                assert_eq!(
+                    args_kwargs_shape_ok(&env_with(&raw)),
+                    full_parse_ok,
+                    "depth {depth}"
+                );
+            }
+        }
+    }
+
+    /// The same equivalence for `\u` escapes: a full surrogate pair passes,
+    /// and every half pair the tree parse refused (in a value or in a key,
+    /// in args or in kwargs) is dead lettered, while an escaped backslash
+    /// followed by `ud800` is ordinary text.
+    #[test]
+    fn surrogate_escapes_are_refused_exactly_where_the_full_parse_refused_them() {
+        let cases = [
+            (r#""\ud83d\ude00""#, true),
+            (r#""\u00e9\u2028""#, true),
+            (r#""\\ud800""#, true),
+            (r#""a\udc80""#, false),
+            (r#""\ud83d""#, false),
+            (r#""\ud83dx""#, false),
+            (r#""\ud83d\n""#, false),
+            (r#""\ud83d\u0041""#, false),
+            (r#""\ud83d\ud83d\ude00""#, false),
+        ];
+        for (text, ok) in cases {
+            for raw in [
+                format!(r#"{{"id":"a","task":"t","args":[1,{text}]}}"#),
+                format!(r#"{{"id":"a","task":"t","kwargs":{{{text}:1}}}}"#),
+            ] {
+                let full_parse_ok = serde_json::from_str::<serde_json::Value>(&raw).is_ok();
+                assert_eq!(full_parse_ok, ok, "{raw}");
+                assert_eq!(args_kwargs_shape_ok(&env_with(&raw)), ok, "{raw}");
+            }
+        }
     }
 
     #[test]
