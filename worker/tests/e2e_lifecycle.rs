@@ -66,6 +66,7 @@ async fn e2e_sigterm_drain_and_sigkill_recovery() {
     drop(w2);
     drop(w1);
 
+    back_to_back_stop_signals_still_drain(&mut c).await;
     kill9_mid_ack_flush_loses_nothing(&mut c).await;
     h1_visibility_floor_does_not_reclaim_long_task(&mut c).await;
     h2_sync_pool_survives_hard_timeout_abandonment(&mut c).await;
@@ -74,6 +75,32 @@ async fn e2e_sigterm_drain_and_sigkill_recovery() {
     bulk_recovery_drains_backlog_per_tick(&mut c).await;
 
     stop_redis();
+}
+
+/// One stop request delivered as two signals a moment apart: systemd's
+/// default control-group stop signals a supervised worker AND its
+/// supervisor, which forwards its own, and a SIGKILLed supervisor delivers
+/// PDEATHSIG once per thread it had. That must still drain, not force 130.
+async fn back_to_back_stop_signals_still_drain(c: &mut redis::aio::MultiplexedConnection) {
+    let mut w = Worker::spawn("dblsigq", &["--drain-timeout", "15"]);
+    wait_group(c, "dblsigq", 20).await;
+    let (id, e) = envelope("fx.slow", "dblsigq", |v| v["args"] = json!([1.5]));
+    xadd(c, "dblsigq", &e.to_string()).await;
+    wait_inflight(c, "dblsigq", 10).await;
+    w.signal(libc::SIGTERM);
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    w.signal(libc::SIGTERM);
+    assert_eq!(
+        w.wait_code(20),
+        0,
+        "a repeated stop signal must not force exit 130"
+    );
+    let r = wait_result(c, &id, 5).await;
+    assert_eq!(
+        r["status"], "success",
+        "in flight task must finish during drain"
+    );
+    drop(w);
 }
 
 /// §4.1 batched-completion crash window: a `kill -9` landing while

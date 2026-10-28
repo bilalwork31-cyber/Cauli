@@ -725,6 +725,44 @@ def submit_async(token, name, args, kwargs, timeout_s, soft_timeout_s=None, meta
         loop.call_soon_threadsafe(_drain, idx, loop)
 
 
+def _fire_deadline(task, fired):
+    fired.append(True)
+    task.cancel()
+
+
+if sys.version_info >= (3, 12):
+
+    async def _await_deadline(coro, timeout_s):
+        """`asyncio.wait_for(coro, timeout_s)` exactly as 3.12+ implements it.
+
+        From 3.12 wait_for is a frame around `async with asyncio.timeout()`,
+        and this is the same cancel, uncancel and TimeoutError conversion
+        written out. What it drops is the scaffolding around that: a Timeout
+        object, two coroutine objects for `__aenter__`/`__aexit__` and the
+        wait_for frame: the shim's noop async task went from 8.0us to 6.6us,
+        all of it GIL held time. 3.10 and 3.11 keep the real wait_for,
+        which is a different algorithm there.
+        """
+        task = asyncio.current_task()
+        loop = task.get_loop()
+        cancelling = task.cancelling()
+        fired = []
+        handle = loop.call_at(loop.time() + timeout_s, _fire_deadline, task, fired)
+        cancelled = None
+        try:
+            return await coro
+        except asyncio.CancelledError as exc:
+            cancelled = exc
+            raise
+        finally:
+            handle.cancel()
+            if fired and task.uncancel() <= cancelling and cancelled is not None:
+                raise TimeoutError from cancelled
+
+else:
+    _await_deadline = asyncio.wait_for
+
+
 async def _await_with_soft_limit(coro, soft_s, hard_s):
     """Run one async task body under the §4.6 soft-then-hard deadline pair.
 
@@ -760,8 +798,11 @@ async def _await_with_soft_limit(coro, soft_s, hard_s):
     done, _ = await asyncio.wait((task,), timeout=remaining if remaining > 0 else 0)
     if not done:
         # Cancellation ignored and the hard budget is gone: that is the hard
-        # limit firing, not the soft one. Raised as the same TimeoutError
-        # `asyncio.wait_for` would have raised so _arun maps it identically.
+        # limit firing, not the soft one. Cancel again, as wait_for does at its
+        # deadline, or the body runs on past the hard limit beside its own
+        # retry. Raised as the same TimeoutError `asyncio.wait_for` would have
+        # raised so _arun maps it identically.
+        task.cancel()
         raise asyncio.TimeoutError()
     if task.cancelled():
         raise SoftTimeLimitExceeded("soft time limit of %.3fs exceeded" % (soft_s,))
@@ -803,30 +844,33 @@ async def _arun(
             # way, which is real money against a small task body.
             if _before_hooks:
                 await _run_hooks_async(_before_hooks, "before_task")
+            deadline = asyncio.get_running_loop().time() + timeout_s
             try:
                 if soft_timeout_s is None:
-                    rv = await asyncio.wait_for(fn(*args, **kwargs), timeout_s)
+                    rv = await _await_deadline(fn(*args, **kwargs), timeout_s)
                 else:
                     rv = await _await_with_soft_limit(
                         fn(*args, **kwargs), soft_timeout_s, timeout_s
                     )
                 out = _finish_value(rv)
-            except (asyncio.TimeoutError, TimeoutError):
-                # The worker's own limit firing, so TimeLimitExceeded, matching
-                # the three Rust side limits in exec.rs. From 3.11 the builtin
-                # and asyncio.TimeoutError are one class, so a task raising
-                # TimeoutError itself is caught here too and reported the same
-                # way; that conflation predates the rename (PROTOCOL section 8).
-                out = {
-                    "ok": False,
-                    "retryable": True,
-                    "error": {
-                        "type": "TimeLimitExceeded",
-                        "message": "task timed out after %.3fs" % (timeout_s,),
-                        "traceback": "",
-                        "origin": "worker",
-                    },
-                }
+            except (asyncio.TimeoutError, TimeoutError) as e:
+                # From 3.11 the builtin and asyncio.TimeoutError are one class,
+                # so the clock is what separates the worker's own limit (it
+                # fires at or after the deadline) from a TimeoutError the task
+                # body raised itself, which is reported as the task's own.
+                if asyncio.get_running_loop().time() < deadline:
+                    out = _finish_exc(e)
+                else:
+                    out = {
+                        "ok": False,
+                        "retryable": True,
+                        "error": {
+                            "type": "TimeLimitExceeded",
+                            "message": "task timed out after %.3fs" % (timeout_s,),
+                            "traceback": "",
+                            "origin": "worker",
+                        },
+                    }
             except BaseException as e:
                 out = _finish_exc(e)
             finally:

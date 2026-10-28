@@ -63,3 +63,86 @@ fn main_thread_panic_after_pyrt_init_skips_atexit_handlers() {
          exists to prevent"
     );
 }
+
+/// A fatal startup error is logged through the async log sink and the
+/// process then `_exit`s: the line has to reach stdout before it does.
+#[test]
+fn a_fatal_startup_error_is_printed_before_exit() {
+    let out = Command::new(env!("CARGO_BIN_EXE_cauli-worker"))
+        .current_dir(fixtures_dir())
+        .args(["--app", "fixture_app:app", "--batch", "0"])
+        .output()
+        .expect("worker spawn");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        stdout.contains("--batch must be >= 1"),
+        "the startup error never reached stdout: {stdout:?}"
+    );
+}
+
+/// A log reader that never reads must not stop the process exiting: the
+/// sink's writer thread blocks holding the stdout lock once the pipe is
+/// full, so an exit path that takes that lock never returns.
+#[test]
+fn a_stalled_log_reader_does_not_block_exit() {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_cauli-worker"))
+        .current_dir(fixtures_dir())
+        // Every filler task trips the visibility timeout warning, far more
+        // than a pipe buffer holds; the bad URL then exits 1 before redis.
+        .args([
+            "--app",
+            "fixture_app:app",
+            "--visibility-timeout",
+            "1",
+            "--redis-url",
+            "not a url",
+        ])
+        .env("FIXTURE_FILLER_TASKS", "2000")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("worker spawn");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            break Some(status);
+        }
+        if std::time::Instant::now() >= deadline {
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    let _ = child.kill();
+    let _ = child.wait();
+    let status =
+        status.expect("worker still running 20s after a fatal error: exit is blocked on stdout");
+    assert_eq!(status.code(), Some(1));
+}
+
+/// Nothing listens on this port: a refused connection, the startup case an
+/// operator hits with redis down or a typo in the URL.
+const UNREACHABLE_REDIS: &str = "redis://127.0.0.1:1/0";
+
+/// With redis-rs's default backoff this run stayed silent for minutes.
+/// Startup must give up within a bounded time and name what failed.
+#[test]
+fn an_unreachable_redis_fails_startup_quickly_and_says_why() {
+    let started = std::time::Instant::now();
+    let out = Command::new(env!("CARGO_BIN_EXE_cauli-worker"))
+        .current_dir(fixtures_dir())
+        .args(["--app", "fixture_app:app", "--redis-url", UNREACHABLE_REDIS])
+        .output()
+        .expect("worker spawn");
+    let elapsed = started.elapsed();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "stdout: {stdout:?}");
+    assert!(
+        stdout.contains("cannot connect to redis"),
+        "the connection failure never reached stdout: {stdout:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(30),
+        "startup took {elapsed:?} to give up on an unreachable redis"
+    );
+}

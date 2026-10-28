@@ -427,26 +427,27 @@ async fn result_write_failure_is_not_counted_ok(c: &mut redis::aio::MultiplexedC
     let (id, e) = envelope("fx.echo", "badttl", |v| v["args"] = json!(["x"]));
     xadd(c, "badttl", &e.to_string()).await;
 
-    // The SET is rejected, so no result key can ever appear; the stream
-    // entry still gets acked/deleted either way (finish() XACKs+XDELs
-    // regardless of the write outcome), so an emptied queue is the
+    // The SET is rejected, so no result key can ever appear, and the ack
+    // must not land without it: the entry stays in the stream, pending, for
+    // recovery to redeliver. The logged write failure is the
     // dispatch-is-done signal.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-    loop {
-        let len: u64 = redis::cmd("XLEN")
-            .arg("cauli:q:badttl")
-            .query_async(c)
-            .await
-            .unwrap();
-        if len == 0 {
-            break;
-        }
+    while !std::fs::read_to_string(&log_path)
+        .unwrap_or_default()
+        .contains("success finish write failed")
+    {
         assert!(
             std::time::Instant::now() < deadline,
             "badttl entry was never dispatched"
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
+    let len: u64 = redis::cmd("XLEN")
+        .arg("cauli:q:badttl")
+        .query_async(c)
+        .await
+        .unwrap();
+    assert_eq!(len, 1, "a refused result write must not delete the entry");
     let raw: Option<String> = redis::cmd("GET")
         .arg(format!("cauli:result:{id}"))
         .query_async(c)
@@ -497,24 +498,19 @@ async fn write_failure_is_not_counted_for_duplicate_final_and_terminal(
     wait_group(c, "badttl2", 20).await;
 
     // The result SET is rejected on every write in this worker, so no
-    // result key ever appears; the stream entry still gets acked/deleted
-    // either way (finish() XACKs+XDELs regardless of the write outcome), so
-    // a drained queue signals that dispatch has finished, same as
-    // `result_write_failure_is_not_counted_ok` above.
-    async fn wait_drained(c: &mut redis::aio::MultiplexedConnection, queue: &str) {
+    // result key ever appears and no entry is ever acked: each step's
+    // logged write failure is what signals that its dispatch has finished.
+    async fn wait_write_failures(log_path: &std::path::Path, n: usize) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-        loop {
-            let len: u64 = redis::cmd("XLEN")
-                .arg(format!("cauli:q:{queue}"))
-                .query_async(c)
-                .await
-                .unwrap();
-            if len == 0 {
-                break;
-            }
+        while std::fs::read_to_string(log_path)
+            .unwrap_or_default()
+            .matches("write failed")
+            .count()
+            < n
+        {
             assert!(
                 std::time::Instant::now() < deadline,
-                "badttl2 entry was never dispatched"
+                "badttl2 entry {n} was never dispatched"
             );
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
@@ -529,25 +525,25 @@ async fn write_failure_is_not_counted_for_duplicate_final_and_terminal(
         v["idempotency_key"] = json!(key.clone())
     });
     xadd(c, "badttl2", &e1.to_string()).await;
-    wait_drained(c, "badttl2").await;
+    wait_write_failures(&log_path, 1).await;
     let (_id2, e2) = envelope("fx.echo", "badttl2", |v| {
         v["idempotency_key"] = json!(key.clone())
     });
     xadd(c, "badttl2", &e2.to_string()).await;
-    wait_drained(c, "badttl2").await;
+    wait_write_failures(&log_path, 2).await;
 
     // B: a final failure that was never retryable (SerializationError, see
     // scenario 8 above). Must not count `failed`/`dlq` when the DLQ write
     // itself fails.
     let (_id3, e3) = envelope("fx.bad_return", "badttl2", |_| {});
     xadd(c, "badttl2", &e3.to_string()).await;
-    wait_drained(c, "badttl2").await;
+    wait_write_failures(&log_path, 3).await;
 
     // C: terminal DLQ for an unregistered task, never executed. Must not
     // count `dlq` when the write fails.
     let (_id4, e4) = envelope("fx.no_such_task", "badttl2", |_| {});
     xadd(c, "badttl2", &e4.to_string()).await;
-    wait_drained(c, "badttl2").await;
+    wait_write_failures(&log_path, 4).await;
 
     // D: a task already expired before dispatch (PROTOCOL §9.1), dead
     // lettered without ever executing. Must not count `expired`/`dlq` when
@@ -556,7 +552,7 @@ async fn write_failure_is_not_counted_for_duplicate_final_and_terminal(
         v["expires_at"] = json!(now_ms().saturating_sub(60_000))
     });
     xadd(c, "badttl2", &e5.to_string()).await;
-    wait_drained(c, "badttl2").await;
+    wait_write_failures(&log_path, 5).await;
 
     bad.signal(libc::SIGTERM);
     assert_eq!(bad.wait_code(20), 0, "badttl2 worker should exit 0");

@@ -380,8 +380,15 @@ async fn final_failure(
 /// --max-envelope-bytes, or one already fully read (unregistered,
 /// redelivery_limit), still parses inside that cap and its id comes back.
 fn recover_id(raw_e: &str) -> Option<String> {
+    // Only the id, not a full Envelope: an envelope is malformed precisely
+    // because some other field failed to parse, and that must not also cost
+    // the caller blocked on its result the answer.
+    #[derive(serde::Deserialize)]
+    struct IdOnly {
+        id: String,
+    }
     let preview = envelope::safe_truncate(raw_e, 4096);
-    match serde_json::from_str::<Envelope>(preview) {
+    match serde_json::from_str::<IdOnly>(preview) {
         Ok(e) if valid_task_id(&e.id) => Some(e.id),
         _ => None,
     }
@@ -528,6 +535,15 @@ mod tests {
     #[test]
     fn recover_id_from_a_fully_parseable_envelope() {
         let raw = r#"{"id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","task":"t"}"#;
+        assert_eq!(
+            recover_id(raw),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
+        );
+    }
+
+    #[test]
+    fn recover_id_from_an_envelope_malformed_in_another_field() {
+        let raw = r#"{"id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","task":"t","idempotency_key":42,"max_retries":-1}"#;
         assert_eq!(
             recover_id(raw),
             Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string())

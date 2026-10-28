@@ -268,7 +268,9 @@ pub async fn run_cpu_task(ctx: &Arc<Ctx>, env: &Envelope) -> Outcome {
         Err(_) => {
             cpu.overflow.fetch_add(1, Ordering::SeqCst);
             let permit = cpu.admission.clone().acquire_owned().await;
-            cpu.overflow.fetch_sub(1, Ordering::SeqCst);
+            if cpu.overflow.fetch_sub(1, Ordering::SeqCst) == 1 {
+                cpu.drained.notify_one();
+            }
             match permit {
                 Ok(p) => p,
                 Err(_) => return fail("WorkerLost", "cpu pool closed".into()),
@@ -280,7 +282,9 @@ pub async fn run_cpu_task(ctx: &Arc<Ctx>, env: &Envelope) -> Outcome {
         Err(async_channel::TrySendError::Full(job)) => {
             cpu.overflow.fetch_add(1, Ordering::SeqCst);
             let r = cpu.tx.send(job).await;
-            cpu.overflow.fetch_sub(1, Ordering::SeqCst);
+            if cpu.overflow.fetch_sub(1, Ordering::SeqCst) == 1 {
+                cpu.drained.notify_one();
+            }
             if r.is_err() {
                 return fail("WorkerLost", "cpu pool closed".into());
             }

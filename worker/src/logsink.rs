@@ -18,7 +18,8 @@
 
 use std::io;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{bounded, Sender};
 
@@ -28,10 +29,27 @@ use crossbeam_channel::{bounded, Sender};
 /// reader that stalls for seconds rather than minutes.
 const CAPACITY: usize = 8192;
 
+/// How often `flush` rechecks the writer thread's progress.
+const FLUSH_POLL: Duration = Duration::from_millis(1);
+
+/// Lines handed to the channel and lines the writer thread has finished
+/// with, so `flush` can tell when everything queued before it has reached
+/// stdout without taking the stdout lock the writer may be blocked under.
+#[derive(Default)]
+struct Progress {
+    queued: AtomicU64,
+    written: AtomicU64,
+}
+
+/// The process sink's progress, for `flush`. Unset until `start` runs, which
+/// is the case on an argument parse error.
+static PROGRESS: OnceLock<Arc<Progress>> = OnceLock::new();
+
 #[derive(Clone)]
 pub struct LogSink {
     tx: Sender<Vec<u8>>,
     dropped: Arc<AtomicU64>,
+    progress: Arc<Progress>,
 }
 
 impl LogSink {
@@ -41,11 +59,12 @@ impl LogSink {
         let (tx, rx) = bounded::<Vec<u8>>(CAPACITY);
         let dropped = Arc::new(AtomicU64::new(0));
         let seen = Arc::clone(&dropped);
+        let progress = Arc::new(Progress::default());
+        let done = Arc::clone(&progress);
+        let _ = PROGRESS.set(Arc::clone(&progress));
         // Not a tokio task: this thread is ALLOWED to block, which is the
-        // whole point. It exits when the sender is dropped, which happens only
-        // at process teardown (the subscriber owns the sink for the process
-        // lifetime), so lines still queued when the process exits are lost --
-        // the same lines a blocking writer would have been stuck inside.
+        // whole point. The process never joins it: exit paths call `flush`,
+        // which waits a bounded time for it to catch up.
         std::thread::Builder::new()
             .name("cauli-log".into())
             .spawn(move || {
@@ -68,10 +87,28 @@ impl LogSink {
                         reported = now;
                     }
                     let _ = io::Write::flush(&mut h);
+                    done.written.fetch_add(1, Ordering::SeqCst);
                 }
             })
             .expect("failed to spawn cauli-log thread");
-        LogSink { tx, dropped }
+        LogSink {
+            tx,
+            dropped,
+            progress,
+        }
+    }
+}
+
+/// Wait, at most `budget`, for every line queued before this call to reach
+/// stdout. Bounded because the stalled reader this module exists for may be
+/// why it has not: exiting a little late is acceptable, never exiting is
+/// not. Never takes the stdout lock, which a blocked writer holds.
+pub fn flush(budget: Duration) {
+    let Some(p) = PROGRESS.get() else { return };
+    let target = p.queued.load(Ordering::SeqCst);
+    let deadline = Instant::now() + budget;
+    while p.written.load(Ordering::SeqCst) < target && Instant::now() < deadline {
+        std::thread::sleep(FLUSH_POLL);
     }
 }
 
@@ -82,6 +119,7 @@ pub struct LineBuf {
     buf: Vec<u8>,
     tx: Sender<Vec<u8>>,
     dropped: Arc<AtomicU64>,
+    progress: Arc<Progress>,
 }
 
 impl io::Write for LineBuf {
@@ -101,9 +139,13 @@ impl Drop for LineBuf {
             return;
         }
         let line = std::mem::take(&mut self.buf);
+        // Counted before the send, so a `flush` that starts after any line
+        // ahead of this one in the channel waits for this one too.
+        self.progress.queued.fetch_add(1, Ordering::SeqCst);
         // try_send, never send: blocking here would reintroduce exactly the
         // stall this module exists to remove, just one queue further out.
         if self.tx.try_send(line).is_err() {
+            self.progress.queued.fetch_sub(1, Ordering::SeqCst);
             self.dropped.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -117,6 +159,7 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogSink {
             buf: Vec::with_capacity(256),
             tx: self.tx.clone(),
             dropped: Arc::clone(&self.dropped),
+            progress: Arc::clone(&self.progress),
         }
     }
 }
@@ -137,6 +180,7 @@ mod tests {
         let sink = LogSink {
             tx,
             dropped: Arc::clone(&dropped),
+            progress: Default::default(),
         };
         for _ in 0..10 {
             let mut w = sink.make_writer();
@@ -150,7 +194,11 @@ mod tests {
     fn an_empty_line_is_never_sent() {
         let (tx, rx) = bounded::<Vec<u8>>(4);
         let dropped = Arc::new(AtomicU64::new(0));
-        let sink = LogSink { tx, dropped };
+        let sink = LogSink {
+            tx,
+            dropped,
+            progress: Default::default(),
+        };
         drop(sink.make_writer());
         assert!(rx.try_recv().is_err());
     }

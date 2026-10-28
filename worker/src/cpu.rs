@@ -49,7 +49,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixListener;
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::{mpsc, oneshot, Semaphore};
+use tokio::sync::{mpsc, oneshot, Notify, Semaphore};
 use tokio::time::{sleep_until, timeout, Instant};
 use tracing::{info, warn};
 
@@ -105,6 +105,9 @@ pub struct CpuPool {
     /// indefinitely (children always make progress thanks to the
     /// hard-timeout SIGKILL).
     pub overflow: Arc<AtomicUsize>,
+    /// Fired when `overflow` falls back to zero, so the admission gates
+    /// that pause on it resume at once instead of at their next poll.
+    pub drained: Arc<Notify>,
     /// Live executor pids: fork-server parent + serving children (fork mode)
     /// or the spawned children (stdio mode). Killed on worker exit paths.
     pub child_pids: Arc<Mutex<Vec<u32>>>,
@@ -156,6 +159,7 @@ pub fn disabled() -> CpuPool {
         tx,
         admission: Arc::new(Semaphore::new(1)),
         overflow: Arc::new(AtomicUsize::new(0)),
+        drained: Arc::new(Notify::new()),
         child_pids: Arc::new(Mutex::new(Vec::new())),
         sock_path: None,
     }
@@ -208,6 +212,7 @@ pub async fn start(cfg: StartCfg, counters: Arc<Counters>) -> CpuPool {
             .max(1),
     ));
     let overflow = Arc::new(AtomicUsize::new(0));
+    let drained = Arc::new(Notify::new());
     let pids = Arc::new(Mutex::new(Vec::new()));
     let (prog, argv) = child_argv(&python, &app_spec);
 
@@ -232,6 +237,7 @@ pub async fn start(cfg: StartCfg, counters: Arc<Counters>) -> CpuPool {
                     tx,
                     admission,
                     overflow,
+                    drained,
                     child_pids: pids,
                     sock_path: Some(Arc::new(sock_path)),
                 };
@@ -255,6 +261,7 @@ pub async fn start(cfg: StartCfg, counters: Arc<Counters>) -> CpuPool {
         tx,
         admission,
         overflow,
+        drained,
         child_pids: pids,
         sock_path: None,
     }
@@ -459,12 +466,17 @@ async fn start_fork_server(
         pids.clone(),
     ));
     tokio::spawn(acceptor_loop(listener, conn_tx, child_threads));
+    let idle_slots = Arc::new(IdleSlots::default());
     for i in 0..workers {
         tokio::spawn(slot_loop(
             i,
             fork_tx.clone(),
             conn_rx.clone(),
-            ServeCfg { prefetch, recycle },
+            ServeCfg {
+                prefetch,
+                recycle,
+                idle_slots: idle_slots.clone(),
+            },
             rx.clone(),
             counters.clone(),
             pids.clone(),
@@ -678,10 +690,34 @@ async fn read_child_ready(
 /// replacement fork whenever the current child is gone (death, hard-timeout
 /// SIGKILL). Respawns are cheap: the parent forks its warmed, frozen image.
 /// Per-child serving knobs, fixed for the pool's lifetime.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct ServeCfg {
     prefetch: usize,
     recycle: usize,
+    idle_slots: Arc<IdleSlots>,
+}
+
+/// Slots that could start a request right now, the ones still forking
+/// included. A busy slot stages prefetch work only while there are none:
+/// otherwise the first slot to wake drained a burst into its own queue and
+/// ran it serially while its siblings sat idle.
+#[derive(Default)]
+struct IdleSlots {
+    count: AtomicUsize,
+    /// Woken when `count` drops, so a slot holding back staged work
+    /// re-checks at once instead of at its own child's next response.
+    dropped: tokio::sync::Notify,
+}
+
+impl IdleSlots {
+    fn add(&self) {
+        self.count.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn remove(&self) {
+        self.count.fetch_sub(1, Ordering::SeqCst);
+        self.dropped.notify_waiters();
+    }
 }
 
 async fn slot_loop(
@@ -699,13 +735,14 @@ async fn slot_loop(
     // planned recycle, which can legitimately be this frequent if the
     // operator configured it that way.
     let mut backoff = Duration::from_millis(100);
+    cfg.idle_slots.add();
     loop {
         if fork_tx.send(()).await.is_err() {
-            return; // control loop gone: worker exiting
+            break; // control loop gone: worker exiting
         }
         let conn = match timeout(FORK_WAIT, conn_rx.recv()).await {
             Ok(Ok(c)) => c,
-            Ok(Err(_)) => return, // acceptor gone: worker exiting
+            Ok(Err(_)) => break, // acceptor gone: worker exiting
             Err(_) => {
                 warn!("cpu[{idx}]: no forked child connected within {FORK_WAIT:?}; re-requesting");
                 continue;
@@ -715,8 +752,8 @@ async fn slot_loop(
             "cpu[{idx}]: fork child serving pid={} concurrency={}",
             conn.pid, conn.concurrency
         );
-        match serve_child(idx, conn, cfg, &rx, &counters, &pids).await {
-            ServeExit::Shutdown => return, // job channel closed: worker exiting
+        match serve_child(idx, conn, cfg.clone(), &rx, &counters, &pids).await {
+            ServeExit::Shutdown => break, // job channel closed: worker exiting
             ServeExit::Recycled => backoff = Duration::from_millis(100),
             ServeExit::Died => {
                 tokio::time::sleep(backoff).await;
@@ -724,6 +761,7 @@ async fn slot_loop(
             }
         }
     }
+    cfg.idle_slots.remove();
 }
 
 struct Pending {
@@ -867,7 +905,13 @@ async fn serve_child(
     counters: &Arc<Counters>,
     pids: &Arc<Mutex<Vec<u32>>>,
 ) -> ServeExit {
-    let ServeCfg { prefetch, recycle } = cfg;
+    let ServeCfg {
+        prefetch,
+        recycle,
+        idle_slots,
+    } = cfg;
+    // slot_loop counted this slot idle; kept in step with `pending` below.
+    let mut idle = true;
     let ChildConn {
         mut lines,
         mut write,
@@ -897,6 +941,16 @@ async fn serve_child(
     let mut write_stall_since: Option<Instant> = None;
 
     let gone = loop {
+        let now_idle = pending.len() + usize::from(pending_write.is_some()) < concurrency;
+        if now_idle != idle {
+            if now_idle {
+                idle_slots.add();
+            } else {
+                idle_slots.remove();
+            }
+            idle = now_idle;
+        }
+        let may_admit = idle || idle_slots.count.load(Ordering::SeqCst) == 0;
         let next_deadline = pending.values().filter_map(|p| p.deadline).min();
         if pending_write.is_some() && next_deadline.is_none() {
             write_stall_since.get_or_insert_with(Instant::now);
@@ -963,6 +1017,7 @@ async fn serve_child(
             // Only ever admit a NEW request once the last one is fully
             // handed to the child: the socket has one write side to share.
             job = rx.recv(), if pending_write.is_none() && pending.len() < queue_depth
+                && may_admit
                 && (recycle == 0 || completed + pending.len() < recycle) => {
                 match job {
                     Ok(job) => {
@@ -1073,6 +1128,7 @@ async fn serve_child(
                 );
                 break ChildGone::Wedged;
             }
+            _ = idle_slots.dropped.notified(), if !may_admit => {}
         }
     };
 
@@ -1100,6 +1156,9 @@ async fn serve_child(
         counters.inflight_cpu.fetch_sub(1, Ordering::Relaxed);
     }
     track_pid(pids, pid, false);
+    if !idle {
+        idle_slots.add();
+    }
     match gone {
         ChildGone::Shutdown => ServeExit::Shutdown,
         ChildGone::Recycled => ServeExit::Recycled,
@@ -1340,6 +1399,7 @@ mod tests {
             ServeCfg {
                 prefetch: 0,
                 recycle: 0,
+                idle_slots: Arc::new(IdleSlots::default()),
             },
             &rx,
             &counters,
