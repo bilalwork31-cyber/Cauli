@@ -120,3 +120,24 @@ def marker(path):
 @app.task()
 def routed_task(x):
     return {"routed": x}
+
+
+def _transit(args, kwargs):
+    # repr shows exactly what arrived (key order, -0.0, big ints, unicode);
+    # the values themselves go back out through the result path.
+    return [repr(args), repr(kwargs), list(args), kwargs]
+
+
+@app.task(max_retries=0)
+def transit_sync(*args, **kwargs):
+    return _transit(args, kwargs)
+
+
+@app.task(max_retries=0)
+async def transit_async(*args, **kwargs):
+    return _transit(args, kwargs)
+
+
+@app.task(kind="cpu", max_retries=0)
+def transit_cpu(*args, **kwargs):
+    return _transit(args, kwargs)

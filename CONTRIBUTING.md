@@ -54,6 +54,8 @@ cargo clippy --all-targets -- -D warnings
 cargo clippy --all-targets --features test-hooks -- -D warnings
 # With no virtualenv activated: the tests embed CPython, which finds an
 # activated venv through PATH, and one test needs cauli NOT to be importable.
+# The worker decodes task args with msgspec, so it must be importable:
+#   pip install --target ~/msgspec-site msgspec && export PYTHONPATH=~/msgspec-site
 cargo test --release --features test-hooks
 
 # Python client

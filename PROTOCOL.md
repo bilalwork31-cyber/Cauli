@@ -129,13 +129,12 @@ client-produced). Worker-side gates apply before an entry is ever executed:
   with / overwrite another task's `cauli:result:{id}` key.
 - The raw `e` field must not exceed `--max-envelope-bytes` (default 1 MiB); oversize -> DLQ
   reason `"malformed"` (a truncated preview is stored, not the full oversize payload). This
-  caps the size of one envelope, not the worker's memory: the parsed `serde_json::Value` tree
-  is far larger than the raw bytes. Measured worst case, a 1 MiB envelope that is one array of
-  small integers: 66 MB of worker RSS on the async lane and 75 MB on the sync lane, which
-  holds a second copy. Text heavy payloads amplify far less. Size for the worst case as
-  `in flight io tasks x max-envelope-bytes x 75`, and lower `--max-envelope-bytes` (and the
-  client's `max_envelope_bytes` with it) when that exceeds the host. Recommendation: pass
-  references (ids, URLs, keys) in args/kwargs, not large blobs.
+  caps the size of one envelope, not the worker's memory. The worker carries `args` and
+  `kwargs` as the producer's JSON text and never builds a tree for them, so what grows with
+  the payload is a few copies of that text plus the Python objects the task receives.
+  Measured worst case, a 1 MiB envelope that is one array of small integers: about 8 MB of
+  worker RSS per in flight task on either io lane, most of it the decoded Python list. Size for the worst case as `in flight io tasks x max-envelope-bytes x 10`.
+  Recommendation: pass references (ids, URLs, keys) in args/kwargs, not large blobs.
 - **The limit is enforced on both ends.** A conforming producer MUST also refuse to publish an
   encoded envelope past its own configured ceiling, raising at the call site and writing
   nothing (`Cauli(max_envelope_bytes=...)`, same 1 MiB default). The worker side check is the

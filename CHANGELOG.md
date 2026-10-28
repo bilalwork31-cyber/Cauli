@@ -115,6 +115,13 @@ Worker CPU per task, single process, noop tasks, interleaved A/B against
 105.8 to 62.0 us. With a real task body the body dominates; a redis INCR
 body moves the sync lane 1.14x and the async lane not measurably.
 
+- Task arguments and results cross the worker as the producer's JSON text.
+  The worker no longer parses them into a tree, converts that tree to Python
+  objects, or writes it out again for a cpu child: msgspec, the client's
+  codec, decodes and encodes them in Python. A 10,000 integer argument: async
+  lane 4,123 to 643 us of CPU per task (2.44x the rate), cpu lane 4,607 to
+  1,000 us (3.96x). Worker RSS with 30 in flight 1 MiB integer array
+  envelopes: 2,698 to 282 MB (async), 2,665 to 297 MB (sync).
 - `--batch` defaults to 64 (was 16): 4x fewer XREADGROUP round trips.
 - Sync pool threads take the GIL once per burst of queued jobs, not once per
   job, so they stop convoying on it.
@@ -137,6 +144,12 @@ body moves the sync lane 1.14x and the async lane not measurably.
   (8 solo nodes, 4,233 tasks/s): cauli is 7.7x on the async lane and 4.9x on
   the sync lane, not 32.8x against a single Celery node.
 - `docs/decisions/` is rewritten as short architecture decision records.
+- The Python the worker embeds needs msgspec importable from the app's
+  environment (cauli depends on it). Without it the worker exits at startup
+  with an error naming that environment.
+- io lane results are encoded by msgspec, as cpu lane results already were,
+  so a float is written the way the client writes it (`1e16`, was `1e+16`).
+  The value is the same.
 
 ### Added
 

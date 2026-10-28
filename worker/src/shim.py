@@ -21,13 +21,12 @@ None when the caller does not report it (older worker, unit test). It is one
 tuple rather than four scalars so the per-task pyo3 call does not grow four
 argument slots on the hottest path in the process; see `_enter_context`.
 
-Task arguments and outcomes cross as REAL PYTHON OBJECTS, not JSON strings.
-Rust converts in both directions (worker/src/pyjson.rs). This module therefore
-contains no per-task JSON codec at all: it used to carry its own copy of
-cauli._codec (a validator, a stdlib/msgspec switch, and an encoder), and every
-task paid two `json.loads` plus a validate-and-encode pass **while holding the
-GIL** that all in-process tasks share. `load_app`'s config is the one
-remaining JSON payload, and it crosses exactly once at startup.
+Task arguments reach `run_sync`/`submit_async` as Python objects that Rust
+decoded from the envelope's JSON text with `_decode`, and Rust encodes the
+outcome dict's result with `_encode` (worker/src/pyrt.rs). Both are msgspec,
+the codec the client (py/cauli/_codec.py) and the cpu child use, so a value
+means the same thing on every side of the wire. `load_app`'s config is the
+one other JSON payload, and it crosses exactly once at startup.
 
 Outcome dict shapes:
   {"ok": True,  "result": <any JSON-representable value>}
@@ -36,8 +35,7 @@ Outcome dict shapes:
                                                "traceback": ..., "origin": ...}}
 
 A result that cannot be represented as JSON is rejected on the Rust side and
-becomes a non-retryable SerializationError, the same classification the
-deleted encoder produced.
+becomes a non-retryable SerializationError, as it does in the cpu child.
 """
 
 import asyncio
@@ -54,6 +52,9 @@ import time
 import traceback
 
 _MAX_TB = 8192
+
+_decode = None  # msgspec.json.Decoder().decode, bound by load_app
+_encode = None  # msgspec.json.Encoder().encode, bound by load_app
 
 try:  # pragma: no cover - only when the real cauli package is importable
     from cauli import SoftTimeLimitExceeded  # type: ignore
@@ -251,6 +252,22 @@ def load_app(app_spec, extra_paths_json):
             # addsitedir (not sys.path.append) so .pth hooks run — editable
             # installs (pip install -e) are invisible without them
             site.addsitedir(sp)
+
+    # Imported here, after the path setup above, for the same reason cauli
+    # itself is rebound below: a source built worker sees the app's
+    # environment only from this point on.
+    global _decode, _encode
+    try:
+        import msgspec.json
+    except ImportError as exc:
+        raise ImportError(
+            "cauli-worker needs msgspec in the Python environment it runs "
+            "(%s): it decodes task arguments and encodes results with it, as "
+            "the cauli client does. Install cauli, which depends on it, or "
+            "msgspec itself into that environment." % (sys.prefix,)
+        ) from exc
+    _decode = msgspec.json.Decoder().decode
+    _encode = msgspec.json.Encoder().encode
 
     module_name, sep, attr = app_spec.partition(":")
     if not sep or not attr:
@@ -483,14 +500,8 @@ def _inject_soft(tid, gen):
 
 
 def run_sync(name, args, kwargs, soft_timeout_ms, meta=None):
-    """Run one sync task. `args`/`kwargs` arrive as real Python objects and the
-    outcome dict is returned as a real Python object.
-
-    No JSON is produced or parsed anywhere on this path. Rust converts in both
-    directions (src/pyjson.rs), because every instruction here holds the GIL
-    that all in-process tasks share -- the two `json.loads` calls and the
-    validate-plus-encode that used to live here were charged directly against
-    total io throughput.
+    """Run one sync task. `args`/`kwargs` arrive as Python objects (decoded by
+    Rust with `_decode`) and the outcome dict is returned as a Python object.
 
     `meta` is the `(id, retries, max_retries, queue)` envelope tuple backing
     `cauli.current_task()`, or None (see `_enter_context`).
@@ -715,7 +726,7 @@ def _drain(idx, loop):
 
 def submit_async(token, name, args, kwargs, timeout_s, soft_timeout_s=None, meta=None):
     """Schedule one async task. `args`/`kwargs` are already Python objects
-    (converted in Rust); nothing on this path touches JSON.
+    (decoded by Rust with `_decode`).
 
     `timeout_s` is the hard deadline and `soft_timeout_s` (or None) the soft
     one; they travel separately so `_arun` can enforce the pair rather than
@@ -946,10 +957,10 @@ async def _arun(
     cb = _callback
     if cb is not None:
         try:
-            # The outcome dict itself, not JSON text: Rust normalizes it in the
-            # callback (pyrt::outcome_from_py), which runs right here on this
-            # loop thread. A non-serializable result becomes SerializationError
-            # there, exactly as the old encode-and-catch did.
+            # The outcome dict itself: Rust normalizes it and encodes the result
+            # in the callback (pyrt::outcome_from_py), which runs right here on
+            # this loop thread. A non-serializable result becomes a
+            # SerializationError there.
             cb(token, out)
         except Exception:
             traceback.print_exc()

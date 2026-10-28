@@ -82,14 +82,16 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 serde = { version = "1", features = ["derive"] }
 # arbitrary_precision (audit CRITICAL): without it, serde_json's default
 # Number silently falls back to f64 for any integer literal outside i64/u64
-# range, at parse time, before any cauli code runs. With it, the parser keeps
-# the exact source digits instead, so json_to_py can hand Python back the
-# exact int the caller sent (see pyjson.rs). Changes how serde_json::Number
-# is represented crate wide; every inspection site was reviewed for fallout,
-# see the commit message.
-# preserve_order: a Python task gets its dicts and kwargs back in the order the
-# caller built them; the default BTreeMap would hand them over sorted.
-serde_json = { version = "1", features = ["arbitrary_precision", "preserve_order"] }
+# range, at parse time. With it, the parser keeps the exact source digits, so
+# an unknown envelope field (`Envelope::extra`) that a retry re-enqueues goes
+# back out with the exact integer the caller wrote.
+# preserve_order: the same passthrough keeps that field's nested key order;
+# the default BTreeMap would write it back sorted.
+# raw_value: args, kwargs and task results cross the worker as opaque JSON
+# text (envelope.rs). The worker never reads them, so it never builds a tree
+# for them; the Python side decodes and encodes them with msgspec, the codec
+# the client uses.
+serde_json = { version = "1", features = ["arbitrary_precision", "preserve_order", "raw_value"] }
 # Trimmed from "full" (audit dependency review) to the features actually used:
 # rt-multi-thread/macros (runtime + tokio::spawn + #[tokio::test]), sync
 # (oneshot/watch/Semaphore), time (timeout/interval/sleep), io-util
