@@ -7,3 +7,4 @@ DONE_KEY = "bench:done"
 # redis-py defaults to 100 connections per pool. Every slot above that raised
 # MaxConnectionsError inside the task body, which once read as a worker stall.
 REDIS_POOL_MAX = 4096
+STARTED_KEY = "bench:started"

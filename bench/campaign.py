@@ -30,7 +30,16 @@ CELERY_NODE_CMD = (
     " --without-heartbeat --without-gossip --without-mingle -l warning"
 )
 
+DRAMATIQ_BIN = os.environ.get("DRAMATIQ_BIN", "dramatiq")
+
 CONFIGS = [
+    {
+        # Best of the RESULTS.md thread sweep: 6 procs x 32 threads tied it.
+        "label": "dramatiq (12 procs x 8 threads)",
+        "framework": "dramatiq",
+        "n": 60_000,
+        "cmd": [DRAMATIQ_BIN, "tasks_dramatiq", "--processes", "12", "--threads", "8"],
+    },
     {
         "label": f"celery ({CELERY_NODES} solo nodes)",
         "framework": "celery",
