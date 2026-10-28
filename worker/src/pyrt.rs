@@ -759,9 +759,72 @@ pub struct SyncJob {
     pub resp: oneshot::Sender<Outcome>,
 }
 
+/// The pool's bounded job queue. A job leaves it only through a thread that
+/// already holds the GIL, which is what makes the GIL the scheduler: while
+/// one thread runs Python, the jobs queued behind it stay where that same
+/// thread finds them next, instead of each being taken by a freshly woken
+/// thread that then parks on the GIL and costs a GIL handoff per job. A job
+/// that blocks releases the GIL inside CPython, and the thread standing by
+/// for it takes the next job at once, so blocking tasks overlap as before.
+struct JobQueue {
+    state: Mutex<QueueState>,
+    ready: std::sync::Condvar,
+    capacity: usize,
+}
+
+struct QueueState {
+    jobs: std::collections::VecDeque<SyncJob>,
+    /// Threads parked on `ready`.
+    parked: usize,
+    /// A parked thread was woken and has not yet reached the GIL. While one
+    /// is on its way, no other is woken: one standby is enough to take over
+    /// the moment the running thread releases the GIL.
+    standby: bool,
+}
+
+impl JobQueue {
+    /// Park until there is a job, without taking it. A woken thread that
+    /// finds the queue already emptied stands down, so the next job wakes
+    /// a thread again.
+    fn wait_for_job(&self) {
+        let mut q = self.state.lock().unwrap();
+        while q.jobs.is_empty() {
+            q.parked += 1;
+            q = self.ready.wait(q).unwrap();
+            q.parked -= 1;
+            if q.jobs.is_empty() {
+                q.standby = false;
+            }
+        }
+    }
+
+    /// Take the next job. Only ever called with the GIL held; `arrived` is
+    /// true on the first take after acquiring it, which is the moment a
+    /// standby stops being one. Leaves a standby behind whenever work
+    /// remains, so a job that blocks does not hold up the one queued behind
+    /// it, while a thread running a burst wakes no one.
+    fn take(&self, arrived: bool) -> Option<SyncJob> {
+        let mut q = self.state.lock().unwrap();
+        if arrived {
+            q.standby = false;
+        }
+        let job = q.jobs.pop_front();
+        if !q.jobs.is_empty() {
+            self.wake_standby(&mut q);
+        }
+        job
+    }
+
+    fn wake_standby(&self, q: &mut QueueState) {
+        if !q.standby && q.parked > 0 {
+            q.standby = true;
+            self.ready.notify_one();
+        }
+    }
+}
+
 pub struct SyncPool {
-    tx: crossbeam_channel::Sender<SyncJob>,
-    rx: crossbeam_channel::Receiver<SyncJob>,
+    queue: Arc<JobQueue>,
     rt: Arc<PyRuntime>,
     next_idx: AtomicUsize,
     /// Fixed at construction: `threads * SYNC_POOL_THREAD_CEILING_MULTIPLE`.
@@ -803,16 +866,22 @@ fn run_sync_job(rt: &PyRuntime, job: SyncJob) {
 }
 
 impl SyncPool {
-    /// `queue_capacity` bounds the crossbeam channel; pass `--io-concurrency`
+    /// `queue_capacity` bounds the job queue; pass `--io-concurrency`
     /// (the same admission gate that already bounds outstanding submissions
     /// in the common case) so a fully-wedged pool cannot grow the backlog
     /// without bound (MEM-2 (c)).
     pub fn start(rt: Arc<PyRuntime>, threads: usize, queue_capacity: usize) -> SyncPool {
-        let (tx, rx) = crossbeam_channel::bounded::<SyncJob>(queue_capacity.max(1));
         let threads = threads.max(1);
         let pool = SyncPool {
-            tx,
-            rx,
+            queue: Arc::new(JobQueue {
+                state: Mutex::new(QueueState {
+                    jobs: std::collections::VecDeque::new(),
+                    parked: 0,
+                    standby: false,
+                }),
+                ready: std::sync::Condvar::new(),
+                capacity: queue_capacity.max(1),
+            }),
             rt,
             next_idx: AtomicUsize::new(0),
             max_threads: threads as i64 * SYNC_POOL_THREAD_CEILING_MULTIPLE,
@@ -841,7 +910,7 @@ impl SyncPool {
             return;
         }
         let idx = self.next_idx.fetch_add(1, Ordering::Relaxed);
-        let rx = self.rx.clone();
+        let queue = self.queue.clone();
         let rt = self.rt.clone();
         let live = self.live_threads.clone();
         live.fetch_add(1, Ordering::Relaxed);
@@ -879,7 +948,8 @@ impl SyncPool {
                     pyo3::ffi::PyGILState_Ensure();
                     pyo3::ffi::PyEval_SaveThread();
                 }
-                while let Ok(first) = rx.recv() {
+                loop {
+                    queue.wait_for_job();
                     // One GIL entry per burst, not per job: while jobs are
                     // queued this thread keeps the GIL and runs the next one.
                     // Taking it per job made every pool thread park on the
@@ -887,12 +957,11 @@ impl SyncPool {
                     // task: at --io-threads 4 and up a noop sync task cost
                     // 127us of CPU against 22us on one thread. A task that
                     // blocks still releases the GIL inside CPython, so the
-                    // other threads keep overlapping blocking io as before.
+                    // standby thread overlaps blocking io as before.
                     Python::attach(|_py| {
-                        let mut next = Some(first);
-                        while let Some(job) = next {
+                        let mut arrived = true;
+                        while let Some(job) = queue.take(std::mem::take(&mut arrived)) {
                             run_sync_job(&rt, job);
-                            next = rx.try_recv().ok();
                         }
                     });
                 }
@@ -907,12 +976,13 @@ impl SyncPool {
     /// allocation buys every `Result<(), _>` on this path a pointer-sized
     /// error variant (`clippy::result_large_err`).
     pub fn submit(&self, job: SyncJob) -> Result<(), Box<SyncJob>> {
-        self.tx.try_send(job).map_err(|e| {
-            Box::new(match e {
-                crossbeam_channel::TrySendError::Full(j) => j,
-                crossbeam_channel::TrySendError::Disconnected(j) => j,
-            })
-        })
+        let mut q = self.queue.state.lock().unwrap();
+        if q.jobs.len() >= self.queue.capacity {
+            return Err(Box::new(job));
+        }
+        q.jobs.push_back(job);
+        self.queue.wake_standby(&mut q);
+        Ok(())
     }
 
     /// Called by the dispatcher when a sync task hard-times-out (exec.rs).
@@ -1175,6 +1245,120 @@ app = _App()
         // not an overcount left over from the panic.
         pool.report_hard_timeout();
         assert_eq!(pool.live_threads.load(Ordering::Relaxed), 1);
+    }
+
+    /// Sync tasks that block (`time.sleep` here) and the thread that ran them.
+    const SYNC_POOL_APP_SRC: &str = r#"
+import threading
+import time
+
+
+class _Task:
+    def __init__(self, fn):
+        self.fn = fn
+        self.kind = "io"
+        self.is_async = False
+
+
+def nap(seconds):
+    if seconds:
+        time.sleep(seconds)
+    return threading.get_ident()
+
+
+class _App:
+    redis_url = "redis://localhost:6379/0"
+    default_queue = "default"
+    result_ttl = 3600
+    idemp_ttl = 86400
+    queue_ttl = {}
+    _tasks = {"nap": _Task(nap)}
+
+
+app = _App()
+"#;
+
+    /// The job's outcome and its `started` receiver, which must outlive the
+    /// job: a dropped one reads as an abandoned job and the pool skips it.
+    fn submit_nap(
+        pool: &SyncPool,
+        seconds: f64,
+    ) -> (oneshot::Receiver<Outcome>, oneshot::Receiver<()>) {
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let (started_tx, started_rx) = oneshot::channel();
+        pool.submit(SyncJob {
+            name: "nap".to_string(),
+            args: format!("[{seconds}]"),
+            kwargs: "{}".to_string(),
+            soft_timeout_ms: None,
+            meta: None,
+            started: started_tx,
+            resp: resp_tx,
+        })
+        .ok()
+        .expect("queue has room");
+        (resp_rx, started_rx)
+    }
+
+    /// Jobs leave the queue only through a GIL holder, so blocking jobs
+    /// overlap only if a standby thread is woken behind each one that starts.
+    /// Without that chain, 8 naps of 300ms queued at once run back to back
+    /// on the one woken thread: 2.4s instead of about 0.3s.
+    #[test]
+    fn sync_pool_overlaps_blocking_jobs_queued_together() {
+        let _shim_state = shim_state_guard();
+        let app_spec = Python::attach(|py| {
+            install_fake_app_module(py, "cauli_test_sync_overlap_app", SYNC_POOL_APP_SRC)
+        });
+        let (rt, _cfg) = PyRuntime::init(&app_spec, 1).expect("valid app must init cleanly");
+        let pool = SyncPool::start(rt, 8, 64);
+
+        let started = std::time::Instant::now();
+        let rxs: Vec<_> = (0..8).map(|_| submit_nap(&pool, 0.3)).collect();
+        let mut threads = std::collections::HashSet::new();
+        for (rx, _started) in rxs {
+            match rx.blocking_recv().expect("pool must answer") {
+                Outcome::Success(ident) => threads.insert(ident),
+                other => panic!("nap failed: {}", outcome_name(&other)),
+            };
+        }
+        let elapsed = started.elapsed();
+        assert_eq!(threads.len(), 8, "every nap must run on its own thread");
+        assert!(
+            elapsed < std::time::Duration::from_millis(1200),
+            "8 blocking jobs on 8 threads took {elapsed:?}, they ran serially"
+        );
+    }
+
+    /// A job submitted while every thread is parked must always wake one,
+    /// however the previous standby stood down. A standby flag left set by
+    /// a thread that found the queue already emptied would park every thread
+    /// with work queued, and this would hang.
+    #[test]
+    fn sync_pool_never_strands_a_job_after_a_burst() {
+        let _shim_state = shim_state_guard();
+        let app_spec = Python::attach(|py| {
+            install_fake_app_module(py, "cauli_test_sync_strand_app", SYNC_POOL_APP_SRC)
+        });
+        let (rt, _cfg) = PyRuntime::init(&app_spec, 1).expect("valid app must init cleanly");
+        let pool = SyncPool::start(rt, 4, 64);
+
+        for round in 0..1000 {
+            let burst: Vec<_> = (0..(round % 16 + 1))
+                .map(|_| submit_nap(&pool, 0.0))
+                .collect();
+            for (rx, started) in burst {
+                let (tx, done) = std::sync::mpsc::channel();
+                std::thread::spawn(move || {
+                    let _ = tx.send(rx.blocking_recv().is_ok());
+                    drop(started);
+                });
+                let answered = done
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .unwrap_or(false);
+                assert!(answered, "round {round}: a queued job was never run");
+            }
+        }
     }
 
     /// Args msgspec refuses can never succeed: a retry decodes the identical
