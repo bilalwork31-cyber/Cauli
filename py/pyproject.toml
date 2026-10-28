@@ -27,7 +27,7 @@ classifiers = [
     "Topic :: System :: Distributed Computing",
 ]
 dependencies = [
-    "redis>=5",
+    "redis>=5.0.1",
     # Required, not an accelerator. cauli has no stdlib json fallback: two
     # backends meant two sets of semantics (they disagreed on lone surrogates,
     # dict-key coercion and exception types), and a fallback lets the slow path
@@ -79,6 +79,8 @@ Issues = "https://github.com/bilalwork31-cyber/Cauli/issues"
 [project.optional-dependencies]
 dev = [
     "pytest>=8",
+    # Same pin as .github/workflows/ci.yml. Newer ruff enables more rules by default.
+    "ruff==0.15.22",
 ]
 # Opt-in Django integration (cauli.contrib.django, TaskDef.delay_on_commit).
 # Core never imports django; this extra just pins a floor for users who do.

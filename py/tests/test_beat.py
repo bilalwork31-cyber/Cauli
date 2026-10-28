@@ -266,7 +266,8 @@ def test_on_missed_skip_suppresses_a_too_late_firing_but_still_advances(
     beat.sync_code_entries()
     beat.tick()
 
-    store.clock += 60_000 + 120_000  # due, and 120s late (> max_lateness 30s)
+    # Due and 105s late; the newer slot it coalesces is 45s late, also > 30s.
+    store.clock += 60_000 + 105_000
     beat.tick()
     assert beat.fired == 0
     assert beat.skipped == 1
@@ -275,7 +276,7 @@ def test_on_missed_skip_suppresses_a_too_late_firing_but_still_advances(
     assert redis_client.zscore(DUE_KEY, "report") > store.clock
     state = store.state("report")
     assert state["status"] == "skipped"
-    assert state["lateness_ms"] == 120_000
+    assert state["lateness_ms"] == 105_000
 
 
 def test_on_missed_skip_still_fires_when_within_max_lateness(
@@ -290,6 +291,22 @@ def test_on_missed_skip_still_fires_when_within_max_lateness(
     store.clock += 60_000 + 5_000  # 5s late, inside the budget
     beat.tick()
     assert (beat.fired, beat.skipped) == (1, 0)
+
+
+def test_on_missed_skip_fires_when_the_newest_missed_slot_is_within_max_lateness(
+    beat_app, store, redis_client
+):
+    beat_app.add_periodic_task(
+        "report", "app.report", interval(3600), on_missed="skip", max_lateness=600
+    )
+    beat = make_beat(beat_app, store)
+    beat.sync_code_entries()
+    beat.tick()
+    # Down for a day: the oldest slot is 24h late, the newest only 5 minutes.
+    store.clock += 25 * 3_600_000 + 300_000
+    beat.tick()
+    assert (beat.fired, beat.skipped) == (1, 0)
+    assert len(stream(redis_client)) == 1
 
 
 def test_default_policy_fires_however_late(beat_app, store, redis_client):
@@ -653,6 +670,24 @@ def test_a_transient_redis_error_does_not_strand_the_leader(beat_app, redis_clie
     assert holder == b"A", "the lease was dropped over a blip that never lost it"
     assert fired, "the leader held the lease but never scheduled anything again"
     assert beat.fired == 1, f"the slot fired {beat.fired} times, not once"
+
+
+def test_an_entry_that_cannot_be_fired_is_retried_at_a_bounded_rate(
+    redis_url, store, redis_client, caplog
+):
+    def router(task_name, args, kwargs):
+        raise KeyError("tenant")
+
+    app = Cauli(redis_url=redis_url, task_routes={"app.*": router})
+    app.add_periodic_task("e", "app.ping", interval(1))
+    beat = make_beat(app, store)
+    beat.sync_code_entries()
+    beat.tick()
+    store.clock += 1_000
+    with caplog.at_level(logging.ERROR, logger="cauli.beat"):
+        sleep_s = beat.tick()
+    assert "cannot build envelope" in caplog.text
+    assert sleep_s >= 1.0, "a slot that stays due must not spin the loop"
 
 
 def test_state_and_run_count_are_readable(beat_app, store, redis_client):

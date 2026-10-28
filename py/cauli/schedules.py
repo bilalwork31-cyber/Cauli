@@ -27,6 +27,7 @@ and only the resulting absolute instant is ever stored or compared.
 
 from __future__ import annotations
 
+import bisect
 import hashlib
 import json
 from datetime import date as _date
@@ -280,9 +281,9 @@ class CrontabSchedule(Schedule):
     slot is stored as an absolute instant and :meth:`next_after` is required to
     return an instant strictly greater than its argument:
 
-    - **Fall back** (a wall time happens twice): the first occurrence
-      (``fold=0``) is the slot. The second cannot fire, because it is not
-      strictly after the first.
+    - **Fall back** (a wall time happens twice): a fixed wall time fires at
+      its first occurrence (``fold=0``) only. A job whose minute or hour field
+      starts with ``*`` fires in the repeated hour too, as ``cron(8)`` does.
     - **Spring forward** (a wall time never happens): ``zoneinfo`` resolves the
       nonexistent time using the pre-transition offset, so e.g. a 02:30 job on
       the skipped day fires at the same instant that 02:30 standard time would
@@ -325,7 +326,13 @@ class CrontabSchedule(Schedule):
         # literally "*". "*/2" is a restriction.
         self._dom_restricted = self.dom_expr != "*"
         self._dow_restricted = self.dow_expr != "*"
+        # cron(8) runs a job whose minute or hour field starts with "*" again
+        # in a repeated fall back hour; only fixed wall times fire once.
+        self._repeats_in_fold = self.minute_expr.startswith("*") or (
+            self.hour_expr.startswith("*")
+        )
 
+        self._shifting_days: dict[_date, list[int]] = {}
         # Sorted (hour, minute) slots for one day; the scan below bisects it.
         self._hm: list[tuple[int, int]] = sorted(
             (h, m) for h in self.hours for m in self.minutes
@@ -345,10 +352,12 @@ class CrontabSchedule(Schedule):
             return dow_ok
         return True
 
-    def _instant_ms(self, d: _date, hour: int, minute: int) -> int:
+    def _instant_ms(self, d: _date, hour: int, minute: int, fold: int = 0) -> int:
         # fold=0 resolves an ambiguous (repeated) wall time to its FIRST
         # occurrence and a nonexistent one via the pre-transition offset.
-        naive = datetime(d.year, d.month, d.day, hour, minute, tzinfo=self.tz)
+        naive = datetime(
+            d.year, d.month, d.day, hour, minute, tzinfo=self.tz, fold=fold
+        )
         return int(naive.timestamp() * 1000)
 
     def _offset_changes_during(self, d: _date) -> bool:
@@ -357,6 +366,35 @@ class CrontabSchedule(Schedule):
         start = datetime(d.year, d.month, d.day, tzinfo=self.tz)
         end = datetime(after.year, after.month, after.day, tzinfo=self.tz)
         return start.utcoffset() != end.utcoffset()
+
+    def _shifting_day_instants(self, d: _date) -> list[int]:
+        """Every instant this schedule fires on a day whose offset changes.
+
+        Wall order equals instant order only while the offset holds still. On
+        a transition day it does not, because a nonexistent wall time resolves
+        through the offset in force BEFORE the jump: with a two hour spring
+        forward (Antarctica/Troll, +00 to +02) wall 02:30 lands at 02:30Z while
+        the real wall 03:30 lands at 01:30Z. So the whole day is resolved and
+        sorted, and the set collapses the ordinary one hour case, where the
+        phantom 02:30 and the real 03:30 are the same instant and fire once.
+        Memoized because a recovery fast forward asks for the same day once
+        per slot; the answer depends only on the definition and the day.
+        """
+        cached = self._shifting_days.get(d)
+        if cached is not None:
+            return cached
+        found: set[int] = set()
+        for hour, minute in self._hm:
+            first = self._instant_ms(d, hour, minute)
+            found.add(first)
+            if self._repeats_in_fold:
+                # fold=1 is LATER only for a repeated wall time; for a
+                # nonexistent one it is earlier and must not fire.
+                again = self._instant_ms(d, hour, minute, fold=1)
+                if again > first:
+                    found.add(again)
+        cached = self._shifting_days[d] = sorted(found)
+        return cached
 
     def next_after(self, slot_ms: int) -> int:
         slot_ms = int(slot_ms)
@@ -369,30 +407,18 @@ class CrontabSchedule(Schedule):
         # so an over-inclusive starting point is harmless.
         from_hm = (local.hour, local.minute)
         for offset in range(_MAX_SCAN_DAYS):
-            if self._date_matches(day):
-                # Wall order equals instant order only while the offset holds
-                # still. On a transition day it does not, because a nonexistent
-                # wall time resolves through the offset in force BEFORE the
-                # jump: with a two hour spring forward (Antarctica/Troll, +00 to
-                # +02) wall 02:30 lands at 02:30Z while the real wall 03:30
-                # lands at 01:30Z. Returning the first wall match would answer
-                # 02:30Z and lose 01:30Z permanently, so a shifting day is
-                # scanned in full and answered with the EARLIEST instant past
-                # the argument. Taking the minimum is also what collapses the
-                # ordinary one hour case, where the phantom 02:30 and the real
-                # 03:30 are the same instant and so must fire once, not twice.
-                shifting = self._offset_changes_during(day)
-                best: int | None = None
+            if self._date_matches(day) and self._offset_changes_during(day):
+                instants = self._shifting_day_instants(day)
+                i = bisect.bisect_right(instants, slot_ms)
+                if i < len(instants):
+                    return instants[i]
+            elif self._date_matches(day):
                 for hm in self._hm:
-                    if offset == 0 and not shifting and hm < from_hm:
+                    if offset == 0 and hm < from_hm:
                         continue
                     ms = self._instant_ms(day, hm[0], hm[1])
-                    if ms > slot_ms and (best is None or ms < best):
-                        best = ms
-                        if not shifting:
-                            break
-                if best is not None:
-                    return best
+                    if ms > slot_ms:
+                        return ms
             day = day + timedelta(days=1)
         raise ValueError(
             f"crontab {self!r} has no occurrence within {_MAX_SCAN_DAYS} days "

@@ -22,6 +22,7 @@ if TYPE_CHECKING:
     from cauli.result import AsyncResult
 
 _VALID_KINDS = ("io", "cpu")
+_U32_MAX = 2**32 - 1
 
 
 def _default_task_name(fn: Callable[..., Any]) -> str:
@@ -109,6 +110,27 @@ class TaskDef:
             raise ValueError(
                 f"soft_timeout ({soft_timeout}s) must be strictly less than timeout ({timeout}s)"
             )
+        max_retries = int(max_retries)
+        backoff_base_ms = int(round(backoff_base * 1000))
+        backoff_max_ms = int(round(backoff_max * 1000))
+        # The worker parses these as unsigned integers and refuses a zero
+        # timeout. Anything else dead letters every call of the task, mostly
+        # without a result key, so get() would wait forever.
+        if timeout_ms <= 0:
+            raise ValueError(f"timeout must be at least 0.001 seconds, got {timeout!r}")
+        if not 0 <= max_retries <= _U32_MAX:
+            raise ValueError(
+                f"max_retries must be between 0 and {_U32_MAX}, got {max_retries!r}"
+            )
+        for field, value_ms in (
+            ("soft_timeout", soft_timeout_ms),
+            ("backoff_base", backoff_base_ms),
+            ("backoff_max", backoff_max_ms),
+        ):
+            if value_ms is not None and value_ms < 0:
+                raise ValueError(
+                    f"{field} must be >= 0 seconds, got {value_ms / 1000:g}"
+                )
 
         self.app = app
         self.name: str = name or _default_task_name(fn)
@@ -123,17 +145,22 @@ class TaskDef:
         # cannot be read this way -- and reaches the same unchecked-call
         # outcome _check_signature used to reach through its except clause.
         try:
-            self._signature: inspect.Signature | None = inspect.signature(fn)
+            # follow_wrapped=False: the worker calls `fn` itself, so a
+            # functools.wraps decorator that injects or drops an argument must
+            # be checked against its own signature, not the wrapped one.
+            self._signature: inspect.Signature | None = inspect.signature(
+                fn, follow_wrapped=False
+            )
         except (TypeError, ValueError):
             self._signature = None
         self.kind: str = kind
         self.queue: str | None = queue
-        self.max_retries: int = int(max_retries)
+        self.max_retries: int = max_retries
         self.timeout_ms: int = timeout_ms
         self.soft_timeout_ms: int | None = soft_timeout_ms
-        self.backoff_base_ms: int = int(round(backoff_base * 1000))
+        self.backoff_base_ms: int = backoff_base_ms
         self.backoff_factor: float = float(backoff_factor)
-        self.backoff_max_ms: int = int(round(backoff_max * 1000))
+        self.backoff_max_ms: int = backoff_max_ms
         self.jitter: bool = bool(jitter)
         self.store_result: bool = bool(store_result)
 

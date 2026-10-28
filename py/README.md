@@ -5,7 +5,7 @@ Define tasks in Python, enqueue from any web framework, execute on the Rust work
 
 ## Install
 
-    pip install cauli               # Python >= 3.10 (deps: redis>=5, msgspec)
+    pip install cauli               # Python >= 3.10 (deps: redis>=5.0.1, msgspec, tzdata)
 
 That also installs the `cauli-worker` binary, but only where its wheels exist:
 Linux (glibc) on x86_64 or aarch64, CPython 3.10 through 3.14. Anywhere else, a

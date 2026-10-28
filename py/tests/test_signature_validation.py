@@ -5,6 +5,8 @@ call that can only ever fail once the worker invokes ``fn(*args, **kwargs)``.
 
 from __future__ import annotations
 
+import functools
+
 import pytest
 
 import cauli.task as task_module
@@ -108,4 +110,25 @@ def test_signature_check_falls_through_when_uninspectable(
 
     assert add._signature is None
     add.delay(a=1, bee=2)  # cannot be checked, so this must NOT raise
+    assert redis_client.xlen("cauli:q:default") == 1
+
+
+def test_wraps_decorator_that_injects_an_argument_is_not_rejected(app, redis_client):
+    # functools.wraps sets __wrapped__, and inspect.signature follows it to the
+    # INNER function by default. The worker calls the wrapper, not the inner
+    # function, so the check has to bind against what will actually be called.
+    def inject_session(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            return fn("session", *args, **kwargs)
+
+        return wrapper
+
+    @app.task()
+    @inject_session
+    def charge(session, order_id):
+        return order_id
+
+    assert charge(7) == 7
+    charge.delay(7)
     assert redis_client.xlen("cauli:q:default") == 1

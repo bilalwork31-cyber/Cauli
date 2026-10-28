@@ -418,3 +418,28 @@ def test_reaper_is_quiet_on_a_clean_exit(fs):
     log = fs.stderr()
     assert "killed by signal" not in log, f"a clean exit must not be logged: {log!r}"
     assert "exited with code" not in log, f"a clean exit must not be logged: {log!r}"
+
+
+@pytest.mark.parametrize("sig", [signal.SIGINT, signal.SIGTERM])
+def test_a_stop_signal_does_not_abort_a_running_task(fs, sig):
+    # A tty Ctrl+C or systemd's control-group stop signals the parent and
+    # every child along with the worker, which is draining this task.
+    child_pid = fs.fork()
+    child = fs.accept_child()
+    child.send(
+        {
+            "id": "s1",
+            "task": "sleepy",
+            "args": [1.0],
+            "kwargs": {},
+            "soft_timeout_ms": None,
+        }
+    )
+    time.sleep(0.3)
+    os.kill(fs.proc.pid, sig)
+    os.kill(child_pid, sig)
+    resp = child.recv()
+    assert resp["ok"] is True, resp
+    assert resp["result"] == "done"
+    assert fs.proc.poll() is None, "the fork-server parent died of the signal"
+    assert fs.fork() > 1

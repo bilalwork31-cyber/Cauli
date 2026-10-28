@@ -55,7 +55,7 @@ import os
 import threading
 from typing import Any, Iterable
 
-from cauli.app import Cauli
+from cauli.app import AsyncCauli, Cauli
 
 _SETTINGS_MAP = (
     ("CAULI_REDIS_URL", "redis_url"),
@@ -65,8 +65,9 @@ _SETTINGS_MAP = (
 )
 
 
-def django_app(settings_module: str | None = None, **overrides: Any) -> Cauli:
-    """Build a :class:`cauli.Cauli` app wired for a Django project.
+def django_app(settings_module: str | None = None, **overrides: Any) -> AsyncCauli:
+    """Build a :class:`cauli.AsyncCauli` app wired for a Django project, so an
+    async view can ``await task.adelay(...)`` instead of blocking its loop.
 
     ``settings_module`` (e.g. ``"myproj.settings"``) is applied via
     ``os.environ.setdefault("DJANGO_SETTINGS_MODULE", ...)``; omit it when the
@@ -95,7 +96,7 @@ def django_app(settings_module: str | None = None, **overrides: Any) -> Cauli:
     )
     kwargs.update(overrides)
 
-    app = Cauli(**kwargs)
+    app = AsyncCauli(**kwargs)
     # Order matters: the executor hook must run BEFORE close_old_connections
     # in the before-task phase, so the health check runs on the sticky thread
     # whose connection the task is about to use, not on asgiref's global one.
@@ -168,7 +169,7 @@ def install_orm_executors(app: Cauli, workers: int = DEFAULT_ORM_EXECUTORS) -> C
     if workers <= 0:
         return app
     try:
-        from asgiref.sync import SyncToAsync
+        from asgiref.sync import SyncToAsync, ThreadSensitiveContext
     except ImportError:
         return app  # no asgiref, no async ORM path to fix
     if not hasattr(SyncToAsync, "thread_sensitive_context") or not hasattr(
@@ -194,9 +195,10 @@ def install_orm_executors(app: Cauli, workers: int = DEFAULT_ORM_EXECUTORS) -> C
                 ex = ThreadPoolExecutor(
                     max_workers=1, thread_name_prefix=f"cauli-orm-{i}"
                 )
-                # The WeakKeyDictionary key must be weakref-able and must stay
-                # alive; a plain object held in the module list satisfies both.
-                token = _StickyToken(i)
+                # asgiref reads attributes off whatever the ContextVar holds
+                # (3.13 added ._exited), so hold its own type, never entered.
+                # The module list keeps the WeakKeyDictionary key alive.
+                token = ThreadSensitiveContext()
                 SyncToAsync.context_to_thread_executor[token] = ex
                 _orm_executors.append(ex)
                 _orm_tokens.append(token)
@@ -218,18 +220,6 @@ def install_orm_executors(app: Cauli, workers: int = DEFAULT_ORM_EXECUTORS) -> C
 
     app.before_task(cauli_assign_orm_executor)
     return app
-
-
-class _StickyToken:
-    """Weakref-able ContextVar value naming one sticky executor."""
-
-    __slots__ = ("__weakref__", "index")
-
-    def __init__(self, index: int) -> None:
-        self.index = index
-
-    def __repr__(self) -> str:  # pragma: no cover - debugging aid
-        return f"<cauli sticky-executor token {self.index}>"
 
 
 def install_db_hooks(app: Cauli) -> Cauli:
@@ -318,12 +308,12 @@ def autodiscover_tasks(
     ``packages``), so ``@app.task`` decorators in those modules register.
 
     Mirrors Celery's ``app.autodiscover_tasks()``: a package without a
-    ``tasks`` module is skipped silently; a ``tasks`` module that exists but
-    fails to import raises (a broken tasks module must be loud, not an
-    unregistered-task DLQ mystery at runtime). Returns the imported module
-    names. ``app`` is unused beyond intent (imports register against whatever
-    cauli app the task modules reference) but keeps call sites explicit about
-    which app the discovery is for.
+    ``tasks`` module is skipped silently; a package that fails to import, or
+    a ``tasks`` module that exists but fails to import, raises (either must be
+    loud, not an unregistered-task DLQ mystery at runtime). Returns the
+    imported module names. ``app`` is unused beyond intent (imports register
+    against whatever cauli app the task modules reference) but keeps call
+    sites explicit about which app the discovery is for.
     """
     del app  # see docstring
     if packages is None:
@@ -333,12 +323,10 @@ def autodiscover_tasks(
 
     imported: list[str] = []
     for pkg in packages:
+        if not hasattr(importlib.import_module(pkg), "__path__"):
+            continue  # a plain module app has no submodules
         module_name = f"{pkg}.{related_name}"
-        try:
-            spec = importlib.util.find_spec(module_name)
-        except ModuleNotFoundError:
-            spec = None  # the parent package itself has no such submodule
-        if spec is None:
+        if importlib.util.find_spec(module_name) is None:
             continue
         importlib.import_module(module_name)
         imported.append(module_name)

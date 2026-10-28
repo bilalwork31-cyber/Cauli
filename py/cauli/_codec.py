@@ -77,6 +77,12 @@ _decoder = _msgspec_json.Decoder()
 # error should say once what the wire format actually takes.
 _ALLOWED = "allowed types: str, int, float, bool, None, list, tuple, dict with str keys"
 
+# serde_json's default recursion limit in the worker: it refuses JSON with
+# more nested arrays/objects than this, counted from the document root. Past
+# it the whole envelope fails to parse, its task id cannot be recovered, and
+# no result is ever written for get() to find.
+_MAX_NESTING = 127
+
 
 def _push_path(exc: BaseException, segment: object) -> None:
     """Record one location segment on an in-flight validation failure.
@@ -117,7 +123,7 @@ def _render_path(segments: list[Any]) -> str:
     return "".join(parts)
 
 
-def _validate_json_types(obj: Any) -> None:
+def _validate_json_types(obj: Any, depth: int = 1) -> None:
     """Reject anything outside the JSON type set, non-finite floats, and
     non-str dict keys.
 
@@ -144,12 +150,14 @@ def _validate_json_types(obj: Any) -> None:
         if math.isfinite(obj):
             return
         raise ValueError("Out of range float values are not JSON compliant")
+    if depth > _MAX_NESTING and isinstance(obj, (dict, list, tuple)):
+        raise ValueError(f"nested deeper than {_MAX_NESTING} arrays/objects")
     if t is dict:
         for k, v in obj.items():
             if type(k) is not str:
                 raise TypeError(f"dict keys must be str, got {type(k).__name__}")
             try:
-                _validate_json_types(v)
+                _validate_json_types(v, depth + 1)
             except (TypeError, ValueError) as exc:
                 _push_path(exc, k)
                 raise
@@ -157,7 +165,7 @@ def _validate_json_types(obj: Any) -> None:
     if t is list or t is tuple:
         for i, v in enumerate(obj):
             try:
-                _validate_json_types(v)
+                _validate_json_types(v, depth + 1)
             except (TypeError, ValueError) as exc:
                 _push_path(exc, i)
                 raise
@@ -174,7 +182,7 @@ def _validate_json_types(obj: Any) -> None:
             if not isinstance(k, str):
                 raise TypeError(f"dict keys must be str, got {type(k).__name__}")
             try:
-                _validate_json_types(v)
+                _validate_json_types(v, depth + 1)
             except (TypeError, ValueError) as exc:
                 _push_path(exc, k)
                 raise
@@ -182,7 +190,7 @@ def _validate_json_types(obj: Any) -> None:
     if isinstance(obj, (list, tuple)):
         for i, v in enumerate(obj):
             try:
-                _validate_json_types(v)
+                _validate_json_types(v, depth + 1)
             except (TypeError, ValueError) as exc:
                 _push_path(exc, i)
                 raise

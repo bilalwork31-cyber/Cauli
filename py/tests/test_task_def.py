@@ -178,3 +178,22 @@ def test_explicit_name_skips_the_main_module_fixup_entirely(monkeypatch):
     _fake_main(monkeypatch)
     t = _offline_app().task(name="jobs.hello")(_main_fn())
     assert t.name == "jobs.hello"
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"timeout": 0},
+        {"timeout": 0.0001},
+        {"timeout": -1},
+        {"soft_timeout": -1},
+        {"max_retries": -1},
+        {"max_retries": 2**32},
+        {"backoff_base": -1},
+        {"backoff_max": -1},
+    ],
+)
+def test_options_the_worker_would_dead_letter_are_refused_at_decoration(options):
+    app = _offline_app()
+    with pytest.raises(ValueError):
+        app.task(**options)(lambda: None)

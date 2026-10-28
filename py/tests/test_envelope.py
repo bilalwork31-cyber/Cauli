@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import datetime, timezone
+
+import pytest
 
 from helpers import ENVELOPE_KEYS, assert_default_option_fields, now_ms
 
@@ -60,3 +63,50 @@ def test_each_delay_gets_unique_id_and_entry(app, redis_client):
     assert len(entries) == 2
     ids = {json.loads(fields[b"e"])["id"] for _sid, fields in entries}
     assert ids == {r1.id, r2.id}
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"idempotency_key": 42},
+        {"expires": datetime(1960, 1, 1, tzinfo=timezone.utc)},
+        {"expires": -2e12},
+        {"expires": 1e17},
+    ],
+    ids=[
+        "int_idempotency_key",
+        "expires_before_epoch",
+        "negative_expires",
+        "huge_expires",
+    ],
+)
+def test_options_the_worker_cannot_parse_are_refused_at_the_call_site(
+    app, redis_client, options
+):
+    # The worker parses these fields as a string and an unsigned 64 bit
+    # integer. Anything else fails the whole parse, the task id cannot be
+    # recovered, no result is ever written, and get() waits forever.
+    @app.task()
+    def t():
+        return None
+
+    with pytest.raises((TypeError, ValueError)):
+        t.apply_async(**options)
+    assert redis_client.xlen("cauli:q:default") == 0
+
+
+def test_arguments_nested_past_the_worker_parse_limit_are_refused(app, redis_client):
+    @app.task()
+    def t(x):
+        return None
+
+    def nest(depth):
+        value = 1
+        for _ in range(depth):
+            value = [value]
+        return value
+
+    t.delay(nest(125))
+    with pytest.raises(ValueError, match="nested"):
+        t.delay(nest(126))
+    assert redis_client.xlen("cauli:q:default") == 1

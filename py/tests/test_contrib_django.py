@@ -8,6 +8,7 @@ driven config, DB hook mechanics, autodiscovery, and on-commit enqueueing.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sys
 import tempfile
@@ -80,6 +81,26 @@ def test_django_app_reads_cauli_settings():
     ]
     assert len(app._after_task_hooks) == 1
     assert len(app._process_init_hooks) == 1
+
+
+def test_django_app_task_enqueues_without_blocking_from_a_coroutine(
+    redis_url, redis_client
+):
+    app = django_app(redis_url=redis_url)
+
+    @app.task(name="dj.adelay")
+    def t(x):
+        return x
+
+    async def async_view():
+        try:
+            return await t.adelay(5)
+        finally:
+            await app.aclose()
+
+    result = asyncio.run(async_view())
+    [(_id, fields)] = redis_client.xrange("cauli:q:dj-queue")
+    assert json.loads(fields[b"e"])["id"] == result.id
 
 
 def test_django_app_kwargs_override_settings():
@@ -295,6 +316,29 @@ def test_autodiscover_propagates_broken_tasks_module(tmp_path, monkeypatch):
     _write_pkg(tmp_path, "pkg_broken", "raise RuntimeError('broken tasks module')\n")
     with pytest.raises(RuntimeError, match="broken tasks module"):
         autodiscover_tasks(_app_no_redis(), packages=["pkg_broken"])
+
+
+def test_autodiscover_propagates_a_package_that_fails_to_import(tmp_path, monkeypatch):
+    monkeypatch.syspath_prepend(str(tmp_path))
+    _write_pkg(tmp_path, "pkg_dep_missing", "DISCOVERED = True\n")
+    (tmp_path / "pkg_dep_missing" / "__init__.py").write_text(
+        "import cauli_test_dependency_not_installed\n"
+    )
+    with pytest.raises(
+        ModuleNotFoundError, match="cauli_test_dependency_not_installed"
+    ):
+        autodiscover_tasks(_app_no_redis(), packages=["pkg_dep_missing"])
+
+
+def test_autodiscover_rejects_a_package_that_does_not_exist():
+    with pytest.raises(ModuleNotFoundError, match="cauli_no_such_package"):
+        autodiscover_tasks(_app_no_redis(), packages=["cauli_no_such_package"])
+
+
+def test_autodiscover_skips_a_plain_module(tmp_path, monkeypatch):
+    monkeypatch.syspath_prepend(str(tmp_path))
+    (tmp_path / "plain_module_app.py").write_text("")
+    assert autodiscover_tasks(_app_no_redis(), packages=["plain_module_app"]) == []
 
 
 def test_autodiscover_defaults_to_installed_apps():

@@ -3,8 +3,12 @@
 One ORM task and one no-DB probe per execution path (sync thread pool,
 embedded asyncio loop, forked cpu child)."""
 
+import asyncio
 import os
 import threading
+
+from asgiref.sync import sync_to_async
+from django.db import connection
 
 from django_site.cauli import app
 from django_site.dapp.models import Item
@@ -33,6 +37,28 @@ async def adb_add(name):
     # closes old connections for async tasks.
     await Item.objects.acreate(name=name)
     return _ctx({"count": await Item.objects.filter(name=name).acount()})
+
+
+def _orm_thread_and_backend():
+    with connection.cursor() as cur:
+        cur.execute("SELECT pg_backend_pid()")
+        return threading.current_thread().name, cur.fetchone()[0]
+
+
+@app.task(max_retries=0, timeout=20)
+async def adb_sticky(name):
+    # Where each async ORM call ran: asgiref thread and Postgres backend.
+    # The sleeps are real suspensions, so other tasks interleave.
+    seen = []
+    item = await Item.objects.acreate(name=name)
+    seen.append(await sync_to_async(_orm_thread_and_backend)())
+    await asyncio.sleep(0.05)
+    item = await Item.objects.aget(pk=item.pk)
+    seen.append(await sync_to_async(_orm_thread_and_backend)())
+    await asyncio.sleep(0.05)
+    await Item.objects.filter(pk=item.pk).aupdate(name=f"{name}-updated")
+    seen.append(await sync_to_async(_orm_thread_and_backend)())
+    return seen
 
 
 @app.task(kind="cpu", max_retries=0, timeout=20)
