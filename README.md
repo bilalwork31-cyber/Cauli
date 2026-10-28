@@ -126,7 +126,7 @@ install marker and the enqueue only install.
 ## Benchmarks
 
 Method, environment and every losing result: [bench/RESULTS.md](bench/RESULTS.md).
-Read [bench/CLAIMS.md](bench/CLAIMS.md) for what each number may claim.
+Each number comes from `python -m bench <name>`; [bench/README.md](bench/README.md) says what each one tests.
 
 | Measurement | cauli | Comparison |
 |---|---:|---|

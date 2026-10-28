@@ -16,7 +16,7 @@ done; issues labelled `good first issue`.
 | `worker/` | the Rust worker, including the embedded Python shim at `worker/src/shim.py` |
 | `py/` | the `cauli` client library and `cauli-beat` |
 | `itest/` | cross component tests: a real worker binary against a real Redis |
-| `bench/` | the benchmark campaign. Read `bench/CLAIMS.md` before any number in it |
+| `bench/` | the benchmarks: `python -m bench <name>`, see `bench/README.md` |
 | `docs/` | configuration, architecture and design decisions, Celery migration |
 
 ## Running the checks

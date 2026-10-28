@@ -6,10 +6,8 @@ session construction and closing a session that never ran a query need no
 I/O, so the suite proves the hook wiring and the ContextVar bookkeeping
 without a database, exactly the way ``test_contrib_django.py`` proves its
 hooks against a file backed sqlite database instead of a real Postgres
-server. The real worker, real Postgres proof (concurrent load through the
-actual ``cauli-worker`` binary, connections counted via ``pg_stat_activity``
-before and during the run) is a manual verification built on
-``bench/sqla_models.py``'s scaffolding, not a committed test.
+server. The real worker against real Postgres (concurrent load, connections
+counted in ``pg_stat_activity``) is ``itest/test_sqlalchemy.py``.
 """
 
 from __future__ import annotations
@@ -41,10 +39,9 @@ from cauli.contrib.sqlalchemy import (  # noqa: E402
 _FAKE_REDIS_URL = "redis://127.0.0.1:1/0"
 _FAKE_DATABASE_URL = "postgresql+psycopg://u:p@127.0.0.1:1/db"
 
-# The audit's throwaway Postgres, role and database both "bench", the same
-# instance bench/sqla_models.py points at. Only the one dispose test below
-# that needs a real, populated pool uses this; it skips itself when nothing
-# answers rather than failing the file in an environment without Postgres.
+# A local Postgres with role and database both "bench" (the benchmarks use
+# the same one). Only the tests that need a real pool use it, and they skip
+# when nothing answers.
 _BENCH_PG_DSN = os.environ.get(
     "BENCH_PG_DSN", "postgresql://bench:bench@127.0.0.1:5432/bench"
 )

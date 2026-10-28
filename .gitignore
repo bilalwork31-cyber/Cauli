@@ -20,5 +20,3 @@ _u/
 itest/worker.log
 *.log
 
-# Transient result file campaign.py overwrites each run
-bench/campaign_result.json
