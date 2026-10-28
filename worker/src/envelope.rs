@@ -8,11 +8,8 @@ fn d_v() -> u32 {
     1
 }
 
-/// Highest envelope protocol version this worker understands (PROTOCOL.md
-/// section 2). The protocol does not define forward compatibility for a
-/// higher `v`, so the conservative reading applies: accept the current
-/// version, reject anything newer rather than guess at a shape this build
-/// has never seen.
+/// Highest envelope `v` understood (PROTOCOL §2). Newer is rejected, since
+/// the protocol defines no forward compatibility.
 pub const PROTOCOL_VERSION: u32 = 1;
 fn d_queue() -> String {
     "default".to_string()
@@ -39,21 +36,14 @@ fn d_timeout() -> u64 {
     300_000
 }
 
-/// Ceiling accepted for `timeout_ms` at parse (the default above is already
-/// well under it). The recovery loop's `required_idle_ms = max(visibility
-/// timeout, timeout_ms + grace)` (worker/src/loops.rs) means a `timeout_ms`
-/// near u64::MAX makes a stuck entry effectively unreclaimable rather than
-/// merely slow to reclaim, so an extreme value is clamped here instead of
-/// left to saturating arithmetic further down the pipeline.
+/// `timeout_ms` clamp. Recovery waits `max(visibility, timeout_ms + grace)`
+/// (loops.rs), so a value near u64::MAX would make a stuck entry
+/// unreclaimable.
 const MAX_TIMEOUT_MS: u64 = 86_400_000; // 24h
 
-/// Core of the `deserialize_flexible_*` family below: a JSON integer is
-/// accepted as is; a JSON float is accepted only when it is an exact whole
-/// number in u64 range, since PROTOCOL.md invites any compliant JSON codec
-/// and several emit large integers in exponent form (`1.7e12`). A fractional
-/// value (`1.5`) is malformed, not rounded: silently truncating it would
-/// change what the caller asked for, which is why this cannot be simplified
-/// into a plain `as u64` cast.
+/// Integers as is; floats only when an exact whole number in u64 range,
+/// since some JSON codecs emit `1.7e12`. `1.5` is malformed, not truncated,
+/// so this cannot become a plain `as u64` cast.
 fn value_to_u64(v: &Value) -> Result<u64, String> {
     let n = match v {
         Value::Number(n) => n,
@@ -95,18 +85,9 @@ where
     }
 }
 
-/// `timeout_ms` gets its own wrapper on top of `deserialize_flexible_u64`: an
-/// extremely large value is clamped to `MAX_TIMEOUT_MS` here rather than
-/// rejected, since it plausibly means the caller wants an effectively
-/// unbounded timeout. Zero is also nonsense (PROTOCOL §4.6: a zero timeout
-/// elapses before any attempt can possibly finish) but is deliberately NOT
-/// rejected here. dispatch.rs checks it after a full, successful parse
-/// instead, the same way it already checks `v` against `PROTOCOL_VERSION`,
-/// so an otherwise valid id is still recoverable and a caller blocked in
-/// `AsyncResult.get()` gets a real "Malformed" answer rather than hanging.
-/// Failing the parse itself, as args/kwargs and the other flexible numeric
-/// fields do, would take that id down with it, same as any other
-/// unparseable envelope.
+/// Huge values clamp to `MAX_TIMEOUT_MS` (they mean "unbounded"). Zero is
+/// rejected later, in dispatch.rs after a full parse, so the id survives and
+/// a caller in `AsyncResult.get()` gets "Malformed" instead of hanging.
 fn deserialize_timeout_ms<'de, D>(deserializer: D) -> Result<u64, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -114,12 +95,9 @@ where
     Ok(deserialize_flexible_u64(deserializer)?.min(MAX_TIMEOUT_MS))
 }
 
-/// Task envelope, PROTOCOL §2. Unknown fields are preserved across
-/// deserialize -> mutate -> serialize (retry re-enqueue) via the flattened map.
-///
-/// `args` and `kwargs` stay the caller's own JSON text: the worker never
-/// reads them, so it never builds a tree for them, and a retry writes them
-/// back out verbatim. Absent and `null` both read as `None`.
+/// Task envelope, PROTOCOL §2. Unknown fields survive a retry re-enqueue
+/// via `extra`. `args` and `kwargs` stay the caller's JSON text and go back
+/// out verbatim; absent and `null` both read as `None`.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Envelope {
     #[serde(default = "d_v", deserialize_with = "deserialize_flexible_u32")]
@@ -167,12 +145,8 @@ pub struct Envelope {
     pub enqueued_at: u64,
     #[serde(default)]
     pub not_before: Option<f64>,
-    /// PROTOCOL §9.1. Absolute epoch-ms deadline past which this task is no
-    /// longer worth running: the worker discards it at dispatch instead of
-    /// executing it. Null means "no deadline". Deliberately absolute (not a
-    /// duration) so it survives a retry, a delayed-zset hop and a crash
-    /// redelivery unchanged, and so it means the same thing on a broker that
-    /// has no delayed-delivery primitive of its own.
+    /// PROTOCOL §9.1 epoch ms deadline, discarded unrun past it. Absolute so
+    /// it survives retries, delayed hops and redelivery unchanged.
     #[serde(default, deserialize_with = "deserialize_flexible_opt_u64")]
     pub expires_at: Option<u64>,
     #[serde(flatten)]
@@ -196,18 +170,10 @@ impl Envelope {
         self.kwargs.as_deref().unwrap_or(&EMPTY_OBJECT)
     }
 
-    /// §4.6 async lane deadlines, as `(soft_s, hard_s)` in seconds.
-    ///
-    /// `hard_s` is always this envelope's own `timeout_ms`. `soft_s` is
-    /// `Some` only when a soft limit was actually set AND lands strictly
-    /// before the hard one, the only case where it can do anything.
-    ///
-    /// This replaced a single `min(soft, hard)` value handed to one
-    /// `asyncio.wait_for`, which collapsed the pair: `SoftTimeLimitExceeded`
-    /// could never be raised, the task silently got the SOFT budget as its
-    /// whole budget, and a Celery migrant porting `soft_time_limit=30,
-    /// time_limit=300` lost 90% of the deadline with no warning and a
-    /// cleanup handler that could never fire.
+    /// §4.6 async deadlines `(soft_s, hard_s)`. `soft_s` is `Some` only when
+    /// set and strictly before hard. Never collapse to `min(soft, hard)`:
+    /// SoftTimeLimitExceeded could not fire and the soft budget would become
+    /// the whole budget.
     pub fn async_timeouts_s(&self) -> (Option<f64>, f64) {
         let hard_s = (self.timeout_ms as f64) / 1000.0;
         let soft_s = match self.soft_timeout_ms {
@@ -217,17 +183,10 @@ impl Envelope {
         (soft_s, hard_s)
     }
 
-    /// PROTOCOL §9.1/§9.2: the instant past which this entry must not run,
-    /// combining the envelope's own `expires_at` with the queue's configured
-    /// max age. The EARLIER of the two wins: a queue TTL is an operator-side
-    /// ceiling on how long anything may sit there, so a per-call `expires`
-    /// cannot be used to exceed it, and a queue TTL cannot extend a per-call
-    /// `expires` either.
-    ///
-    /// `queue_ttl_ms` is applied only when `enqueued_at` is present (a
-    /// crafted or ancient envelope with `enqueued_at == 0` would otherwise be
-    /// judged expired by ~55 years and dropped). `saturating_add` keeps a
-    /// hostile `enqueued_at` near u64::MAX from wrapping into a past deadline.
+    /// PROTOCOL §9.1/§9.2 deadline: the earlier of `expires_at` and
+    /// `enqueued_at + queue_ttl_ms`. The TTL applies only when `enqueued_at`
+    /// is set (0 would read as expired decades ago); saturating so a hostile
+    /// `enqueued_at` cannot wrap into the past.
     pub fn expiry_deadline_ms(&self, queue_ttl_ms: Option<u64>) -> Option<u64> {
         let by_ttl = match (queue_ttl_ms, self.enqueued_at) {
             (Some(ttl), enq) if enq > 0 => Some(enq.saturating_add(ttl)),
@@ -253,21 +212,14 @@ pub struct ErrorJson {
     pub message: String,
     #[serde(default)]
     pub traceback: String,
-    /// §8 `origin`: `"worker"` when cauli machinery synthesized this object,
-    /// `"task"` when an exception propagated out of user code. Empty means
-    /// unknown, which happens only for an executor response written before
-    /// the field existed; it is then omitted from the wire rather than sent
-    /// as `""`, since the empty string is not one of the defined values.
+    /// §8 `origin`: `"worker"` or `"task"`. Empty (an executor that does not
+    /// send it) is omitted from the wire, since `""` is not a defined value.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub origin: String,
 }
 
 impl ErrorJson {
-    /// Every Rust side construction is cauli machinery minting an error for
-    /// a task that raised nothing, so origin is `"worker"` by construction
-    /// and there is no call site that has to remember to set it. The one
-    /// error object Rust does NOT mint, the one decoded from an executor
-    /// response, carries the origin Python put on it.
+    /// Every Rust minted error is cauli machinery, so origin is `"worker"`.
     pub fn new(type_: &str, message: impl Into<String>) -> Self {
         ErrorJson {
             type_: type_.to_string(),
@@ -287,9 +239,7 @@ struct FailureResult<'a> {
     finished_at: u64,
 }
 
-/// `result_json` is JSON text the executor already encoded (msgspec, in the
-/// shim or the cpu child), embedded as is rather than parsed and written
-/// again.
+/// `result_json` is JSON text the executor already encoded, embedded as is.
 pub fn result_success(result_json: &str, finished_at: u64) -> String {
     format!(
         r#"{{"status":"success","result":{result_json},"error":null,"finished_at":{finished_at}}}"#
@@ -306,12 +256,9 @@ pub fn result_failure(error: &ErrorJson, finished_at: u64) -> String {
     .expect("result envelope is always serializable")
 }
 
-/// §4.5 suppression. `claimant_id` names the task that holds the key, and it
-/// is the only thread a suppressed caller has: a claim is never released, so
-/// a resubmission after the claimant was dead lettered is suppressed too, and
-/// without the id there is no way to discover that the work never succeeded.
-/// Null only in the race where the key expired between the failed claim and
-/// the read of its holder.
+/// §4.5 suppression. A claim is never released, so `claimant_id` is the
+/// caller's only way to learn the holder was dead lettered. Null only if the
+/// key expired between the failed claim and the read.
 pub fn result_duplicate(finished_at: u64, claimant_id: &str) -> String {
     serde_json::json!({
         "status": "duplicate",
@@ -323,11 +270,8 @@ pub fn result_duplicate(finished_at: u64, claimant_id: &str) -> String {
     .to_string()
 }
 
-/// §9.1: a task discarded unrun past its deadline. Its own status rather than
-/// a `"failure"`, because it is not one — the task never ran, so there is no
-/// exception, no traceback and nothing to retry. The error object is carried
-/// anyway so a client that only knows `failure`/`success` still gets a usable
-/// `type`/`message` out of it.
+/// §9.1 discarded unrun: its own status, not a failure. The error object is
+/// still carried for clients that only know `failure`/`success`.
 pub fn result_expired(deadline_ms: u64, finished_at: u64) -> String {
     serde_json::json!({
         "status": "expired",
@@ -347,9 +291,8 @@ pub fn result_expired(deadline_ms: u64, finished_at: u64) -> String {
     .to_string()
 }
 
-/// Truncate `s` to at most `max_bytes` bytes, backing off to the nearest
-/// preceding UTF-8 char boundary so multibyte input (audit H4 — executor
-/// garbage, oversize envelopes) can never panic on a byte-index slice.
+/// At most `max_bytes`, backed off to a char boundary so untrusted multibyte
+/// input cannot panic the slice.
 pub fn safe_truncate(s: &str, max_bytes: usize) -> &str {
     if s.len() <= max_bytes {
         return s;
@@ -451,8 +394,6 @@ mod tests {
         assert_eq!(e.idempotency_key, None);
         assert!(e.store_result);
         assert_eq!(e.not_before, None);
-        // null args/kwargs normalize to an empty array/object rather than
-        // reaching a task as None.
         assert_eq!(e.args_raw().get(), "[]");
         assert_eq!(e.kwargs_raw().get(), "{}");
     }
@@ -464,21 +405,15 @@ mod tests {
         assert!(serde_json::from_str::<Envelope>(r#"{"id":"x"}"#).is_err()); // no task
     }
 
-    /// The async lane must carry BOTH deadlines, never their min: the soft
-    /// mark is where `SoftTimeLimitExceeded` is raised and the hard one stays
-    /// the backstop. `min(soft, hard)` is the exact bug this replaced.
     #[test]
     fn async_timeouts_keep_soft_and_hard_apart() {
         let mut e: Envelope = serde_json::from_str(r#"{"id":"a","task":"t"}"#).unwrap();
         e.timeout_ms = 10_000;
         assert_eq!(e.async_timeouts_s(), (None, 10.0));
 
-        // The Celery migration shape: soft_time_limit=4, time_limit=10. The
-        // hard budget must stay 10, not collapse to 4.
         e.soft_timeout_ms = Some(4_000);
         assert_eq!(e.async_timeouts_s(), (Some(4.0), 10.0));
 
-        // soft >= hard can never fire, so it is dropped rather than armed.
         e.soft_timeout_ms = Some(50_000);
         assert_eq!(e.async_timeouts_s(), (None, 10.0));
         e.soft_timeout_ms = Some(10_000);
@@ -487,50 +422,35 @@ mod tests {
         assert_eq!(e.async_timeouts_s(), (None, 10.0));
     }
 
-    /// §9.1/§9.2: the deadline is the EARLIER of the envelope's own
-    /// `expires_at` and `enqueued_at + queue_ttl`, in both directions.
     #[test]
     fn expiry_deadline_takes_the_earlier_of_expires_and_queue_ttl() {
         let mut e: Envelope = serde_json::from_str(r#"{"id":"a","task":"t"}"#).unwrap();
         e.enqueued_at = 1_000_000;
 
-        // Neither set: no deadline at all.
         assert_eq!(e.expiry_deadline_ms(None), None);
 
-        // Only the envelope's own expiry.
         e.expires_at = Some(1_060_000);
         assert_eq!(e.expiry_deadline_ms(None), Some(1_060_000));
 
-        // Only the queue TTL.
         e.expires_at = None;
         assert_eq!(e.expiry_deadline_ms(Some(30_000)), Some(1_030_000));
 
-        // Both: queue TTL is the tighter one and wins (a per-call `expires`
-        // cannot be used to sit in a TTL-bounded queue longer than allowed).
         e.expires_at = Some(1_060_000);
         assert_eq!(e.expiry_deadline_ms(Some(30_000)), Some(1_030_000));
 
-        // Both: the envelope's own expiry is tighter and wins.
         e.expires_at = Some(1_010_000);
         assert_eq!(e.expiry_deadline_ms(Some(30_000)), Some(1_010_000));
     }
 
-    /// A queue TTL needs a real `enqueued_at` to mean anything. Without this
-    /// guard an envelope missing the field (0) would be "expired" by decades
-    /// and every such entry would be silently discarded.
     #[test]
     fn queue_ttl_ignored_without_enqueued_at() {
         let mut e: Envelope = serde_json::from_str(r#"{"id":"a","task":"t"}"#).unwrap();
         assert_eq!(e.enqueued_at, 0);
         assert_eq!(e.expiry_deadline_ms(Some(30_000)), None);
-        // ... but an explicit expires_at still applies.
         e.expires_at = Some(7);
         assert_eq!(e.expiry_deadline_ms(Some(30_000)), Some(7));
     }
 
-    /// H3-style overflow guard: a hostile `enqueued_at` near u64::MAX must not
-    /// wrap the queue-TTL deadline into the past (which would expire every
-    /// task on that queue).
     #[test]
     fn queue_ttl_deadline_saturates_instead_of_wrapping() {
         let mut e: Envelope = serde_json::from_str(r#"{"id":"a","task":"t"}"#).unwrap();
@@ -545,8 +465,6 @@ mod tests {
         let back: Value = serde_json::from_str(&serde_json::to_string(&e).unwrap()).unwrap();
         assert_eq!(back["expires_at"], 1_700_000_060_000u64);
 
-        // Absent in an older client's envelope: null, never a bogus 0 (which
-        // would read as "expired in 1970" and discard the task).
         let old: Envelope = serde_json::from_str(r#"{"id":"a","task":"t"}"#).unwrap();
         assert_eq!(old.expires_at, None);
     }
@@ -599,10 +517,6 @@ mod tests {
         assert_eq!(v["error"], Value::Null);
     }
 
-    /// A suppressed caller gets nothing back but this result, so the id of
-    /// the task that holds the key has to travel in it: the claim is never
-    /// released, and after the claimant is dead lettered the only way to
-    /// find out the work never succeeded is `cauli:result:{claimant_id}`.
     #[test]
     fn duplicate_result_carries_the_claimant_id() {
         let claimant = "0123456789abcdef0123456789abcdef";
@@ -610,16 +524,10 @@ mod tests {
         assert_eq!(v["claimant_id"], claimant);
         assert_eq!(v["finished_at"], 9);
 
-        // Unknown holder (the key expired mid claim) reports null rather
-        // than an empty string a caller would have to special case.
         let v: Value = serde_json::from_str(&result_duplicate(9, "")).unwrap();
         assert_eq!(v["claimant_id"], Value::Null);
     }
 
-    /// H4 regression: a naive `&s[..512]` panics when byte 512 lands inside a
-    /// multibyte char. Build a string where that is guaranteed (3-byte chars
-    /// don't divide 512 evenly) and confirm safe_truncate never panics and
-    /// never returns a string longer than the cap.
     #[test]
     fn safe_truncate_never_panics_on_multibyte_boundary() {
         let s = "€".repeat(200); // 600 bytes, 3 bytes/char; 512 is mid-char
@@ -631,15 +539,6 @@ mod tests {
         assert_eq!(safe_truncate(short, 512), "hello");
     }
 
-    // Bug: a wrongly typed args/kwargs must be rejected before execution,
-    // never reach fn(*args, **kwargs). The shape gate itself lives in
-    // dispatch.rs (args_kwargs_shape_ok), not here: see that module's
-    // tests for the array/object/null cases. Deserialize still accepts
-    // any JSON type for these two fields, unchanged.
-
-    /// Regression coverage requested alongside the fix above: a legitimate
-    /// envelope with args/kwargs absent, and one with them present but
-    /// empty, must both still normalize to an empty array/object.
     #[test]
     fn args_kwargs_absent_or_empty_still_normalize_correctly() {
         let absent: Envelope = serde_json::from_str(r#"{"id":"a","task":"t"}"#).unwrap();
@@ -652,24 +551,14 @@ mod tests {
         assert_eq!(empty.kwargs_raw().get(), "{}");
     }
 
-    // Bug: timeout_ms 0 guarantees a hard timeout on every attempt.
-    // Rejected in dispatch.rs (after a successful parse, like the `v`
-    // version check), not here: see this file's doc comment on
-    // deserialize_timeout_ms for why.
-
+    /// Zero is rejected in dispatch.rs, not at parse (deserialize_timeout_ms).
     #[test]
     fn timeout_ms_zero_parses_here_unclamped() {
         let e: Envelope = serde_json::from_str(r#"{"id":"a","task":"t","timeout_ms":0}"#).unwrap();
         assert_eq!(e.timeout_ms, 0);
     }
 
-    /// A value near u64::MAX must not make the recovery loop's
-    /// required_idle_ms effectively infinite (worker/src/loops.rs); it is
-    /// clamped rather than rejected, since it plausibly means "never time
-    /// out" rather than a malformed request. The clamp value (86_400_000 =
-    /// 24h) is hardcoded rather than referencing the implementation's own
-    /// constant, so a change to that constant fails this test instead of
-    /// trivially passing it.
+    /// The 24h clamp is hardcoded so a change to MAX_TIMEOUT_MS fails here.
     #[test]
     fn timeout_ms_huge_value_clamped_not_rejected() {
         let e: Envelope =
@@ -681,7 +570,6 @@ mod tests {
             serde_json::from_str(r#"{"id":"a","task":"t","timeout_ms":999999999999}"#).unwrap();
         assert_eq!(e.timeout_ms, 86_400_000);
 
-        // Just at and just under the ceiling: passed through unclamped.
         let e: Envelope =
             serde_json::from_str(r#"{"id":"a","task":"t","timeout_ms":86400000}"#).unwrap();
         assert_eq!(e.timeout_ms, 86_400_000);
@@ -689,8 +577,6 @@ mod tests {
             serde_json::from_str(r#"{"id":"a","task":"t","timeout_ms":86399999}"#).unwrap();
         assert_eq!(e.timeout_ms, 86_399_999);
     }
-
-    // Bug: integers in exponent or float form rejected outright.
 
     #[test]
     fn integral_float_accepted_for_integer_fields() {
@@ -724,12 +610,8 @@ mod tests {
         assert_eq!(e.expires_at, None);
     }
 
-    /// The whole risk of the fix above: a fractional value must still be
-    /// rejected, not rounded; NaN, infinity and out of range floats must be
-    /// rejected too, not saturated into a plausible looking integer.
     #[test]
     fn fractional_and_non_finite_and_out_of_range_floats_rejected() {
-        // fractional: must not be silently rounded
         assert!(
             serde_json::from_str::<Envelope>(r#"{"id":"a","task":"t","timeout_ms":1.5}"#).is_err()
         );
@@ -737,7 +619,6 @@ mod tests {
             serde_json::from_str::<Envelope>(r#"{"id":"a","task":"t","enqueued_at":1.1}"#).is_err()
         );
 
-        // negative: out of range for an unsigned field, integer or float form
         assert!(
             serde_json::from_str::<Envelope>(r#"{"id":"a","task":"t","timeout_ms":-5}"#).is_err()
         );
@@ -746,32 +627,25 @@ mod tests {
                 .is_err()
         );
 
-        // infinity: a plain JSON number token can overflow f64 to infinity
-        // with no "Infinity" keyword involved, so this must reach and fail
-        // the finiteness check rather than being merely unreachable.
+        // A plain number token can overflow f64 to infinity.
         assert!(
             serde_json::from_str::<Envelope>(r#"{"id":"a","task":"t","enqueued_at":1e400}"#)
                 .is_err()
         );
 
-        // huge but finite float: out of u64 range
         assert!(
             serde_json::from_str::<Envelope>(r#"{"id":"a","task":"t","enqueued_at":1e30}"#)
                 .is_err()
         );
 
-        // out of range for u32 specifically (v is u32)
         assert!(
             serde_json::from_str::<Envelope>(r#"{"id":"a","task":"t","v":4294967296.0}"#).is_err()
         );
         assert!(serde_json::from_str::<Envelope>(r#"{"id":"a","task":"t","v":1.0}"#).is_ok());
     }
 
-    /// A retry re-enqueues args and kwargs as the exact text the caller
-    /// wrote: key order, integers past 64 bits, `-0.0`, escapes and
-    /// whitespace all survive, so the next attempt's task sees the same
-    /// values the first one did. The unknown field passthrough keeps its own
-    /// exact digits and key order too.
+    /// Key order, integers past 64 bits, `-0.0`, escapes and whitespace all
+    /// survive a retry re-enqueue.
     #[test]
     fn retry_reserialize_copies_args_and_kwargs_verbatim() {
         let args = r#"[{"zeta":1,"alpha":2}, 338958331192819208857724424333372550912, -0.0, "caf\u00e9 \ud83d\ude00", [[[]]]]"#;
@@ -792,14 +666,11 @@ mod tests {
             back.contains(r#""meta":{"z":123456789012345678901234567890,"a":2}"#),
             "{back}"
         );
-        // ...and what goes back out is an envelope this worker reads again.
         let again: Envelope = serde_json::from_str(&back).unwrap();
         assert_eq!(again.args_raw().get(), args);
         assert_eq!(again.retries, 1);
     }
 
-    /// Absent and explicit null both go back out as `null`, which is what
-    /// the previous `Value` field wrote for them.
     #[test]
     fn null_or_absent_args_reserialize_as_null() {
         for raw in [

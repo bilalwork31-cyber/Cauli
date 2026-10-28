@@ -1,16 +1,10 @@
 //! Embedded CPython integration.
 //!
-//! Rules honored here:
-//! - `pyo3::prepare_freethreaded_python()` once at startup, before tokio.
-//! - The GIL is only ever taken on dedicated OS threads (sync pool) or inside
-//!   `spawn_blocking` (async submit). Tokio worker threads never hold the GIL
-//!   while doing broker I/O.
-//! - All Python-side complexity lives in the embedded shim (src/shim.py).
-//! - Task arguments cross as the caller's JSON text and results come back as
-//!   JSON text, both turned into and out of Python objects by msgspec (the
-//!   shim's `_decode` and `_encode`), the codec the client and the cpu child
-//!   use. The worker never builds a tree for either; a result only passes
-//!   the type gate in src/pyjson.rs on its way to the encoder.
+//! - The GIL is only taken on dedicated OS threads (sync pool, async
+//!   submitter). Tokio worker threads never hold it.
+//! - Python-side logic lives in the embedded shim (src/shim.py).
+//! - Args and results cross as JSON text, decoded and encoded by msgspec, the
+//!   codec the client and the cpu child use.
 
 use crate::ctx::Outcome;
 use crate::envelope::ErrorJson;
@@ -24,13 +18,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
 
-/// Registry entry parsed from shim `load_app` JSON (PROTOCOL §6 attributes).
-/// Routing uses kind/is_async; timeout_ms feeds the H1 startup invariant
-/// check (main.rs). shim.py's `load_app` sends several more attributes
-/// (max_retries, backoff_*, jitter, store_result, queue) that only matter
-/// per-envelope at execution time (§4.2/§4.6 math always uses the envelope's
-/// own values, never the registry) — serde ignores those extra JSON fields
-/// rather than the struct carrying dead fields nothing reads.
+/// Registry entry parsed from shim `load_app` JSON (PROTOCOL §6). The shim
+/// sends more attributes; retry math always uses the envelope's own values, so
+/// serde ignores them.
 #[derive(Deserialize, Clone, Debug)]
 pub struct TaskSpec {
     pub kind: String,
@@ -45,7 +35,6 @@ pub struct AppConfig {
     pub result_ttl: u64,
     pub idemp_ttl: u64,
     /// PROTOCOL §9.2: `{queue: seconds}` with `"*"` as the fallback key.
-    /// `default` because an app object predating queue TTLs must still load.
     #[serde(default)]
     pub queue_ttl: HashMap<String, f64>,
     pub tasks: HashMap<String, TaskSpec>,
@@ -58,31 +47,18 @@ pub struct PyRuntime {
     encode: Py<PyAny>,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Outcome>>>>,
     next_token: AtomicU64,
-    /// Async submissions are queued here and drained by ONE dedicated
-    /// submitter thread (see `init`), one GIL entry per batch. The previous
-    /// design took the GIL from a fresh `spawn_blocking` closure per task;
-    /// at high --io-concurrency that inflated tokio's blocking pool toward
-    /// its 512-thread cap, all of them convoying on the GIL against the
-    /// event-loop thread that was trying to run the tasks (measured: 527 OS
-    /// threads and a 20 ms task body inflated to 92 ms p99 at 2048 in
-    /// flight). A single submitter deletes the convoy and the pool usage;
-    /// submission order becomes FIFO, which the racing closures never were.
+    /// Drained by one submitter thread (see `init`), one GIL entry per batch.
+    /// A GIL entry per task from `spawn_blocking` convoys hundreds of blocking
+    /// threads on the GIL against the event loop thread running the tasks.
     submit_tx: crossbeam_channel::Sender<SubmitJob>,
-    /// MEM-5: cumulative submissions the shim rejected because a loop's own
-    /// pending list was at cap (stats: `async_rejected`). Counted here
-    /// rather than polled from Python: the GIL may only be taken on a
-    /// dedicated thread or inside spawn_blocking (see the module doc above),
-    /// and submit_batch_under_gil already holds it once per batch anyway.
+    /// Submissions the shim rejected because a loop's pending list was at cap
+    /// (stats: `async_rejected`). Counted here, where the GIL is already held.
     async_rejected: AtomicU64,
 }
 
-/// The envelope facts a running task can read back about itself through
-/// `cauli.current_task()` (py/cauli/_context.py). Crosses into the shim as a
-/// single `(id, retries, max_retries, queue)` tuple: one tuple rather than
-/// four extra argument slots on the two hottest pyo3 calls in the process.
-///
-/// `id` is the envelope id the enqueuing side holds as `AsyncResult.id`, not
-/// the cpu lane's suffixed wire id.
+/// What `cauli.current_task()` reads. Crosses into the shim as one
+/// `(id, retries, max_retries, queue)` tuple. `id` is the envelope id the
+/// caller holds as `AsyncResult.id`, not the cpu lane's suffixed wire id.
 #[derive(Clone)]
 pub struct TaskMeta {
     pub id: String,
@@ -104,8 +80,7 @@ impl TaskMeta {
     }
 }
 
-/// One queued async submission. Owns its data: the envelope's args/kwargs
-/// JSON text is copied at queue time.
+/// One queued async submission; args/kwargs text is copied at queue time.
 struct SubmitJob {
     token: u64,
     name: String,
@@ -113,27 +88,20 @@ struct SubmitJob {
     kwargs: String,
     /// Hard deadline (envelope `timeout_ms`), seconds.
     timeout_s: f64,
-    /// Soft deadline, seconds, when one is set and lands strictly before the
-    /// hard one (`envelope::async_timeouts_s`). `None` means no soft limit.
-    /// The two travel separately so the shim can raise
-    /// `SoftTimeLimitExceeded` at the soft mark and still keep the hard
-    /// deadline as the backstop, instead of collapsing them to their minimum.
+    /// Soft deadline, seconds, set only when it lands before the hard one.
+    /// Kept separate so the shim raises `SoftTimeLimitExceeded` at the soft
+    /// mark and keeps the hard deadline as the backstop.
     soft_timeout_s: Option<f64>,
-    /// Backs `cauli.current_task()` inside the coroutine. `None` only from
-    /// call sites with no envelope behind them (unit tests).
+    /// Backs `cauli.current_task()`. `None` only in unit tests.
     meta: Option<TaskMeta>,
 }
 
-/// Args JSON text into Python objects. msgspec reads any buffer, so it gets a
-/// read only memoryview of the Rust string rather than a PyBytes copy of it:
-/// on a large payload that copy, and the trim of the big allocation behind
-/// it, cost more than the decode. The view is released before returning, so
-/// nothing that kept a reference to it can reach the borrowed memory after.
+/// Args JSON text into Python objects. msgspec gets a read only memoryview of
+/// the Rust string: a PyBytes copy of a large payload costs more than the
+/// decode. The view is released before returning.
 fn decode_text<'py>(decode: &Bound<'py, PyAny>, text: &str) -> PyResult<Bound<'py, PyAny>> {
     let py = decode.py();
-    // A task called with no args or no kwargs is the common case, and every
-    // call here holds the GIL that caps the io lanes' rate: build the empty
-    // container directly rather than run a view and a decoder for it.
+    // Empty args or kwargs is the common case and this runs under the GIL.
     match text {
         "[]" => return Ok(PyList::empty(py).into_any()),
         "{}" => return Ok(PyDict::new(py).into_any()),
@@ -156,12 +124,10 @@ fn decode_text<'py>(decode: &Bound<'py, PyAny>, text: &str) -> PyResult<Bound<'p
     decoded
 }
 
-/// A task result as JSON text: the type gate, then msgspec. Either one
-/// failing is the same terminal SerializationError the cpu child reports:
-/// retrying re-runs the task to fail identically.
+/// A task result as JSON text: the type gate, then msgspec. Either failing is
+/// a terminal SerializationError, as in the cpu child.
 fn encode_result(result: &Bound<'_, PyAny>, encode: &Bound<'_, PyAny>) -> Outcome {
-    // A task that returns nothing, written exactly as msgspec writes None,
-    // without a GIL held call into the encoder (see `decode_text`).
+    // None, written exactly as msgspec writes it, without calling the encoder.
     if result.is_none() {
         return Outcome::Success("null".to_owned());
     }
@@ -186,10 +152,8 @@ fn encode_result(result: &Bound<'_, PyAny>, encode: &Bound<'_, PyAny>) -> Outcom
     }
 }
 
-/// Normalize the shim's outcome dict (a real Python object, not JSON text)
-/// into an `Outcome`. Mirrors `ctx::parse_pyresp` field for field so the two
-/// entry points cannot drift; the only difference is where the data comes
-/// from.
+/// The shim's outcome dict into an `Outcome`. Mirrors `ctx::parse_pyresp`
+/// field for field; keep the two in step.
 fn outcome_from_py(obj: &Bound<'_, PyAny>, encode: &Bound<'_, PyAny>) -> Outcome {
     let get = |k: &str| obj.get_item(k).ok();
     let flag = |k: &str| {
@@ -221,9 +185,8 @@ fn outcome_from_py(obj: &Bound<'_, PyAny>, encode: &Bound<'_, PyAny>) -> Outcome
                 type_,
                 message: f("message"),
                 traceback: f("traceback"),
-                // Passed through, not decided here: the shim knows whether an
-                // exception left user code. Absent stays empty (unknown) so
-                // §8 omits it rather than guessing.
+                // Only the shim knows whether an exception left user code.
+                // Absent stays empty so §8 omits it.
                 origin: f("origin"),
             })
         })
@@ -243,16 +206,9 @@ fn outcome_from_py(obj: &Bound<'_, PyAny>, encode: &Bound<'_, PyAny>) -> Outcome
     Outcome::Failure { err, retryable }
 }
 
-/// msgspec refuses args the worker's parse let through only for a property of
-/// the payload itself (a float literal past f64 range, a lone surrogate
-/// escape), never for a transient shim or environment problem, so a retry
-/// would decode the identical text and fail identically every time.
-/// Classified the same as a result that cannot be encoded (`encode_result`
-/// above) rather than left to fall into the generic `WorkerShimError` catch
-/// all below: that type name reads as "the shim itself misbehaved", which
-/// sends the next reader looking in the wrong place, and worse, is
-/// retryable, which would burn the full backoff schedule on a payload that
-/// can never succeed.
+/// msgspec refuses args only for a property of the payload (a float past f64
+/// range, a lone surrogate), so a retry fails identically. Terminal, not the
+/// retryable `WorkerShimError` that would burn the whole backoff schedule.
 fn args_failure_outcome(py: Python<'_>, e: &PyErr) -> Outcome {
     Outcome::Failure {
         err: ErrorJson::new(
@@ -266,11 +222,8 @@ fn args_failure_outcome(py: Python<'_>, e: &PyErr) -> Outcome {
     }
 }
 
-/// Matches the caps already enforced Python side (shim.py's `_MAX_TB`,
-/// _exec.py's `_TRACEBACK_CAP`, both 8192): `pyerr_string` below feeds
-/// `ErrorJson`, which is written into Redis result keys and DLQ entries
-/// verbatim, so an unbounded exception message or traceback would land
-/// there whole.
+/// Bounds error text written verbatim into result keys and DLQ entries.
+/// Matches shim.py's `_MAX_TB` and _exec.py's `_TRACEBACK_CAP`.
 const MAX_PYERR_CHARS: usize = 8192;
 
 fn pyerr_string(py: Python<'_>, e: &PyErr) -> String {
@@ -284,34 +237,16 @@ fn pyerr_string(py: Python<'_>, e: &PyErr) -> String {
     crate::envelope::safe_truncate(&s, MAX_PYERR_CHARS).to_string()
 }
 
-/// One `PyRuntime` per process, enforced rather than left to the fact that
-/// main.rs happens to have the only call site.
-///
-/// shim.py keeps every piece of its dispatch state (`_loops`, `_pending`,
-/// `_registry`, `_callback`) in module globals, and the shim is published in
-/// `sys.modules` under one fixed name, `cauli_worker_shim`, which loops.rs
-/// imports back by that name. `PyModule::from_code` therefore cannot produce
-/// a second, independent shim: `PyImport_ExecCodeModuleEx` finds the module
-/// already registered and runs the source again in ITS dict. A second `init`
-/// would empty the first runtime's loop list and submission queues and take
-/// over the single completion callback, after which the first runtime's
-/// completions arrive at a pending map that no longer holds their tokens and
-/// are dropped. Every task it still had in flight would then hang to its
-/// backstop timeout with nothing logged anywhere, which is the failure this
-/// guard exists to convert into an immediate startup error.
+/// One `PyRuntime` per process, enforced. The shim's dispatch state lives in
+/// module globals under one fixed `sys.modules` name, so a second `init`
+/// reruns the shim in the same dict and takes over the completion callback:
+/// the first runtime's in flight tasks would hang silently to their timeout.
 static RUNTIME_BUILT: AtomicBool = AtomicBool::new(false);
 
-/// The interpreter cpu children should run, as `shim.cpu_child_python()`
-/// picks it: one that loads the same libpython this worker embeds, or None
-/// when the embedding gives no path (a statically linked or frozen build).
-///
-/// This is the default for `--python`. A bare `"python3"` off `PATH` finds
-/// the base interpreter with no `cauli` in it under a systemd unit or Docker
-/// `CMD` that never activates the venv, and the embedded `sys.executable` is
-/// itself only a `PATH` guess: on a uv, pyenv or free threaded build it named
-/// a different CPython, whose children could not import the app's C
-/// extensions. A misrouted interpreter fails the fork server, the cpu
-/// backlog fills, and the fetch loop's backlog gate stops io work too.
+/// Default for `--python`: an interpreter loading the same libpython this
+/// worker embeds (`shim.cpu_child_python()`), or None for a static or frozen
+/// build. `python3` off `PATH` or `sys.executable` can name a different
+/// CPython that cannot import the app's C extensions.
 pub fn interpreter_executable() -> Option<String> {
     Python::attach(|py| {
         let exe: String = py
@@ -330,12 +265,9 @@ pub fn interpreter_executable() -> Option<String> {
 impl PyRuntime {
     /// Initialize the interpreter, import the shim, load the app, register the
     /// completion callback and start the asyncio loop threads.
-    /// Returns the runtime and the parsed app config.
     pub fn init(app_spec: &str, io_loops: usize) -> Result<(Arc<PyRuntime>, AppConfig)> {
-        // Taken before anything else and never given back, including on the
-        // failure paths below: those have already run shim.py's module body and
-        // started its loop threads by the time they report, and main.rs exits
-        // on an init error anyway.
+        // Never given back, even on failure: by then the shim body has run and
+        // its loop threads exist.
         if RUNTIME_BUILT.swap(true, Ordering::SeqCst) {
             return Err(anyhow!(
                 "PyRuntime::init was called twice in this process. The embedded shim \
@@ -386,12 +318,9 @@ impl PyRuntime {
                 move |args: &Bound<'_, PyTuple>,
                       _kwargs: Option<&Bound<'_, PyDict>>|
                       -> PyResult<()> {
-                    // Runs on the asyncio loop thread WITH THE GIL HELD.
-                    //
-                    // Encode BEFORE taking the mutex: this lock is also taken
-                    // (GIL-free) by submit_async and cancel, and blocking on it
-                    // while holding the GIL would stall the whole event loop,
-                    // not just this task.
+                    // Runs on the loop thread with the GIL held. Encode before
+                    // taking the mutex: blocking on it under the GIL would stall
+                    // the whole event loop.
                     let token: u64 = args.get_item(0)?.extract()?;
                     let outcome = outcome_from_py(&args.get_item(1)?, encode_cb.bind(args.py()));
                     if let Some(tx) = pending_cb.lock().unwrap().remove(&token) {
@@ -417,13 +346,8 @@ impl PyRuntime {
             Ok((m.unbind(), decode, encode, cfg))
         })?;
 
-        // Do not interpolate cfg_json here: shim.py's load_app serializes
-        // redis_url (with its password) and the full task registry into this
-        // same string, and main.rs logs the full context chain on startup
-        // failure ({e:#}). The wrapped serde_json error is appended to that
-        // chain automatically and already names the parse failure (its type
-        // and position) without echoing unrelated fields, so this stays
-        // useful for debugging without the raw JSON.
+        // Never interpolate cfg_json: it carries redis_url with its password,
+        // and startup failures are logged with the full context chain.
         let cfg: AppConfig = serde_json::from_str(&cfg_json).with_context(|| {
             format!("shim load_app returned unparseable config for app {app_spec:?}")
         })?;
@@ -439,32 +363,18 @@ impl PyRuntime {
             async_rejected: AtomicU64::new(0),
         });
 
-        // The async submitter thread. Blocks on the channel, then drains
-        // whatever else is already queued and schedules the whole batch under
-        // ONE GIL entry. Unbounded is safe: the io admission semaphore
-        // (exec::run_async_task) caps queued jobs at --io-concurrency.
-        //
-        // Thread-state note (see the sync-pool landmine below): this thread
-        // pins ONE persistent CPython thread state, the same way the sync pool
-        // does, but for a different reason. The sync pool pins so that
-        // threading.local survives between tasks; nothing on THIS path relies
-        // on that, since the shim's submit_async touches module globals only.
-        // Here the reason is pure cost: an unpinned Python::attach on a
-        // non-Python thread creates and then DESTROYS a whole thread state per
-        // batch, and batches average 1.4 to 9 jobs in practice rather than the
-        // DRAIN_MAX ceiling of 128, so that per-batch teardown measured at ~7%
-        // of async lane CPU. Correctness is identical either way.
+        // The async submitter: drains the channel and schedules each batch
+        // under one GIL entry. Unbounded is safe: the io admission semaphore
+        // caps queued jobs at --io-concurrency. It pins one thread state for
+        // cost only: an unpinned attach builds and destroys one per batch.
         let rt_submit = Arc::clone(&rt);
         std::thread::Builder::new()
             .name("cauli-async-submit".into())
             .spawn(move || {
-                // SAFETY: the interpreter is initialized (PyRuntime::init runs
-                // to the point of loading the shim before this thread is
-                // spawned), and the Ensure is paired with an immediate
-                // SaveThread so the GIL is not held around the blocking recv
-                // below. The state is never Released, so CPython keeps it
-                // registered in gilstate TSS for this thread's whole lifetime
-                // and every later attach finds and reuses it.
+                // SAFETY: the interpreter is initialized before this thread is
+                // spawned, and Ensure is paired with an immediate SaveThread so
+                // the GIL is not held around the blocking recv. The state is
+                // never Released, so every later attach reuses it.
                 unsafe {
                     pyo3::ffi::PyGILState_Ensure();
                     pyo3::ffi::PyEval_SaveThread();
@@ -488,12 +398,8 @@ impl PyRuntime {
         Ok((rt, cfg))
     }
 
-    /// Blocking sync task execution. MUST be called from a dedicated OS thread
-    /// (the sync io pool), never from a tokio worker thread.
-    ///
-    /// `args`/`kwargs` are the caller's JSON text. Every instruction executed
-    /// here holds the GIL, which all in-process tasks share, so both
-    /// directions are one msgspec call each rather than a walk.
+    /// Blocking sync task execution. Call only from a sync pool thread, never
+    /// from a tokio worker thread. `args`/`kwargs` are the caller's JSON text.
     pub fn run_sync_blocking(
         &self,
         name: &str,
@@ -532,11 +438,9 @@ impl PyRuntime {
         })
     }
 
-    /// Queue an async task for the submitter thread. Completion arrives
-    /// push-style on the returned oneshot (via the registered Python
-    /// callback). Takes no GIL and never blocks: call it directly from a
-    /// tokio worker thread. Returns the token alongside the receiver so the
-    /// caller can `cancel(token)` if it gives up waiting (MEM-1).
+    /// Queue an async task for the submitter thread; completion arrives on the
+    /// returned oneshot. Takes no GIL and never blocks. The token lets the
+    /// caller `cancel(token)` if it gives up waiting.
     pub fn queue_submit(
         &self,
         name: &str,
@@ -548,9 +452,8 @@ impl PyRuntime {
     ) -> (u64, oneshot::Receiver<Outcome>) {
         let token = self.next_token.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
-        // Insert BEFORE send: once the job is on the channel the completion
-        // callback can fire on the loop thread at any moment, and it must
-        // find the slot.
+        // Insert before send: the completion callback can fire as soon as the
+        // job is on the channel, and must find the slot.
         self.pending.lock().unwrap().insert(token, tx);
 
         let job = SubmitJob {
@@ -572,15 +475,10 @@ impl PyRuntime {
         (token, rx)
     }
 
-    /// Schedule one drained batch on the event loops, under a single GIL
-    /// entry. Runs ONLY on the cauli-async-submit thread. `submit_async` is
-    /// resolved once per batch; the shim then batches its own loop wakeups on
-    /// top (its per-loop pending queues), so a burst of N tasks costs one
-    /// GIL entry here and one loop wakeup there instead of N of each.
+    /// Schedule one drained batch on the event loops under a single GIL entry.
+    /// Runs only on the cauli-async-submit thread.
     fn submit_batch_under_gil(&self, batch: &mut Vec<SubmitJob>) {
-        // Args failures are collected separately from generic shim failures:
-        // they complete with a typed Outcome that is not retryable, directly,
-        // rather than through `fail_pending`'s WorkerShimError/retryable bucket.
+        // Args failures are terminal, unlike `fail_pending`'s retryable bucket.
         let (failures, args_failures) = Python::attach(|py| {
             let mut failed: Vec<(u64, String)> = Vec::new();
             let mut args_failed: Vec<(u64, Outcome)> = Vec::new();
@@ -596,8 +494,6 @@ impl PyRuntime {
                     return (failed, args_failed);
                 }
             };
-            // MEM-5: fetched once per batch, not cached on PyRuntime -- this
-            // closure already holds the GIL and nothing else needs it.
             let queue_full_ty = self.shim.bind(py).getattr("AsyncQueueFull").ok();
             let decode = self.decode.bind(py);
             for job in batch.iter() {
@@ -664,72 +560,35 @@ impl PyRuntime {
         );
     }
 
-    /// MEM-1: remove (and drop) a pending completion slot. Called when the
-    /// Rust-side backstop timeout gives up waiting on a submitted async task,
-    /// so a wedged event-loop thread that never actually completes the
-    /// coroutine (and so never calls the completion callback) cannot leak
-    /// this slot -- and the Python-side coroutine/args/kwargs it was
-    /// holding -- forever. A no-op if the callback already consumed it.
+    /// Drop a pending completion slot when the backstop timeout gives up, so a
+    /// wedged event loop that never calls back cannot leak it. A no-op if the
+    /// callback already consumed it.
     pub fn cancel(&self, token: u64) {
         self.pending.lock().unwrap().remove(&token);
     }
 
-    /// Cumulative submissions rejected because a loop's own pending list was
-    /// at cap (stats: `async_rejected`, MEM-5). This is the counter that
-    /// actually moves during an event loop wedge, which is why it replaced
-    /// the pending completion map size on the stats line: see
-    /// submit_batch_under_gil.
+    /// Submissions rejected because a loop's pending list was at cap (stats:
+    /// `async_rejected`). This counter moves during an event loop wedge.
     pub fn async_rejected(&self) -> u64 {
         self.async_rejected.load(Ordering::Relaxed)
     }
 }
 
-// ---------------------------------------------------------------------------
-// Sync io pool: dedicated OS threads that acquire the GIL only around the shim
-// run_sync call. CPython releases the GIL during blocking socket I/O, so this
-// yields real io parallelism.
-//
-// H2 hardening: a hard timeout cannot kill a wedged OS thread (blocking call
-// with no timeout, a C extension ignoring the async-exc injection). Rather
-// than silently losing that pool slot forever:
-//  - the queue is bounded (capacity = --io-concurrency) so a permanent global
-//    wedge cannot grow memory without bound;
-//  - each queued job's oneshot `resp` is the cancellation signal: if the
-//    dispatcher already gave up (hard timeout elapsed) the receiver is
-//    dropped and `resp.is_closed()` is true, so a worker thread skips running
-//    it instead of executing a "zombie" job with unpredictable-timing side
-//    effects;
-//  - on a reported hard timeout, a replacement thread is spawned to restore
-//    capacity, up to a fixed ceiling (SYNC_POOL_THREAD_CEILING_MULTIPLE
-//    times the configured pool size); past that point spawn_worker logs a
-//    warning and refuses instead of growing without bound. If the original
-//    wedged thread ever does return, it just resumes serving as extra
-//    headroom (we cannot safely kill a genuinely blocked OS thread from
-//    here).
-// ---------------------------------------------------------------------------
+// Sync io pool. CPython releases the GIL during blocking I/O, so these threads
+// give real io parallelism. A hard timeout cannot kill a wedged OS thread, so:
+// the queue is bounded at --io-concurrency; a job whose `resp` receiver is
+// closed (dispatcher gave up) is skipped, never run as a zombie; each reported
+// hard timeout spawns a replacement up to a fixed ceiling. A wedged thread that
+// returns keeps serving as extra headroom.
 
-/// `report_hard_timeout` -> `spawn_worker` replaces a possibly wedged thread
-/// with no way to know whether the original is ever coming back (H2). Left
-/// unchecked, a hot loop of hard timeouts leaks one OS thread (an 8 MB stack
-/// plus a pinned CPython thread state) per hit, forever, and no wedge is
-/// even required to trigger it: an envelope with timeout_ms 0 alone makes
-/// the dispatcher give up before a sync thread can ever answer (see
-/// exec::run_sync_task). 4x gives real headroom for the legitimate case
-/// (several genuinely wedged calls at once should not make the pool refuse
-/// a replacement on the first one) while keeping the worst case a small
-/// fixed multiple of the operator's own --io-threads choice instead of
-/// unbounded growth: even at the largest auto derived --io-threads (512,
-/// cli.rs) the ceiling (2048) is a small constant factor above the measured
-/// sync knee (~1000 threads per proc, cli.rs), not the unbounded thousands
-/// a leak like this used to reach within minutes.
+/// Replacement ceiling as a multiple of --io-threads. Without it a stream of
+/// hard timeouts (timeout_ms 0 is enough) leaks an OS thread and a thread
+/// state per hit. 4x leaves room for several real wedges at once.
 const SYNC_POOL_THREAD_CEILING_MULTIPLE: i64 = 4;
 
-/// Test only hook (gated like `CAULI_EXEC_CMD` in cpu.rs, a plain `cargo
-/// build --release` carries none of this): a job queued with this exact
-/// name makes the pool worker panic deliberately right after dequeuing it,
-/// before touching Python. Lets a test reproduce the DecrGuard regression
-/// (a panic inside a pool thread must still decrement live_threads) without
-/// needing a real blocking call that hangs.
+/// Test hook, absent from release builds: a job with this name makes the pool
+/// thread panic right after dequeuing it, to test that DecrGuard still
+/// decrements live_threads.
 #[cfg(any(test, feature = "test-hooks"))]
 const TEST_HOOK_PANIC_JOB: &str = "__cauli_test_hook_panic__";
 
@@ -739,33 +598,19 @@ pub struct SyncJob {
     pub args: String,
     pub kwargs: String,
     pub soft_timeout_ms: Option<u64>,
-    /// Backs `cauli.current_task()` inside the task body. `None` only from
-    /// call sites with no envelope behind them (unit tests). Boxed so this
-    /// job (which is handed back by value when the bounded queue is full)
-    /// stays small enough for `clippy::result_large_err`.
+    /// Backs `cauli.current_task()`. `None` only in unit tests. Boxed to keep
+    /// the job small for `clippy::result_large_err`.
     pub meta: Option<Box<TaskMeta>>,
-    /// Fired by the pool thread at the instant it commits to running this
-    /// job, before the first Python instruction.
-    ///
-    /// The dispatcher starts the job's `timeout_ms` clock from this signal
-    /// rather than from submit time. The pool queue and the io admission
-    /// gate are sized independently (`--io-threads` against
-    /// `--io-concurrency`, 64 against 256 on the standalone defaults), so up
-    /// to `io_concurrency - io_threads` jobs can sit in the channel with no
-    /// thread behind them. Charging that wait to the task both stole time
-    /// from the task itself and made a job that never left the queue report
-    /// as an abandoned wedged thread.
+    /// Fired when a pool thread commits to running this job. The dispatcher
+    /// starts `timeout_ms` here, not at submit: up to `io_concurrency -
+    /// io_threads` jobs can wait in the queue with no thread behind them.
     pub started: oneshot::Sender<()>,
     pub resp: oneshot::Sender<Outcome>,
 }
 
-/// The pool's bounded job queue. A job leaves it only through a thread that
-/// already holds the GIL, which is what makes the GIL the scheduler: while
-/// one thread runs Python, the jobs queued behind it stay where that same
-/// thread finds them next, instead of each being taken by a freshly woken
-/// thread that then parks on the GIL and costs a GIL handoff per job. A job
-/// that blocks releases the GIL inside CPython, and the thread standing by
-/// for it takes the next job at once, so blocking tasks overlap as before.
+/// The pool's bounded job queue. A job leaves it only through a thread holding
+/// the GIL, so a burst runs on one thread with no GIL handoff per job. A job
+/// that blocks releases the GIL, and the standby thread takes the next one.
 struct JobQueue {
     state: Mutex<QueueState>,
     ready: std::sync::Condvar,
@@ -776,9 +621,7 @@ struct QueueState {
     jobs: std::collections::VecDeque<SyncJob>,
     /// Threads parked on `ready`.
     parked: usize,
-    /// A parked thread was woken and has not yet reached the GIL. While one
-    /// is on its way, no other is woken: one standby is enough to take over
-    /// the moment the running thread releases the GIL.
+    /// A woken thread has not yet reached the GIL. Only one standby at a time.
     standby: bool,
 }
 
@@ -798,11 +641,9 @@ impl JobQueue {
         }
     }
 
-    /// Take the next job. Only ever called with the GIL held; `arrived` is
-    /// true on the first take after acquiring it, which is the moment a
-    /// standby stops being one. Leaves a standby behind whenever work
-    /// remains, so a job that blocks does not hold up the one queued behind
-    /// it, while a thread running a burst wakes no one.
+    /// Take the next job, GIL held; `arrived` is true on the first take after
+    /// acquiring it. Leaves a standby whenever work remains, so a blocking job
+    /// does not hold up the one queued behind it.
     fn take(&self, arrived: bool) -> Option<SyncJob> {
         let mut q = self.state.lock().unwrap();
         if arrived {
@@ -831,27 +672,21 @@ pub struct SyncPool {
     max_threads: i64,
     /// Hard-timeout abandonments reported so far (stats: `sync_abandoned`).
     pub abandoned: Arc<AtomicU64>,
-    /// Worker threads currently alive (initial pool + replacements; stats:
-    /// `sync_live`). Never decremented below the count that returns from a
-    /// wedge, since we let those resume as extra headroom rather than race to
-    /// retire them.
+    /// Threads alive, initial plus replacements (stats: `sync_live`).
     pub live_threads: Arc<std::sync::atomic::AtomicI64>,
 }
 
 fn run_sync_job(rt: &PyRuntime, job: SyncJob) {
     if job.resp.is_closed() {
-        // The dispatcher already abandoned this job (hard timeout while
-        // still queued): running it now would be zombie execution with no
-        // one listening.
+        // Abandoned while queued: do not run a zombie.
         return;
     }
     #[cfg(any(test, feature = "test-hooks"))]
     if job.name == TEST_HOOK_PANIC_JOB {
         panic!("test-hooks: deliberate sync pool worker panic");
     }
-    // Committing to run: from here the dispatcher charges the job's own
-    // timeout_ms. An Err means it stopped waiting between the is_closed
-    // check above and now, so skip rather than run a zombie.
+    // From here the dispatcher charges timeout_ms. Err: it stopped waiting
+    // since the check above.
     if job.started.send(()).is_err() {
         return;
     }
@@ -866,10 +701,8 @@ fn run_sync_job(rt: &PyRuntime, job: SyncJob) {
 }
 
 impl SyncPool {
-    /// `queue_capacity` bounds the job queue; pass `--io-concurrency`
-    /// (the same admission gate that already bounds outstanding submissions
-    /// in the common case) so a fully-wedged pool cannot grow the backlog
-    /// without bound (MEM-2 (c)).
+    /// `queue_capacity` bounds the job queue (pass `--io-concurrency`) so a
+    /// fully wedged pool cannot grow the backlog without bound.
     pub fn start(rt: Arc<PyRuntime>, threads: usize, queue_capacity: usize) -> SyncPool {
         let threads = threads.max(1);
         let pool = SyncPool {
@@ -895,11 +728,8 @@ impl SyncPool {
     }
 
     fn spawn_worker(&self) {
-        // Fail loud instead of leaking (H2 follow up): see
-        // SYNC_POOL_THREAD_CEILING_MULTIPLE for why this number. sync_live
-        // (stats_loop) will sit at the ceiling until an earlier wedged
-        // thread returns on its own; nothing here can safely force that (see
-        // the module doc above).
+        // Refuse loudly at the ceiling; sync_live stays there until a wedged
+        // thread returns on its own.
         if self.live_threads.load(Ordering::Relaxed) >= self.max_threads {
             tracing::warn!(
                 max_threads = self.max_threads,
@@ -917,47 +747,24 @@ impl SyncPool {
         std::thread::Builder::new()
             .name(format!("cauli-sync-{idx}"))
             .spawn(move || {
-                // Panic safe (MEM-3 precedent, ctx::DecrGuard): this must be
-                // the first thing in the closure so it covers the whole
-                // thread body, including a panic inside run_sync_blocking.
-                // The plain fetch_sub this replaced ran only after the recv
-                // loop returned normally, so a panic here used to both lose
-                // the thread AND leave sync_live over reporting forever --
-                // exactly the failure mode that stat exists to catch.
+                // First in the closure, so a panic anywhere in the thread body
+                // still decrements sync_live.
                 let _live_guard = crate::ctx::DecrGuard(&live);
-                // Pin ONE persistent CPython thread state to this OS thread
-                // for its whole lifetime. Without this, each `Python::attach`
-                // below (a PyGILState_Ensure/Release pair on a non-Python
-                // thread) creates and then DESTROYS a fresh thread state per
-                // task, which wipes `threading.local` storage between tasks
-                // — and everything the Python ecosystem builds on it: Django
-                // caches its DB connection per thread (`CONN_MAX_AGE` is
-                // meaningless if the cache dies with every task, and each
-                // task then leaks a fresh connection until GC reaps the
-                // orphaned one), as do requests.Session patterns, SQLAlchemy
-                // scoped_session, etc. The initial Ensure registers the
-                // state in CPython's gilstate TSS (never Released, so never
-                // destroyed while the thread lives); SaveThread releases the
-                // GIL before entering the blocking recv loop. Subsequent
-                // attaches find and reuse the registered state.
+                // Pin one thread state for the thread's lifetime. An unpinned
+                // attach destroys it per task, wiping `threading.local`: Django
+                // per thread DB connections, scoped sessions and the like.
                 //
-                // SAFETY: the interpreter is initialized (PyRuntime::init)
-                // before any pool starts, and this pairs Ensure with an
-                // immediate SaveThread so the GIL is not held around recv().
+                // SAFETY: the interpreter is initialized before any pool
+                // starts, and Ensure is paired with an immediate SaveThread so
+                // the GIL is not held around recv(). Never Released.
                 unsafe {
                     pyo3::ffi::PyGILState_Ensure();
                     pyo3::ffi::PyEval_SaveThread();
                 }
                 loop {
                     queue.wait_for_job();
-                    // One GIL entry per burst, not per job: while jobs are
-                    // queued this thread keeps the GIL and runs the next one.
-                    // Taking it per job made every pool thread park on the
-                    // GIL behind the others and be woken again for each
-                    // task: at --io-threads 4 and up a noop sync task cost
-                    // 127us of CPU against 22us on one thread. A task that
-                    // blocks still releases the GIL inside CPython, so the
-                    // standby thread overlaps blocking io as before.
+                    // One GIL entry per burst, not per job: a GIL handoff per
+                    // job costs several times the task itself.
                     Python::attach(|_py| {
                         let mut arrived = true;
                         while let Some(job) = queue.take(std::mem::take(&mut arrived)) {
@@ -969,12 +776,8 @@ impl SyncPool {
             .expect("failed to spawn sync pool thread");
     }
 
-    /// Enqueue a job. `Err` means the bounded queue is full (every thread is
-    /// wedged and the backlog is already at capacity); the caller should fail
-    /// the task rather than block the async runtime. The rejected job comes
-    /// back boxed: it is a wide value and this is the cold path, so the one
-    /// allocation buys every `Result<(), _>` on this path a pointer-sized
-    /// error variant (`clippy::result_large_err`).
+    /// Enqueue a job. `Err` means the bounded queue is full; fail the task
+    /// rather than block the runtime. Boxed for `clippy::result_large_err`.
     pub fn submit(&self, job: SyncJob) -> Result<(), Box<SyncJob>> {
         let mut q = self.queue.state.lock().unwrap();
         if q.jobs.len() >= self.queue.capacity {
@@ -985,9 +788,8 @@ impl SyncPool {
         Ok(())
     }
 
-    /// Called by the dispatcher when a sync task hard-times-out (exec.rs).
-    /// The underlying OS thread may be permanently wedged; spawn a
-    /// replacement so pool capacity is restored immediately.
+    /// Called on a sync hard timeout: the thread may be wedged for good, so
+    /// spawn a replacement.
     pub fn report_hard_timeout(&self) {
         self.abandoned.fetch_add(1, Ordering::Relaxed);
         self.spawn_worker();
@@ -998,44 +800,17 @@ impl SyncPool {
 mod tests {
     use super::*;
 
-    /// Serializes every test below that builds a `PyRuntime`, or that
-    /// otherwise mutates state the embedded interpreter shares process wide.
-    ///
-    /// shim.py keeps all of its dispatch state (`_loops`, `_pending`,
-    /// `_registry`, `_callback`) in module globals, and `PyModule::from_code`
-    /// publishes that module in `sys.modules` under one fixed name
-    /// (`cauli_worker_shim`, which loops.rs then imports back by that name).
-    /// A second `PyRuntime::init` in one process therefore does not get a
-    /// second shim: `PyImport_ExecCodeModuleEx` finds the module already in
-    /// `sys.modules` and runs the source again in ITS dict, which empties
-    /// `_loops` and `_pending` and points the one `_callback` at the newest
-    /// runtime. An older runtime's async completion then lands in the newest
-    /// runtime's pending map, where its token does not exist, and is
-    /// dropped, so the older test's `queue_submit` receiver never resolves
-    /// and that test thread parks forever. Land the same reset a moment
-    /// earlier, while an older runtime is mid submit, and `submit_async`
-    /// finds `_loops` empty and raises instead, so the task comes back as a
-    /// retryable WorkerShimError. Both shapes were reproduced by running
-    /// this binary at default parallelism pinned to two busy cores.
-    ///
-    /// main.rs builds exactly one runtime per process, at startup, before
-    /// any dispatch thread exists, so nothing outside this module can create
-    /// that overlap. Keep the lock: without it the tests still pass at
-    /// `--test-threads=1` and on an idle box, which is exactly what makes
-    /// the hang look like someone else's problem.
+    /// Serializes every test that builds a `PyRuntime` or mutates process wide
+    /// interpreter state. A second runtime reruns the shim in the same module
+    /// dict (see `RUNTIME_BUILT`), so overlapping tests hang or fail with
+    /// WorkerShimError. Without the lock they still pass on an idle box.
     static SHIM_STATE_LOCK: Mutex<()> = Mutex::new(());
 
-    /// Poison tolerant on purpose: a test that panics while holding the lock
-    /// must not turn every other test here into a lock poisoning failure
-    /// that buries the one real failure.
+    /// Poison tolerant, so one panicking test does not fail all the others.
     fn shim_state_guard() -> std::sync::MutexGuard<'static, ()> {
         let guard = SHIM_STATE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        // The one runtime per process guard stays ARMED for tests rather than
-        // being compiled out of them: it is cleared here, once, and only with
-        // the lock above already held, so a second `PyRuntime::init` inside any
-        // single test body still fails exactly the way the product path would.
-        // Clearing it is sound only because the lock makes the handoff between
-        // tests strictly sequential, which is the same reason the lock exists.
+        // Cleared only under the lock, so the guard stays armed inside each
+        // test body.
         RUNTIME_BUILT.store(false, Ordering::SeqCst);
         // Mandated entry point; pyo3 0.26 aliases it to Python::initialize.
         #[allow(deprecated)]
@@ -1043,11 +818,8 @@ mod tests {
         guard
     }
 
-    /// Registers a synthetic module in `sys.modules` under `module_name` so
-    /// shim.py's `importlib.import_module` finds it without touching the
-    /// filesystem, and returns the "module:app" spec `PyRuntime::init`
-    /// expects. `module_name` must be unique per test: `sys.modules` is
-    /// process global and tests run concurrently.
+    /// Registers a synthetic module in `sys.modules` and returns its
+    /// "module:app" spec. `module_name` must be unique per test.
     fn install_fake_app_module(py: Python<'_>, module_name: &str, src: &str) -> String {
         let code = CString::new(src).expect("test app source has no NUL bytes");
         let filename = CString::new(format!("{module_name}.py")).unwrap();
@@ -1063,10 +835,8 @@ mod tests {
         format!("{module_name}:app")
     }
 
-    /// Startup regression: a config parse failure must never echo the raw
-    /// shim JSON, which carries `redis_url` (password and all) verbatim.
-    /// `result_ttl = -1` is one of several unvalidated fields that reach
-    /// Rust's `u64` and fail to parse (see the docstring on AppConfig).
+    /// A config parse failure must never echo the raw shim JSON, which
+    /// carries `redis_url` with its password.
     #[test]
     fn unparseable_config_error_does_not_leak_redis_password() {
         let _shim_state = shim_state_guard();
@@ -1091,9 +861,7 @@ app = _App()
             Ok(_) => panic!("expected init to fail: result_ttl=-1 cannot parse as u64"),
             Err(e) => e,
         };
-        // main.rs prints startup errors with {e:#}, which walks the whole
-        // anyhow context chain (see the with_context call above) -- this is
-        // the exact text an operator would see in the log.
+        // The exact text startup logs with {e:#}.
         let logged = format!("{err:#}");
         assert!(
             !logged.contains("s3cr3tpw"),
@@ -1105,11 +873,8 @@ app = _App()
         );
     }
 
-    /// `pyerr_string` feeds `ErrorJson` (run_sync_blocking, fail_pending),
-    /// which is written into Redis result keys and DLQ entries verbatim: an
-    /// exception with a huge message or traceback must not carry all of it
-    /// along, the same way shim.py's `_MAX_TB` and _exec.py's
-    /// `_TRACEBACK_CAP` already bound the Python side equivalents.
+    /// A huge exception message or traceback is capped before it reaches
+    /// result keys and DLQ entries.
     #[test]
     fn pyerr_string_is_capped_to_a_bounded_size() {
         #[allow(deprecated)]
@@ -1125,8 +890,7 @@ app = _App()
         );
     }
 
-    /// A minimal app that parses cleanly: `_tasks` is empty because these
-    /// tests drive `SyncPool` directly and never dispatch a real task.
+    /// A minimal app with no tasks, for tests that drive `SyncPool` directly.
     const MINIMAL_VALID_APP_SRC: &str = r#"
 class _App:
     redis_url = "redis://localhost:6379/0"
@@ -1139,12 +903,7 @@ class _App:
 app = _App()
 "#;
 
-    /// RUNTIME_BUILT is enforcement, not documentation: a second `init` in one
-    /// process must fail immediately rather than quietly empty the first
-    /// runtime's dispatch state. This also pins down how the guard is scoped
-    /// for tests. `shim_state_guard` clears it once per test and only under
-    /// the serialization lock, so the guard is still armed inside every test
-    /// body, which is exactly what the second call here proves.
+    /// A second `init` in one process fails immediately, also inside a test.
     #[test]
     fn a_second_pyruntime_in_one_process_fails_loudly() {
         let _shim_state = shim_state_guard();
@@ -1167,8 +926,7 @@ app = _App()
         );
     }
 
-    /// H2 follow up: `report_hard_timeout` must stop spawning once the pool
-    /// hits its ceiling, instead of growing without bound.
+    /// `report_hard_timeout` stops spawning at the ceiling.
     #[test]
     fn report_hard_timeout_stops_spawning_at_the_thread_ceiling() {
         let _shim_state = shim_state_guard();
@@ -1179,8 +937,6 @@ app = _App()
         let pool = SyncPool::start(rt, 1, 32); // threads=1 -> max_threads = 4
         assert_eq!(pool.live_threads.load(Ordering::Relaxed), 1);
 
-        // Hammer well past the ceiling: an unbounded spawner would keep
-        // growing live_threads by one per call.
         for _ in 0..20 {
             pool.report_hard_timeout();
         }
@@ -1197,10 +953,7 @@ app = _App()
         );
     }
 
-    /// MEM-3 style regression for the sync pool specifically: a panic inside
-    /// a pool thread (deliberately triggered via TEST_HOOK_PANIC_JOB) must
-    /// still decrement live_threads, or the stat added to make thread loss
-    /// observable silently stops telling the truth the moment it matters.
+    /// A panic inside a pool thread still decrements live_threads.
     #[test]
     fn sync_pool_thread_panic_does_not_overcount_live_threads() {
         let _shim_state = shim_state_guard();
@@ -1225,10 +978,7 @@ app = _App()
         .ok()
         .expect("bounded queue has room for one job");
 
-        // Poll instead of a fixed sleep: the decrement lands within
-        // microseconds of the panic in practice, this just avoids a flaky
-        // race on a slow host. resp_rx is kept alive so job.resp.is_closed()
-        // is false when the worker thread dequeues the job.
+        // resp_rx stays alive so the pool thread does not skip the job.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while pool.live_threads.load(Ordering::Relaxed) != 0 {
             assert!(
@@ -1240,9 +990,7 @@ app = _App()
         }
         drop(resp_rx);
 
-        // The pool must still be usable afterward: report_hard_timeout can
-        // spawn a fresh replacement, and the count reflects exactly that,
-        // not an overcount left over from the panic.
+        // Still usable, and the count has no leftover from the panic.
         pool.report_hard_timeout();
         assert_eq!(pool.live_threads.load(Ordering::Relaxed), 1);
     }
@@ -1300,10 +1048,8 @@ app = _App()
         (resp_rx, started_rx)
     }
 
-    /// Jobs leave the queue only through a GIL holder, so blocking jobs
-    /// overlap only if a standby thread is woken behind each one that starts.
-    /// Without that chain, 8 naps of 300ms queued at once run back to back
-    /// on the one woken thread: 2.4s instead of about 0.3s.
+    /// Blocking jobs overlap only if a standby is woken behind each one that
+    /// starts: without it 8 naps of 300ms take 2.4s instead of about 0.3s.
     #[test]
     fn sync_pool_overlaps_blocking_jobs_queued_together() {
         let _shim_state = shim_state_guard();
@@ -1330,10 +1076,8 @@ app = _App()
         );
     }
 
-    /// A job submitted while every thread is parked must always wake one,
-    /// however the previous standby stood down. A standby flag left set by
-    /// a thread that found the queue already emptied would park every thread
-    /// with work queued, and this would hang.
+    /// A job submitted while every thread is parked always wakes one, however
+    /// the previous standby stood down. A stale standby flag hangs this test.
     #[test]
     fn sync_pool_never_strands_a_job_after_a_burst() {
         let _shim_state = shim_state_guard();
@@ -1361,11 +1105,8 @@ app = _App()
         }
     }
 
-    /// Args msgspec refuses can never succeed: a retry decodes the identical
-    /// text again. Before the fix, `run_sync_blocking` bucketed this into
-    /// "WorkerShimError" with `retryable: true`, burning the whole backoff
-    /// schedule on a payload that can never run. `1e400` is valid JSON
-    /// syntax past f64 range, which serde_json carries through as text.
+    /// Args msgspec refuses are terminal, not a retryable WorkerShimError.
+    /// `1e400` is valid JSON past f64 range, which serde_json carries as text.
     #[test]
     fn run_sync_blocking_args_decode_failure_is_not_retryable() {
         let _shim_state = shim_state_guard();
@@ -1374,8 +1115,7 @@ app = _App()
         });
         let (rt, _cfg) = PyRuntime::init(&app_spec, 1).expect("valid app must init cleanly");
 
-        // The failure happens while decoding, before the (unregistered) task
-        // name is ever looked up.
+        // Decoding fails before the unregistered name is looked up.
         for (args, kwargs) in [("[1e400]", "{}"), ("[]", r#"{"k": -1e400}"#)] {
             match rt.run_sync_blocking("does.not.matter", args, kwargs, None, None) {
                 Outcome::Failure { err, retryable } => {
@@ -1387,9 +1127,7 @@ app = _App()
         }
     }
 
-    /// Same as `run_sync_blocking_args_decode_failure_is_not_retryable`
-    /// above, for the async submit lane (`queue_submit` ->
-    /// `submit_batch_under_gil`).
+    /// Same, for the async submit lane.
     #[test]
     fn queue_submit_args_decode_failure_is_not_retryable() {
         let _shim_state = shim_state_guard();
@@ -1400,9 +1138,7 @@ app = _App()
 
         for (args, kwargs) in [("[1e400]", "{}"), ("[]", r#"{"k": -1e400}"#)] {
             let (_token, rx) = rt.queue_submit("does.not.matter", args, kwargs, 5.0, None, None);
-            // blocking_recv rather than #[tokio::test] and `.await`: the guard
-            // above has to span both the submit and the completion, and a std
-            // MutexGuard has no business crossing an await point.
+            // blocking_recv: the std MutexGuard must not cross an await.
             match rx.blocking_recv().expect("submitter thread must respond") {
                 Outcome::Failure { err, retryable } => {
                     assert!(!retryable, "{args} {kwargs} can never succeed on retry");
@@ -1413,11 +1149,9 @@ app = _App()
         }
     }
 
-    /// A task result goes through the type gate and msgspec: values msgspec
-    /// alone would write without complaint (NaN as null, a set as an array)
-    /// and values it refuses itself (a lone surrogate) are all the same
-    /// terminal SerializationError, while every JSON value comes back as the
-    /// exact text the client's codec writes for it.
+    /// Values msgspec alone would write (NaN as null, a set as an array) and
+    /// values it refuses (a lone surrogate) are a terminal SerializationError;
+    /// every JSON value comes back as the text the client's codec writes.
     #[test]
     fn result_encoding_matches_the_client_codec_and_rejects_non_json() {
         #[allow(deprecated)]
@@ -1448,14 +1182,8 @@ app = _App()
         });
     }
 
-    /// shim.py's own `_registry` miss (sync lane, `_run_sync_inner`) must use
-    /// the canonical "UnregisteredTask" string, the one PROTOCOL section 8
-    /// documents and dispatch.rs's own registry gate uses, not the stale
-    /// "Unregistered". In a real worker process dispatch.rs's registry
-    /// check (built from this same `load_app()` snapshot) never lets an
-    /// unregistered name reach here, but calling `run_sync_blocking`
-    /// directly, as this test does, bypasses that gate the same way a
-    /// future caller might.
+    /// The shim's own registry miss (sync lane) reports "UnregisteredTask",
+    /// as PROTOCOL §8 and dispatch.rs's gate do. That gate is bypassed here.
     #[test]
     fn shim_sync_unregistered_task_error_type_is_canonical() {
         let _shim_state = shim_state_guard();
@@ -1480,8 +1208,7 @@ app = _App()
         }
     }
 
-    /// Same as `shim_sync_unregistered_task_error_type_is_canonical` above,
-    /// for the async lane (`_arun`).
+    /// Same, for the async lane.
     #[test]
     fn shim_async_unregistered_task_error_type_is_canonical() {
         let _shim_state = shim_state_guard();
@@ -1495,9 +1222,7 @@ app = _App()
         let (rt, _cfg) = PyRuntime::init(&app_spec, 1).expect("valid app must init cleanly");
 
         let (_token, rx) = rt.queue_submit("no.such.task", "[]", "{}", 5.0, None, None);
-        // blocking_recv rather than #[tokio::test] and `.await`: the guard
-        // above has to span both the submit and the completion, and a std
-        // MutexGuard has no business crossing an await point.
+        // blocking_recv: the std MutexGuard must not cross an await.
         match rx.blocking_recv().expect("submitter thread must respond") {
             Outcome::Failure { err, retryable } => {
                 assert_eq!(err.type_, "UnregisteredTask");
@@ -1510,33 +1235,11 @@ app = _App()
         }
     }
 
-    /// The shim's module body runs `from cauli import SoftTimeLimitExceeded`
-    /// (top of shim.py) before `load_app` does any sys.path/VIRTUAL_ENV setup:
-    /// `PyRuntime::init` above builds the shim module and calls `load_app` back
-    /// to back with no gap between them. Installing the worker's wheel into the
-    /// app's own venv (README "Install") links that venv's interpreter, so
-    /// cauli is already on sys.path at that first import and this never bites.
-    /// Building the worker from source (same doc, the very next section) links
-    /// whatever interpreter the build found, which has no such site packages on
-    /// its default sys.path, so that first import fails and the module falls
-    /// back to its own local stand in class. Unless `load_app` rebinds once
-    /// cauli actually becomes reachable, a user's own
-    /// `except SoftTimeLimitExceeded:` then compares against a different class
-    /// object and silently never matches.
-    ///
-    /// Reproduced directly rather than through a real venv. This process's
-    /// embedded interpreter already stands in for the source built shape: no
-    /// VIRTUAL_ENV, no cauli on its default sys.path, and every other test in
-    /// this module runs with the fallback class. So the only thing left to
-    /// control is exactly when cauli becomes importable relative to the shim's
-    /// two calls. That is done through `sys.modules` directly rather than a
-    /// real install, because mutating `VIRTUAL_ENV` or the process cwd is
-    /// global state shared with every other test in this binary running at the
-    /// same time. Both phases (cauli absent throughout, cauli appearing
-    /// between the module body and `load_app`) run sequentially in this one
-    /// test, each against its own shim instance, so neither can race the
-    /// other's `sys.modules` mutation the way two separate `#[test]` functions
-    /// executing in parallel could.
+    /// The shim body imports `SoftTimeLimitExceeded` before `load_app` sets up
+    /// sys.path. A source built worker may not see cauli yet and falls back
+    /// to a local class; `load_app` must rebind once cauli is importable, or
+    /// a user's `except SoftTimeLimitExceeded:` never matches. Driven through
+    /// `sys.modules`, since VIRTUAL_ENV and cwd are shared with other tests.
     #[test]
     fn load_app_rebinds_soft_time_limit_exceeded_once_cauli_becomes_importable() {
         let _shim_state = shim_state_guard();
@@ -1554,11 +1257,8 @@ app = _App()
             );
             let code = CString::new(include_str!("shim.py")).expect("shim.py contains NUL byte");
 
-            // Phase 1: PROTOCOL section 4.2's documented supported case (and
-            // how the entire fixture based e2e suite in this repo runs) is
-            // cauli never installed at all. load_app must still succeed and
-            // must not disturb the local fallback class: a working fallback
-            // must not become an import error.
+            // Phase 1: cauli never installed (supported, PROTOCOL §4.2).
+            // load_app succeeds and keeps the fallback class.
             let shim_no_cauli = PyModule::from_code(
                 py,
                 code.as_c_str(),
@@ -1583,11 +1283,8 @@ app = _App()
                 "load_app must not disturb the local fallback class when cauli is absent"
             );
 
-            // Phase 2, the actual bug: load a second, independent shim while
-            // cauli is still not importable (its module body fails exactly
-            // like phase 1's), then make cauli importable the way the venv
-            // wheel or a source checkout would once load_app's own path
-            // setup ran, and only then call load_app.
+            // Phase 2: cauli becomes importable between the module body and
+            // load_app.
             let shim = PyModule::from_code(
                 py,
                 code.as_c_str(),
@@ -1596,10 +1293,7 @@ app = _App()
             )
             .expect("failed to load embedded shim");
 
-            // A minimal stand in "cauli" package, built now but not yet
-            // registered in sys.modules: this is what a real `import cauli`
-            // resolves to once the venv's site packages (or a source
-            // checkout) join sys.path.
+            // A stand in "cauli" package, not yet in sys.modules.
             let fake_cauli_code =
                 CString::new("class SoftTimeLimitExceeded(Exception):\n    pass\n")
                     .expect("fake cauli source has no NUL bytes");
@@ -1614,15 +1308,8 @@ app = _App()
                 .getattr("SoftTimeLimitExceeded")
                 .expect("fake cauli exposes SoftTimeLimitExceeded");
 
-            // Sanity check on the repro itself: before cauli is reachable at
-            // all (sys.modules still has no "cauli" entry), this second
-            // shim's module body must have landed on ITS OWN fallback class,
-            // not on the fake cauli's, or this test would pass for a reason
-            // that has nothing to do with the rebind. Each shim
-            // instance defines its own distinct fallback class object (a
-            // fresh `class SoftTimeLimitExceeded(Exception)` statement runs
-            // every time the module body does), so this compares against
-            // `real_cls`, not phase 1's `fallback_before`.
+            // Sanity check: this shim starts on its own fallback class, not
+            // the fake cauli's, or the test would pass without the rebind.
             let before = shim
                 .getattr("SoftTimeLimitExceeded")
                 .expect("shim always exposes SoftTimeLimitExceeded");
@@ -1651,13 +1338,11 @@ app = _App()
                  would silently never match"
             );
 
-            // Best effort: do not leave the fake package poisoning sys.modules
-            // for every test that runs after this one in the same process.
+            // Do not leave the fake package in sys.modules for later tests.
             let _ = sys_modules.del_item("cauli");
         });
     }
-    /// `Outcome` has no `Debug`; this names the variant for a failed
-    /// assertion without widening the public type just for tests.
+    /// `Outcome` has no `Debug`; names the variant for a failed assertion.
     fn outcome_name(o: &Outcome) -> &'static str {
         match o {
             Outcome::Success(_) => "Success",
@@ -1666,9 +1351,7 @@ app = _App()
         }
     }
 
-    /// An app with three `async def` bodies that react differently to being
-    /// stopped at the soft mark. `_Task` is the duck-typed shape `load_app`
-    /// reads (`fn`, `kind`, `is_async`).
+    /// Three `async def` bodies that react differently to the soft mark.
     const SOFT_TIMEOUT_APP_SRC: &str = r#"
 import asyncio
 
@@ -1717,12 +1400,9 @@ class _App:
 app = _App()
 "#;
 
-    /// BLOCKER regression: the async lane used to hand the shim a single
-    /// `min(soft, hard)` deadline, so an `async def` task never raised
-    /// `SoftTimeLimitExceeded` and its soft limit silently became the whole
-    /// budget, reported as `TimeLimitExceeded`. All five behaviours are
-    /// checked against ONE runtime because only one `PyRuntime` may exist
-    /// per process.
+    /// The async lane keeps soft and hard deadlines separate: an `async def`
+    /// task gets `SoftTimeLimitExceeded` at the soft mark and keeps its hard
+    /// budget. One runtime for all cases, since only one may exist.
     #[test]
     fn async_soft_timeout_fires_before_the_hard_deadline() {
         let _shim_state = shim_state_guard();
@@ -1765,9 +1445,8 @@ app = _App()
             ),
         }
 
-        // 3. The HARD budget survives the soft mark. This body ignores the
-        //    stop and keeps working past `soft`; under the collapsed
-        //    `min(soft, hard)` it timed out at 0.2s.
+        // 3. The hard budget survives the soft mark: this body ignores the
+        //    stop and keeps working past `soft`.
         match submit("stubborn", 0.3, 5.0, Some(0.2)) {
             Outcome::Success(v) => assert_eq!(v, r#""finished""#),
             other => panic!(

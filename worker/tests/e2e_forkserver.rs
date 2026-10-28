@@ -1,8 +1,6 @@
-//! Fork-server e2e: threaded child pipelining, kill/respawn via replacement
-//! forks, soft timeout in threaded mode, and the stdio fallback path.
-//! Separate binary so it owns its redis instance (cargo runs test binaries
-//! sequentially). Uses the CAULI_EXEC_CMD hook -> tests/fixtures/fake_exec.py
-//! which implements both §5.1 modes.
+//! Fork server e2e: threaded child pipelining, kill and respawn, soft timeout
+//! in threaded mode, and the stdio fallback. Own binary, own redis. Uses the
+//! CAULI_EXEC_CMD hook -> tests/fixtures/fake_exec.py (both §5.1 modes).
 mod common;
 use common::*;
 use serde_json::json;
@@ -28,9 +26,8 @@ async fn e2e_fork_server() {
     stop_redis();
 }
 
-/// With ONE child advertising concurrency 4, four 1.2s cpu tasks must
-/// interleave on that single child: all four succeed on the SAME pid in far
-/// less than the 4.8s serial time.
+/// One child advertising concurrency 4 runs four 1.2s tasks interleaved on
+/// the same pid, well under the 4.8s serial time.
 async fn threaded_child_pipelining(c: &mut redis::aio::MultiplexedConnection) {
     let mut w = Worker::spawn("fsq", &["--cpu-workers", "1", "--cpu-child-threads", "4"]);
     wait_group(c, "fsq", 20).await;
@@ -68,10 +65,8 @@ async fn threaded_child_pipelining(c: &mut redis::aio::MultiplexedConnection) {
     drop(w);
 }
 
-/// Two tasks arriving together on two idle single-threaded children must
-/// run one per child. With the default `--cpu-prefetch 4` the first slot to
-/// wake used to take both, stage the second behind the first, and leave its
-/// sibling idle: twice the wall time.
+/// Two tasks arriving together on two idle single threaded children run one
+/// per child, not both staged on the first slot to wake.
 async fn idle_children_take_a_burst_before_prefetch_stages_it(
     c: &mut redis::aio::MultiplexedConnection,
 ) {
@@ -109,9 +104,8 @@ async fn idle_children_take_a_burst_before_prefetch_stages_it(
     drop(w);
 }
 
-/// A child that os._exit(9)s mid-task is a retryable WorkerLost; the slot
-/// requests a replacement fork and the retry succeeds on the fresh child.
-/// Also exercises hard-timeout SIGKILL + replacement-fork on the same pool.
+/// A child that os._exit(9)s mid task is a retryable WorkerLost and the retry
+/// succeeds on a replacement fork; a hard timeout SIGKILLs and replaces too.
 async fn kill_and_respawn_via_fork(c: &mut redis::aio::MultiplexedConnection) {
     let log_path = std::env::temp_dir().join(format!("cauli-fs-lost-{}.log", unique_id()));
     let mut w = Worker::spawn_ex("fsq2", &["--cpu-workers", "1"], &[], Some(&log_path));
@@ -134,9 +128,7 @@ async fn kill_and_respawn_via_fork(c: &mut redis::aio::MultiplexedConnection) {
     assert_eq!(r["result"], "revived");
     let _ = std::fs::remove_file(&cf);
 
-    // The death has to be countable, not only loggable: folded into `failed`
-    // as a generic WorkerLost, an OOM killed or segfaulting child is just a
-    // scrolling warning with no number to alert on.
+    // Child deaths are counted, so an OOM kill or segfault is alertable.
     assert!(
         wait_stats_field_nonzero(&log_path, "cpu_lost=", 12)
             .await
@@ -170,8 +162,8 @@ async fn kill_and_respawn_via_fork(c: &mut redis::aio::MultiplexedConnection) {
     let _ = std::fs::remove_file(&log_path);
 }
 
-/// Soft timeout in a threaded (M=4) child: injected via async-exc, reported
-/// as SoftTimeLimitExceeded, while the child itself keeps serving.
+/// Soft timeout in a threaded (M=4) child: reported as SoftTimeLimitExceeded,
+/// and the child keeps serving.
 async fn threaded_soft_timeout(c: &mut redis::aio::MultiplexedConnection) {
     let mut w = Worker::spawn("fsq3", &["--cpu-workers", "1", "--cpu-child-threads", "4"]);
     wait_group(c, "fsq3", 20).await;
@@ -199,9 +191,8 @@ async fn threaded_soft_timeout(c: &mut redis::aio::MultiplexedConnection) {
     drop(w);
 }
 
-/// `--no-fork-server` preserves the old spawn-per-child stdio path end to
-/// end: success, hard timeout kill+respawn, and continued service (the
-/// CAULI_EXEC_CMD override applies to this mode too).
+/// `--no-fork-server` stdio path end to end: success, hard timeout kill and
+/// respawn, continued service.
 async fn fallback_stdio_mode(c: &mut redis::aio::MultiplexedConnection) {
     let mut w = Worker::spawn("fbq", &["--no-fork-server", "--cpu-workers", "2"]);
     wait_group(c, "fbq", 20).await;
@@ -239,16 +230,9 @@ async fn fallback_stdio_mode(c: &mut redis::aio::MultiplexedConnection) {
     drop(w);
 }
 
-/// Audit regression: a cpu child response whose id matches no pending
-/// request used to log up to 256 bytes of the raw response line verbatim,
-/// including result/error content from the task: the one log site in the
-/// worker that still leaked task data. Only reachable with the fork server
-/// pool (`serve_child_conn`'s pending map, which is keyed by id); the stdio
-/// fallback path does no id matching at all, so it cannot exercise this
-/// branch.
-/// fx.cpu_ghost makes fake_exec.py send exactly one such unsolicited line
-/// before its real response, so the log line the worker writes for it can
-/// be checked.
+/// An unsolicited cpu child response (unknown id) must not log task data.
+/// Fork server only: the stdio path does no id matching. fx.cpu_ghost sends
+/// one such line before its real response.
 async fn cpu_unknown_id_log_does_not_leak_payload(c: &mut redis::aio::MultiplexedConnection) {
     let log_path = fixtures_dir().join(format!("cpughost-{}.log", unique_id()));
     let mut w = Worker::spawn_ex("cpughost", &["--cpu-workers", "1"], &[], Some(&log_path));
@@ -279,19 +263,10 @@ async fn cpu_unknown_id_log_does_not_leak_payload(c: &mut redis::aio::Multiplexe
     let _ = std::fs::remove_file(&log_path);
 }
 
-/// Blocker regression: `--cpu-prefetch` (default 4) stages requests into a
-/// busy child's socket buffer whether or not it is draining. A child with
-/// `--cpu-child-threads` default 1 does not read again until it finishes
-/// what it is executing, so prefetched writes queued behind one legitimately
-/// long task block once the (~208 KiB default) unix socket buffer fills --
-/// that is backpressure the worker itself created by prefetching, not
-/// evidence the child is wedged. Before the fix this SIGKILLed the busy
-/// child while it was still running (a healthy 8s task reported WorkerLost)
-/// and lost a prefetched sibling; the same shape recurred on the
-/// replacement child.
-/// One task holds the child busy for 8s; four more each carry a 700 KB
-/// argument (ordinary input, well under the 1 MiB `--max-envelope-bytes`
-/// default) so their prefetch writes stall behind it.
+/// Prefetched writes stalled behind a busy single threaded child are the
+/// worker's own backpressure, not a wedge: the busy child must not be killed
+/// and no sibling lost. One 8s task, then four 700 KB arguments (under the
+/// 1 MiB `--max-envelope-bytes`) that fill the socket buffer behind it.
 async fn busy_child_write_backpressure_is_not_wedged(c: &mut redis::aio::MultiplexedConnection) {
     let log_path = fixtures_dir().join(format!("cpubusy-{}.log", unique_id()));
     let mut w = Worker::spawn_ex("busyq", &["--cpu-workers", "1"], &[], Some(&log_path));
@@ -353,12 +328,8 @@ async fn busy_child_write_backpressure_is_not_wedged(c: &mut redis::aio::Multipl
     let _ = std::fs::remove_file(&log_path);
 }
 
-/// The other direction of the same fix: a child that stops READING and stops
-/// RESPONDING (genuinely wedged, not merely busy) must still be killed. Uses
-/// the identical write stall shape as the healthy case above (a big payload
-/// queued behind one already in flight), but this time the in flight
-/// request's own timeout is short and the child never returns from it, so
-/// nothing excuses the stall once that deadline passes.
+/// A child that stops reading and responding must still be killed: same
+/// stall shape, but the in flight request's short timeout passes.
 async fn genuinely_wedged_child_is_still_killed_despite_prefetch_stall(
     c: &mut redis::aio::MultiplexedConnection,
 ) {
@@ -384,9 +355,7 @@ async fn genuinely_wedged_child_is_still_killed_despite_prefetch_stall(
     assert_eq!(r["status"], "failure");
     assert_eq!(r["error"]["type"], "TimeLimitExceeded");
 
-    // the prefetched sibling, whose write was blocked behind the wedged
-    // task, must still recover on the replacement child rather than hang
-    // forever waiting on a write that will never unblock.
+    // The sibling blocked behind the wedged task recovers on the replacement.
     let r = wait_result(c, &big_id, 20).await;
     assert_eq!(r["status"], "success");
 
@@ -395,27 +364,13 @@ async fn genuinely_wedged_child_is_still_killed_despite_prefetch_stall(
     drop(w);
 }
 
-/// Item 3 (audit): a child that forks successfully and then dies instantly,
-/// repeatedly, must be backed off before the next fork request (mirrors
-/// `parent_control_loop`'s `Refused` backoff), not forked again at full OS
-/// speed with no delay. fx.cpu_die_always os._exit(9)s unconditionally on
-/// receipt, so every one of these SIX SEPARATE tasks (`max_retries` 0: one
-/// attempt each, no task level retry involved) kills its own dedicated
-/// child on `--cpu-workers 1`'s one slot. Deliberately six independent
-/// tasks rather than retries of one: a retried task's next attempt is only
-/// picked up by the 250ms delayed mover poll (§4.3), which would dominate
-/// this timing and hide cpu.rs's own backoff entirely. Before the fix this
-/// ran at full OS speed (measured 14.4 fork/crash cycles per second, 2 to
-/// 5ms gaps); the escalating 100ms to 2s backoff makes even a handful of
-/// cycles take well over the 300ms threshold below.
+/// A child that dies instantly on every fork is backed off (escalating 100ms
+/// to 2s), not reforked at full speed. Six independent tasks (`max_retries` 0),
+/// not retries: retries go through the 250ms delayed mover (§4.3), which would
+/// hide the backoff.
 async fn instant_repeated_child_death_is_backed_off(c: &mut redis::aio::MultiplexedConnection) {
-    // --cpu-prefetch 0: with the default prefetch, several of the six tasks
-    // below can be admitted into the same soon to die child's socket
-    // buffer before it ever reads the first one, so its single death
-    // resolves multiple of them at once and only one backoff interval is
-    // observed. Disabling prefetch forces one task per child, one death
-    // per task, so the timing assertion actually reflects consecutive
-    // backoff intervals rather than getting lucky on request batching.
+    // --cpu-prefetch 0: one task per child, one death per task, so the timing
+    // measures consecutive backoff intervals.
     let mut w = Worker::spawn("backoffq", &["--cpu-workers", "1", "--cpu-prefetch", "0"]);
     wait_group(c, "backoffq", 20).await;
 
@@ -445,8 +400,7 @@ async fn instant_repeated_child_death_is_backed_off(c: &mut redis::aio::Multiple
     drop(w);
 }
 
-/// Same regression, stdio mode (`--no-fork-server`): `stdio_child_loop`
-/// used to go straight back to spawning a replacement with no delay either.
+/// Same backoff, stdio mode (`--no-fork-server`).
 async fn instant_repeated_child_death_is_backed_off_stdio(
     c: &mut redis::aio::MultiplexedConnection,
 ) {
@@ -478,15 +432,8 @@ async fn instant_repeated_child_death_is_backed_off_stdio(
     drop(w);
 }
 
-/// Item 4 (audit), stdio mode counterpart to the fork server parent's
-/// reaper fix (`cauli._exec._reap_children`, covered at the Python level by
-/// `py/tests/test_fork_server.py`): in stdio mode there is no separate
-/// parent process, `stdio_child_loop` reaps its own child directly, and it
-/// had the exact same gap, discarding the exit status entirely so a
-/// segfault, an OOM kill and any other unprompted death all logged
-/// identically. fx.cpu_selfsignal kills itself with SIGSEGV (signal 11),
-/// standing in for a real crash; `child.try_wait()`'s WIFSIGNALED peek now
-/// appends the signal number to the existing "child died mid-task" line.
+/// Stdio mode logs a child's terminating signal on "child died mid-task".
+/// fx.cpu_selfsignal raises SIGSEGV (signal 11).
 async fn selfsignal_death_is_logged_with_signal_number_stdio(
     c: &mut redis::aio::MultiplexedConnection,
 ) {

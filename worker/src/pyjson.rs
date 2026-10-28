@@ -1,32 +1,18 @@
-//! The JSON type gate for task results on the io lanes.
+//! JSON type gate for task results on the io lanes.
 //!
-//! Results are encoded by msgspec (the shim's `_encode`), the codec the
-//! client and the cpu child use, so every lane writes a value the same way.
-//! msgspec is permissive where the protocol is strict, though: it writes
-//! NaN/Infinity as `null`, a `set` as an array, `bytes` as base64, a
-//! `datetime` as a string, and coerces non-str dict keys. This walk rejects
-//! all of that before the encoder runs, with the same rules the client's
-//! `_validate_json_types` (`py/cauli/_codec.py`) applies on the cpu lane:
-//! - non-finite floats (NaN/Infinity) are rejected -- they are not JSON;
-//! - dict keys must be `str`;
-//! - anything outside the JSON type set is rejected as unserializable.
-//!
-//! It is a check only: it allocates nothing and builds nothing, so the one
-//! traversal that produces bytes is msgspec's.
-//!
-//! Depth is capped explicitly, so a cyclic or very deep structure comes back
-//! as a normal error rather than a stack overflow that aborts the worker.
+//! msgspec writes NaN as `null`, a `set` as an array, `bytes` as base64 and
+//! coerces non-str keys; the protocol forbids all of that. This walk applies
+//! the rules of `_validate_json_types` (`py/cauli/_codec.py`) before encoding.
+//! Depth is capped so a cycle is an error, not a stack overflow abort.
 
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
 
-/// Maximum nesting depth accepted: comfortably deeper than any real task
-/// result, far shallower than the Rust stack.
+/// Deeper than any real result, far shallower than the Rust stack.
 pub const MAX_DEPTH: usize = 128;
 
-/// Why a Python value cannot be represented as JSON. Carries a message
-/// shaped like the one the Python codec produces, so the resulting
-/// `SerializationError` reads the same to task authors.
+/// Message shaped like the Python codec's, so `SerializationError` reads the
+/// same on every lane.
 pub struct ConvError(pub String);
 
 impl ConvError {
@@ -35,8 +21,6 @@ impl ConvError {
     }
 }
 
-/// Ok when `obj` is made only of JSON types: None, bool, int, finite float,
-/// str, and list, tuple or str keyed dict of those.
 pub fn check_json(obj: &Bound<'_, PyAny>, depth: usize) -> Result<(), ConvError> {
     if depth > MAX_DEPTH {
         return Err(ConvError::new(format!(
@@ -102,10 +86,6 @@ mod tests {
             .unwrap()
     }
 
-    /// Every JSON shape passes, including the ones msgspec writes exactly
-    /// and the old tree conversion special cased: integers past 64 bits,
-    /// `-0.0`, a tuple (an array, as json.dumps writes it), a bool next to
-    /// an int.
     #[test]
     fn accepts_every_json_shape() {
         Python::initialize();
@@ -122,8 +102,7 @@ mod tests {
         });
     }
 
-    /// The same rejections the client's codec enforces (PROTOCOL §8), each
-    /// one a value msgspec would otherwise write without complaint.
+    /// Values msgspec would write without complaint (PROTOCOL §8).
     #[test]
     fn rejects_non_json_values() {
         Python::initialize();
@@ -151,8 +130,6 @@ mod tests {
         });
     }
 
-    /// A self referential container must come back as a normal error, not a
-    /// stack overflow that aborts the process.
     #[test]
     fn cyclic_structure_is_an_error_not_a_crash() {
         Python::initialize();

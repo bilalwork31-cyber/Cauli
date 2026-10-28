@@ -18,10 +18,8 @@ def _ctx(extra):
     return {"pid": os.getpid(), "tid": threading.get_ident(), **extra}
 
 
-# max_retries=0 on every ORM task: a stale-connection failure must surface as
-# a task failure, not be quietly healed by a retry (the restart-survival test
-# depends on the FIRST attempt succeeding). timeout=20 keeps the §4.4
-# invariant (visibility_timeout 30 > task timeout) satisfied.
+# max_retries=0: a stale connection must fail the task, not be healed by a
+# retry. timeout=20 stays under visibility_timeout 30 (PROTOCOL.md 4.4).
 
 
 @app.task(max_retries=0, timeout=20)

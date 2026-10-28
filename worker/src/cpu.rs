@@ -1,39 +1,27 @@
 //! CPU task pool (PROTOCOL §5.1), two modes:
 //!
-//! **Fork-server mode (default):** ONE parent process
+//! **Fork-server mode (default):** one parent
 //! (`{python} -m cauli._exec --app {spec} --fork-server --connect {sock}
 //! --child-threads {M}`) imports the app once, calls `gc.freeze()`, and forks
-//! a child per `{"cmd":"fork"}` control line (stdin/stdout). Each forked
-//! child connects back to the worker's unix socket listener, sends
-//! `{"ready": true, "pid": N, "concurrency": M}`, then serves the line
-//! protocol on that connection with up to M requests in flight (responses
-//! matched by `id`, possibly out of order). Hard timeout: SIGKILL the child
-//! by pid and request a replacement fork (cheap: no re-import). Child death
-//! fails its in-flight requests as WorkerLost (retryable). If the parent's
-//! control channel breaks mid-run the parent is respawned and the fork
-//! request that was in flight is retried against the fresh parent, rather
-//! than dropped for the requesting slot's `FORK_WAIT` backstop to notice; a
-//! *healthy* parent's transient fork refusal (EAGAIN/ENOMEM) retries with
-//! backoff and never touches the parent. If fork-server startup fails
-//! outright the pool falls back to stdio mode. The listener socket lives in
-//! a private (0700) directory and every accepted connection is checked
-//! against our own uid (SO_PEERCRED) before it is trusted as a real child.
+//! a child per `{"cmd":"fork"}` control line. Each child connects back to the
+//! worker's unix socket, sends `{"ready": true, "pid": N, "concurrency": M}`,
+//! and serves up to M requests at once, responses matched by `id`. Hard
+//! timeout SIGKILLs the child and forks a replacement; child death fails its
+//! in flight requests as WorkerLost (retryable). A broken control channel
+//! respawns the parent and retries the pending fork; a healthy parent's fork
+//! refusal (EAGAIN/ENOMEM) retries with backoff. If startup fails the pool
+//! falls back to stdio mode. The socket lives in a 0700 directory and every
+//! connection is checked against our uid (SO_PEERCRED).
 //!
 //! **Stdio mode (fallback, `--no-fork-server`):** each child is spawned
 //! directly (`{python} -m cauli._exec --app {spec}`), speaks the protocol on
-//! its own stdin/stdout, one request in flight, kill+respawn on hard timeout
-//! or death. This is the pre-fork-server behavior, preserved verbatim.
+//! its stdin/stdout, one request in flight, killed and respawned on hard
+//! timeout or death.
 //!
-//! Test hook (documented, M5): if env var `CAULI_EXEC_CMD` is set, it is
-//! split on whitespace and used verbatim as the child argv instead of
-//! `{python} -m cauli._exec --app {spec}` (fork-server mode appends its
-//! `--fork-server --connect ... --child-threads ...` flags to the override
-//! argv too). This lets the e2e suite run a standalone stand-in child
-//! (tests/fixtures/fake_exec.py) without the real cauli Python package
-//! installed. Compiled in only under `cfg(test)` or the `test-hooks`
-//! feature -- a plain `cargo build --release` has no code path that reads
-//! this env var at all, so `cargo test --features test-hooks` is required to
-//! exercise it (see worker/Cargo.toml `[features]`).
+//! Test hook: `CAULI_EXEC_CMD`, split on whitespace, replaces the child argv
+//! (fork-server flags are appended to it). Compiled only under `cfg(test)` or
+//! the `test-hooks` feature, so a release binary has no env driven way to
+//! replace the cpu child command.
 
 use crate::stats::Counters;
 use anyhow::Context;
@@ -56,11 +44,9 @@ use tracing::{info, warn};
 /// Handshake budget for the parent's server-ready line, a forked child's
 /// ready line, and a control-channel fork reply.
 const READY_TIMEOUT: Duration = Duration::from_secs(30);
-/// How long a pool slot waits for a requested fork to connect before asking
-/// again. `parent_control_loop` already retries a request internally until
-/// it succeeds (FS-3/FS-6), so this is a backstop for the rarer case where
-/// the fork itself succeeded but the resulting child never completed its
-/// ready handshake (e.g. it crashed between connect() and its ready line).
+/// How long a slot waits for a requested fork to connect before asking again.
+/// `parent_control_loop` already retries failed forks; this covers a child
+/// that forked but never completed its ready handshake.
 const FORK_WAIT: Duration = Duration::from_secs(60);
 
 pub enum CpuOutcome {
@@ -68,13 +54,12 @@ pub enum CpuOutcome {
     Resp(String),
     /// Hard timeout: child was SIGKILLed and respawned.
     Timeout,
-    /// Child died / pipe broke: respawned.
+    /// Child died or pipe broke: respawned.
     Lost,
 }
 
 pub struct CpuJob {
-    /// Wire correlation id (unique per request; §5.1 fork-server mode matches
-    /// responses to requests by this).
+    /// Wire correlation id, unique per request (§5.1).
     pub id: String,
     pub req_line: String,
     pub timeout_ms: u64,
@@ -85,25 +70,13 @@ pub struct CpuJob {
 pub struct CpuPool {
     pub tx: async_channel::Sender<CpuJob>,
     /// Admission slots for cpu work: `workers * (child_threads + prefetch)`,
-    /// the number of requests the pool can hold without a new one queueing
-    /// behind work that has not started.
-    ///
-    /// `run_cpu_task` never took an io slot, so `io_sem` sat at full and the
-    /// fetch loop's bound did nothing for cpu work: entries piled into the
-    /// backlog channel, into blocked dispatch tasks and into each child's
-    /// staged queue, all with their PEL idle clocks running from delivery.
-    /// Past `max(visibility_timeout, timeout_ms + grace)` the recovery loop
-    /// reclaimed them, and four reclaims dead lettered a task as
-    /// `RedeliveryLimitExceeded` that had executed zero instructions. This
-    /// gives the cpu lane an admission gate of its own, and a dispatch
-    /// waiting on it counts into `overflow`, which is what the fetch loop
-    /// and the recovery loop's admission gate already watch.
+    /// what the pool can hold without queueing behind unstarted work. Without
+    /// this gate entries wait with their PEL idle clocks running and get
+    /// reclaimed, then dead lettered, having never run. A dispatch waiting
+    /// here counts into `overflow`, which the fetch and recovery loops watch.
     pub admission: Arc<Semaphore>,
-    /// Number of dispatch tasks currently blocked on a full backlog or
-    /// waiting for an admission slot; the fetch loop pauses while > 0 so the
-    /// in-worker cpu backlog stays bounded without starving io fetch
-    /// indefinitely (children always make progress thanks to the
-    /// hard-timeout SIGKILL).
+    /// Dispatch tasks blocked on a full backlog or an admission slot; the
+    /// fetch loop pauses while > 0 so the cpu backlog stays bounded.
     pub overflow: Arc<AtomicUsize>,
     /// Fired when `overflow` falls back to zero, so the admission gates
     /// that pause on it resume at once instead of at their next poll.
@@ -116,11 +89,7 @@ pub struct CpuPool {
 }
 
 pub fn child_argv(python: &str, app_spec: &str) -> (String, Vec<String>) {
-    // M5: the CAULI_EXEC_CMD override is a test-only hook (e2e uses it to run
-    // tests/fixtures/fake_exec.py without the real cauli package). Compiled
-    // out entirely for a normal `cargo build --release` so a production
-    // binary has no env-driven way to replace the cpu child command; only
-    // `cargo test` / `--features test-hooks` builds honor it.
+    // Test hook only; see the module doc.
     #[cfg(any(test, feature = "test-hooks"))]
     if let Ok(cmd) = std::env::var("CAULI_EXEC_CMD") {
         tracing::warn!(
@@ -142,16 +111,9 @@ pub fn child_argv(python: &str, app_spec: &str) -> (String, Vec<String>) {
     )
 }
 
-/// A pool with no executors at all, for an app that registers no
-/// `kind = "cpu"` task.
-///
-/// Routing is by REGISTRY kind, not envelope kind (dispatch.rs: "registry
-/// authoritative over envelope kind"), so when no registered task is cpu-kind
-/// `exec::run_cpu_task` is unreachable by construction -- no fork-server
-/// parent, no children, and none of their RAM. The channel is created with
-/// its receiver dropped so the defensive path (if this ever did get reached)
-/// fails fast and loudly as `WorkerLost` rather than parking forever on a
-/// send nobody will service.
+/// A pool with no executors, for an app with no `kind = "cpu"` task. Routing
+/// is by registry kind, so `run_cpu_task` is unreachable; the receiver is
+/// dropped so reaching it anyway fails as `WorkerLost` instead of parking.
 pub fn disabled() -> CpuPool {
     let (tx, rx) = async_channel::bounded::<CpuJob>(1);
     drop(rx);
@@ -165,18 +127,15 @@ pub fn disabled() -> CpuPool {
     }
 }
 
-/// Everything needed to start the pool. Held by Ctx so the pool can start
-/// lazily: forked on the first cpu task rather than at boot, so an io heavy
-/// deployment that registers a rarely used cpu task does not pay resident
-/// children for work that has not arrived (`--eager-cpu` restores warmup).
+/// Everything needed to start the pool, held by Ctx so it can start lazily on
+/// the first cpu task (`--eager-cpu` starts it at boot).
 #[derive(Clone)]
 pub struct StartCfg {
     pub workers: usize,
     pub child_threads: usize,
     pub prefetch: usize,
-    /// Recycle a child after this many completed tasks (0 = never). The
-    /// backstop for leaky C extensions and CoW pages dirtied over hours,
-    /// same role as Celery's maxtasksperchild.
+    /// Recycle a child after this many completed tasks (0 = never), against
+    /// leaky C extensions and dirtied CoW pages.
     pub recycle: usize,
     pub python: String,
     pub app_spec: String,
@@ -197,15 +156,10 @@ pub async fn start(cfg: StartCfg, counters: Arc<Counters>) -> CpuPool {
         no_fork_server,
     } = cfg;
     let child_threads = child_threads.max(1);
-    // Backlog bound: 2 in-flight-capacities worth of pending items. Prefetched
-    // requests live in the children, not this channel, so they are counted in
-    // the per-child queue depth rather than here.
+    // Twice the in flight capacity. Prefetched requests live in the children.
     let cap = (2 * workers * child_threads).max(1);
     let (tx, rx) = async_channel::bounded::<CpuJob>(cap);
-    // One admission slot per request the pool can actually hold: the
-    // executing ones plus the deliberately staged prefetch depth. Anything
-    // beyond that would be parking with its idle clock running (see the
-    // `admission` field on CpuPool).
+    // Executing plus staged prefetch; see `CpuPool::admission`.
     let admission = Arc::new(Semaphore::new(
         workers
             .saturating_mul(child_threads.saturating_add(prefetch))
@@ -267,10 +221,8 @@ pub async fn start(cfg: StartCfg, counters: Arc<Counters>) -> CpuPool {
     }
 }
 
-/// SIGKILL every live executor pid (children + fork-server parent) and clean
-/// up the listener socket. Used on process exit paths; every executor also
-/// carries PR_SET_PDEATHSIG (parent via pre_exec, forked children re-arm it
-/// themselves) so a SIGKILLed worker cannot leak them either.
+/// SIGKILL every live executor and remove the listener socket. Executors also
+/// carry PR_SET_PDEATHSIG, so a SIGKILLed worker cannot leak them either.
 pub fn kill_children(pool: &CpuPool) {
     let pids = pool.child_pids.lock().unwrap().clone();
     for pid in pids {
@@ -281,11 +233,8 @@ pub fn kill_children(pool: &CpuPool) {
     }
 }
 
-/// Remove the fork-server socket file and its private containing directory
-/// (FS-8). Called on every path that can leave a bound socket behind: clean
-/// shutdown, forced double-signal exit, and fork-server startup failure
-/// after a successful bind. `remove_dir` only succeeds once the directory is
-/// empty, so this is safe to call from a partial-startup path too.
+/// Remove the socket file and its private directory. Safe after a partial
+/// startup: `remove_dir` only succeeds once the directory is empty.
 fn cleanup_sock_path(p: &std::path::Path) {
     let _ = std::fs::remove_file(p);
     if let Some(dir) = p.parent() {
@@ -294,11 +243,7 @@ fn cleanup_sock_path(p: &std::path::Path) {
 }
 
 fn kill_pid(pid: u32) {
-    // L1: pid 0 is never a real executor (Command::id() is Some right after a
-    // successful spawn, and ready lines with pid <= 1 are rejected);
-    // `kill(0, SIGKILL)` signals this process's ENTIRE process group
-    // (self-SIGKILL) rather than one child, so it must never reach libc::kill
-    // even if tracking ever regresses.
+    // `kill(0, SIGKILL)` would kill our own process group; pid 1 is init.
     if pid <= 1 {
         return;
     }
@@ -316,10 +261,6 @@ fn track_pid(pids: &Mutex<Vec<u32>>, pid: u32, add: bool) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// fork-server mode
-// ---------------------------------------------------------------------------
-
 struct ParentProc {
     child: Child,
     stdin: ChildStdin,
@@ -334,12 +275,9 @@ struct ChildConn {
     concurrency: usize,
 }
 
-/// Create a private (0700) directory under the system temp dir and return a
-/// socket path inside it (FS-1). Connecting to a unix-domain socket on Linux
-/// also requires search/write permission on its containing directory, so a
-/// 0700 directory alone already stops any other local uid from reaching the
-/// socket; the SO_PEERCRED check in `read_child_ready` is defense in depth
-/// on top of that (belt-and-suspenders against a umask/platform surprise).
+/// A socket path inside a new 0700 directory under the temp dir. Connecting
+/// needs access to the directory, so no other uid can reach the socket;
+/// SO_PEERCRED in `read_child_ready` is defense in depth.
 fn fork_sock_path() -> anyhow::Result<PathBuf> {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -404,10 +342,7 @@ async fn wait_server_ready(parent: &mut ParentProc) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Pool shape: how many children, how each one is launched, and how deeply
-/// each is fed. Grouped rather than passed as a parameter run, which both
-/// reads better and keeps the fork-server entry point under clippy's argument
-/// limit as the knobs grow.
+/// Pool shape: how many children, how each is launched, how deeply each is fed.
 pub struct PoolCfg {
     pub workers: usize,
     pub child_threads: usize,
@@ -434,9 +369,7 @@ async fn start_fork_server(
     let sock_path = fork_sock_path()?;
     let listener = UnixListener::bind(&sock_path)
         .with_context(|| format!("bind unix listener at {}", sock_path.display()))?;
-    // FS-1 defense in depth: explicitly restrict the socket file itself too,
-    // rather than relying solely on whatever the platform's default bind()
-    // mode (subject to umask) happens to produce.
+    // The socket file too, not just its directory, whatever the umask.
     std::fs::set_permissions(&sock_path, std::fs::Permissions::from_mode(0o600))
         .with_context(|| format!("chmod 0600 {}", sock_path.display()))?;
 
@@ -444,7 +377,7 @@ async fn start_fork_server(
     if let Err(e) = wait_server_ready(&mut parent).await {
         let _ = parent.child.start_kill();
         let _ = parent.child.wait().await;
-        cleanup_sock_path(&sock_path); // FS-8: don't abandon a bound socket on startup failure
+        cleanup_sock_path(&sock_path);
         return Err(e);
     }
     info!(
@@ -485,15 +418,10 @@ async fn start_fork_server(
     Ok(sock_path)
 }
 
-/// Owns the fork-server parent: writes one `{"cmd":"fork"}` per request from
-/// the pool slots and reads the reply. FS-3/FS-6: a request is retried until
-/// it succeeds instead of being dropped on the first setback. A parseable
-/// `{"error": ...}` reply from a HEALTHY parent (e.g. transient
-/// EAGAIN/ENOMEM) retries with backoff and never touches the parent process;
-/// a genuine control-channel failure (parent crashed/killed) respawns the
-/// parent and then retries the SAME request against the fresh one, so the
-/// requesting slot is served promptly instead of waiting out its FORK_WAIT
-/// backstop.
+/// Owns the fork-server parent: one `{"cmd":"fork"}` per slot request, retried
+/// until it succeeds. An `{"error": ...}` reply from a healthy parent retries
+/// with backoff and leaves the parent alone; a broken control channel respawns
+/// the parent and retries the same request against it.
 async fn parent_control_loop(
     mut parent: ParentProc,
     mut fork_rx: mpsc::Receiver<()>,
@@ -505,7 +433,7 @@ async fn parent_control_loop(
 ) {
     loop {
         if fork_rx.recv().await.is_none() {
-            // all slots gone (worker exiting): shut the parent down
+            // All slots gone: worker exiting.
             let _ = parent.child.start_kill();
             let _ = parent.child.wait().await;
             track_pid(&pids, parent.pid, false);
@@ -529,7 +457,6 @@ async fn parent_control_loop(
                     let _ = parent.child.wait().await;
                     track_pid(&pids, parent.pid, false);
                     parent = respawn_parent(&prog, &argv, &sock_path, child_threads, &pids).await;
-                    // loop back and retry request_fork against the fresh parent
                 }
             }
         }
@@ -568,9 +495,8 @@ async fn respawn_parent(
 enum ForkResult {
     /// The parent forked a child successfully.
     Forked(u32),
-    /// The parent is healthy and replied with a parseable `{"error": ...}`
-    /// (e.g. transient EAGAIN/ENOMEM) -- FS-3: this must NOT be treated the
-    /// same as a dead/unreachable parent (no kill, no respawn).
+    /// A healthy parent replied `{"error": ...}` (e.g. EAGAIN/ENOMEM): no
+    /// kill, no respawn.
     Refused(String),
 }
 
@@ -628,16 +554,11 @@ async fn acceptor_loop(
     }
 }
 
-/// Read `{"ready": true, "pid": N, "concurrency": M}` from a fresh child
-/// connection. FS-1: the private 0700 socket directory already keeps other
-/// uids out; this additionally verifies the connecting process's
-/// kernel-reported credentials (SO_PEERCRED) match our own uid before
-/// trusting anything it says, and prefers the kernel-reported peer pid over
-/// the JSON-claimed one (which is otherwise attacker-controlled) for
-/// tracking/kill decisions. FS-2: concurrency is clamped to the configured
-/// `child_threads` so a hostile/buggy value can't defeat the pool's backlog
-/// bound. The same buffered reader is kept for the serving loop so no bytes
-/// can be lost between handshake and first response.
+/// Read `{"ready": true, "pid": N, "concurrency": M}` from a fresh child. The
+/// peer's uid (SO_PEERCRED) must be ours, and the kernel's peer pid is used
+/// for kill decisions rather than the claimed one. Concurrency is clamped to
+/// `child_threads` so a bad value cannot defeat the backlog bound. The same
+/// buffered reader is kept for serving so no bytes are lost.
 async fn read_child_ready(
     stream: tokio::net::UnixStream,
     child_threads: usize,
@@ -686,9 +607,6 @@ async fn read_child_ready(
     })
 }
 
-/// One pool slot: keep exactly one serving child alive, requesting a
-/// replacement fork whenever the current child is gone (death, hard-timeout
-/// SIGKILL). Respawns are cheap: the parent forks its warmed, frozen image.
 /// Per-child serving knobs, fixed for the pool's lifetime.
 #[derive(Clone)]
 struct ServeCfg {
@@ -697,15 +615,13 @@ struct ServeCfg {
     idle_slots: Arc<IdleSlots>,
 }
 
-/// Slots that could start a request right now, the ones still forking
-/// included. A busy slot stages prefetch work only while there are none:
-/// otherwise the first slot to wake drained a burst into its own queue and
-/// ran it serially while its siblings sat idle.
+/// Slots that could start a request now, forking ones included. A busy slot
+/// stages prefetch work only while there are none, or the first slot to wake
+/// drains a burst into its own queue while its siblings sit idle.
 #[derive(Default)]
 struct IdleSlots {
     count: AtomicUsize,
-    /// Woken when `count` drops, so a slot holding back staged work
-    /// re-checks at once instead of at its own child's next response.
+    /// Woken when `count` drops, so a slot holding back work re-checks at once.
     dropped: tokio::sync::Notify,
 }
 
@@ -729,20 +645,17 @@ async fn slot_loop(
     counters: Arc<Counters>,
     pids: Arc<Mutex<Vec<u32>>>,
 ) {
-    // Mirrors parent_control_loop's Refused backoff (FS-3): a child that
-    // forks successfully and then dies immediately, over and over, must
-    // not be forked again at full OS speed with no delay. Reset on a
-    // planned recycle, which can legitimately be this frequent if the
-    // operator configured it that way.
+    // A child that dies right after every fork must not be reforked at full
+    // speed. Reset on a planned recycle.
     let mut backoff = Duration::from_millis(100);
     cfg.idle_slots.add();
     loop {
         if fork_tx.send(()).await.is_err() {
-            break; // control loop gone: worker exiting
+            break;
         }
         let conn = match timeout(FORK_WAIT, conn_rx.recv()).await {
             Ok(Ok(c)) => c,
-            Ok(Err(_)) => break, // acceptor gone: worker exiting
+            Ok(Err(_)) => break,
             Err(_) => {
                 warn!("cpu[{idx}]: no forked child connected within {FORK_WAIT:?}; re-requesting");
                 continue;
@@ -753,7 +666,7 @@ async fn slot_loop(
             conn.pid, conn.concurrency
         );
         match serve_child(idx, conn, cfg.clone(), &rx, &counters, &pids).await {
-            ServeExit::Shutdown => break, // job channel closed: worker exiting
+            ServeExit::Shutdown => break,
             ServeExit::Recycled => backoff = Duration::from_millis(100),
             ServeExit::Died => {
                 tokio::time::sleep(backoff).await;
@@ -767,36 +680,23 @@ async fn slot_loop(
 struct Pending {
     resp: oneshot::Sender<CpuOutcome>,
     timeout_ms: u64,
-    /// `None` while this request is still sitting unread in the child's socket
-    /// buffer behind earlier work (a prefetched request), `Some` once the
-    /// child is believed to have actually started executing it.
-    ///
-    /// A prefetched request must NOT have its hard-timeout clock running while
-    /// an earlier request is still computing -- otherwise a queued task could
-    /// be declared timed out having never executed a single instruction.
+    /// `None` while the request is prefetched behind earlier work, `Some` once
+    /// the child has started it, so a queued task cannot time out unstarted.
     deadline: Option<Instant>,
 }
 
-/// A request accepted from `rx` but not yet fully handed to the child: at
-/// most one of these at a time (see the `job = rx.recv()` branch's guard
-/// below), tracked outside `pending`/`order` until the write actually
-/// finishes so those two only ever describe requests the child has
-/// definitely received. Written a few bytes at a time via plain `write`
-/// (never `write_all`) so a stalled write never stops this same select! loop
-/// from also polling `lines.next_line()` -- otherwise the child's own
-/// response, sent right back over the same socket, could fill its buffer and
-/// block on us reading it while we are blocked writing to it, a deadlock
-/// neither side can break.
+/// A request not yet fully written to the child; at most one at a time, kept
+/// out of `pending`/`order` until written. Written with plain `write`, never
+/// `write_all`, so the select! loop keeps reading responses: otherwise both
+/// sides block writing to each other's full buffer and deadlock.
 struct PendingWrite {
     id: String,
     buf: Vec<u8>,
     sent: usize,
     resp: oneshot::Sender<CpuOutcome>,
     timeout_ms: u64,
-    /// How long this write may stall once nothing else in flight excuses it
-    /// (`next_deadline` is `None`): `min(timeout_ms, 5s)`, the same shape as
-    /// the old flat write budget. Applied from `write_stall_since` in
-    /// `serve_child`, NOT from when this write started -- see its comment.
+    /// How long this write may stall with nothing in flight to excuse it:
+    /// `min(timeout_ms, 5s)`, counted from `write_stall_since`.
     budget: Duration,
 }
 
@@ -806,18 +706,15 @@ impl PendingWrite {
     }
 }
 
-/// H3-style saturation: a crafted/huge `timeout_ms` must not overflow `Instant`
-/// math into a panic or wrap to a near-zero deadline.
+/// Saturating: a huge `timeout_ms` must not overflow `Instant` math.
 fn deadline_for(timeout_ms: u64) -> Instant {
     Instant::now()
         .checked_add(Duration::from_millis(timeout_ms))
         .unwrap_or_else(|| Instant::now() + Duration::from_secs(86_400 * 365))
 }
 
-/// Start the hard-timeout clock on the oldest not-yet-started requests until
-/// `concurrency` of them are running. Called after every send and after every
-/// completion: a prefetched request's clock starts when the request ahead of
-/// it finishes, which is the moment the child actually picks it up.
+/// Start the hard timeout clock on the oldest unstarted requests until
+/// `concurrency` are running. Called after every send and every completion.
 fn arm_started(
     pending: &mut HashMap<String, Pending>,
     order: &std::collections::VecDeque<String>,
@@ -837,10 +734,8 @@ fn arm_started(
     }
 }
 
-/// Extracts just the `id` from a child response line, borrowing it out of the
-/// source string. serde skips every other field (including the result) without
-/// building or allocating it -- `parse_pyresp` does the real parse afterwards,
-/// and only for a line we've matched to a pending request.
+/// Just the `id` of a child response line, borrowed; serde skips the rest
+/// without allocating. `parse_pyresp` parses matched lines afterwards.
 #[derive(serde::Deserialize)]
 struct IdOnly<'a> {
     #[serde(borrow, default)]
@@ -848,32 +743,23 @@ struct IdOnly<'a> {
 }
 
 enum ChildGone {
-    /// EOF observed on read, or a write that completed with an error (or
-    /// returned 0 for a non empty buffer): either way the kernel is telling
-    /// us the child process has already gone, one way reaped by the
-    /// fork-server parent's SIGCHLD handler (FS-7) and the other simply
-    /// refusing to receive: its pid may already be reused by an unrelated
-    /// process, so it must NOT be SIGKILLed again.
+    /// Read EOF or a failed write: the child is gone, possibly reaped by the
+    /// parent already, so its pid may be reused. Must not be SIGKILLed.
     Exited,
     /// A request exceeded its hard timeout: SIGKILL the child.
     HardTimeout,
-    /// A write to the child's socket stalled past its budget (FS-4) with
-    /// nothing already in flight to excuse it: the child is presumed
-    /// wedged, not confirmed exited. SIGKILL it.
+    /// A write stalled past its budget with nothing in flight to excuse it:
+    /// presumed wedged. SIGKILL it.
     Wedged,
-    /// `--cpu-max-tasks-per-child` reached with nothing in flight: SIGKILL and
-    /// fork a replacement. Only ever chosen with an empty pending map, so no
-    /// task can be lost to it.
+    /// `--cpu-max-tasks-per-child` reached with nothing pending: SIGKILL and
+    /// fork a replacement.
     Recycled,
     /// The job channel closed: worker shutdown.
     Shutdown,
 }
 
-/// What `slot_loop` should do once `serve_child` returns: told apart from a
-/// plain bool so a child that dies (or is killed) gets backed off before the
-/// next fork request, while a `--cpu-max-tasks-per-child` recycle, which is
-/// planned and can legitimately be just as frequent as the operator
-/// configured it to be, does not.
+/// What `slot_loop` does once `serve_child` returns. A dead child is backed
+/// off before the next fork; a planned recycle is not.
 enum ServeExit {
     /// The job channel closed: worker shutdown, stop looping.
     Shutdown,
@@ -884,19 +770,9 @@ enum ServeExit {
     Died,
 }
 
-/// Serve one child connection, keeping up to `concurrency` requests EXECUTING
-/// and up to `prefetch` more pre-staged in the child's socket buffer (pending
-/// map keyed by request id, FIFO order tracked separately). Returns what the
-/// slot should do next (`ServeExit`): stop (worker shutting down), or fork a
-/// replacement child, immediately or after a backoff.
-///
-/// Prefetch is what keeps a child busy back to back. Without it, a child that
-/// finishes a task writes its response and then sits idle for a full round
-/// trip -- socket write, tokio wakeup, select-loop iteration, channel recv,
-/// socket write, child wakeup -- before the next request even reaches it. That
-/// dead time is pure lost throughput on cpu-bound work, and at small task
-/// sizes it can rival the task itself. With a request already queued behind
-/// the current one, the child's next read returns immediately.
+/// Serve one child connection: up to `concurrency` requests executing and up
+/// to `prefetch` more staged in its socket buffer. Prefetch saves a full round
+/// trip between tasks, which on small tasks rivals the task itself.
 async fn serve_child(
     idx: usize,
     conn: ChildConn,
@@ -920,24 +796,16 @@ async fn serve_child(
     } = conn;
     track_pid(pids, pid, true);
     let mut pending: HashMap<String, Pending> = HashMap::new();
-    // Send order, so we can tell which pending requests the child has actually
-    // reached (it reads its socket in order) and which are still queued.
+    // Send order: the child reads in order, so this tells started from queued.
     let mut order: std::collections::VecDeque<String> = std::collections::VecDeque::new();
     let queue_depth = concurrency.saturating_add(prefetch);
-    // --cpu-max-tasks-per-child accounting. The intake gate below stops
-    // ADMITTING once completed + in flight reaches the budget, so staged
-    // prefetch work always drains before the recycle fires.
+    // Intake stops once completed plus in flight reaches the recycle budget,
+    // so staged work drains before the recycle.
     let mut completed: usize = 0;
-    // At most one request being written to the child at a time -- see the
-    // `job = rx.recv()` branch's guard below.
     let mut pending_write: Option<PendingWrite> = None;
-    // The instant `pending_write` most recently became stalled with nothing
-    // in `pending` to excuse it (`next_deadline` is `None`). Recomputed every
-    // iteration below, NOT set once when the write started: a write that
-    // stalls first because the child is legitimately busy with something
-    // already in flight, and only later runs out of that excuse, must be
-    // judged against a clock that starts at the moment it ran out, not one
-    // that has been running since before it had anything to excuse.
+    // When `pending_write` last became stalled with nothing in flight to
+    // excuse it. Recomputed every iteration: a write first excused by busy
+    // work is judged from the moment that excuse ran out.
     let mut write_stall_since: Option<Instant> = None;
 
     let gone = loop {
@@ -957,9 +825,6 @@ async fn serve_child(
         } else {
             write_stall_since = None;
         }
-        // `pending_write`'s own budget (`min(timeout_ms, 5s)`), counted from
-        // `write_stall_since` above -- `None` whenever there is nothing to
-        // apply it to, or something else in flight already excuses the wait.
         let write_fallback_at = write_stall_since
             .zip(pending_write.as_ref())
             .map(|(since, pw)| since + pw.budget);
@@ -967,12 +832,6 @@ async fn serve_child(
             line = lines.next_line() => {
                 match line {
                     Ok(Some(l)) => {
-                        // Read ONLY the correlation id. The previous
-                        // `from_str::<Value>` built a full tree for the entire
-                        // response -- including the task's whole result -- and
-                        // threw it away, then `parse_pyresp` parsed the same
-                        // line a second time. `IdOnly` borrows the id out of
-                        // `l` and skips every other field without allocating.
                         let rid = serde_json::from_str::<IdOnly>(&l)
                             .ok()
                             .and_then(|v| v.id);
@@ -981,9 +840,8 @@ async fn serve_child(
                                 let _ = p.resp.send(CpuOutcome::Resp(l));
                                 counters.inflight_cpu.fetch_sub(1, Ordering::Relaxed);
                                 order.retain(|x| *x != done_id);
-                                // The child just freed a slot: whatever it was
-                                // holding prefetched starts executing now, so
-                                // start that request's clock now too.
+                                // A slot freed: the next prefetched request
+                                // starts now.
                                 arm_started(&mut pending, &order, concurrency);
                                 completed += 1;
                                 if recycle > 0 && completed >= recycle && pending.is_empty() {
@@ -994,11 +852,7 @@ async fn serve_child(
                                     break ChildGone::Recycled;
                                 }
                             }
-                            // rid alone, plus a length: never the response
-                            // line itself, which carries the task's own
-                            // result / error.message content (audit: the
-                            // last log site in the worker that still leaked
-                            // task data).
+                            // Never log the line: it carries task data.
                             None => warn!(
                                 "cpu[{idx}] pid={pid}: response with unknown or missing id (rid={rid:?} len={})",
                                 l.len()
@@ -1014,8 +868,7 @@ async fn serve_child(
                     }
                 }
             }
-            // Only ever admit a NEW request once the last one is fully
-            // handed to the child: the socket has one write side to share.
+            // One write in progress at a time: the socket has one write side.
             job = rx.recv(), if pending_write.is_none() && pending.len() < queue_depth
                 && may_admit
                 && (recycle == 0 || completed + pending.len() < recycle) => {
@@ -1037,33 +890,14 @@ async fn serve_child(
                     Err(_) => break ChildGone::Shutdown,
                 }
             }
-            // Drive an in flight write forward a `write()` call at a time
-            // (never `write_all`, which would run to completion or timeout
-            // outside this select! -- see `PendingWrite`'s doc comment for
-            // why that already deadlocked once). A blocked write is NOT by
-            // itself evidence the child is wedged: prefetch means the
-            // worker stages more requests than a busy child has drained
-            // yet, and a busy child legitimately does not read again until
-            // it finishes what it is already executing -- that is
-            // backpressure the worker itself created, not a wedge. So a
-            // stall here only counts against the child once nothing already
-            // in flight is still within ITS OWN deadline either: once
-            // `next_deadline` passes with still no write and no response,
-            // the child has stopped both reading and responding, a real
-            // hard timeout (handled by the `sleep_until(next_deadline)` arm
-            // below, which this same stall leaves free to fire). With
-            // nothing armed to excuse it, `write_fallback_at` above is this
-            // write's only bound -- nothing legitimate can excuse a stall
-            // with nothing else in flight either.
+            // One `write()` per poll (see `PendingWrite`). A blocked write is
+            // not a wedge by itself: a busy child does not read until it
+            // finishes, which is backpressure from our own prefetch. In flight
+            // deadlines bound it; with nothing in flight, `write_fallback_at`.
             //
-            // The `write()` call is wrapped in an async block, not called
-            // directly as the branch expression: `tokio::select!` only skips
-            // POLLING a disabled branch, it still constructs every branch's
-            // future up front, and `write.write(buf)` needs `buf` (borrowed
-            // from `pending_write`) at construction time. An async block
-            // defers everything in it, including that borrow, to first
-            // poll -- which the `if pending_write.is_some()` guard below
-            // then ensures never happens while it is `None`.
+            // An async block because select! constructs every branch future
+            // up front, and `buf` borrows from `pending_write`, which may be
+            // `None` while the branch is disabled.
             r = async {
                 write.write(pending_write.as_ref().expect("guarded by is_some() below").remaining()).await
             }, if pending_write.is_some() => {
@@ -1078,25 +912,14 @@ async fn serve_child(
                             pending.insert(pw.id, Pending {
                                 resp: pw.resp,
                                 timeout_ms: pw.timeout_ms,
-                                // Armed by arm_started below only if the
-                                // child has capacity to run it right now;
-                                // otherwise it is prefetched and its clock
-                                // starts when the request ahead completes.
+                                // Armed by arm_started below.
                                 deadline: None,
                             });
                             arm_started(&mut pending, &order, concurrency);
                         }
                     }
-                    // A write that completes with an error (EPIPE,
-                    // ECONNRESET, ...), or a stream write() returning 0 for
-                    // a non empty buffer, is the kernel telling us the same
-                    // "already gone" thing a read EOF does: the child is not
-                    // there to receive this, so its pid may just as well
-                    // already be reused by an unrelated process (see
-                    // `ChildGone::Exited`'s doc comment). This is not a
-                    // write that merely stalled while the child might still
-                    // be alive (the arms below), so it does not repeat the
-                    // kill: it takes the `Exited` path, not `Wedged`.
+                    // A write error or a 0 byte write means the child is gone,
+                    // like a read EOF: `Exited`, not `Wedged`, so no kill.
                     Ok(_zero) => {
                         let pw = pending_write.take().expect("just matched Some");
                         warn!("cpu[{idx}] pid={pid}: write returned 0 bytes, treating as closed");
@@ -1111,8 +934,6 @@ async fn serve_child(
                     }
                 }
             }
-            // Some(_) pattern guard: the branch is disabled when nothing is
-            // pending, so unwrap-by-pattern here is safe.
             _ = sleep_until(next_deadline.unwrap_or_else(Instant::now)), if next_deadline.is_some() => {
                 warn!(
                     "cpu[{idx}] pid={pid}: hard timeout with {} in flight; SIGKILL + replacement fork",
@@ -1132,11 +953,8 @@ async fn serve_child(
         }
     };
 
-    // Resolve every in-flight request: expired ones as Timeout, the rest as
-    // Lost (retryable WorkerLost). FS-7: only SIGKILL when the child is not
-    // confirmed already exited -- on a read-EOF (`Exited`) the fork-server
-    // parent has already reaped this pid via SIGCHLD, so it may already be
-    // reused by an unrelated process; SIGKILLing it again would be wrong.
+    // Expired requests resolve as Timeout, the rest as retryable WorkerLost.
+    // An `Exited` pid may already be reused, so it is not killed.
     if !matches!(gone, ChildGone::Exited) {
         kill_pid(pid);
     }
@@ -1146,9 +964,8 @@ async fn serve_child(
     let now = Instant::now();
     for (_, p) in pending.drain() {
         let out = match gone {
-            // Only the request that actually blew its deadline is a Timeout;
-            // a prefetched sibling that never started (deadline None) is
-            // collateral damage and must stay retryable WorkerLost.
+            // Only a request past its own deadline is a Timeout; unstarted
+            // siblings stay retryable.
             ChildGone::HardTimeout if p.deadline.is_some_and(|d| d <= now) => CpuOutcome::Timeout,
             _ => CpuOutcome::Lost,
         };
@@ -1166,10 +983,6 @@ async fn serve_child(
     }
 }
 
-// ---------------------------------------------------------------------------
-// stdio mode (fallback): spawn-per-child, one request in flight
-// ---------------------------------------------------------------------------
-
 async fn stdio_child_loop(
     idx: usize,
     prog: String,
@@ -1179,9 +992,8 @@ async fn stdio_child_loop(
     counters: Arc<Counters>,
     pids: Arc<Mutex<Vec<u32>>>,
 ) {
-    // Mirrors parent_control_loop's Refused backoff (FS-3) and slot_loop's
-    // fork-server equivalent: a child that dies instantly and repeatedly
-    // must not respawn at full OS speed. Reset on a planned recycle.
+    // A child that dies instantly and repeatedly must not respawn at full
+    // speed. Reset on a planned recycle.
     let mut backoff = Duration::from_millis(100);
     loop {
         let mut cmd = Command::new(&prog);
@@ -1211,7 +1023,6 @@ async fn stdio_child_loop(
         let mut stdin = child.stdin.take().expect("child stdin piped");
         let mut lines = BufReader::new(child.stdout.take().expect("child stdout piped")).lines();
 
-        // Ready line: {"ready": true, "pid": N}
         let ready_ok = match timeout(READY_TIMEOUT, lines.next_line()).await {
             Ok(Ok(Some(line))) => {
                 let ok = serde_json::from_str::<serde_json::Value>(&line)
@@ -1237,16 +1048,13 @@ async fn stdio_child_loop(
         info!("cpu[{idx}]: child ready pid={pid}");
 
         let mut respawn = false;
-        // Set on every respawn EXCEPT a planned recycle, so the backoff
-        // below only ever applies to a child dying or being killed, never
-        // to `--cpu-max-tasks-per-child`, which can be legitimately frequent.
+        // True unless this is a planned recycle; only then is there backoff.
         let mut died_unplanned = false;
         let mut completed: usize = 0;
         while !respawn {
             let job = match rx.recv().await {
                 Ok(j) => j,
                 Err(_) => {
-                    // channel closed: shut this child down
                     let _ = child.start_kill();
                     let _ = child.wait().await;
                     track_pid(&pids, pid, false);
@@ -1262,7 +1070,7 @@ async fn stdio_child_loop(
                 let _ = job.resp.send(CpuOutcome::Lost);
                 counters.inflight_cpu.fetch_sub(1, Ordering::Relaxed);
                 died_unplanned = true;
-                break; // exits while: child gets killed + respawned below
+                break;
             }
 
             match timeout(Duration::from_millis(job.timeout_ms), lines.next_line()).await {
@@ -1278,21 +1086,10 @@ async fn stdio_child_loop(
                     }
                 }
                 Ok(_) => {
-                    // EOF or read error: child died mid-task. Read its exit
-                    // status (WIFSIGNALED and the signal number) so an
-                    // operator can tell a segfault, an OOM kill, and any
-                    // other unprompted death apart, since by the time this
-                    // fires the child cannot self report why it is gone.
-                    //
-                    // Polled rather than probed once: the pipe reaches EOF
-                    // when the kernel tears the child's fds down, which can
-                    // land before its exit status is reapable, so a single
-                    // try_wait loses the race often enough to drop the
-                    // signal number from the log (it did, intermittently, in
-                    // tests/e2e_forkserver.rs). Bounded and never a blocking
-                    // wait: EOF does not prove the child is gone, since one
-                    // can close stdout and keep running, and this path must
-                    // not hang on that case.
+                    // Child died mid-task: log its exit signal so a segfault
+                    // and an OOM kill can be told apart. Polled, bounded: EOF
+                    // can land before the status is reapable, and a child can
+                    // close stdout and keep running.
                     let mut cause = String::new();
                     for _ in 0..100 {
                         match child.try_wait() {
@@ -1342,21 +1139,10 @@ async fn stdio_child_loop(
 mod tests {
     use super::*;
 
-    /// Item 2 (audit): a write error (EPIPE/ECONNRESET, e.g. from a child
-    /// that already died) must resolve to `ChildGone::Exited`, same as a
-    /// read EOF, not `Wedged`: the pid may already have been reused by an
-    /// unrelated process. Hands `serve_child` a REAL, unrelated process's
-    /// pid as the "child" pid. Uses TWO independent socketpairs, not one:
-    /// with item 1's fix, reads and writes are polled concurrently by the
-    /// same select! loop, so closing one shared connection makes read EOF
-    /// and the write error race each other for which arm fires first,
-    /// which would make this test flaky, since read EOF already resolved
-    /// to `Exited` before this fix and would mask a regression here half
-    /// the time. Keeping the read side's peer alive and silent removes that
-    /// race: `lines.next_line()` can never resolve, so only the write side
-    /// (whose peer IS dropped) decides the outcome. If the fix regresses
-    /// and kills the pid again on a write error, this innocent bystander
-    /// process dies.
+    /// A write error resolves to `ChildGone::Exited`, not `Wedged`, so the
+    /// possibly reused pid is not killed. The "child" pid is a real bystander
+    /// process. Two socketpairs: the read side stays silent, so only the
+    /// write error decides the outcome.
     #[tokio::test]
     async fn write_error_does_not_rekill_a_possibly_reused_pid() {
         let mut bystander = std::process::Command::new("sleep")
@@ -1367,9 +1153,7 @@ mod tests {
 
         let (write_worker, write_peer) = tokio::net::UnixStream::pair().unwrap();
         let (read_worker, _read_peer) = tokio::net::UnixStream::pair().unwrap();
-        drop(write_peer); // the write side's peer is gone from the start
-                          // _read_peer stays alive (and silent) for the whole test: nothing
-                          // ever arrives, so the read arm can never fire.
+        drop(write_peer);
 
         let (_unused_read_half, write) = write_worker.into_split();
         let (read, _unused_write_half) = read_worker.into_split();
@@ -1413,10 +1197,6 @@ mod tests {
             "a dead child's write error must still resolve the request as Lost"
         );
 
-        // The regression this guards: a naive fix kills again on any write
-        // failure, which would SIGKILL this bystander if the kernel had
-        // already reused its pid for it (exactly what happens once the
-        // fork-server parent reaps the real child via SIGCHLD).
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert!(
             bystander.try_wait().expect("try_wait").is_none(),

@@ -1,16 +1,5 @@
-//! The cauli worker runtime, as a library with exactly one public entry
-//! point, [`run`].
-//!
-//! It lives here rather than in a `main.rs` because the crate ships the same
-//! program under two names: `cauli-worker` for the source tree (itest, bench,
-//! PROTOCOL.md and both READMEs all name that path) and `cauli-worker-bin`
-//! for the published wheel, where the plain name belongs to the Python
-//! console script that repairs the dynamic loader's libpython path first.
-//! Pointing two `[[bin]]` targets at one `main.rs` is what cargo warns about
-//! with "file found to be present in multiple build targets"; one library and
-//! two three-line entry points (`src/main.rs`, `src/wheel_main.rs`) give each
-//! target its own source file and compile the runtime once. See
-//! worker/Cargo.toml for the features that select between the two names.
+//! The cauli worker runtime. One public item, [`run`], shared by the
+//! `cauli-worker` and `cauli-worker-bin` entry points (see worker/Cargo.toml).
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -41,10 +30,7 @@ use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::watch;
 use tracing::{debug, error, info, warn};
 
-/// Test-only hooks for the exit-path regression (worker/tests/exit_path.rs).
-/// Gated the same way as `CAULI_EXEC_CMD` in cpu.rs: a plain `cargo build
-/// --release` carries none of this, `cargo test --features test-hooks`
-/// compiles it into the binary the e2e suite spawns as a subprocess.
+/// Hooks for worker/tests/exit_path.rs; absent from a release build.
 #[cfg(any(test, feature = "test-hooks"))]
 mod exit_path_test_hooks {
     use std::sync::OnceLock;
@@ -57,10 +43,8 @@ mod exit_path_test_hooks {
         }
     }
 
-    /// If `CAULI_TEST_ATEXIT_MARKER` names a file, register a real libc
-    /// atexit handler that writes it -- an observable stand-in for the
-    /// OPENSSL_cleanup handler `exit_now`'s doc comment describes, without
-    /// depending on a specific library being linked in the test build.
+    /// A real atexit handler writing `CAULI_TEST_ATEXIT_MARKER`: a stand in
+    /// for the `OPENSSL_cleanup` handler `exit_now` must skip.
     pub fn install() {
         if let Ok(path) = std::env::var("CAULI_TEST_ATEXIT_MARKER") {
             if MARKER_PATH.set(path).is_ok() {
@@ -72,10 +56,8 @@ mod exit_path_test_hooks {
         }
     }
 
-    /// If set, panic right now. Called right after `PyRuntime::init`
-    /// returns, so the panic lands after the interpreter's daemon asyncio
-    /// loop threads and the async-submit thread are already running -- the
-    /// exact "threads still live" condition `exit_now` exists for.
+    /// Panics once the interpreter's threads are live, the condition
+    /// `exit_now` exists for.
     pub fn maybe_panic_after_pyrt_init() {
         if std::env::var_os("CAULI_TEST_PANIC_AFTER_PYRT_INIT").is_some() {
             panic!("test-hooks: forced main-thread panic after PyRuntime::init");
@@ -84,71 +66,22 @@ mod exit_path_test_hooks {
 }
 
 /// Run the worker and terminate the process. Never returns.
-///
-/// Both `[[bin]]` targets are nothing but a call to this: the name a build
-/// produces is a packaging decision (see the crate docs above), not a
-/// behavioural one, so there is exactly one copy of the program.
 pub fn run() -> ! {
-    // A panic that unwinds out of real_main must not be allowed to unwind
-    // out of `run` itself: past that point the C runtime returns from
-    // crt0's real `main` and calls ordinary libc `exit()` -- the exact
-    // atexit/DSO-teardown race exit_now exists to prevent (see its doc
-    // comment below), and an uncaught panic here is the one path that used
-    // to bypass it. catch_unwind only guards this top-level call; it does
-    // not change how panics inside individual tasks/threads are handled
-    // (those already catch their own -- Cargo.toml is deliberately not
-    // panic = "abort").
+    // A panic escaping `run` would reach libc `exit()` and the atexit race
+    // `exit_now` prevents.
     let code = std::panic::catch_unwind(real_main).unwrap_or(101);
-    // Explicit exit: sync pool threads and Python daemon threads must not
-    // keep the process alive.
     exit_now(code);
 }
 
 /// Longest `exit_now` waits for queued log lines to reach stdout.
 const EXIT_LOG_FLUSH_BUDGET: Duration = Duration::from_secs(1);
 
-/// Terminate the process immediately, WITHOUT running libc `atexit` handlers
-/// or shared-library destructors.
+/// Terminate via `_exit`, skipping atexit handlers and DSO destructors.
 ///
-/// `std::process::exit` calls libc `exit()`, and `exit()` runs every
-/// registered atexit handler and DSO destructor on the calling thread. That
-/// teardown assumes a process which is effectively single threaded by then.
-/// This one never is, by design: the sync io pool threads, the embedded
-/// interpreter's asyncio loop threads (daemon threads the shim never joins),
-/// and any threads the task code itself started -- a psycopg or SQLAlchemy
-/// connection pool, a requests session -- are all still running or still
-/// unwinding at that moment, and none of them are joinable from here.
-///
-/// A handler that frees process-wide state then races them. The one that
-/// actually fires is `OPENSSL_cleanup`, registered via `atexit` by the libssl
-/// that a database driver's libpq links: it tears down the global OpenSSL
-/// state while those same threads are running their own per-thread OpenSSL
-/// teardown on the way out. The process then dies of "double free or
-/// corruption (fasttop)" / "malloc_consolidate(): unaligned fastbin chunk
-/// detected" AFTER every task has already completed and been acked -- a
-/// corrupt heap reported as a successful drain. Measured on the psycopg3 sync
-/// lane at --io-threads 80: ~39% of shutdowns aborted, 0% with this.
-///
-/// `_exit` is the thread-safe primitive for "stop this process now": it skips
-/// the handlers and goes straight to the kernel. Nothing here depends on them.
-/// Every resource with an owner outside this process (cpu children, the fork
-/// server socket) is released explicitly before this is reached, and Rust
-/// destructors never ran under `process::exit` either.
-///
-/// Only the log sink needs draining first: tracing lines wait in its channel
-/// for the `cauli-log` thread, and `_exit` alone discarded them, which is
-/// how a fatal startup error exited 1 with nothing printed. `logsink::flush`
-/// waits a bounded time and never takes the stdout lock, because a stalled
-/// log reader leaves the writer blocked holding it, and the
-/// `stdout().flush()` this used to call then never returned. The embedded
-/// interpreter's `sys.stdout` buffer is not flushed, but it never was:
-/// CPython only flushes it from `Py_Finalize`, which an embedded worker with
-/// live daemon threads must not call.
-///
-/// Callers: this `main`, the forced exit on a second signal (130), and
-/// `loops::wedge_loop` on a confirmed event loop wedge
-/// (`loops::WEDGE_EXIT_CODE`), which is the one that runs with the whole
-/// process still executing tasks.
+/// Pool, asyncio and task threads are still live at exit. libc `exit()` would
+/// run `OPENSSL_cleanup` (registered by libpq's libssl) under them and corrupt
+/// the heap after a clean drain. Only the log sink is drained first, bounded
+/// and without the stdout lock a stalled writer may hold.
 fn exit_now(code: i32) -> ! {
     logsink::flush(EXIT_LOG_FLUSH_BUDGET);
     // SAFETY: `_exit` is async-signal-safe and valid to call from any thread
@@ -173,21 +106,14 @@ fn real_main() -> i32 {
     };
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&args.log_level));
-    // Through logsink, not straight to stdout: every tokio runtime worker
-    // reaches a per-envelope warn!/error! site, so a stalled log reader used
-    // to fill the pipe and park them inside write(2) one by one -- the whole
-    // runtime frozen, with no error and nothing for the wedge watchdog to
-    // see. See src/logsink.rs.
+    // Never stdout directly: a stalled reader would freeze the runtime.
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(logsink::LogSink::start())
         .init();
 
-    // Pure-argument validation runs before the embedded interpreter comes up:
-    // a bad value must fail once, loudly — not crash-loop N supervised
-    // children through a Python startup each.
-    // M8: floor CLI values that would otherwise storm-duplicate or fetch
-    // unbounded amounts of work (0 is not a safe "unlimited" here).
+    // Validated before Python starts, so a bad flag fails once instead of
+    // crash looping every supervised child.
     if args.batch == 0 {
         error!("--batch must be >= 1 (0 means unlimited XREADGROUP fetch)");
         return 1;
@@ -208,10 +134,7 @@ fn real_main() -> i32 {
         );
         return 1;
     }
-    // FS-10: an absurd value (e.g. a typo'd extra digit) would eagerly
-    // allocate a `2 * cpu_workers * cpu_child_threads`-sized channel and ask
-    // Python to start that many threads per child; reject early with a clear
-    // message instead of an opaque allocation failure or a Python startup hang.
+    // Sizes an eager channel and a thread count per child.
     if args.cpu_child_threads == 0 || args.cpu_child_threads > 1024 {
         error!(
             "--cpu-child-threads must be within [1, 1024] (got {})",
@@ -238,11 +161,7 @@ fn real_main() -> i32 {
         .map(|n| n.get())
         .unwrap_or(1);
     let resolved = cli::resolve(&args, cores);
-    // FS-11: the ceiling `--cpu-child-threads` already gets, applied to the
-    // two io knobs that eagerly allocate. Checked on the RESOLVED per-process
-    // values rather than the raw flags, because `-c` derives both (§ cli.rs
-    // resolve), so `-c 100000000` reaches the sync pool and the admission
-    // gate with an absurd value without either flag being typed.
+    // On resolved values: `-c` derives both io knobs without either flag set.
     if let Some(msg) = io_limits_error(&resolved) {
         error!("{msg}");
         return 1;
@@ -264,7 +183,6 @@ fn real_main() -> i32 {
         return supervisor::run(&args, &resolved);
     }
 
-    // Embedded CPython: init interpreter, shim, app, asyncio loops (§ pyrt.rs).
     let (pyrt, appcfg) = match pyrt::PyRuntime::init(args.app_spec(), args.io_loops) {
         Ok(v) => v,
         Err(e) => {
@@ -304,14 +222,8 @@ fn real_main() -> i32 {
         resolved.io_concurrency,
         resolved.cpu_workers
     );
-    // §4.7's drain waits `--drain-timeout` and then `_exit`s, killing whatever
-    // is still running. The default pair is 30s of drain against a 300s task
-    // timeout, so a rolling deploy kills every task older than 30 seconds and
-    // the entry survives only because it stays pending for recovery. Warned
-    // ONCE, naming the longest registered task: with stock defaults every
-    // task in every app trips it, and a per task warning would be a wall of
-    // text at every boot. (No such check exists for idemp_ttl: the claim is
-    // written with at least the task's own timeout, broker::claim_ttl_s.)
+    // Warned once, for the longest task: stock defaults (30s drain, 300s
+    // timeout) trip it for every task.
     if let Some((name, timeout_ms)) = longest_timeout_past_drain(&appcfg.tasks, args.drain_timeout)
     {
         warn!(
@@ -323,18 +235,8 @@ fn real_main() -> i32 {
         );
     }
 
-    // One tokio pool exists per WORKER PROCESS and the supervisor runs
-    // `procs` of them on the same box, so the default (one worker thread per
-    // core) had every process claim a whole box: 6 procs on 6 cores meant 36
-    // runtime threads competing for 6 cores. None of them ever executes
-    // Python -- task bodies run on the sync pool threads, the asyncio loop
-    // threads, or in cpu children, and these only drive redis io and the
-    // dispatch futures -- so the extra threads bought nothing and cost
-    // scheduler churn. Give each process its share of the box instead.
-    //
-    // TOKIO_WORKER_THREADS stays authoritative: it is tokio's own documented
-    // escape hatch, and calling .worker_threads() unconditionally would
-    // silently disable it.
+    // Each of `procs` processes gets its share of the cores; tokio threads
+    // never run Python. TOKIO_WORKER_THREADS, when set, still wins.
     let mut rt_builder = tokio::runtime::Builder::new_multi_thread();
     rt_builder.enable_all();
     if std::env::var_os("TOKIO_WORKER_THREADS").is_none() {
@@ -360,15 +262,9 @@ async fn run_worker(
             return 1;
         }
     };
-    // Config level timeout, not tokio::time::timeout wrapped around each
-    // call: a caller side timeout only abandons the caller's own wait, the
-    // ConnectionManager itself never observes an Err, so its internal
-    // reconnect_if_io_error! never fires and the same wedged socket gets
-    // reused by every later call. Setting response_timeout here makes the
-    // manager itself see a timeout as a genuine Err (it converts to
-    // ErrorKind::IoError), which activates that already existing reconnect
-    // path instead of leaving it dormant. Do not "simplify" this back to a
-    // per call tokio::timeout; it silently breaks reconnection.
+    // Config level timeout, never a per call tokio::time::timeout: only this
+    // makes the manager see the timeout as an IoError and reconnect; a caller
+    // side timeout leaves it reusing the wedged socket.
     let conn_cfg = ConnectionManagerConfig::new()
         .set_max_delay(REDIS_RETRY_MAX_DELAY)
         .set_number_of_retries(REDIS_RETRIES)
@@ -393,10 +289,8 @@ async fn run_worker(
             return 1;
         }
     };
-    // Redis Cluster is refused here, at the first reachable point, rather
-    // than diagnosed later: on a cluster every delayed and retried task is
-    // already lost by the time loops::report_mover_error gets to name the
-    // cause (docs/decisions/redis-cluster.md).
+    // Refused up front: on a cluster delayed and retried tasks are lost
+    // before the mover can report it (docs/architecture.md).
     if let Some(info) = probe_cluster_info(&mut write_conn).await {
         let override_raw = std::env::var(ALLOW_REDIS_CLUSTER_ENV).ok();
         match cluster_decision(&info, override_raw.as_deref(), &redis_url) {
@@ -412,16 +306,11 @@ async fn run_worker(
         error!("XGROUP CREATE failed: {e}");
         return 1;
     }
-    // Anchor the wall clock on redis before anything can read it. Blocking
-    // once here is free: reaching redis is already a precondition of the call
-    // above. See clock.rs for why absolute instants must not come from this
-    // host's own clock, and why the anchor is sampled rather than read per call.
+    // Before anything reads the clock (clock.rs).
     clock::init(&mut write_conn).await;
     tokio::spawn(clock::sampler_loop(write_conn.clone()));
 
-    // §9.2 queue TTLs, seconds -> ms. Logged so an operator can see at a
-    // glance that entries in this deployment have a bounded shelf life;
-    // silently dropping work is only acceptable when it is announced.
+    // §9.2 queue TTLs, logged because dropping work must be announced.
     let queue_ttl_ms: std::collections::HashMap<String, u64> = appcfg
         .queue_ttl
         .iter()
@@ -434,21 +323,15 @@ async fn run_worker(
 
     let counters = Arc::new(stats::Counters::default());
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    // PROTOCOL §1: "{hostname}:{pid}" (any unique string is acceptable) --
-    // no per-loop/per-thread `n` component exists in this worker (one fetch
-    // loop per process), so it is dropped rather than hardcoded to a
-    // meaningless constant.
+    // PROTOCOL §1 consumer name; one fetch loop per process, so no `n` part.
     let consumer = format!(
         "{}:{}",
         gethostname::gethostname().to_string_lossy(),
         std::process::id()
     );
     let io_concurrency = resolved.io_concurrency;
-    // Only pay for cpu executors if the app actually has cpu tasks, and even
-    // then only once one arrives (ctx.cpu_pool). Routing is by REGISTRY kind
-    // (dispatch.rs), so with no cpu-kind task registered the cpu path is
-    // unreachable and the fork-server parent + N children would be pure
-    // resident memory for work that can never arrive.
+    // Routing is by registry kind, so with no cpu task the pool is unreachable
+    // and never started; with one, it starts lazily on the first cpu task.
     let needs_cpu = appcfg.tasks.values().any(|s| s.kind == "cpu");
     let cpu_python = resolve_python(args.python.as_deref());
     let cpu_cfg = needs_cpu.then(|| cpu::StartCfg {
@@ -469,8 +352,6 @@ async fn run_worker(
             resolved.cpu_workers
         );
     }
-    // The same gate on the io side (see `sync_pool_threads`): an app whose io
-    // tasks are all `async def` can never reach a sync pool thread.
     let sync_threads = sync_pool_threads(&appcfg.tasks, resolved.io_threads);
     if sync_threads < resolved.io_threads {
         info!(
@@ -479,8 +360,7 @@ async fn run_worker(
             resolved.io_threads
         );
     }
-    // One set per queue, built once: the dispatch path only ever inserts
-    // into and removes from an existing entry, never grows this map.
+    // Built once; dispatch never adds a key, so the map needs no lock.
     let inflight_entries = queues
         .iter()
         .map(|q| (q.clone(), std::sync::Mutex::new(Default::default())))
@@ -539,8 +419,7 @@ async fn run_worker(
     code
 }
 
-/// A stop signal this soon after the first is the same stop request
-/// delivered twice, not an operator asking for the forced exit.
+/// A repeat signal within this gap is the same stop request, not a force.
 const SECOND_SIGNAL_MIN_GAP: Duration = Duration::from_secs(1);
 
 fn spawn_signal_task(shutdown_tx: watch::Sender<bool>, ctx: Arc<Ctx>) {
@@ -552,11 +431,8 @@ fn spawn_signal_task(shutdown_tx: watch::Sender<bool>, ctx: Arc<Ctx>) {
             _ = int.recv() => info!("SIGINT: stop fetching, draining"),
         }
         let _ = shutdown_tx.send(true);
-        // One stop request often arrives as two signals: systemd's default
-        // KillMode=control-group signals this process AND the supervisor,
-        // which forwards its own; a SIGKILLed supervisor re-delivers
-        // PDEATHSIG once per thread it had. Only a signal sent after a
-        // human-scale gap means "stop waiting".
+        // One stop often arrives twice: systemd signals both this process
+        // and the supervisor, which forwards its own.
         let first = tokio::time::Instant::now();
         loop {
             tokio::select! {
@@ -569,64 +445,34 @@ fn spawn_signal_task(shutdown_tx: watch::Sender<bool>, ctx: Arc<Ctx>) {
             info!("signal within {SECOND_SIGNAL_MIN_GAP:?} of the first: same stop request, still draining");
         }
         warn!("second signal: forced exit 130");
-        // FS-8: this path bypasses run_worker's normal drain-then-cleanup
-        // tail entirely (exit_now below never returns), so it must do
-        // its own cpu pool cleanup or the fork-server socket file (and,
-        // absent PDEATHSIG, its children) would be abandoned.
+        // Skips run_worker's cleanup tail, so the cpu children and the fork
+        // server socket are released here.
         if let Some(pool) = ctx.cpu.get() {
             cpu::kill_children(pool);
         }
-        // Not `process::exit`: see exit_now. This path is strictly worse for
-        // atexit handlers than the graceful one -- it runs from a tokio task
-        // with tasks still executing on the pool threads.
         exit_now(130);
     });
 }
 
-/// Reconnect backoff cap and retry count for every redis connection. The
-/// crate's delays double from 100 ms; uncapped, a redis restart at run time
-/// could leave a connection waiting out one long sleep after redis was back.
-/// Six retries put an unreachable redis at startup at a few seconds before
-/// the worker gives up and says why.
+/// Capped so a recovered redis is not met by one long sleep; six retries fail
+/// an unreachable redis at startup within seconds.
 const REDIS_RETRY_MAX_DELAY: Duration = Duration::from_secs(2);
 const REDIS_RETRIES: usize = 6;
 
 /// Operator override for the Redis Cluster startup refusal.
-///
-/// An environment variable rather than a CLI flag: the refusal is the part
-/// that matters and it ships without widening the flag surface, while the
-/// `--allow-redis-cluster` name that docs/decisions/redis-cluster.md proposed
-/// stays free for whoever adds it to cli.rs.
 const ALLOW_REDIS_CLUSTER_ENV: &str = "CAULI_ALLOW_REDIS_CLUSTER";
 
-/// What startup does about the topology redis just reported.
 #[derive(Debug, PartialEq, Eq)]
 enum ClusterDecision {
-    /// Not a cluster: start normally, say nothing.
     Start,
-    /// A cluster, and the operator opted in: start, but say what they bought.
+    /// Cluster, and the operator opted in.
     StartAnyway(String),
-    /// A cluster: refuse, with the message an operator needs.
     Refuse(String),
 }
 
-/// Ask redis once whether it runs in cluster mode. `None` when the question
-/// could not be answered.
-///
-/// The command is `INFO cluster`, NOT `CLUSTER INFO`. Those are not synonyms
-/// and only one of them answers this question: `CLUSTER INFO` reports the
-/// health of a cluster (`cluster_state`, slot counts, known nodes) and carries
-/// no `cluster_enabled` field at all, while a standalone server refuses it
-/// outright with "ERR This instance has cluster support disabled". `INFO`'s
-/// Cluster section is the one both topologies answer, and it holds the single
-/// field that decides. Probing the wrong one reads as "not a cluster" on a
-/// real cluster, which is the failure this refusal exists to prevent; the
-/// pairing is pinned against a live server of each topology by
-/// `the_probe_reads_the_topology_off_a_real_server`.
-///
-/// A failed probe never blocks startup: every redis answers `INFO`, so an
-/// error here means an ACL or a proxy in front of a deployment that has been
-/// working, and refusing to boot on it would turn a diagnostic into an outage.
+/// `INFO cluster`, not `CLUSTER INFO`: only the former answers on both
+/// topologies and carries `cluster_enabled`. A failed probe (ACL, proxy)
+/// returns `None` and never blocks startup.
 async fn probe_cluster_info(conn: &mut ConnectionManager) -> Option<String> {
     match redis::cmd("INFO")
         .arg("cluster")
@@ -641,35 +487,20 @@ async fn probe_cluster_info(conn: &mut ConnectionManager) -> Option<String> {
     }
 }
 
-/// True when an `INFO cluster` reply says this server runs in cluster mode.
-///
-/// The reply is a `# Cluster` header followed by flat `field:value` lines with
-/// CRLF endings; the header carries no colon and drops out of the parse. A
-/// standalone server answers the same command with `cluster_enabled:0`, so
-/// that one field is the entire signal. `cluster_state` is deliberately not
-/// consulted: it belongs to a different command's reply, and a cluster whose
-/// slots are not yet assigned is still a cluster.
+/// `cluster_enabled:1` is the whole signal; a cluster with unassigned slots
+/// is still a cluster.
 fn cluster_info_says_enabled(info: &str) -> bool {
     info.lines()
         .filter_map(|line| line.split_once(':'))
         .any(|(k, v)| k.trim() == "cluster_enabled" && v.trim() == "1")
 }
 
-/// Whether the operator knowingly opted in, given the raw variable.
-///
-/// Pure over the string rather than reading the environment itself, so the
-/// accepted spellings are testable without mutating process-wide state from a
-/// test that runs in parallel with every other one.
+/// Takes the raw value, not the env, so tests need not mutate the process env.
 fn cluster_override_enabled(raw: Option<&str>) -> bool {
     let normalized = raw.map(|v| v.trim().to_ascii_lowercase());
     matches!(normalized.as_deref(), Some("1" | "true" | "yes" | "on"))
 }
 
-/// The startup decision for an `INFO cluster` reply.
-///
-/// Split out from the probe so both the refusal and its message are testable
-/// without a redis, matching how `io_limits_error` returns its message rather
-/// than logging it.
 fn cluster_decision(info: &str, override_raw: Option<&str>, redis_url: &str) -> ClusterDecision {
     if !cluster_info_says_enabled(info) {
         return ClusterDecision::Start;
@@ -689,12 +520,11 @@ fn cluster_decision(info: &str, override_raw: Option<&str>, redis_url: &str) -> 
          the stream without ever reaching the delayed set -- silent loss, not a visible error \
          -- and fetching two or more queues fails with CROSSSLOT. Point the worker at a \
          standalone or Sentinel fronted redis, or set {ALLOW_REDIS_CLUSTER_ENV}=1 to start \
-         anyway and accept that loss (docs/decisions/redis-cluster.md)."
+         anyway and accept that loss (docs/architecture.md)."
     ))
 }
 
-/// --print-plan: the derived execution plan, human first. Runs before any
-/// Python or Redis so it is safe anywhere, including boxes without the app.
+/// --print-plan. Needs no Python, app or Redis.
 fn print_plan(args: &cli::Args, r: &cli::Resolved, cores: usize) {
     let c = args
         .concurrency
@@ -736,35 +566,20 @@ up to {} cpu children",
         plan_total((cores / r.procs).max(1), r.procs),
         plan_total(r.cpu_workers, r.procs)
     );
-    println!("  override any value with its flag; see --help and docs/CONFIGURATION.md");
+    println!("  override any value with its flag; see --help and docs/configuration.md");
 }
 
-/// Per process value times process count, for the --print-plan totals line.
-/// Saturating, matching the overflow safe style used elsewhere for hostile or
-/// just huge input (dispatch.rs, envelope.rs, exec.rs, cpu.rs, and
-/// visibility_timeout_ms below): release builds have no overflow-checks, so a
-/// plain multiply would wrap silently instead, e.g. a 19 digit -c wrapping
-/// the printed total down to single digits.
+/// Saturating: a 19 digit -c would otherwise wrap the printed total.
 fn plan_total(per_process: usize, procs: usize) -> usize {
     per_process.saturating_mul(procs)
 }
 
-/// Exit code for a graceful shutdown that ran out of `--drain-timeout` with
-/// tasks still executing. A clean drain still exits 0; this one says the
-/// process was cut short and those entries are coming back through recovery,
-/// which is the difference an orchestrator or a CI job needs and could not
-/// see when both outcomes returned 0. Neighbour of `loops::WEDGE_EXIT_CODE`
-/// (87), and outside the ranges a shell attributes to signals (128 + n) or to
-/// a panic (101).
+/// Drain ran out of `--drain-timeout` with tasks still running; they return
+/// through recovery. Clear of signal codes (128 + n) and panic (101).
 const DRAIN_TIMEOUT_EXIT_CODE: i32 = 88;
 
-/// The registered task whose timeout outlives the drain window, and by how
-/// much, or `None` when every task can finish inside it.
-///
-/// Ties are broken toward the longest timeout, and then by name so the
-/// warning is stable across runs (a `HashMap` iterates in a different order
-/// every process start, and an operator comparing two boots should not see
-/// the same fleet report different tasks).
+/// The longest task timeout past the drain window, ties broken by name so
+/// the warning is stable across boots.
 fn longest_timeout_past_drain(
     registry: &std::collections::HashMap<String, pyrt::TaskSpec>,
     drain_timeout_s: u64,
@@ -781,27 +596,13 @@ fn longest_timeout_past_drain(
         .map(|(name, spec)| (name.as_str(), spec.timeout_ms))
 }
 
-/// Per process ceiling for `--io-threads`. Four times the sync knee cli.rs
-/// documents (~1000 threads per process, past which throughput and latency
-/// fall together), so nothing tunable is refused. Above it there is no
-/// configuration, only a typo: `SyncPool::start` spawns every thread eagerly,
-/// each one an OS thread with an 8 MB stack pinning a CPython thread state,
-/// and with no ceiling it spawns until the OS refuses and then panics.
+/// Four times the ~1000 thread sync knee: above it is a typo, and the eager
+/// spawn would run until the OS refuses and then panic.
 const MAX_IO_THREADS: usize = 4096;
 
-/// Per process ceiling for `--io-concurrency`. The measured band ends at 128
-/// per process (see the flag's own long help) and the standalone default is
-/// 256, so 65536 is 256x past anything this repo has measured. Above it the
-/// sync pool's bounded channel, allocated at this size before a single task
-/// arrives, is the first thing to fail.
+/// 256x the measured band; the sync pool channel is allocated at this size.
 const MAX_IO_CONCURRENCY: usize = 65_536;
 
-/// The operator facing message for a resolved io plan that cannot be built,
-/// or `None` when it can.
-///
-/// Returns the message instead of logging it so the bound itself is testable
-/// without a tracing subscriber, and so the caller keeps the single exit path
-/// the other startup validations use.
 fn io_limits_error(r: &cli::Resolved) -> Option<String> {
     if r.io_threads > MAX_IO_THREADS {
         return Some(format!(
@@ -823,23 +624,9 @@ fn io_limits_error(r: &cli::Resolved) -> Option<String> {
     None
 }
 
-/// Threads the sync io pool starts with: the operator's `--io-threads` when
-/// the app registers at least one SYNC io task, and the pool's own floor when
-/// it registers none.
-///
-/// Dispatch routes by REGISTRY kind (dispatch.rs), so `exec::run_sync_task`
-/// is reachable only for a registered task with `kind != "cpu"` and
-/// `is_async == false`. An app that registers none of those can never touch
-/// the sync pool, and the pool is expensive dead weight: `SyncPool::start`
-/// spawns every thread eagerly and each one pins a CPython thread state plus
-/// an 8 MB stack for the process lifetime. On the auto derived defaults that
-/// is up to 86 threads per process, 516 across a 6 process deployment, bought
-/// by an app whose tasks are all `async def`. This is the `needs_cpu` gate
-/// applied to the io side.
-///
-/// It floors at 1, not 0, because `SyncPool::start` clamps its own thread
-/// count up to 1 (pyrt.rs): a gated-off pool still keeps one idle standby
-/// thread, and returning 0 here would misreport what actually starts.
+/// `--io-threads` when a sync io task is registered, else 1: an all `async
+/// def` app can never reach the eagerly spawned pool. 1, not 0, because
+/// `SyncPool::start` clamps to 1 and this must report what starts.
 fn sync_pool_threads(
     registry: &std::collections::HashMap<String, pyrt::TaskSpec>,
     io_threads: usize,
@@ -852,10 +639,7 @@ fn sync_pool_threads(
     }
 }
 
-/// The interpreter cpu children are spawned with: the operator's `--python`
-/// when they set one, otherwise this worker's own embedded interpreter, and
-/// only as a last resort the historical `python3` off `PATH` (reachable only
-/// on an embedding that reports no `sys.executable`).
+/// `--python`, else the embedded interpreter, else `python3` off `PATH`.
 fn resolve_python(flag: Option<&str>) -> String {
     match flag {
         Some(p) => p.to_string(),
@@ -876,36 +660,22 @@ fn resolve_python(flag: Option<&str>) -> String {
     }
 }
 
-/// Install the rustls crypto provider for `rediss://` before any connection
-/// is opened. `redis` pulls rustls in with default features off, so no
-/// provider is compiled in on its side and `ClientConfig::builder()` would
-/// panic ("no process-level CryptoProvider available") on the first TLS
-/// handshake. Installing `ring` here rather than relying on rustls's
-/// install-from-crate-features fallback keeps the choice deterministic: a
-/// future dependency that also enables `aws-lc-rs` would turn that fallback
-/// into a panic instead of a decision.
-///
-/// Idempotent and infallible by design: `install_default` returns `Err` only
-/// when a provider is already installed, which is exactly as good an outcome.
+/// redis builds rustls without a provider, so the first `rediss://` handshake
+/// would panic. Installed explicitly so a dependency enabling `aws-lc-rs`
+/// cannot make the fallback ambiguous. `Err` only means already installed.
 fn install_tls_provider() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
 
-/// Mask `user:password@` userinfo, and `password=`/`username=` query
-/// parameters, before a redis URL reaches logs or error messages (audit M4:
-/// both are shapes redis-py accepts as real credentials, so either would
-/// otherwise land in plaintext logs).
+/// Mask userinfo and query credentials before a redis URL is logged.
 fn redact_redis_url(url: &str) -> String {
     let Some(scheme_end) = url.find("://") else {
         return url.to_string();
     };
     let scheme = &url[..scheme_end];
     let rest = &url[scheme_end + 3..];
-    // The userinfo '@' is searched for up to the query, not just up to the
-    // first '/' or '#': an unencoded '/' or '#' in a password (base64 output
-    // has '/') makes the URL unparseable, and the error that reports it must
-    // not print the password. Last '@', not first, for a password that
-    // itself contains '@'. An '@' inside `?password=` is masked below.
+    // Up to the query, not the first '/' or '#': both occur unencoded in
+    // passwords (base64). Last '@', for passwords containing '@'.
     let userinfo_end = rest.find('?').unwrap_or(rest.len());
     let (mask, rest) = match rest[..userinfo_end].rfind('@') {
         Some(at) => ("***@", &rest[at + 1..]),
@@ -919,9 +689,7 @@ fn redact_redis_url(url: &str) -> String {
     )
 }
 
-/// Mask `password=`/`username=` VALUES in a URL's query string (the form
-/// redis-py accepts straight as connection kwargs, no userinfo involved).
-/// Keys and every other query parameter stay visible.
+/// Masks credential values only; keys and other parameters stay visible.
 fn redact_query_credentials(tail: &str) -> String {
     let Some(q) = tail.find('?') else {
         return tail.to_string();
@@ -953,12 +721,6 @@ fn is_credential_key(key: &str) -> bool {
 mod tests {
     use super::*;
 
-    /// Audit (perf): the sync pool used to start `--io-threads` threads
-    /// whatever the app registered, so a pure `async def` workload paid for
-    /// up to 86 idle OS threads per process (516 across the 6 process
-    /// deployment the memory claim was measured on). Only a registered sync
-    /// io task can reach `exec::run_sync_task`, so only that should size the
-    /// pool.
     #[test]
     fn sync_pool_is_sized_by_the_registry_not_by_the_flag_alone() {
         let spec = |kind: &str, is_async: bool| pyrt::TaskSpec {
@@ -974,7 +736,6 @@ mod tests {
                 .collect::<std::collections::HashMap<_, _>>()
         };
 
-        // Nothing that can reach the pool: gated down to the floor.
         for gated in [
             registry(&[]),
             registry(&[("io", true)]),
@@ -984,7 +745,6 @@ mod tests {
             assert_eq!(sync_pool_threads(&gated, 86), 1);
         }
 
-        // One sync io task anywhere in the registry restores the full pool.
         assert_eq!(sync_pool_threads(&registry(&[("io", false)]), 86), 86);
         assert_eq!(
             sync_pool_threads(
@@ -994,14 +754,9 @@ mod tests {
             86
         );
 
-        // The gate never asks for zero threads: SyncPool::start clamps to 1
-        // and stats/`sync_live` would then report a pool that does not exist.
         assert_eq!(sync_pool_threads(&registry(&[]), 0), 1);
     }
 
-    /// Audit FS-11: `--cpu-child-threads` is rejected outside [1, 1024] in
-    /// this same file, while the two io knobs had only `.max(1)`. The bound
-    /// has to sit on the RESOLVED plan, because `-c` derives both.
     #[test]
     fn io_limits_reject_only_what_cannot_be_built() {
         let plan = |io_threads, io_concurrency| cli::Resolved {
@@ -1011,7 +766,6 @@ mod tests {
             cpu_workers: 1,
         };
 
-        // Everything the derivation and the documented bands can produce.
         assert_eq!(io_limits_error(&plan(1, 1)), None);
         assert_eq!(io_limits_error(&plan(64, 256)), None); // standalone defaults
         assert_eq!(io_limits_error(&plan(1000, 1024)), None); // past the sync knee, still allowed
@@ -1020,8 +774,6 @@ mod tests {
             None
         );
 
-        // `--io-threads 100000`: SyncPool::start would spawn until the OS
-        // refuses and then panic.
         let msg = io_limits_error(&plan(100_000, 256)).expect("rejected");
         assert!(msg.contains("--io-threads"), "{msg}");
         assert!(msg.contains("100000"), "{msg}");
@@ -1031,16 +783,10 @@ mod tests {
         assert!(msg.contains("--io-concurrency"), "{msg}");
         assert!(msg.contains("-c"), "{msg}");
 
-        // Off by one on both, in both directions.
         assert!(io_limits_error(&plan(MAX_IO_THREADS + 1, 256)).is_some());
         assert!(io_limits_error(&plan(64, MAX_IO_CONCURRENCY + 1)).is_some());
     }
 
-    /// Audit (failure modes): startup cross checks `timeout_ms` against
-    /// `visibility_timeout` and `idemp_ttl` but never against
-    /// `--drain-timeout`, whose default (30s) is a tenth of the default task
-    /// timeout (300s) -- so a rolling deploy kills every task older than 30
-    /// seconds and nothing at startup said so.
     #[test]
     fn drain_timeout_is_cross_checked_against_the_longest_task() {
         let spec = |timeout_ms| pyrt::TaskSpec {
@@ -1055,19 +801,17 @@ mod tests {
                 .collect::<std::collections::HashMap<_, _>>()
         };
 
-        // The shipped defaults are the case that trips it.
+        // The shipped defaults trip it.
         assert_eq!(
             longest_timeout_past_drain(&registry(&[("t", 300_000)]), 30),
             Some(("t", 300_000))
         );
-        // Everything finishes inside the window: silent.
         assert_eq!(longest_timeout_past_drain(&registry(&[]), 30), None);
         assert_eq!(
             longest_timeout_past_drain(&registry(&[("t", 30_000), ("u", 1_000)]), 30),
             None,
             "equal to the window still fits; the drain only kills what is still running"
         );
-        // One long task among short ones is the one named.
         assert_eq!(
             longest_timeout_past_drain(
                 &registry(&[("short", 1_000), ("long", 600_000), ("mid", 45_000)]),
@@ -1075,15 +819,13 @@ mod tests {
             ),
             Some(("long", 600_000))
         );
-        // Ties resolve by name, not by HashMap order, so two boots of the
-        // same fleet report the same task.
+        // Ties by name, whatever the HashMap order.
         for _ in 0..8 {
             assert_eq!(
                 longest_timeout_past_drain(&registry(&[("b", 90_000), ("a", 90_000)]), 30),
                 Some(("a", 90_000))
             );
         }
-        // No wrap on an absurd --drain-timeout, matching visibility_timeout_ms.
         assert_eq!(
             longest_timeout_past_drain(&registry(&[("t", u64::MAX)]), u64::MAX),
             None
@@ -1114,10 +856,7 @@ mod tests {
 
     #[test]
     fn redacts_password_containing_at_sign() {
-        // M4 follow up: userinfo is split at the LAST '@', matching how the
-        // `url` crate (and the redis client that uses it) actually parses
-        // it. Splitting at the first one used to leave the rest of a
-        // password containing '@' sitting in plaintext right after the mask.
+        // Split at the last '@', as the `url` crate parses it.
         assert_eq!(
             redact_redis_url("redis://user:p@ss@dbhost:6379/0"),
             "redis://***@dbhost:6379/0"
@@ -1126,9 +865,7 @@ mod tests {
 
     #[test]
     fn redacts_query_string_credentials() {
-        // redis-py accepts `password=`/`username=` straight off the query
-        // string as connection kwargs, no userinfo involved, so this form
-        // carries a real credential even with no '@' anywhere in the URL.
+        // redis-py reads these as connection kwargs.
         assert_eq!(
             redact_redis_url("redis://dbhost:6379/0?password=s3cr3t"),
             "redis://dbhost:6379/0?password=***"
@@ -1175,13 +912,7 @@ mod tests {
         );
     }
 
-    /// Audit BLOCKER (TLS). Built with no TLS feature on the redis crate,
-    /// `rediss://` fails inside `Client::open` itself: the scheme is
-    /// recognized but the arm that builds `ConnectionAddr::TcpTls` is
-    /// `#[cfg]`'d out, so the worker exits 1 at startup on Upstash, Azure
-    /// Cache or any ElastiCache with encryption in transit, while redis-py
-    /// keeps enqueueing into it. This asserts the URL both parses AND
-    /// selects the TLS transport.
+    /// Without the redis TLS feature `rediss://` fails in `Client::open`.
     #[test]
     fn rediss_url_opens_and_selects_the_tls_transport() {
         let client =
@@ -1196,9 +927,6 @@ mod tests {
         );
     }
 
-    /// The plain scheme must stay plaintext: enabling TLS support must not
-    /// quietly upgrade `redis://`, which is what every local and itest
-    /// deployment uses.
     #[test]
     fn redis_url_stays_plaintext() {
         let client = redis::Client::open("redis://127.0.0.1:6392/0").expect("redis:// opens");
@@ -1211,16 +939,12 @@ mod tests {
     #[test]
     fn tls_provider_install_is_idempotent() {
         install_tls_provider();
-        install_tls_provider(); // second call must not panic
+        install_tls_provider();
         assert!(rustls::crypto::CryptoProvider::get_default().is_some());
     }
 
-    /// The other half of the blocker: opening the client is not enough, the
-    /// handshake has to actually run. A listener that accepts and closes
-    /// immediately makes the TLS handshake fail at the transport, which is
-    /// proof we got past URL parsing and into a real connection attempt --
-    /// the failure mode being fixed produced `InvalidClientConfig` before a
-    /// single byte was sent.
+    /// A listener that closes at once: failing at the handshake, not with
+    /// `InvalidClientConfig`, proves a real TLS attempt ran.
     #[tokio::test]
     async fn rediss_reaches_a_real_connection_attempt() {
         install_tls_provider();
@@ -1243,29 +967,18 @@ mod tests {
         );
     }
 
-    /// Verbatim `INFO cluster` from a cluster-enabled node (redis 7.0.15),
-    /// section header and CRLF endings and all.
+    /// Verbatim `INFO cluster` from redis 7.0.15.
     const CLUSTER_INFO_ENABLED: &str = "# Cluster\r\n\
                                         cluster_enabled:1\r\n";
-    /// The same command against a standalone server, which answers it too.
     const CLUSTER_INFO_DISABLED: &str = "# Cluster\r\n\
                                          cluster_enabled:0\r\n";
-    /// Verbatim `CLUSTER INFO` from that same cluster node, which is the
-    /// command this probe must NOT use: it describes cluster health and never
-    /// mentions `cluster_enabled`, so probing it reads a real cluster as a
-    /// standalone and the refusal never fires (see `probe_cluster_info`).
+    /// Verbatim `CLUSTER INFO` from the same node: the command not to probe.
     const WRONG_COMMAND_REPLY: &str = "cluster_state:fail\r\n\
                                        cluster_slots_assigned:0\r\n\
                                        cluster_known_nodes:1\r\n\
                                        cluster_size:1\r\n";
     const TEST_REDIS_URL: &str = "redis://user:hunter2@cluster.example:6379/0";
 
-    /// docs/decisions/redis-cluster.md: pointing the worker at a Redis
-    /// Cluster used to start cleanly and then lose work, because
-    /// cauli:q:{queue} and cauli:delayed:{queue} never share a hash slot --
-    /// a retried task leaves the stream and never reaches the delayed set.
-    /// loops::report_mover_error names the cause, but only on the mover path
-    /// and only after the loss. Startup has to refuse instead.
     #[test]
     fn cluster_mode_is_refused_at_startup() {
         match cluster_decision(CLUSTER_INFO_ENABLED, None, TEST_REDIS_URL) {
@@ -1294,8 +1007,7 @@ mod tests {
             cluster_decision(CLUSTER_INFO_DISABLED, None, TEST_REDIS_URL),
             ClusterDecision::Start
         );
-        // Nothing usable in the reply is not evidence of a cluster: an
-        // unreadable probe must never keep a working deployment from booting.
+        // An unreadable reply must never block boot.
         assert_eq!(
             cluster_decision("", None, TEST_REDIS_URL),
             ClusterDecision::Start
@@ -1304,12 +1016,6 @@ mod tests {
         assert!(!cluster_info_says_enabled("not_cluster_enabled:1\r\n"));
     }
 
-    /// The refusal shipped inert because it asked the wrong command.
-    /// `CLUSTER INFO` reports cluster HEALTH and has no `cluster_enabled`
-    /// field, so its reply reads as "not a cluster" no matter the topology --
-    /// and a standalone answers it with a flat error, which is why the bug
-    /// never showed up as a false refusal either. Pin the shape of the reply
-    /// that must never be fed to this parser.
     #[test]
     fn the_health_command_reply_can_never_prove_a_cluster() {
         assert!(
@@ -1318,7 +1024,6 @@ mod tests {
         );
         assert!(WRONG_COMMAND_REPLY.contains("cluster_state"));
         assert!(!WRONG_COMMAND_REPLY.contains("cluster_enabled"));
-        // The reply the probe does read says it in one field, on both sides.
         assert!(cluster_info_says_enabled(CLUSTER_INFO_ENABLED));
         assert!(!cluster_info_says_enabled(CLUSTER_INFO_DISABLED));
     }
@@ -1349,13 +1054,8 @@ mod tests {
         ));
     }
 
-    /// A throwaway redis-server this test owns, on ports dedicated to these
-    /// tests: never :6409/:6410/:6422 (broker.rs), :6392 (worker/tests
-    /// common), :6391 (py/itest), and never :6379.
-    ///
-    /// Slots are deliberately left unassigned: the node reports
-    /// cluster_enabled:1 from the moment it boots, and the refusal has to
-    /// rest on that field alone rather than on a healthy cluster_state.
+    /// Throwaway redis on ports no other suite uses (not 6409, 6410, 6422,
+    /// 6392, 6391, 6379). Slots stay unassigned on purpose.
     struct ProbeRedis {
         port: u16,
     }
@@ -1377,8 +1077,7 @@ mod tests {
                 "yes".to_string(),
             ];
             if cluster {
-                // A stale nodes.conf from an earlier run brings the node up
-                // with someone else-s view of the cluster: start blank.
+                // A stale nodes.conf would carry an old cluster view.
                 let dir = std::env::temp_dir().join(format!("cauli-probe-cluster-{port}"));
                 let _ = std::fs::remove_dir_all(&dir);
                 std::fs::create_dir_all(&dir).expect("cluster test dir");
@@ -1425,11 +1124,7 @@ mod tests {
         }
     }
 
-    /// The refusal is only worth as much as the probe under it, so this runs
-    /// it against real servers of both topologies rather than against the
-    /// samples above. This is the test that caught the probe asking `CLUSTER
-    /// INFO`: every unit test passed on hand written samples while a live
-    /// cluster node started cleanly and lost work.
+    /// Against real servers of both topologies, not hand written samples.
     #[tokio::test]
     async fn the_probe_reads_the_topology_off_a_real_server() {
         for (port, cluster) in [(6430u16, true), (6431, false)] {

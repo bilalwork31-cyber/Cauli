@@ -1,44 +1,19 @@
 """cauli-beat: the periodic scheduler (PROTOCOL.md section 10).
 
-Design in one paragraph. Schedule state lives in Redis, never in a local file,
-so every beat replica sees the same schedule and the same "what has already
-fired" state. Replicas take a **lease** so that normally exactly one of them is
-doing the ticking, and failover is automatic when the leader dies. But the
-lease is NOT what makes firing exactly-once -- a lease can always be defeated
-by a stop-the-world pause or a partition, so relying on it for safety would be
-a bug waiting for a bad day. Safety comes from a **compare-and-set on the
-entry's next-fire slot**: advancing a slot from S to S' and publishing the task
-happen inside ONE Lua script, and the script refuses unless the stored slot is
-still exactly S. Two replicas that both believe they are the leader therefore
-still produce exactly one firing per slot; the loser's CAS simply returns 0.
+Schedule state lives in Redis, so several replicas are the supported setup.
+A lease picks one ticking leader, but a pause or partition can defeat a lease,
+so exactly once firing comes from a compare and set instead: one Lua script
+advances an entry's slot from S to S' and publishes, only if the slot is
+still S. Slots are a pure function of the previous slot and "now" is Redis
+``TIME``, so skewed replicas agree on S'.
 
-Why that works even with skewed clocks: the next slot is computed by
-:mod:`cauli.schedules` as a pure function of the PREVIOUS slot, not of "now"
-(see that module's docstring). Both replicas compute the same S' from the same
-S, so the CAS is a real mutual exclusion rather than a race between two
-different proposed values. "Now" itself is read from Redis (``TIME``), not from
-the replica, so a replica whose clock is minutes off does not fire early or
-late -- it just agrees with everyone else.
+Failure semantics:
 
-Contrast with Celery's beat, which persists last-run times to a local
-``shelve`` file with no locking at all; its own docs tell you to make sure only
-one is running, and two of them means every cron fires twice. Running two
-``cauli-beat`` replicas for availability is the supported configuration.
-
-Failure semantics, stated rather than implied:
-
-- **Leader dies mid-tick.** Advance-and-publish is one atomic script, so a slot
-  is either fired-and-advanced or neither. A leader that dies between two
-  entries of the same tick leaves the remaining entries un-advanced; the next
-  leader finds them due and fires them (late, but exactly once).
-- **Leader dies between ticks.** The lease expires after ``--lock-ttl``
-  seconds, another replica acquires it and continues. Worst-case added lateness
-  is one lease TTL.
-- **Beat was down for a while.** A due entry fires ONCE on recovery and its
-  slot is then fast-forwarded past the present: missed slots are coalesced, not
-  replayed. Set ``max_lateness`` with ``on_missed="skip"`` on entries where a
-  very late firing is worse than none (see
-  :class:`cauli.schedules.ScheduleEntry`).
+- Leader dies mid tick: each slot is fired and advanced, or neither; the next
+  leader fires the rest late, once.
+- Leader dies between ticks: up to ``--lock-ttl`` seconds of added lateness.
+- Beat was down: a due entry fires once and missed slots are coalesced (see
+  :class:`cauli.schedules.ScheduleEntry` for ``max_lateness``).
 """
 
 from __future__ import annotations
@@ -61,7 +36,7 @@ from cauli.schedules import ScheduleEntry
 
 log = logging.getLogger("cauli.beat")
 
-# PROTOCOL.md section 10.1 key layout.
+# PROTOCOL.md section 10.1.
 SCHEDULE_KEY = "cauli:beat:schedule"  # HASH  name -> definition JSON
 DUE_KEY = "cauli:beat:due"  # ZSET  name -> next fire epoch ms
 REV_KEY = "cauli:beat:rev"  # HASH  name -> schedule fingerprint
@@ -71,36 +46,18 @@ LOCK_KEY = "cauli:beat:lock"  # STRING lease holder id
 
 DEFAULT_LOCK_TTL = 30.0
 DEFAULT_MAX_INTERVAL = 5.0
-#: Never sleep less than this between ticks, so a pathological schedule (or a
-#: clock jump) cannot turn the loop into a busy spin against Redis.
+#: Floor on the tick sleep, so a clock jump cannot busy spin against Redis.
 MIN_SLEEP = 0.05
-#: Most due entries claimed per tick. Bounds one tick's work when a large
-#: schedule comes due at once (e.g. every entry at midnight).
+#: Most due entries claimed per tick.
 DUE_BATCH = 500
-#: Longest wait before retrying an entry that could not be fired. Its slot
-#: stays due, so without this the loop would retry it every MIN_SLEEP.
+#: Retry delay for an entry that could not be fired (its slot stays due).
 FAILED_FIRE_RETRY = 1.0
 
 
-# --------------------------------------------------------------------------
-# Lua
-# --------------------------------------------------------------------------
-
-# The whole safety argument lives here. `expected` is the slot this caller
-# believes is current; if the stored score still equals it, this caller wins:
-# the slot advances and the task is published, atomically. Any other caller
-# racing the same slot then sees a different score and returns 0.
-#
-# mode 'none' advances the slot without publishing (an entry whose firing was
-# suppressed by on_missed="skip").
-#
-# Publish before advancing the slot, deliberately. A script is atomic against
-# other clients but does NOT roll back on its own error: every write it
-# already made stays committed. Advancing first would let a failed publish
-# (say the target key now holds the wrong type) consume the slot with
-# nothing ever sent: a silently lost firing. Publishing first means a
-# failure here can only be retried and republished next tick, a duplicate,
-# never a loss. Do not move the slot ZADD back above the publish.
+# Fires only if the stored slot still equals ARGV[2]. Mode 'none' advances
+# without publishing (on_missed="skip").
+# Publish stays above the slot ZADD: Lua does not roll back on error, so a
+# failed publish after the advance would silently lose the firing.
 _CLAIM_LUA = """
 local cur = redis.call('ZSCORE', KEYS[1], ARGV[1])
 if cur == false then return 0 end
@@ -117,11 +74,8 @@ redis.call('HSET', KEYS[2], ARGV[1], ARGV[7])
 return 1
 """
 
-# Seed (or reseed) an entry's slot. Idempotent across replicas: whoever gets
-# here first writes both the score and the rev, and every later caller sees a
-# matching rev plus an existing score and does nothing. Without the rev check a
-# slow replica could reseed a slot that a fast one had already fired, firing it
-# twice.
+# Without the rev check a slow replica could reseed a slot a fast one had
+# already fired, firing it twice.
 _SEED_LUA = """
 local rev = redis.call('HGET', KEYS[2], ARGV[1])
 if rev == ARGV[3] and redis.call('ZSCORE', KEYS[1], ARGV[1]) then return 0 end
@@ -134,23 +88,14 @@ return 1
 class RedisClusterUnsupported(RuntimeError):
     """A beat Lua script hit Redis Cluster's CROSSSLOT.
 
-    Deliberately not a redis.exceptions.RedisError. Every RedisError run()
-    retries below is a plausible blip: a dropped connection, a failover in
-    progress. This is not one of those. The beat keys and the target queue
-    key never share a hash tag, so the script that just failed will fail the
-    same way on the next tick, and every tick after that. Its own type keeps
-    it out of the generic handler so it can be logged as what it actually
-    is: permanent, not transient.
+    Not a RedisError, so run() logs it as permanent rather than as a blip:
+    the beat keys and queue keys never share a hash slot.
     """
 
 
 def _crossslot(exc: "redis.exceptions.ResponseError") -> bool:
-    # Newer redis-py maps the server's CROSSSLOT code to a dedicated
-    # ClusterCrossSlotError whose message is a rewritten "Keys in request
-    # don't hash to the same slot", with no "CROSSSLOT" substring left in
-    # str(exc) at all -- checked by type first for that case, older redis-py
-    # (no such class; the raw "CROSSSLOT ..." server message survives) by
-    # substring after.
+    # Newer redis-py raises ClusterCrossSlotError with the word rewritten
+    # away; older redis-py keeps the raw "CROSSSLOT" message.
     cross_slot_type = getattr(redis.exceptions, "ClusterCrossSlotError", ())
     if isinstance(exc, cross_slot_type):
         return True
@@ -180,26 +125,13 @@ def _text(value: Any) -> str | None:
     return str(value)
 
 
-# --------------------------------------------------------------------------
-# Store (the broker seam)
-# --------------------------------------------------------------------------
-
-
 class ScheduleStore:
     """Everything beat needs from a broker (PROTOCOL.md section 10.6).
 
-    Deliberately small, and deliberately not a general broker abstraction. A
-    non-Redis backend has to provide exactly two non-trivial primitives:
-
-    1. a **lease** with a TTL that only its holder can refresh or release
-       (:meth:`acquire_lock` / :meth:`refresh_lock` / :meth:`release_lock`);
-    2. an atomic **compare-and-set on a per-entry value, bundled with the
-       publish** (:meth:`claim_and_publish`).
-
-    Only (2) is required for correctness. SQS has neither and would need an
-    external store (a DynamoDB conditional write is the usual answer); RabbitMQ
-    has neither natively either. This class is where that lands, so the rest of
-    beat never touches a Redis command.
+    Another backend needs two primitives: a lease only its holder can
+    refresh or release, and an atomic compare and set bundled with the
+    publish (:meth:`claim_and_publish`). Only the second is needed for
+    correctness.
     """
 
     def now_ms(self) -> int:
@@ -264,18 +196,11 @@ class RedisScheduleStore(ScheduleStore):
         self._refresh = client.register_script(_REFRESH_LUA)
         self._release = client.register_script(_RELEASE_LUA)
 
-    # -- clock ------------------------------------------------------------
     def now_ms(self) -> int:
-        """Authoritative "now", read from REDIS rather than from this process.
-
-        Replica clock skew then cannot make one instance fire early and another
-        late; every replica is comparing against the same clock the slots are
-        stored against.
-        """
+        """Redis ``TIME``, so replica clock skew cannot fire early or late."""
         seconds, micros = self.client.time()
         return int(seconds) * 1000 + int(micros) // 1000
 
-    # -- definitions ------------------------------------------------------
     def load(self) -> dict[str, ScheduleEntry]:
         raw = self.client.hgetall(SCHEDULE_KEY)
         out: dict[str, ScheduleEntry] = {}
@@ -286,8 +211,7 @@ class RedisScheduleStore(ScheduleStore):
                 doc.setdefault("name", name)
                 out[name] = ScheduleEntry.from_dict(doc)
             except Exception as exc:
-                # One corrupt/unsupported entry must not stop the whole
-                # scheduler: skip it loudly and keep every other entry firing.
+                # One bad entry must not stop every other entry firing.
                 log.error("beat: ignoring unusable schedule entry %r: %s", name, exc)
         return out
 
@@ -310,7 +234,6 @@ class RedisScheduleStore(ScheduleStore):
         pipe.hdel(REV_KEY, name)
         pipe.execute()
 
-    # -- slots ------------------------------------------------------------
     def seed(self, name: str, slot_ms: int, rev: str) -> bool:
         try:
             return bool(
@@ -327,13 +250,7 @@ class RedisScheduleStore(ScheduleStore):
             ) from exc
 
     def slots_and_revs(self) -> tuple[dict[str, int], dict[str, str]]:
-        """Current next-fire slots and schedule fingerprints, in one round trip.
-
-        The tick uses this to skip the (cron) next-slot computation entirely
-        for entries that are already correctly seeded -- otherwise every tick
-        would re-derive every entry's next occurrence just to discover the seed
-        script has nothing to do.
-        """
+        """Next fire slots and fingerprints, in one round trip."""
         pipe = self.client.pipeline(transaction=False)
         pipe.zrange(DUE_KEY, 0, -1, withscores=True)
         pipe.hgetall(REV_KEY)
@@ -411,7 +328,6 @@ class RedisScheduleStore(ScheduleStore):
         doc["total_run_count"] = int(self.client.hget(RUNS_KEY, name) or 0)
         return doc
 
-    # -- lease ------------------------------------------------------------
     def acquire_lock(self, holder: str, ttl_ms: int) -> bool:
         return bool(self.client.set(LOCK_KEY, holder, nx=True, px=ttl_ms))
 
@@ -423,11 +339,6 @@ class RedisScheduleStore(ScheduleStore):
 
     def lock_holder(self) -> str | None:
         return _text(self.client.get(LOCK_KEY))
-
-
-# --------------------------------------------------------------------------
-# The scheduler
-# --------------------------------------------------------------------------
 
 
 class Beat:
@@ -455,29 +366,22 @@ class Beat:
             or f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
         )
         self.use_lock = use_lock
-        # Refresh at a third of the lease so two consecutive refresh failures
-        # (a redis blip) still leave a full third of the lease in hand.
+        # Two failed refreshes in a row still leave a third of the lease.
         self.refresh_interval = self.lock_ttl / 3.0
         self._is_leader = not use_lock
         self._next_refresh = 0.0
         self._reconciled = False
-        #: Slots actually published by THIS process. The HA test reads it, and
-        #: it is the number an operator wants in a metric.
+        #: Slots published by this process.
         self.fired = 0
         self.skipped = 0
         self.lost_races = 0
-        # Runs here, once per process, rather than from add_periodic_task: a
-        # task name may resolve to an @app.task decorated later in the same
-        # module, so a name still missing is only a real typo once the whole
-        # app module has finished importing, which construction time
-        # guarantees. Logged instead of left to raise: one typo must not stop
-        # every other entry in the schedule from being reconciled and fired.
+        # Here, not in add_periodic_task: the task may be decorated later in
+        # the module. Logged, not raised, so one typo cannot stop every entry.
         try:
             self.app.check_periodic_tasks()
         except ValueError as exc:
             log.error("beat: %s", exc)
 
-    # -- leadership -------------------------------------------------------
     @property
     def is_leader(self) -> bool:
         return self._is_leader
@@ -492,10 +396,6 @@ class Beat:
             if self.store.refresh_lock(self.instance_id, int(self.lock_ttl * 1000)):
                 self._next_refresh = monotonic + self.refresh_interval
                 return True
-            # Someone else holds it now (our lease lapsed during a pause, a
-            # GC stall, a redis failover). Step down immediately -- and note
-            # that even if we had NOT noticed, the CAS in claim_and_publish
-            # would still have kept every slot single-fired.
             log.warning("beat: lost the scheduler lease, stepping down to standby")
             self._is_leader = False
             self._reconciled = False
@@ -509,16 +409,11 @@ class Beat:
             return True
         return False
 
-    # -- schedule sync ----------------------------------------------------
     def sync_code_entries(self) -> None:
         """Push the app's code-declared entries into Redis, and reap orphans.
 
-        Reconciliation rule (PROTOCOL.md section 10.3): entries declared in
-        code are upserted and carry ``source == "code"``; an entry in Redis
-        with ``source == "code"`` that no longer exists in code is DELETED, so
-        removing an ``add_periodic_task`` call actually unschedules it. Entries
-        with any other source (created through the API, or a future admin view)
-        are never touched by this.
+        A ``source == "code"`` entry no longer declared in code is deleted;
+        entries with any other source are never touched (PROTOCOL.md 10.3).
         """
         declared: dict[str, ScheduleEntry] = dict(
             getattr(self.app, "_periodic", {}) or {}
@@ -536,7 +431,6 @@ class Beat:
                 )
                 self.store.delete(name)
 
-    # -- one tick ---------------------------------------------------------
     def tick(self) -> float:
         """Seed, claim and publish everything due. Returns seconds to sleep."""
         started = time.monotonic()
@@ -556,7 +450,7 @@ class Beat:
                 continue
             rev = entry.rev()
             if name in slots and revs.get(name) == rev:
-                continue  # already seeded, definition unchanged
+                continue
             try:
                 first = entry.schedule.next_after(now)
             except ValueError as exc:
@@ -614,8 +508,8 @@ class Beat:
             return False
 
         lateness = now - slot
-        # Judged on the NEWEST coalesced slot, not the oldest: after a day of
-        # downtime yesterday's 03:00 is too late, but today's may not be.
+        # Judged on the newest coalesced slot: after a day of downtime
+        # yesterday's 03:00 is too late, but today's may not be.
         suppress = (
             entry.on_missed == "skip"
             and entry.max_lateness_ms is not None
@@ -643,9 +537,7 @@ class Beat:
             except Exception as exc:
                 log.error("beat: cannot build envelope for %r: %s", entry.name, exc)
                 return False
-            # Provenance: which schedule entry and which slot produced this
-            # task. Informational only -- the worker preserves but ignores it
-            # (PROTOCOL.md section 2).
+            # Informational; the worker preserves but ignores it (PROTOCOL.md 2).
             envelope["beat_name"] = entry.name
             envelope["beat_slot"] = slot
 
@@ -667,8 +559,6 @@ class Beat:
             return False
 
         if not won:
-            # Another replica advanced this slot first. Expected under
-            # contention; the whole point is that it is harmless.
             self.lost_races += 1
             log.debug("beat: lost the claim race for %r slot %s", entry.name, slot)
             return True
@@ -685,9 +575,6 @@ class Beat:
             )
             return True
         self.fired += 1
-        # A coalesced firing silently consumes every slot it slept through
-        # (PROTOCOL.md section 10.4), so say how many rather than leaving an
-        # operator to divide lateness by the cadence.
         if missed is None:
             coalesced = ", coalescing more missed slots than the fast forward bound"
         elif missed:
@@ -711,12 +598,9 @@ class Beat:
     def _sleep_for(self, now: int, started: float, failed: set[str]) -> float:
         """Sleep until the next slot, bounded by max_interval and the lease.
 
-        ``now`` is the instant the tick STARTED, so the tick's own duration is
-        subtracted from the wait. Without that correction every tick wakes a
-        tick-duration late, and a schedule whose interval is close to the tick
-        cost drifts far enough to start coalescing slots that were never
-        actually missed. A ``failed`` slot is still due and is left out, so it
-        neither spins the loop nor delays the next slot of any other entry.
+        The tick's own duration is subtracted, or a short interval drifts
+        into coalescing slots that were never missed. ``failed`` slots are
+        still due and left out, so they cannot spin the loop.
         """
         upcoming = [
             slot
@@ -731,12 +615,9 @@ class Beat:
             wait = self.max_interval
         wait = min(wait, self.max_interval)
         if self.use_lock:
-            # Never sleep past our own lease refresh, or we would wake up
-            # holding nothing.
             wait = min(wait, self.refresh_interval)
         return max(wait - (time.monotonic() - started), MIN_SLEEP)
 
-    # -- run --------------------------------------------------------------
     def run(self, stop: threading.Event | None = None) -> None:
         """Loop until ``stop`` is set (or forever). Releases the lease on exit."""
         stop = stop or threading.Event()
@@ -751,37 +632,23 @@ class Beat:
             while not stop.is_set():
                 try:
                     if not self._hold_leadership(time.monotonic()):
-                        # Standby: poll for the lease. Nothing is scheduled
-                        # here, so this costs one GET-ish command per poll.
                         stop.wait(min(1.0, self.refresh_interval))
                         continue
                     if not self._reconciled:
-                        # Reconcile code-vs-Redis only as leader, so a rolling
-                        # deploy's two versions do not fight over orphan
-                        # deletion from both sides at once.
+                        # Leader only, so a rolling deploy's two versions do
+                        # not delete each other's entries as orphans.
                         self.sync_code_entries()
                         self._reconciled = True
                     sleep_s = self.tick()
                 except RedisClusterUnsupported as exc:
-                    # Same lease reasoning as the generic handler below (force
-                    # a refresh, do not step down), but never logged as
-                    # "retrying in 1s": stepping down would just hand the
-                    # exact same permanent CROSSSLOT to the next leader, and
-                    # a message that reads like a blip would send an operator
-                    # chasing a network problem that does not exist.
+                    # Permanent, so not logged as a retryable blip.
                     log.error("beat: %s", exc)
                     self._next_refresh = 0.0
                     sleep_s = 1.0
                 except redis.exceptions.RedisError as exc:
-                    # Do NOT step down here. A transient error says nothing
-                    # about whether the lease is still ours, and `acquire_lock`
-                    # is SET NX -- it cannot reacquire a key whose value is
-                    # already our own id. Stepping down would therefore strand
-                    # this instance as a standby, unable to take back a lease it
-                    # never lost, until that lease expired: one blip costing a
-                    # full `lock_ttl` of no scheduling. Force a refresh instead.
-                    # It renews when we still hold it, and returns 0 -> the
-                    # normal step-down path when we genuinely do not.
+                    # Do not step down: acquire_lock is SET NX and cannot take
+                    # back our own lease, so one blip would cost a full
+                    # lock_ttl. A forced refresh renews it or steps down.
                     log.error("beat: redis error (%s); retrying in 1s", exc)
                     self._next_refresh = 0.0
                     sleep_s = 1.0
@@ -793,11 +660,6 @@ class Beat:
                     log.info("beat: released the scheduler lease")
                 except Exception:  # pragma: no cover - best effort on shutdown
                     pass
-
-
-# --------------------------------------------------------------------------
-# CLI
-# --------------------------------------------------------------------------
 
 
 def load_app(spec: str) -> Any:
@@ -864,11 +726,8 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:
         log.error("failed to load app %r: %s", args.app, exc)
         return 1
-    # An app built with `redis_client=` (a Sentinel master_for factory, a
-    # custom pool) connects through that client, not through `redis_url`, so
-    # rewriting the URL here would change nothing while looking like it had.
-    # An explicit --redis-url is then a contradiction the operator has to
-    # resolve; the ambient env var is not, and simply loses.
+    # An injected redis_client= ignores redis_url, so an explicit --redis-url
+    # is a contradiction; the ambient env var simply loses.
     if getattr(app, "redis_client", None) is not None:
         if args.redis_url:
             log.error(

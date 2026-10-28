@@ -1,12 +1,9 @@
-//! --procs N supervisor: the productized form of "run N workers on one box"
-//! (bench3: 1→4 processes was +74% throughput at lower p99 — one GIL each).
-//!
-//! The parent stays Python-free: it resolves the -c derivation once, re-execs
-//! itself `--procs 1` with every setting passed explicitly, and from then on
-//! only spawns, restarts and forwards signals. Children join their own process
-//! group (a tty Ctrl+C must not reach them directly, or the supervisor's
-//! forwarded SIGTERM would look like a second signal and force-exit the drain)
-//! and carry PR_SET_PDEATHSIG so a SIGKILLed supervisor cannot leak them.
+//! --procs N supervisor: one GIL per process. The parent stays Python free,
+//! resolves -c once, re-execs itself `--procs 1` with every setting explicit,
+//! then only spawns, restarts and forwards signals. Children get their own
+//! process group (a tty Ctrl+C plus the forwarded SIGTERM would read as a
+//! second signal and force exit the drain) and PR_SET_PDEATHSIG (a SIGKILLed
+//! supervisor cannot leak them).
 
 use crate::cli;
 use std::path::{Path, PathBuf};
@@ -140,6 +137,7 @@ fn fan_out(slots: &mut [Slot]) {
     for s in slots {
         if let Some(child) = &s.child {
             if let Some(pid) = child.id() {
+                // SAFETY: kill(2) takes plain integers and touches no memory.
                 unsafe {
                     libc::kill(pid as libc::pid_t, libc::SIGTERM);
                 }
@@ -151,11 +149,12 @@ fn fan_out(slots: &mut [Slot]) {
 fn spawn_child(exe: &Path, argv: &[String], redis_url: Option<&str>) -> std::io::Result<Child> {
     let mut cmd = Command::new(exe);
     cmd.args(argv).kill_on_drop(false);
-    // Out of argv and into the environment: same value, same precedence in
-    // main.rs, but not visible in `ps aux` (see `child_argv`).
+    // In the environment, not argv, so the userinfo stays out of `ps aux`.
     if let Some(url) = redis_url {
         cmd.env("CAULI_REDIS_URL", url);
     }
+    // SAFETY: the closure runs between fork and exec and calls only the
+    // async signal safe setpgid(2) and prctl(2); it allocates nothing.
     unsafe {
         cmd.pre_exec(|| {
             libc::setpgid(0, 0);
@@ -166,9 +165,8 @@ fn spawn_child(exe: &Path, argv: &[String], redis_url: Option<&str>) -> std::io:
     cmd.spawn()
 }
 
-/// The child command line: every execution setting explicit, `--procs 1`, and
-/// never `-c` — the derivation already happened here, and a child re-deriving
-/// with its own procs divisor would compute different numbers.
+/// Every setting explicit, `--procs 1`, never `-c`: a child re-deriving with
+/// its own procs divisor would compute different numbers.
 fn child_argv(args: &cli::Args, r: &cli::Resolved) -> Vec<String> {
     let mut v: Vec<String> = vec![
         "--app".into(),
@@ -201,11 +199,6 @@ fn child_argv(args: &cli::Args, r: &cli::Resolved) -> Vec<String> {
         args.stats_interval.to_string(),
         "--log-level".into(),
         args.log_level.clone(),
-        // Was missing: `-c` alone turns the supervisor on whenever
-        // `c / 64 > 1`, so an operator who raised --redis-timeout after an
-        // incident on a noisy redis silently got the clap default of 5 in
-        // every child, with nothing logged. `child_argv_covers_every_runtime_flag`
-        // below is the guard against the next flag repeating this.
         "--redis-timeout".into(),
         args.redis_timeout.to_string(),
         "--mover-interval".into(),
@@ -217,10 +210,8 @@ fn child_argv(args: &cli::Args, r: &cli::Resolved) -> Vec<String> {
         "--ack-flush-ms".into(),
         args.ack_flush_ms.to_string(),
     ];
-    // Only when the operator set one: with no flag each child resolves its
-    // own embedded interpreter, which is the same binary and so the same
-    // path, and forwarding a literal "python3" here would reinstate exactly
-    // the PATH lookup the new default exists to avoid.
+    // Only when set: without it each child resolves the same embedded
+    // interpreter, and forwarding "python3" would force a PATH lookup.
     if let Some(python) = &args.python {
         v.push("--python".into());
         v.push(python.clone());
@@ -229,14 +220,9 @@ fn child_argv(args: &cli::Args, r: &cli::Resolved) -> Vec<String> {
         v.push("--queues".into());
         v.push(args.queues.join(","));
     }
-    // `--redis-url` is deliberately NOT here: it carries userinfo, and argv
-    // is world readable through `/proc/<pid>/cmdline` and `ps aux`. The
-    // worker redacts the same URL in every log path, the python client
-    // redacts it in `repr`, and pyrt refuses to interpolate it into a
-    // startup error, so republishing it in plaintext once per child was the
-    // one place it escaped. It reaches children through the child's own
-    // `CAULI_REDIS_URL` instead (see `spawn_child`), which main.rs already
-    // consults with exactly the precedence the flag had.
+    // No `--redis-url`: its userinfo would be world readable in
+    // /proc/<pid>/cmdline. Children get it as CAULI_REDIS_URL (spawn_child),
+    // which has the flag's precedence.
     if args.no_fork_server {
         v.push("--no-fork-server".into());
     }
@@ -251,10 +237,8 @@ mod tests {
     use super::*;
     use clap::{CommandFactory, Parser};
 
-    /// Long flag names that legitimately do NOT belong on a child command
-    /// line, each with the reason it is excluded. Everything else must be
-    /// forwarded, or the flag is silently ignored whenever the supervisor is
-    /// active -- which `-c` turns on without the operator asking for it.
+    /// Flags a child must not get. Any other flag not forwarded is silently
+    /// ignored whenever `-c` turns the supervisor on.
     const NOT_FORWARDED: &[(&str, &str)] = &[
         ("help", "clap builtin"),
         ("version", "clap builtin"),
@@ -278,11 +262,8 @@ mod tests {
         ),
     ];
 
-    /// Every `Args` field with a runtime effect has to appear in
-    /// `child_argv`, or it is silently dropped for every supervised worker.
-    /// Enumerated from clap's own definition rather than a hand written list,
-    /// so a newly added flag fails this test until it is either forwarded or
-    /// explicitly excluded with a reason.
+    /// Enumerated from clap's definition, so a new flag fails here until it
+    /// is forwarded or listed in NOT_FORWARDED.
     #[test]
     fn child_argv_covers_every_runtime_flag() {
         let args = cli::Args::try_parse_from([
@@ -336,8 +317,6 @@ mod tests {
         .unwrap();
         let r = cli::resolve(&args, 6);
         let v = child_argv(&args, &r);
-        // The child must not re-derive: no -c, procs pinned to 1, io/cpu
-        // settings passed as the per-proc numbers the supervisor computed.
         assert!(!v.contains(&"-c".to_string()));
         assert!(!v.contains(&"--concurrency".to_string()));
         let at = |flag: &str| v.iter().position(|s| s == flag).unwrap() + 1;
@@ -346,11 +325,9 @@ mod tests {
         assert_eq!(v[at("--io-concurrency")], r.io_concurrency.to_string());
         assert_eq!(v[at("--cpu-workers")], r.cpu_workers.to_string());
         assert_eq!(v[at("--queues")], "high,low");
-        // Credentials never reach argv; the URL travels in the child's env.
         assert!(!v.contains(&"--redis-url".to_string()));
         assert!(!v.iter().any(|s| s.contains("127.0.0.1:6392")));
         assert!(v.contains(&"--no-fork-server".to_string()));
-        // Round-trips through the parser, and a child resolves to itself.
         let mut child_cmd = vec!["cauli-worker".to_string()];
         child_cmd.extend(v);
         let child = cli::Args::try_parse_from(&child_cmd).unwrap();

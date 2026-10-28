@@ -34,9 +34,8 @@ async fn e2e_sigterm_drain_and_sigkill_recovery() {
     // --- SIGKILL recovery: second worker claims after visibility timeout ---
     let mut w1 = Worker::spawn("killq", &["--visibility-timeout", "60"]);
     wait_group(&mut c, "killq", 20).await;
-    // H1: the recovery loop's reclaim threshold is max(visibility_timeout,
-    // envelope.timeout_ms + grace), so this envelope needs an explicit low
-    // timeout_ms (default is 300_000ms) for reclaim to happen quickly here.
+    // Reclaim needs idle > max(visibility_timeout, timeout_ms + grace), so a
+    // low timeout_ms keeps this fast.
     let (id, e) = envelope("fx.slow", "killq", |v| {
         v["args"] = json!([3.0]);
         v["timeout_ms"] = json!(4000);
@@ -77,10 +76,8 @@ async fn e2e_sigterm_drain_and_sigkill_recovery() {
     stop_redis();
 }
 
-/// One stop request delivered as two signals a moment apart: systemd's
-/// default control-group stop signals a supervised worker AND its
-/// supervisor, which forwards its own, and a SIGKILLed supervisor delivers
-/// PDEATHSIG once per thread it had. That must still drain, not force 130.
+/// One stop delivered as two signals (systemd signals worker and supervisor;
+/// a SIGKILLed supervisor sends PDEATHSIG per thread) must still drain, not 130.
 async fn back_to_back_stop_signals_still_drain(c: &mut redis::aio::MultiplexedConnection) {
     let mut w = Worker::spawn("dblsigq", &["--drain-timeout", "15"]);
     wait_group(c, "dblsigq", 20).await;
@@ -103,14 +100,9 @@ async fn back_to_back_stop_signals_still_drain(c: &mut redis::aio::MultiplexedCo
     drop(w);
 }
 
-/// §4.1 batched-completion crash window: a `kill -9` landing while
-/// completions sit in the ack buffer must lose ZERO tasks. The first worker
-/// runs with an absurd flush window (`--ack-flush-ms 8000 --ack-batch
-/// 100000`), so everything it executes is still unflushed — no ack, no
-/// result — when the SIGKILL lands. Every entry must then still be pending,
-/// be redelivered (§4.4), and finish on a second worker with normal flush
-/// settings. This is the widest version of the window a real crash can hit
-/// (the default is 64 completions / 2ms).
+/// §4.1: a `kill -9` while completions sit unflushed in the ack buffer must
+/// lose no task. w1's huge flush window keeps everything unacked; every entry
+/// must be redelivered (§4.4) and finish on w2.
 async fn kill9_mid_ack_flush_loses_nothing(c: &mut redis::aio::MultiplexedConnection) {
     const N: usize = 40;
     let mut w1 = Worker::spawn(
@@ -180,13 +172,8 @@ async fn kill9_mid_ack_flush_loses_nothing(c: &mut redis::aio::MultiplexedConnec
     drop(w1);
 }
 
-/// Recovery-throughput regression: after a `kill -9` with ~200 tasks in
-/// flight, the recovery loop must reclaim the WHOLE eligible backlog per
-/// tick, not one `--batch`-sized page. Pre-fix, reclaim trickled at 16
-/// entries per visibility_timeout/2 tick (~12 extra ticks for this load),
-/// which shows up here as (a) a first-to-last result spread of ~12s instead
-/// of execution-bound ~3s and (b) a total recovery time several times the
-/// idle-threshold + execution floor.
+/// After a `kill -9` with ~200 tasks in flight, recovery must reclaim the whole
+/// eligible backlog per tick, not one `--batch` page.
 async fn bulk_recovery_drains_backlog_per_tick(c: &mut redis::aio::MultiplexedConnection) {
     const N: usize = 192;
     let pool_flags = [
@@ -257,9 +244,8 @@ async fn bulk_recovery_drains_backlog_per_tick(c: &mut redis::aio::MultiplexedCo
         remaining.len()
     );
     let spread = total - first_result_at.unwrap();
-    // Idle threshold ~7s + one 1s tick + 3s of execution waves ≈ 11-12s new;
-    // the pre-fix trickle needed ~12 additional ticks (~21s total, ~12s
-    // spread). Bounds sit between the two with margin on both sides.
+    // Idle ~7s + one 1s tick + 3s of execution ≈ 11-12s; one page per tick needs
+    // ~21s total with ~12s spread. Bounds sit between.
     assert!(
         total < std::time::Duration::from_secs(17),
         "recovery took {total:?}; per-tick reclaim is trickling again (pre-fix behavior ~21s)"
@@ -277,13 +263,9 @@ async fn bulk_recovery_drains_backlog_per_tick(c: &mut redis::aio::MultiplexedCo
     drop(w2);
 }
 
-/// MEM-1 regression: when an async task's event-loop thread is wedged by a
-/// synchronous blocking call (so Python's own `asyncio.wait_for` timeout can
-/// never fire), the Rust-side backstop (timeout_ms + grace) must still
-/// resolve the task cleanly as a TimeLimitExceeded. This is specifically the
-/// path that calls `PyRuntime::cancel` to drop the pending-completion entry;
-/// without it, each such backstop firing used to leak that entry (and the
-/// coroutine/args/kwargs it references) forever.
+/// An async task wedging its loop with a blocking call never hits asyncio's
+/// timeout; the Rust backstop must still resolve it as TimeLimitExceeded via
+/// `PyRuntime::cancel`, which also frees its pending completion entry.
 async fn mem1_async_backstop_fires_cleanly(c: &mut redis::aio::MultiplexedConnection) {
     let mut w = Worker::spawn("mem1q", &["--io-loops", "1"]);
     wait_group(c, "mem1q", 20).await;
@@ -309,11 +291,8 @@ async fn mem1_async_backstop_fires_cleanly(c: &mut redis::aio::MultiplexedConnec
     drop(w);
 }
 
-/// M8 regression: `--batch 0`, `--visibility-timeout 0` and
-/// `--max-envelope-bytes 0` must be rejected at startup (exit 1) rather than
-/// accepted. 0 would mean "unlimited" XREADGROUP fetch, a recovery loop
-/// that reclaims every task in flight on nearly every tick, or (0 bytes)
-/// every single message dead lettered as oversize.
+/// `--batch 0`, `--visibility-timeout 0` and `--max-envelope-bytes 0` exit 1
+/// at startup.
 fn m8_cli_floors_reject_zero() {
     let mut bad_batch = Worker::spawn("m8q", &["--batch", "0"]);
     assert_eq!(bad_batch.wait_code(15), 1, "--batch 0 must be rejected");
@@ -336,13 +315,8 @@ fn m8_cli_floors_reject_zero() {
     drop(bad_meb);
 }
 
-/// H1 regression: a task sleeping well past the visibility_timeout floor,
-/// with a (default, large) timeout_ms, must NOT be reclaimed and re-executed
-/// concurrently. Uses a low --visibility-timeout (1s) specifically so the
-/// recovery loop's XPENDING IDLE floor is satisfied quickly and repeatedly
-/// while the task is still legitimately running for several seconds; without
-/// the per-envelope idle check this would XCLAIM and re-dispatch the same
-/// entry a second time.
+/// A task running past a low visibility_timeout with a large timeout_ms must
+/// not be reclaimed and run twice: reclaim also checks the envelope's idle.
 async fn h1_visibility_floor_does_not_reclaim_long_task(c: &mut redis::aio::MultiplexedConnection) {
     let mut w = Worker::spawn("h1q", &["--visibility-timeout", "1"]);
     wait_group(c, "h1q", 20).await;
@@ -352,9 +326,7 @@ async fn h1_visibility_floor_does_not_reclaim_long_task(c: &mut redis::aio::Mult
     xadd(c, "h1q", &e.to_string()).await;
     wait_inflight(c, "h1q", 10).await;
 
-    // Give the recovery loop (period = max(vt/2, 500ms) = 500ms here) several
-    // chances to (wrongly, pre-fix) reclaim: well past the 1s visibility
-    // floor, well short of the 4s sleep or the default 300s task timeout.
+    // Several recovery ticks (500ms) past the 1s floor, short of the 4s sleep.
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
     let r = wait_result(c, &id, 10).await;
@@ -373,18 +345,13 @@ async fn h1_visibility_floor_does_not_reclaim_long_task(c: &mut redis::aio::Mult
     drop(w);
 }
 
-/// H2 regression: after a sync-pool hard-timeout abandonment, the pool must
-/// still execute NEW tasks at full capacity (a replacement thread is spawned
-/// immediately) rather than waiting for the wedged original thread to free
-/// up. Uses --io-threads 1 so the pool's sole thread is deterministically
-/// occupied by the abandoned task for its full sleep duration.
+/// After a sync hard timeout abandons a thread, a replacement thread runs new
+/// tasks at once. --io-threads 1 pins the wedged thread.
 async fn h2_sync_pool_survives_hard_timeout_abandonment(c: &mut redis::aio::MultiplexedConnection) {
     let mut w = Worker::spawn("h2q", &["--io-threads", "1"]);
     wait_group(c, "h2q", 20).await;
 
-    // Task A: sleeps 3s but hard-times-out at 300ms, so the dispatcher gives
-    // up quickly while the sole pool thread keeps sleeping in the background
-    // (wedged from the pool's point of view for ~3s).
+    // A sleeps 3s with a 300ms hard timeout, wedging the only pool thread.
     let (id_a, e_a) = envelope("fx.slow", "h2q", |v| {
         v["args"] = json!([3.0]);
         v["timeout_ms"] = json!(300);
@@ -395,9 +362,7 @@ async fn h2_sync_pool_survives_hard_timeout_abandonment(c: &mut redis::aio::Mult
     assert_eq!(r_a["status"], "failure");
     assert_eq!(r_a["error"]["type"], "TimeLimitExceeded");
 
-    // Task B: a fast task submitted right after. With the sole original
-    // thread still wedged in A's sleep, this only completes quickly if a
-    // replacement thread was spawned when A's hard timeout fired.
+    // B completes quickly only if a replacement thread was spawned.
     let (id_b, e_b) = envelope("fx.echo", "h2q", |v| {
         v["args"] = json!(["capacity-restored"])
     });
@@ -408,8 +373,7 @@ async fn h2_sync_pool_survives_hard_timeout_abandonment(c: &mut redis::aio::Mult
         "pool must serve new tasks at full capacity after an abandonment"
     );
 
-    // A's underlying sleep finishes in the background; its already-recorded
-    // failure result must not be disturbed when that happens.
+    // A's late return must not overwrite its recorded failure.
     tokio::time::sleep(std::time::Duration::from_millis(3200)).await;
     let a_final: String = redis::cmd("GET")
         .arg(format!("cauli:result:{id_a}"))

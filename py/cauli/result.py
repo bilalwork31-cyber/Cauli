@@ -15,31 +15,20 @@ from cauli.exceptions import TaskFailedError
 if TYPE_CHECKING:
     from cauli.app import Cauli
 
-# Where a result wait starts before it backs off toward its poll_interval.
-# 1ms is below any round trip this client can make to Redis, so the floor is
-# set by the network rather than by this number.
+# Below any Redis round trip, so the network sets the real floor.
 _POLL_FLOOR = 0.001
 
-# Polls held at the floor before the ramp starts doubling. Pure doubling from
-# 1ms reaches 50ms after only 6 sleeps but has already spent 63ms getting
-# there, so it barely beat the flat 50ms poll for the mid range results it was
-# meant to rescue. Ten flat polls cover the first 10ms one millisecond at a
-# time, and the doubling then takes over: cumulative wake times run 1..10, 12,
-# 16, 24, 40, 72, 122ms. Thirteen extra reads, and only from a client that is
-# blocked waiting anyway.
+# Polls held at the floor before doubling. Pure doubling from 1ms spends 63ms
+# reaching 50ms and barely beats a flat 50ms poll; ten flat polls first cover
+# the common 1 to 10ms results for thirteen extra reads in total.
 _POLL_FLAT = 10
 
 
 class _Status(str):
     """A status string that is also callable, returning itself.
 
-    :attr:`AsyncResult.status` is a property, so the Celery idiom
-    ``r.status == "success"`` compares two strings instead of silently
-    comparing a bound method to a string and being ``False`` forever. Every
-    existing call site spells it ``r.status()``, though, and PROTOCOL.md
-    documents that spelling, so the value stays callable rather than
-    breaking them. Calling it does NOT re-read Redis: the read happened when
-    the property was evaluated.
+    ``r.status == "success"`` (Celery) and ``r.status()`` (PROTOCOL.md section
+    6) both work. Calling it does not re read Redis.
     """
 
     __slots__ = ()
@@ -51,12 +40,10 @@ class _Status(str):
 class AsyncResult:
     """Handle to a task result stored in Redis.
 
-    ``duplicate`` becomes ``True`` after :meth:`get` observes a result with
-    status ``"duplicate"`` (idempotency guard hit); ``get`` returns ``None``
-    in that case, and ``claimant_id`` names the task that holds the
-    idempotency key (see :meth:`claimant`). ``expired`` becomes ``True`` when
-    the task was discarded unrun past its ``expires`` deadline; :meth:`get`
-    raises in that case.
+    After :meth:`get` sees a ``"duplicate"`` result, ``duplicate`` is ``True``
+    and ``claimant_id`` names the task holding the idempotency key (see
+    :meth:`claimant`). ``expired`` is ``True`` once :meth:`get` sees the task
+    was discarded unrun past its ``expires`` deadline.
     """
 
     def __init__(self, task_id: str, app: "Cauli") -> None:
@@ -71,7 +58,6 @@ class AsyncResult:
         return f"cauli:result:{self.id}"
 
     def _async_redis(self) -> Any:
-        """The app's ``redis.asyncio`` client, or a clear error if it has none."""
         getter = getattr(self.app, "_get_async_redis", None)
         if getter is None:
             raise TypeError(
@@ -82,22 +68,16 @@ class AsyncResult:
         return getter()
 
     def _load(self) -> dict[str, Any] | None:
-        """Fetch and decode the result document, or None if the key is absent."""
         return self._decode(self.app._get_redis().get(self._key))
 
     async def _aload(self) -> dict[str, Any] | None:
-        """:meth:`_load` on the asyncio client. Requires an ``AsyncCauli`` app."""
         return self._decode(await self._async_redis().get(self._key))
 
     def _decode(self, raw: Any) -> dict[str, Any] | None:
         """Decode a raw result value, or None if the key was absent.
 
-        A key that DOES exist but is not a usable result document (bytes that
-        are not valid JSON, or JSON that decodes to something other than an
-        object) raises :class:`TaskFailedError` with ``type ==
-        "InvalidResult"`` naming the task id and the problem, rather than
-        leaking msgspec's or Python's own internal exception type up through
-        :meth:`status`/:meth:`get`.
+        A present but unusable document raises :class:`TaskFailedError` with
+        ``type == "InvalidResult"``, never a msgspec or builtin exception.
         """
         if raw is None:
             return None
@@ -124,27 +104,17 @@ class AsyncResult:
     def status(self) -> _Status:
         """``"pending" | "success" | "failure" | "duplicate" | "expired"``.
 
-        Readable either way: ``r.status`` (Celery's spelling) and ``r.status()``
-        (cauli's own, and the one PROTOCOL.md section 12 documents) both give
-        the same string. Each evaluation of the attribute reads Redis once.
-
-        ``"pending"`` means the result key does not exist (yet, or anymore
-        after result_ttl expiry). ``"expired"`` means the task passed its
-        ``expires`` deadline (or its queue's TTL) before a worker picked it up,
-        so it was discarded without running (PROTOCOL.md section 9.1). Raises
-        :class:`TaskFailedError` (``type == "InvalidResult"``) for a result
-        document that exists but is unusable, including one missing its
-        ``"status"`` field. See :meth:`_decode` and :meth:`get`, which treat
-        the same document the same way.
+        ``r.status`` and ``r.status()`` give the same string; each evaluation
+        reads Redis once. ``"pending"`` means no result key (not yet, or past
+        ``result_ttl``). ``"expired"`` means the task passed its ``expires``
+        deadline or queue TTL unrun (PROTOCOL.md section 9.1). An unusable
+        document, including one with no ``"status"``, raises
+        :class:`TaskFailedError` with ``type == "InvalidResult"``.
         """
         return self._status_of(self._load())
 
     async def astatus(self) -> _Status:
-        """:attr:`status` on the asyncio client. Requires an ``AsyncCauli`` app.
-
-        A coroutine, so this one is only ever ``await r.astatus()``; the
-        awaited value is callable too, purely for symmetry with ``status``.
-        """
+        """:attr:`status` on the asyncio client. Requires an ``AsyncCauli`` app."""
         return self._status_of(await self._aload())
 
     def _status_of(self, doc: dict[str, Any] | None) -> _Status:
@@ -161,19 +131,7 @@ class AsyncResult:
 
     @staticmethod
     def _poll_delays(ceiling: float) -> Iterator[float]:
-        """Successive sleeps for a result wait: 1ms, doubling up to ``ceiling``.
-
-        A fixed 50ms poll costs a task 25ms of latency on average purely
-        waiting to be noticed, which for a 5ms task is 6x its own runtime. Most
-        results land in the first few milliseconds, so the wait spends its
-        first ten polls at the 1ms floor and only then doubles away: the extra
-        Redis reads are thirteen in the first tenth of a second and nothing
-        after that, and they come from a client that is already blocked.
-
-        ``poll_interval`` keeps its meaning as the ceiling, so an explicit
-        value still bounds how often this talks to Redis, and a value below
-        1ms is simply used as-is.
-        """
+        """Ten polls at 1ms, then doubling up to ``ceiling`` (used as is below 1ms)."""
         delay = min(_POLL_FLOOR, ceiling)
         for _ in range(_POLL_FLAT):
             yield delay
@@ -185,35 +143,20 @@ class AsyncResult:
         """Block until the result key exists, then resolve it.
 
         - success: returns the result value.
-        - failure: raises :class:`TaskFailedError` (with
-          .type/.message/.traceback/.origin).
-        - duplicate: sets ``self.duplicate = True`` and ``self.claimant_id``
-          (see :meth:`claimant`), and returns ``None``.
-        - expired: sets ``self.expired = True`` and raises
-          :class:`TaskFailedError` with ``type == "Expired"``. It raises rather
-          than returning None because the caller asked for a result that is
-          never going to exist -- the task did not run and never will.
-        - still pending when ``timeout`` (seconds) expires: raises TimeoutError
-          (naming the task id; it does NOT claim the task is still pending,
-          since a result that ran and already passed result_ttl looks
-          identical to one that never ran).
-        - a result document that exists but is unusable (not valid JSON, not
-          a JSON object, or a JSON object with no ``"status"`` field): raises
-          :class:`TaskFailedError` with ``type == "InvalidResult"`` (see
-          :meth:`_decode`).
+        - failure: raises :class:`TaskFailedError`.
+        - duplicate: sets ``duplicate`` and ``claimant_id``, returns ``None``.
+        - expired: sets ``expired``, raises :class:`TaskFailedError` with
+          ``type == "Expired"``.
+        - no key after ``timeout`` seconds: raises ``TimeoutError``. A result
+          already past ``result_ttl`` looks the same as one never run.
+        - unusable document: raises :class:`TaskFailedError` with
+          ``type == "InvalidResult"``.
 
-        This is poll-based, not push/blocking redis-side: the wait starts at
-        a 1ms poll and doubles up to ``poll_interval`` (default 0.05s), so a
-        fast task is collected almost as soon as it finishes while a long wait
-        settles back to one read every 50ms. Without ``timeout``, ``get()`` can block forever by design:
-        a task enqueued with ``store_result=False`` never gets a result key at
-        all, and neither does one dead lettered as malformed, unregistered, or
-        over its redelivery limit, but only when the task id itself could not
-        be recovered from the envelope (rare). In the usual case those three
-        get a result key too (a synthesized failure), so ``get()`` raises
-        instead of hanging (see PROTOCOL.md §4/§4.4/§8 and ARCHITECTURE.md
-        limitation #2). Passing an explicit ``timeout`` is recommended for
-        anything but throwaway scripts.
+        Polls from 1ms, doubling up to ``poll_interval``. Without ``timeout``
+        it can block forever: ``store_result=False`` tasks never get a result
+        key, nor does a dead lettered envelope whose task id could not be
+        recovered (PROTOCOL.md sections 4, 4.4 and 8, docs/architecture.md).
+        Pass a ``timeout``.
         """
         deadline = None if timeout is None else time.monotonic() + timeout
         delays = self._poll_delays(poll_interval)
@@ -230,12 +173,7 @@ class AsyncResult:
     ) -> Any:
         """:meth:`get` without blocking the event loop. Requires an ``AsyncCauli``.
 
-        Identical outcomes, identical exceptions and the identical backoff
-        ramp -- the same ``_resolve`` and ``_poll_delays`` drive both -- but the
-        poll sleeps on the loop and the Redis read goes through
-        ``redis.asyncio``. Awaiting the blocking ``get()`` inside a
-        coroutine would park the whole loop thread for the entire wait, which
-        for a task that never produces a result key is forever.
+        Same outcomes, exceptions and backoff as :meth:`get`.
         """
         deadline = None if timeout is None else time.monotonic() + timeout
         delays = self._poll_delays(poll_interval)
@@ -248,7 +186,6 @@ class AsyncResult:
             await asyncio.sleep(next(delays))
 
     def _resolve(self, doc: dict[str, Any]) -> Any:
-        """Turn a present result document into a return value or an exception."""
         status = doc.get("status")
         if status == "success":
             return doc.get("result")
@@ -258,8 +195,6 @@ class AsyncResult:
                 error.get("type"),
                 error.get("message"),
                 error.get("traceback"),
-                # Absent against a worker predating the field, which
-                # reads as unknown rather than as any known origin.
                 error.get("origin"),
             )
         if status == "duplicate":
@@ -286,20 +221,17 @@ class AsyncResult:
     def claimant(self) -> "AsyncResult | None":
         """Handle to the task that suppressed this one, or ``None``.
 
-        Populated once :meth:`get`/:meth:`aget` has resolved a ``"duplicate"``
-        result. A suppressed submission never ran, so its own result carries
-        nothing but the claimant's id; the claimant's result is where the real
-        outcome lives, and a claim is never released even after the claimant
-        is dead lettered (PROTOCOL.md section 4.5)::
+        The suppressed submission never ran; the claimant's result holds the
+        real outcome. A claim is never released, even after the claimant is
+        dead lettered (PROTOCOL.md section 4.5)::
 
             r = send_email.delay("a@b.com", idempotency_key="welcome:42")
             if r.get(timeout=5) is None and r.duplicate:
                 claimant = r.claimant()
                 outcome = claimant.get(timeout=5) if claimant else None
 
-        ``None`` when this task was not deduplicated, when :meth:`get` has not
-        run yet, or in the race where the claim key expired before the worker
-        could read its holder (section 4.5 writes a null ``claimant_id`` then).
+        ``None`` when the task was not deduplicated, before :meth:`get` ran,
+        or when the claim key expired before the worker read its holder.
         """
         if self.claimant_id is None:
             return None

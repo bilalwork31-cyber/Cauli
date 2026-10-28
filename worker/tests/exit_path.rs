@@ -1,17 +1,12 @@
-//! Exit-path regression: a panic that unwinds out of the main thread must
-//! reach `exit_now` (libc `_exit`), never ordinary libc `exit()`. See the
-//! `exit_now` doc comment in src/main.rs for the incident this guards
-//! against (OPENSSL_cleanup racing live threads during shutdown).
-//!
-//! No redis needed: the injected panic fires right after `PyRuntime::init`,
-//! before `run_worker` ever touches a connection.
+//! A panic unwinding out of the main thread must reach `exit_now` (libc
+//! `_exit`), never libc `exit()`, which races live threads in atexit and DSO
+//! teardown. No redis needed: the panic fires right after `PyRuntime::init`.
 mod common;
 use common::fixtures_dir;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Unique-enough temp path for this test run (pid + a monotonic counter),
-/// avoiding a crates.io tempfile dependency for one marker file.
+/// Unique temp path (pid + counter), no tempfile dependency.
 fn marker_path() -> PathBuf {
     use std::sync::atomic::{AtomicU32, Ordering};
     static SEQ: AtomicU32 = AtomicU32::new(0);
@@ -22,14 +17,10 @@ fn marker_path() -> PathBuf {
     ))
 }
 
-/// Spawn the real `cauli-worker` binary with the test-hooks env vars set:
-/// `CAULI_TEST_ATEXIT_MARKER` registers a libc `atexit` handler that writes
-/// `marker`, chosen because it directly observes the thing that matters --
-/// whether the libc atexit/DSO-teardown path ran at all -- rather than
-/// something probabilistic like heap corruption. `CAULI_TEST_PANIC_AFTER_PYRT_INIT`
-/// forces a main-thread panic once the embedded interpreter's daemon asyncio
-/// loop threads and the async-submit thread are already running, matching
-/// the real incident's "threads still live at exit" condition.
+/// Spawn the real binary with test hooks: `CAULI_TEST_ATEXIT_MARKER` registers
+/// an atexit handler that writes `marker`, directly observing whether libc
+/// teardown ran. `CAULI_TEST_PANIC_AFTER_PYRT_INIT` panics with the interpreter's
+/// threads already live.
 fn spawn_and_wait(marker: &Path) -> i32 {
     let out = Command::new(env!("CARGO_BIN_EXE_cauli-worker"))
         .current_dir(fixtures_dir())
@@ -120,11 +111,9 @@ fn a_stalled_log_reader_does_not_block_exit() {
     assert_eq!(status.code(), Some(1));
 }
 
-/// Nothing listens on this port: a refused connection, the startup case an
-/// operator hits with redis down or a typo in the URL.
+/// Nothing listens here: redis down or a typo in the URL.
 const UNREACHABLE_REDIS: &str = "redis://127.0.0.1:1/0";
 
-/// With redis-rs's default backoff this run stayed silent for minutes.
 /// Startup must give up within a bounded time and name what failed.
 #[test]
 fn an_unreachable_redis_fails_startup_quickly_and_says_why() {

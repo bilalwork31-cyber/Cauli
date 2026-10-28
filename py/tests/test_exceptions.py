@@ -43,7 +43,7 @@ def test_soft_limit_docstring_states_the_reported_failure_type() -> None:
 
 
 def test_soft_limit_docstring_points_at_the_configuration_row() -> None:
-    assert "docs/CONFIGURATION.md" in _docstring()
+    assert "docs/configuration.md" in _docstring()
 
 
 def test_configuration_soft_timeout_row_still_documents_both_lanes() -> None:

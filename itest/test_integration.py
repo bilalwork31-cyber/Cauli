@@ -186,11 +186,9 @@ def test_final_failure_dlq_and_error(stack):
 
 
 def test_unregistered_task_result_resolves_instead_of_hanging(stack):
-    """Dead letter root cause fix: dlq_terminal used to always write
-    result=None, so AsyncResult.get() blocked forever on a result key that
-    would never appear. An unregistered task name is the cheapest way to
-    reach a terminal DLQ with a recoverable id: the envelope parses fine,
-    only the registry lookup fails.
+    """A terminal dead letter writes a result, so get() raises, not hangs.
+
+    An unregistered name reaches the DLQ with a recoverable id.
     """
     from cauli import TaskFailedError
     from cauli.result import AsyncResult
@@ -230,9 +228,8 @@ def test_idempotency_dedup(stack):
 
 
 def test_idempotency_key_allows_retry(stack):
-    # C1 regression: idempotency_key + a task that fails once then succeeds
-    # must actually retry and finish "success" -- previously it silently
-    # resolved as "duplicate" against its own earlier claim, forever.
+    # A keyed task that fails once must retry and succeed, not resolve as a
+    # duplicate of its own claim.
     m = _app()
     path = f"/tmp/cauli-itest-idemp-retry-{uuid.uuid4().hex}"
     key = f"itest-retry-{uuid.uuid4().hex}"
@@ -287,15 +284,8 @@ def test_eta_delays_execution_to_an_absolute_instant(stack):
 def test_expired_task_is_discarded_without_running(stack):
     """PROTOCOL section 9.1: expired work is dropped at dispatch, not executed.
 
-    The marker file is the proof that the task body never ran -- a result key
-    saying "expired" would be satisfied by a task that ran and then got
-    relabelled.
-
-    The envelope is already past its deadline at enqueue, which section 3 says
-    is published anyway rather than refused, so that expiry keeps a single
-    enforcement point. Pairing a countdown with a shorter expires would never
-    reach the worker at all: the client refuses that combination at the call
-    site (section 9.2).
+    The marker file proves the body never ran. The envelope is already past
+    its deadline at enqueue, which the client publishes anyway (section 3).
     """
     from datetime import datetime, timedelta, timezone
 
@@ -373,18 +363,10 @@ def test_app_level_routing_moves_a_task_to_another_queue(stack):
 
 
 def test_dlq_stream_is_bounded(stack):
-    """C1 (DLQ) regression: cauli:dlq:{queue} must not grow without bound.
+    """cauli:dlq:{queue} stays near its 1000 entry cap under a flood.
 
-    A sustained trickle of failures on a long lived worker used to grow the
-    DLQ stream forever (no MAXLEN), eventually running Redis out of memory
-    for every queue, not just the failing one. Malformed entries are the
-    cheapest way to generate many DLQ writes (no Python task execution, just
-    parse-fail -> XADD dlq + XACK + XDEL), so this floods the `shortlived`
-    queue's DLQ with far more entries than the 1000 entry cap and checks it
-    settles near the cap, not near the count pushed. `shortlived` is used
-    here (not `default` or `routed`) because no other test in this file
-    inspects its DLQ stream, so this cannot race with them regardless of
-    test execution order.
+    Malformed entries are the cheapest DLQ writes. `shortlived` because no
+    other test inspects its DLQ, so this cannot race them.
     """
     r, _ = stack
     dlq_key = "cauli:dlq:shortlived"
@@ -411,18 +393,12 @@ def test_dlq_stream_is_bounded(stack):
 
 
 def test_crash_redelivery_resolves_mine_again_not_duplicate(stack):
-    """PROTOCOL section 4.5 "mine again": a worker that dies mid task leaves
-    its claim standing in cauli:idemp:{h}. `test_idempotency_key_allows_retry`
-    above already covers the scheduled retry half of that fix; this covers
-    the other half, crash redelivery, which the coverage audit found had no
-    test anywhere despite being the half that matters most: it is what stops
-    a task being stuck forever after a worker dies mid execution.
+    """PROTOCOL section 4.5 "mine again": a crash victim's claim must not
+    strand it.
 
-    A worker claims the task and is killed before it can finish, so the
-    entry stays in the pending entries list; a second worker's recovery loop
-    reclaims it with XCLAIM once idle exceeds the visibility timeout. The
-    guard must resolve that reclaim as MineAgain so it genuinely re-executes,
-    not Duplicate, which would strand the task forever.
+    A worker is killed mid task; a second worker reclaims the pending entry
+    with XCLAIM, and the guard must resolve it as MineAgain and re execute,
+    not as Duplicate.
     """
     from cauli.result import AsyncResult
 
@@ -490,20 +466,11 @@ def test_crash_redelivery_resolves_mine_again_not_duplicate(stack):
 
 
 def test_redelivery_limit_dead_letters_with_result(stack):
-    """PROTOCOL section 4.4: redelivery_limit = max(3, max_retries + 1)
-    bounds how many times the recovery loop will XCLAIM the same crash
-    victim before giving up on it. `redelivery_limit_rules` in envelope.rs
-    already covers the formula; the coverage audit found the actual path,
-    repeated XCLAIM redelivery reaching that limit and then dead lettering,
-    had no end to end test anywhere.
+    """PROTOCOL section 4.4: past redelivery_limit = max(3, max_retries + 1)
+    the worker dead letters with reason redelivery_limit and writes a result.
 
-    The three prior redeliveries are simulated with the same redis primitive
-    the worker's own recovery loop uses to reclaim (XCLAIM increments
-    delivery_count identically regardless of caller), so the real worker
-    below is the one making the last, decisive call: dead letter with reason
-    redelivery_limit (not max_retries, the other dead letter reason), and
-    write a result so a waiting client gets an error instead of hanging on
-    it forever.
+    Prior redeliveries are simulated with XCLAIM, which increments
+    delivery_count exactly as the recovery loop does.
     """
     from cauli import TaskFailedError
     from cauli.result import AsyncResult

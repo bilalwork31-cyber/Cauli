@@ -1,8 +1,7 @@
-"""Cauli application object: task registry + enqueue.
+"""Cauli application object: task registry and enqueue (PROTOCOL.md 2 and 3).
 
-Implements the client enqueue rules from PROTOCOL.md sections 2 and 3.
-The attribute names ``_tasks``, ``redis_url``, ``default_queue``,
-``result_ttl``, ``idemp_ttl`` are read by the Rust worker (section 6).
+The worker reads ``_tasks``, ``redis_url``, ``default_queue``, ``result_ttl``
+and ``idemp_ttl`` by name (section 6).
 """
 
 from __future__ import annotations
@@ -27,26 +26,18 @@ from cauli.task import TaskDef
 log = logging.getLogger("cauli.app")
 
 _DEFAULT_REDIS_URL = "redis://localhost:6379/0"
-# Matches the Rust worker's --redis-timeout default (worker/src/cli.rs). Passed
-# explicitly to the connection pools below: redis-py's own default for this
-# depends on the installed version (pyproject pins only "redis>=5.0.1", no upper
-# bound), so leaving it unset would make this client's hang behavior an
-# accident of whatever version happens to be installed rather than a decision.
+# The worker's --redis-timeout default. Explicit because redis-py's default
+# differs across the versions "redis>=5.0.1" allows.
 _DEFAULT_SOCKET_TIMEOUT = 5
-# Connections per client. redis-py 8 caps its default pool at 100 and raises
-# MaxConnectionsError on the 101st concurrent caller (redis-py 5 had no cap),
-# so a burst of adelay() calls lost enqueues. A blocking pool keeps the cap but
-# makes a caller past it wait, up to the socket timeout, for a free connection.
+# redis-py 8's default pool raises on the 101st concurrent caller; a blocking
+# pool makes that caller wait, up to the socket timeout, instead.
 _POOL_MAX_CONNECTIONS = 100
-# Matches the Rust worker's --max-envelope-bytes default (worker/src/cli.rs).
-# The two are one setting in two places: the client refuses to write what the
-# worker would refuse to read.
+# The worker's --max-envelope-bytes default; keep the two equal.
 _DEFAULT_MAX_ENVELOPE_BYTES = 1_048_576
 _QUEUE_NAME_RE = re.compile(r"[a-zA-Z0-9_.-]+\Z")
 _U64_MAX = 2**64 - 1
 
-#: Wildcard key in :attr:`Cauli.queue_ttl` meaning "every queue without an
-#: explicit entry". Also read by the Rust worker (PROTOCOL.md section 9.2).
+#: :attr:`Cauli.queue_ttl` key for every queue without its own entry (PROTOCOL.md 9.2).
 QUEUE_TTL_WILDCARD = "*"
 
 
@@ -55,15 +46,7 @@ def _now_ms() -> int:
 
 
 def _aware_epoch_ms(value: datetime, field: str) -> int:
-    """Convert a timezone-AWARE datetime to epoch ms, or refuse.
-
-    A naive datetime is rejected rather than guessed at. Celery's
-    ``enable_utc`` reinterprets naive datetimes as UTC, which silently shifts
-    every ``eta`` by the local offset for anyone who passes
-    ``datetime.now()``; guessing "local" instead is just as wrong on a server
-    whose TZ differs from the developer's laptop. There is no correct default,
-    so there is no default.
-    """
+    """Epoch ms of an aware datetime; a naive one has no correct guess, so it raises."""
     if not isinstance(value, datetime):
         raise TypeError(f"{field} must be a datetime, got {type(value).__name__}")
     if value.tzinfo is None or value.tzinfo.utcoffset(value) is None:
@@ -78,10 +61,8 @@ def _aware_epoch_ms(value: datetime, field: str) -> int:
 def _normalize_routes(routes: Any) -> list[tuple[str | None, Any]]:
     """Normalize ``task_routes`` into an ordered ``[(glob | None, dest)]`` list.
 
-    Accepted inputs (PROTOCOL.md section 9.3): a mapping ``{glob: dest}``
-    (insertion ordered), a sequence of ``(glob, dest)`` pairs, or a sequence
-    mixing pairs with bare callables (a bare callable is consulted for every
-    task, i.e. its pattern is ``None``).
+    Accepts a mapping, ``(glob, dest)`` pairs, or bare callables, which match
+    every task (PROTOCOL.md section 9.3).
     """
     if not routes:
         return []
@@ -110,11 +91,7 @@ def _normalize_routes(routes: Any) -> list[tuple[str | None, Any]]:
 
 
 def _normalize_queue_ttl(queue_ttl: Any) -> dict[str, float]:
-    """Normalize ``queue_ttl`` into ``{queue: seconds}`` with a ``"*"`` fallback.
-
-    A bare number means "every queue"; a mapping is per queue and may itself
-    carry a ``"*"`` entry as the fallback.
-    """
+    """Normalize ``queue_ttl`` into ``{queue: seconds}``; a bare number means ``"*"``."""
     if queue_ttl is None:
         return {}
     if isinstance(queue_ttl, bool):
@@ -137,20 +114,14 @@ def _normalize_queue_ttl(queue_ttl: Any) -> dict[str, float]:
     return out
 
 
-#: Keyword options one :meth:`Cauli.enqueue_many` element may carry: the
-#: same set :meth:`cauli.task.TaskDef.apply_async` accepts, minus args/kwargs.
+#: Options of :meth:`cauli.task.TaskDef.apply_async` that enqueue_many accepts.
 _CALL_OPTIONS = ("countdown", "queue", "idempotency_key", "eta", "expires")
 
 
 def _normalize_call(
     call: Any,
 ) -> tuple[TaskDef, tuple[Any, ...], dict[str, Any], dict[str, Any]]:
-    """Normalize one :meth:`Cauli.enqueue_many` element.
-
-    Accepts a bare :class:`TaskDef` (called with no arguments) or a tuple (or
-    list) ``(task, args, kwargs, options)`` whose trailing parts may be
-    omitted. Returns ``(task, args, kwargs, options)``.
-    """
+    """Normalize one :meth:`Cauli.enqueue_many` element to ``(task, args, kwargs, options)``."""
     if isinstance(call, TaskDef):
         return call, (), {}, {}
     if not isinstance(call, (tuple, list)) or not call:
@@ -180,29 +151,18 @@ def _normalize_call(
 
 
 def _dumps(obj: Any) -> bytes:
-    # _codec rejects NaN/Infinity: they are not valid JSON and would poison
-    # the Rust-side parser; fail loudly at enqueue time instead. Compact UTF-8
-    # bytes, so len() of the result is the wire size the worker measures.
+    # len() of the result is the wire size the worker measures.
     return _codec.encode(obj)
 
 
 def _redact_redis_url(url: str) -> str:
-    """Mask ``user:password@`` userinfo, and ``password=``/``username=``
-    query parameters, before a redis URL reaches logs/repr.
-
-    Both are shapes redis-py accepts as real credentials (audit M4); without
-    this either would appear in plaintext wherever ``repr(app)`` or a log
-    line includes ``redis_url``.
-    """
+    """Mask userinfo and credential query values before a redis URL reaches logs or repr."""
     scheme_sep = url.find("://")
     if scheme_sep == -1:
         return url
     rest = url[scheme_sep + 3 :]
-    # The userinfo "@" is searched for up to the query, not just up to the
-    # first "/" or "#": an unencoded "/" or "#" in a password (base64 output
-    # has "/") makes the URL unparseable, and whatever reports that must not
-    # print the password. Last "@", not first, for a password that itself
-    # contains "@". An "@" inside ?password= is masked below.
+    # Up to the query, not the first "/" or "#": a base64 password may hold
+    # "/". Last "@", for a password that itself contains "@".
     query_start = rest.find("?")
     at = rest.rfind("@", 0, len(rest) if query_start == -1 else query_start)
     mask = "***@" if at != -1 else ""
@@ -223,10 +183,7 @@ def _is_credential_key(name: str) -> bool:
 
 
 def _redact_query_credentials(tail: str) -> str:
-    """Mask ``password=``/``username=`` VALUES in a URL's query string (the
-    form redis-py accepts straight as connection kwargs, no userinfo
-    involved). Keys and every other query parameter stay visible.
-    """
+    """Mask credential values in a URL's query string; keys stay visible."""
     q = tail.find("?")
     if q == -1:
         return tail
@@ -256,74 +213,41 @@ class Cauli:
         redis_client: Any = None,
         max_envelope_bytes: int = _DEFAULT_MAX_ENVELOPE_BYTES,
     ) -> None:
-        # Resolution order: explicit arg > env CAULI_REDIS_URL > default.
         env_redis_url = os.environ.get("CAULI_REDIS_URL")
         self.redis_url: str = redis_url or env_redis_url or _DEFAULT_REDIS_URL
         if not redis_url and not env_redis_url:
-            # Otherwise this is silent: a box with an unrelated redis already
-            # on 6379 (common) makes tasks vanish into the wrong instance with
-            # no error anywhere. warning (not info) so it is visible even with
-            # no logging configuration at all, via logging's own last resort
-            # handler.
+            # An unrelated redis on 6379 would swallow tasks silently. warning
+            # is visible with no logging configured.
             log.warning(
                 "no redis_url given and CAULI_REDIS_URL is not set, defaulting to %s",
                 _DEFAULT_REDIS_URL,
             )
         self.default_queue: str = default_queue
-        # result_ttl=0 reads like "disabled" but Redis rejects `SET key val EX
-        # 0`, so the result key would never be written and AsyncResult.get()
-        # would hang forever; validate the same way _normalize_queue_ttl does.
+        # Redis rejects `SET ... EX 0`, so get() would hang forever.
         if result_ttl <= 0:
             raise ValueError(f"result_ttl must be > 0 seconds, got {result_ttl!r}")
         if idemp_ttl <= 0:
             raise ValueError(f"idemp_ttl must be > 0 seconds, got {idemp_ttl!r}")
         self.result_ttl: int = result_ttl
         self.idemp_ttl: int = idemp_ttl
-        # The client half of the worker's --max-envelope-bytes (PROTOCOL.md
-        # section 2). Keep the two equal: the client then refuses to write
-        # exactly what the worker would refuse to read.
         if max_envelope_bytes <= 0:
             raise ValueError(
                 f"max_envelope_bytes must be > 0 bytes, got {max_envelope_bytes!r}"
             )
         self.max_envelope_bytes: int = int(max_envelope_bytes)
-        # App-level routing rules (PROTOCOL.md section 9.3): pattern -> queue,
-        # applied at enqueue time. They OVERRIDE a task's own decorator queue,
-        # which is the point -- an operator re-routes without editing task code
-        # -- but never a per-call `queue=`, which is explicit runtime intent.
+        # Overrides a task's decorator queue, never a per call queue= (PROTOCOL.md 9.3).
         self.task_routes: list[tuple[str | None, Any]] = _normalize_routes(task_routes)
-        # Per-queue maximum age (PROTOCOL.md section 9.2). `{"*": seconds}` is
-        # the fallback for queues with no explicit entry. Read by BOTH the
-        # client (stamps `expires_at` at enqueue) and the Rust worker (enforced
-        # at dispatch even for envelopes that predate the setting).
+        # Also enforced by the worker at dispatch (PROTOCOL.md 9.2).
         self.queue_ttl: dict[str, float] = _normalize_queue_ttl(queue_ttl)
         self._tasks: dict[str, TaskDef] = {}
-        # Code-declared periodic schedule entries (PROTOCOL.md section 10).
-        # `cauli-beat` upserts these into Redis at startup; Redis is the
-        # source of truth from then on.
+        # cauli-beat syncs these into Redis, the source of truth from then on.
         self._periodic: dict[str, ScheduleEntry] = {}
-        # Lifecycle hooks (PROTOCOL.md section 4.8). The worker reads these
-        # exact attribute names by getattr through the embedded interpreter
-        # and in the cpu child executor; keep them as plain lists of zero-arg
-        # callables. Registration order is call order.
+        # Read by name by the worker and the cpu child (PROTOCOL.md 4.8).
         self._before_task_hooks: list[Callable[[], Any]] = []
         self._after_task_hooks: list[Callable[[], Any]] = []
         self._process_init_hooks: list[Callable[[], Any]] = []
-        # Client injection. `redis_url` covers exactly what
-        # `redis.Redis.from_url` can parse, which is standalone only: a Sentinel
-        # set has no URL form redis-py accepts, and neither has a client that
-        # needs a custom retry policy, a TLS context, or a pool shared with the
-        # rest of the application. So accept a ready client, or a zero-arg
-        # factory returning one, and let the caller build it however redis-py
-        # wants:
-        #
-        #     sentinel = redis.sentinel.Sentinel([("h1", 26379), ("h2", 26379)])
-        #     app = Cauli(redis_client=lambda: sentinel.master_for("mymaster"))
-        #
-        # The FACTORY form is the useful one for Sentinel: it is called once,
-        # lazily, on first use, so importing the app module does not resolve the
-        # master. `redis_url` is still recorded (it is what an operator points
-        # the worker and `cauli-beat` at) but is not used to connect here.
+        # A client or zero arg factory, for what has no URL form (Sentinel,
+        # TLS context, shared pool). The factory runs lazily on first use.
         self.redis_client: Any = redis_client
         self._redis: redis.Redis | None = None
         self._redis_lock = threading.Lock()
@@ -342,12 +266,7 @@ class Cauli:
         return self.redis_client() if callable(self.redis_client) else self.redis_client
 
     def _get_redis(self) -> redis.Redis:
-        """Lazily create the redis-py client (no connection is made until first command).
-
-        Double-checked locking (audit L6): without the lock, two threads
-        racing the first call could each build their own client, and one
-        pool would leak.
-        """
+        """Lazily create the redis-py client; the lock stops two racing threads leaking a pool."""
         if self._redis is None:
             with self._redis_lock:
                 if self._redis is None:
@@ -355,42 +274,27 @@ class Cauli:
         return self._redis
 
     def before_task(self, fn: Callable[[], Any]) -> Callable[[], Any]:
-        """Register ``fn`` to run immediately before EVERY task executes.
+        """Register ``fn`` to run before every task, as a decorator or a plain call.
 
-        Usable as a decorator (``@app.before_task``) or a plain call
-        (``app.before_task(close_old_connections)``). ``fn`` is called with
-        no arguments, in the same thread/process that is about to run the
-        task, on every execution path: the worker's sync io thread pool, its
-        embedded asyncio loop threads, and the forked/stdio cpu children.
-
-        On the asyncio path a hook may return an awaitable; the worker awaits
-        it on the loop thread (sync-pool and cpu paths call hooks purely
-        synchronously and ignore a returned awaitable).
-
-        A hook that raises is logged (stderr) and skipped; it never fails the
-        task and never stops the remaining hooks from running. Registration
-        order is call order. Typical use: per-task resource lifecycle such as
-        Django's ``close_old_connections`` (see ``cauli.contrib.django``).
+        ``fn`` takes no arguments and runs in the thread that runs the task, on
+        every lane. For an ``async def`` task a returned awaitable is awaited.
+        A hook that raises is logged to stderr and skipped; it never fails the
+        task. Hooks run in registration order.
         """
         self._before_task_hooks.append(fn)
         return fn
 
     def after_task(self, fn: Callable[[], Any]) -> Callable[[], Any]:
-        """Register ``fn`` to run after EVERY task finishes (success, failure
-        or timeout inside the task). Same calling convention, execution
-        contexts and error handling as :meth:`before_task`."""
+        """Register ``fn`` to run after every task, whatever the outcome. As :meth:`before_task`."""
         self._after_task_hooks.append(fn)
         return fn
 
     def process_init(self, fn: Callable[[], Any]) -> Callable[[], Any]:
-        """Register ``fn`` to run once in every cauli-managed Python process
-        after the app is imported and before any task executes.
+        """Register ``fn`` to run once per cauli process, after app import, before any task.
 
-        Runs in: the worker's embedded interpreter (at app load), each forked
-        cpu child (right after fork, before serving), each stdio-mode cpu
-        child (after import), and the fork-server parent (before the first
-        fork — so resources opened at import time can be closed before any
-        child can inherit them). Same error handling as :meth:`before_task`.
+        Also runs in the fork server parent before the first fork, so a
+        resource opened at import is closed before children inherit it.
+        Errors are handled as in :meth:`before_task`.
         """
         self._process_init_hooks.append(fn)
         return fn
@@ -434,16 +338,8 @@ class Cauli:
     ) -> TaskDef | Callable[[Callable[..., Any]], TaskDef]:
         """Register a function as a task. Usable as ``@app.task`` or ``@app.task(...)``.
 
-        Seconds-based options (timeout, soft_timeout, backoff_*) are converted
-        to milliseconds on the TaskDef. ``kind=None`` means ``"io"``; ``"cpu"``
-        must be explicit.
-
-        The two ``@overload``s above carry no runtime behaviour: they exist so
-        a type checker resolves ``@app.task`` to a :class:`TaskDef` and
-        ``@app.task(...)`` to a decorator returning one. With only the single
-        union return type below, every decorated name typed as
-        ``TaskDef | Callable`` and ``.delay()`` did not resolve on it -- in a
-        package that ships ``py.typed`` and so claims to be checkable.
+        Times are in seconds. ``kind`` defaults to ``"io"``; ``"cpu"`` must be
+        explicit. See docs/configuration.md for every option.
         """
 
         def decorate(fn: Callable[..., Any]) -> TaskDef:
@@ -487,15 +383,9 @@ class Cauli:
     ) -> ScheduleEntry:
         """Declare a periodic schedule entry in code (PROTOCOL.md section 10).
 
-        ``schedule`` is a :class:`~cauli.schedules.Schedule` (``interval(...)``
-        or ``crontab(...)``), a ``timedelta``, or a number of seconds. ``name``
-        is the entry's stable identity: it is the Redis field key, so renaming
-        an entry creates a new one (with a fresh schedule slot) and orphans the
-        old one.
-
-        This only registers the definition. ``cauli-beat`` syncs it into Redis
-        at startup and owns the runtime state from then on; nothing here talks
-        to Redis and nothing here fires anything.
+        ``schedule`` is ``interval(...)``, ``crontab(...)``, a ``timedelta`` or
+        seconds. ``name`` is the Redis key, so renaming starts a fresh entry.
+        Only registers the definition; ``cauli-beat`` syncs and fires it.
         """
         if name in self._periodic:
             raise ValueError(f"duplicate periodic task name {name!r}")
@@ -520,14 +410,8 @@ class Cauli:
     def check_periodic_tasks(self) -> None:
         """Raise if a declared periodic entry names a task this app has not registered.
 
-        Not called from :meth:`add_periodic_task`: a periodic entry may
-        legitimately name a task by string before that task's own
-        ``@app.task`` runs later in the same module, so checking at
-        declaration time would reject valid code. This is meant to be called
-        once the whole app module has finished importing (every decorator has
-        therefore run) and right before the schedule actually starts running,
-        which is the earliest point a name that is still missing is a real
-        typo rather than an ordering artifact.
+        Call after the app module is fully imported: an entry may name a task
+        decorated later in the same module.
         """
         for entry in self._periodic.values():
             if entry.task not in self._tasks:
@@ -538,13 +422,7 @@ class Cauli:
                 )
 
     def _route(self, task_name: str, args: Any, kwargs: dict[str, Any]) -> str | None:
-        """First matching app-level route's queue, or None (PROTOCOL.md 9.3).
-
-        A route destination is a queue name, a ``{"queue": ...}`` mapping, or a
-        callable ``(task_name, args, kwargs) -> str | dict | None``; a callable
-        returning None means "no opinion, keep looking", so a router can fall
-        through to the next rule.
-        """
+        """First matching route's queue, or None (PROTOCOL.md 9.3); a router returning None falls through."""
         for pattern, dest in self.task_routes:
             if pattern is not None and not fnmatch.fnmatchcase(task_name, pattern):
                 continue
@@ -569,13 +447,7 @@ class Cauli:
         task: TaskDef | None = None,
         entry_queue: str | None = None,
     ) -> str:
-        """Queue precedence, highest first (PROTOCOL.md section 9.3):
-
-        1. per-call ``queue=`` (or a beat entry's ``queue``) -- explicit intent
-        2. app-level ``task_routes`` -- the operator's re-routing lever
-        3. the task's own decorator ``queue=``
-        4. ``app.default_queue``
-        """
+        """Per call (or beat entry) queue, then task_routes, task queue, default (PROTOCOL.md 9.3)."""
         chosen = explicit if explicit is not None else entry_queue
         if chosen is None:
             chosen = self._route(task_name, args, kwargs)
@@ -612,20 +484,10 @@ class Cauli:
     ) -> tuple[dict[str, Any], str, int | None]:
         """Build a PROTOCOL.md section 2 envelope. Does NOT touch Redis.
 
-        Returns ``(envelope, queue_name, fire_at_ms)`` where ``fire_at_ms`` is
-        None for "publish to the stream now" and an epoch-ms score for "hold in
-        the delayed zset until then".
-
-        Shared by :meth:`_enqueue` and by ``cauli-beat``, deliberately: a task
-        published by the scheduler must be byte-for-byte the same shape as one
-        published by ``.delay()``, or the two would drift on exactly the fields
-        (routing, queue TTL, expiry) this is here to centralize. ``task`` is
-        the registered :class:`TaskDef` when known; when it is not (a schedule
-        entry naming a task this process has not imported), protocol defaults
-        are used and the worker's registry still wins at execution time.
-
-        Raises ValueError when the computed fire time is already past the
-        envelope's expiry, since that task could only ever be discarded unrun.
+        Returns ``(envelope, queue_name, fire_at_ms)``; ``fire_at_ms`` is None
+        to publish now. Shared with ``cauli-beat`` so both write the same
+        envelope. Without ``task`` protocol defaults are used. Raises
+        ValueError when the task would fire after it expires.
         """
         if countdown is not None and eta is not None:
             raise ValueError(
@@ -649,9 +511,6 @@ class Cauli:
             fire_at = now + int(round(float(countdown) * 1000))
         elif eta is not None:
             fire_at = _aware_epoch_ms(eta, "eta")
-        # An eta/countdown already in the past is not an error and is not
-        # "late": it just means the task is due now, so it goes straight to the
-        # stream instead of taking a pointless trip through the delayed zset.
         not_before = fire_at
         if fire_at is not None and fire_at <= now:
             fire_at = None
@@ -670,32 +529,18 @@ class Cauli:
                     "expires must be seconds (number) or a timezone-aware datetime, "
                     f"got {type(expires).__name__}"
                 )
-            # The worker parses expires_at as an unsigned 64 bit integer; a
-            # value outside that range fails the whole envelope parse, so no
-            # result is ever written and get() waits forever.
+            # Out of u64 range fails the worker's parse, so get() waits forever.
             if not 0 <= expires_at <= _U64_MAX:
                 raise ValueError(
                     f"expires={expires!r} gives epoch ms {expires_at}, outside "
                     f"0..{_U64_MAX}"
                 )
         elif queue_ttl_ms is not None:
-            # Only a client-side DEFAULT, which is why it is in the `elif`:
-            # an explicit `expires` is stamped as given and is never clamped
-            # here. The queue TTL is still a ceiling -- the worker takes the
-            # earlier of the two at dispatch (PROTOCOL.md section 9.2), so
-            # an over-long `expires` cannot outlive the queue's configured
-            # max age. Enforcing that is the worker's job, not the client's.
+            # A default only; the worker applies the earlier of the two (PROTOCOL.md 9.2).
             expires_at = now + queue_ttl_ms
 
-        # Both halves of that deadline are measured from ENQUEUE, never from
-        # the due time (PROTOCOL.md section 9.2). So a countdown/eta landing
-        # past it describes a task that can never run: it waits out its delay
-        # in the zset, gets published on time, and is then discarded unrun at
-        # dispatch -- with nothing at all raised or logged at the call site.
-        # `Cauli(queue_ttl=300)` plus `countdown=600` is the whole trap, and
-        # an app-wide TTL makes it every delayed task in the application.
-        # Refuse at enqueue, where the caller can still see which of the two
-        # settings to move.
+        # Expiry counts from enqueue, so queue_ttl=300 with countdown=600 would
+        # be discarded unrun with nothing raised. Refuse it here.
         deadline = expires_at
         if queue_ttl_ms is not None:
             ttl_deadline = now + queue_ttl_ms
@@ -717,11 +562,7 @@ class Cauli:
 
         envelope: dict[str, Any] = {
             "v": 1,
-            # os.urandom, not uuid4: the wire format is 32 hex characters
-            # either way (PROTOCOL section 2) and nothing on either side ever
-            # parses this back into a UUID, so the version/variant bits bought
-            # nothing. uuid4().hex was 2429ns and 17.5% of a .delay(); this is
-            # 927ns, with 128 bits of entropy instead of 122.
+            # 32 hex chars as uuid4().hex, at under half the cost; never parsed as a UUID.
             "id": task_id or os.urandom(16).hex(),
             "task": task_name,
             "args": args,
@@ -755,14 +596,7 @@ class Cauli:
         eta: "datetime | None" = None,
         expires: "float | datetime | None" = None,
     ) -> AsyncResult:
-        """Build the envelope and enqueue it (PROTOCOL.md section 3).
-
-        Queue precedence: call-site ``queue`` > app ``task_routes`` > task
-        queue > app ``default_queue``. With ``countdown`` or ``eta``: ZADD to
-        ``cauli:delayed:{queue}`` (score = fire time, mirrored into
-        ``not_before``); no XADD. Otherwise XADD to ``cauli:q:{queue}`` with
-        the single field ``e``.
-        """
+        """Build the envelope and enqueue it (PROTOCOL.md section 3)."""
         envelope, queue_name, fire_at = self.make_envelope(
             task.name,
             args,
@@ -795,18 +629,10 @@ class Cauli:
                 (rebuild, (), {}, {"countdown": 30, "queue": "slow"}),
             ])
 
-        Each call still goes through :meth:`make_envelope`, so routing, queue
-        TTL and expiry behave exactly as they do for ``.delay()``; what changes
-        is that the N writes leave in one batch instead of paying N round
-        trips. Delayed and immediate calls may be mixed freely.
-
-        Every call is validated and encoded BEFORE anything is written, so a
-        bad one (unknown option, unencodable argument, oversize envelope)
-        raises with nothing published. The pipeline is deliberately NOT a
-        transaction: it is one batched write, not an atomic one, so a Redis
-        failure part way through can still leave earlier entries published.
-
-        Returns one :class:`~cauli.result.AsyncResult` per call, in order.
+        Routing, queue TTL and expiry behave as for ``.delay()``. Every call is
+        validated before anything is written, so a bad one publishes nothing.
+        Not a transaction: a Redis failure part way can leave earlier entries
+        published. Returns one :class:`~cauli.result.AsyncResult` per call, in order.
         """
         prepared = self._prepare_many(calls)
         if not prepared:
@@ -820,12 +646,7 @@ class Cauli:
     def _prepare_many(
         self, calls: Iterable["TaskDef | tuple[Any, ...]"]
     ) -> list[tuple[str, bytes, str, int | None]]:
-        """Validate and encode a batch into ``(id, raw, queue, fire_at)`` rows.
-
-        Shared by the sync and the asyncio batch paths so both build identical
-        envelopes, and kept separate from the write so the whole batch is known
-        good before the first byte goes out.
-        """
+        """Validate and encode a whole batch into ``(id, raw, queue, fire_at)`` before any write."""
         prepared: list[tuple[str, bytes, str, int | None]] = []
         for call in calls:
             task, args, kwargs, options = _normalize_call(call)
@@ -847,14 +668,7 @@ class Cauli:
         return prepared
 
     def _encode_envelope(self, envelope: dict[str, Any]) -> bytes:
-        """Encode one envelope for the wire, refusing an oversize payload.
-
-        A worker discards an entry bigger than its ``--max-envelope-bytes``
-        BEFORE parsing it, so it never learns the task id, never writes
-        ``cauli:result:{id}``, and an :meth:`~cauli.result.AsyncResult.get`
-        with no timeout polls forever. Refusing at the call site turns that
-        silent hang into an exception on the line that built the payload.
-        """
+        """Encode one envelope, refusing one the worker would drop unparsed (get() would hang)."""
         raw = _dumps(envelope)
         if len(raw) > self.max_envelope_bytes:
             raise ValueError(
@@ -870,17 +684,7 @@ class Cauli:
 
     @staticmethod
     def _publish(client: Any, raw: bytes, queue: str, fire_at: int | None) -> Any:
-        """Issue the ONE Redis write an enqueue makes, and return whatever the
-        client returns. ``raw`` is an envelope already encoded, and size
-        checked, by :meth:`_encode_envelope`.
-
-        Shared verbatim by the sync and the asyncio paths: redis-py's asyncio
-        client exposes the same method names, so the async half awaits this
-        return value instead of calling it. Keeping the key names and the
-        delayed/immediate decision in one place is the point -- the two paths
-        must put byte-identical envelopes in identical keys or the worker sees
-        two different protocols.
-        """
+        """The one Redis write of an enqueue; the async paths await its return value."""
         if fire_at is not None:
             return client.zadd(f"cauli:delayed:{queue}", {raw: fire_at})
         return client.xadd(f"cauli:q:{queue}", {"e": raw})
@@ -895,10 +699,8 @@ class Cauli:
 class AsyncCauli(Cauli):
     """A :class:`Cauli` that can also enqueue from a running event loop.
 
-    Everything a plain ``Cauli`` does it still does: the same ``@app.task``
-    registry, the same routing, the same ``make_envelope``, the same blocking
-    ``.delay()``. What it adds is a second client built on ``redis.asyncio``
-    and the ``a``-prefixed calls that use it::
+    Adds a ``redis.asyncio`` client and the ``a`` prefixed calls; everything
+    else, ``.delay()`` included, works as on ``Cauli``::
 
         app = AsyncCauli(redis_url="redis://localhost:6379/0")
 
@@ -910,35 +712,20 @@ class AsyncCauli(Cauli):
             result = await send_email.adelay("a@example.com")
             return {"task_id": result.id}
 
-    Without this, an enqueue from an ``async def`` handler blocks the loop
-    thread for a full Redis round trip -- and for up to ``socket_timeout``
-    seconds when Redis degrades, which stalls every other request that loop is
-    serving, not just this one.
-
-    The envelope written is byte-for-byte what ``.delay()`` writes: the async
-    path reuses :meth:`make_envelope` and :meth:`_publish` unchanged, so there
-    is no second wire format to keep in step.
-
-    The asyncio client is created lazily and cached per event loop, since
-    redis-py binds its connections to the loop that first uses them. Call
-    ``await app.aclose()`` on that loop at shutdown (FastAPI's lifespan
-    handler is the natural place) to close its pool.
+    The envelope is the same as ``.delay()`` writes. The client is cached per
+    event loop; call ``await app.aclose()`` on that loop at shutdown.
     """
 
     def __init__(
         self, *args: Any, async_redis_client: Any = None, **kwargs: Any
     ) -> None:
         super().__init__(*args, **kwargs)
-        # The asyncio twin of ``redis_client``: a ready ``redis.asyncio.Redis``
-        # or a zero-arg factory returning one. Same reason it exists -- a
-        # Sentinel set, a TLS context or a shared pool has no URL form.
+        # The asyncio twin of ``redis_client``.
         self.async_redis_client: Any = async_redis_client
         self._aredis: weakref.WeakKeyDictionary[Any, Any] = weakref.WeakKeyDictionary()
 
     def _new_async_redis(self) -> Any:
-        # Imported here, not at module scope: the worker's embedded interpreter
-        # imports this module on every start and does not enqueue, so it should
-        # not pay for redis.asyncio (and asyncio itself) to be imported.
+        # Lazy: the worker imports this module and never enqueues.
         from redis import asyncio as aioredis
 
         if self.async_redis_client is None:
@@ -954,19 +741,11 @@ class AsyncCauli(Cauli):
         return supplied() if callable(supplied) else supplied
 
     def _get_async_redis(self) -> Any:
-        """The running loop's cached ``redis.asyncio`` client. Creating it
-        opens no connection.
+        """The running loop's cached ``redis.asyncio`` client.
 
-        One client per loop: redis-py binds a pool's connections and its lock
-        to the loop that first used them, so one client shared by a second
-        loop raised "Event loop is closed" on every other ``asyncio.run()``
-        (``async_to_sync``, pytest-asyncio) and hung outright when two loop
-        threads raced it. Weak keys drop a client together with its loop.
-
-        Guarded by the SAME threading lock as the sync client rather than an
-        ``asyncio.Lock``: an asyncio lock binds to the first loop that awaits
-        it. Building the client object does no I/O, so a plain lock costs
-        nothing here.
+        Per loop: redis-py binds a pool to the loop that first used it, and a
+        second loop gets "Event loop is closed". A threading lock, because an
+        ``asyncio.Lock`` binds to one loop too.
         """
         import asyncio
 
@@ -976,9 +755,8 @@ class AsyncCauli(Cauli):
             with self._redis_lock:
                 client = self._aredis.get(loop)
                 if client is None:
-                    # The client's connections hold its loop, so a weak key
-                    # alone never lets go of a finished asyncio.run(): drop
-                    # closed loops here, and their sockets with them.
+                    # The client's connections keep its loop alive, so a weak
+                    # key alone never frees a finished asyncio.run().
                     for closed in [lp for lp in self._aredis if lp.is_closed()]:
                         del self._aredis[closed]
                     client = self._aredis[loop] = self._new_async_redis()
@@ -995,7 +773,6 @@ class AsyncCauli(Cauli):
         eta: "datetime | None" = None,
         expires: "float | datetime | None" = None,
     ) -> AsyncResult:
-        """The asyncio mirror of :meth:`_enqueue`; identical envelope and keys."""
         envelope, queue_name, fire_at = self.make_envelope(
             task.name,
             args,
@@ -1014,32 +791,24 @@ class AsyncCauli(Cauli):
     async def aenqueue_many(
         self, calls: Iterable["TaskDef | tuple[Any, ...]"]
     ) -> list[AsyncResult]:
-        """The asyncio mirror of :meth:`Cauli.enqueue_many`: same call shapes,
-        same envelopes, same single pipelined round trip."""
+        """The asyncio mirror of :meth:`Cauli.enqueue_many`."""
         prepared = self._prepare_many(calls)
         if not prepared:
             return []
         async with self._get_async_redis().pipeline(transaction=False) as pipe:
             for _task_id, raw, queue_name, fire_at in prepared:
-                # NOT awaited: a buffered pipeline command returns the pipeline
-                # itself on both clients. Only execute() is a coroutine here.
+                # Not awaited: a buffered pipeline command returns the pipeline.
                 self._publish(pipe, raw, queue_name, fire_at)
             await pipe.execute()
         return [AsyncResult(task_id, self) for task_id, _raw, _q, _f in prepared]
 
     async def aclose(self) -> None:
-        """Close the running loop's asyncio client and its pool. Safe to call
-        more than once.
-
-        Does NOT touch the sync client: that one has its own lifetime and is
-        not bound to any event loop.
-        """
+        """Close the running loop's asyncio client and pool; idempotent. The sync client stays open."""
         import asyncio
 
         client = self._aredis.pop(asyncio.get_running_loop(), None)
         if client is None:
             return
-        # redis-py renamed the coroutine to `aclose()` in 5.0.1 and deprecated
-        # `close()`; pyproject pins only `redis>=5`, so accept either.
+        # `aclose()` from redis-py 5.0.1; `close()` before.
         closer = getattr(client, "aclose", None) or client.close
         await closer()

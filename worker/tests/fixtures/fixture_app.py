@@ -96,9 +96,8 @@ def slow(seconds=30.0):
 
 
 def slow_counted(counter_file, seconds=30.0):
-    """Records one invocation (append-only counter) BEFORE sleeping, so a test
-    can detect duplicate concurrent execution even while the task is still
-    in flight (used by the H1 visibility-timeout regression test)."""
+    """Counts the invocation BEFORE sleeping, so a test sees a duplicate
+    concurrent run while the first is still in flight."""
     n = 0
     if os.path.exists(counter_file):
         with open(counter_file) as f:
@@ -116,13 +115,8 @@ async def aslow(seconds=30.0):
 
 
 async def async_block(seconds=3.0):
-    """A coroutine that blocks synchronously instead of awaiting.
-
-    Wedges the ONE event loop thread it runs on: with no `await`, asyncio
-    cannot run any other callback on that thread -- including its own
-    `wait_for` timeout check -- until this call returns. Used to force the
-    Rust-side backstop timeout path (MEM-1 regression: without cancel(), that
-    path used to leak a pending-completion map entry forever)."""
+    """Blocks its event loop thread so its own `wait_for` cannot fire,
+    forcing the Rust side backstop timeout path."""
     time.sleep(float(seconds))
     return "unreachable-in-time"
 

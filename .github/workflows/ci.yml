@@ -19,10 +19,8 @@ jobs:
           components: rustfmt, clippy
       - name: Install redis-server
         run: sudo apt-get update && sudo apt-get install -y redis-server
-      # The interpreter the worker embeds, here and in every test binary. The
-      # shim decodes task arguments and encodes results with msgspec, so it
-      # has to be importable there; cauli itself deliberately is not (the
-      # fixture app is duck typed and pyrt.rs asserts cauli is absent).
+      # The interpreter the worker embeds. The shim needs msgspec; cauli itself
+      # must be absent (pyrt.rs asserts it, the fixture app is duck typed).
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
@@ -41,9 +39,7 @@ jobs:
         working-directory: worker
         run: cargo test --release --features test-hooks
       - name: cargo audit
-        # Advisory-db fetch is occasionally flaky in CI; don't fail the
-        # whole build over a transient network issue on an advisory-only
-        # check. A real hit still shows up loudly in the job log.
+        # The advisory db fetch is flaky; a real hit still shows in the log.
         continue-on-error: true
         working-directory: worker
         run: |
@@ -66,13 +62,9 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y redis-server
       - name: Install cauli (editable, dev extras) and ruff
         run: |
-          # cauli requires cauli-worker, the prebuilt binary wheel that this
-          # repository BUILDS rather than downloads, and that only exists on
-          # the index once a release has been cut. Resolving it here would
-          # make this job's result depend on the state of PyPI instead of on
-          # the code under test, so the third party dependencies are installed
-          # first and the client goes in with --no-deps. The packaging job is
-          # where that pin is proved, against the wheels it just built.
+          # cauli requires cauli-worker, which this repo builds and PyPI only has after
+          # a release, so third party deps go first and cauli goes in with --no-deps.
+          # The packaging job proves the pin against the wheels it builds.
           pip install "redis>=5.0.1" "msgspec>=0.18" tzdata "pytest>=8"
           pip install -e py --no-deps
           pip install ruff==0.15.22
@@ -95,8 +87,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 3.14t: the free threaded build, which the worker embeds with the
-        # GIL off; this is the job that exercises it end to end.
+        # 3.14t: the free threaded build, worker embedded with the GIL off.
         python-version: ["3.12", "3.14t"]
     steps:
       - uses: actions/checkout@v7
@@ -112,9 +103,7 @@ jobs:
           PYO3_PYTHON: ${{ env.pythonLocation }}/bin/python
         run: cargo build --release --bin cauli-worker
       - name: Install cauli (editable) and pytest
-        # --no-deps for the same reason as the py job: cauli-worker is built
-        # here, not fetched, and this job runs against the binary cargo just
-        # produced.
+        # --no-deps: cauli-worker is the binary cargo just built, not PyPI's.
         run: |
           pip install "redis>=5.0.1" "msgspec>=0.18" tzdata pytest
           pip install -e py --no-deps
@@ -147,20 +136,10 @@ jobs:
           pip install build
           python -m build --sdist --wheel --outdir dist py
 
-      # One config only. The release workflow builds the full
-      # (CPython minor x arch) matrix; this exists so packaging breakage shows
-      # up on the PR that caused it rather than at tag time.
-      # manylinux is OFF here, deliberately, and this job is weaker than the
-      # release build because of it. The manylinux_2_28 image ships a CPython
-      # with no shared libpython, and pyo3's auto-initialize feature refuses
-      # to build against a static only interpreter, which is the same hazard
-      # the release workflow warns about right before its readelf assertion.
-      # The runner's own CPython is built with --enable-shared, so building
-      # on the host proves the code compiles, the wheel assembles and the
-      # binary links libpython dynamically. What it no longer proves is the
-      # glibc floor: this wheel carries the runner's glibc, not 2.28. Cutting
-      # a real release still needs a build environment that has both an old
-      # glibc and a shared CPython.
+      # One config, so packaging breakage shows on the PR; release builds the full
+      # matrix. No manylinux here: its CPython has no shared libpython, which pyo3
+      # auto-initialize refuses. So this proves build, wheel assembly and dynamic
+      # libpython linking, but not the glibc 2.28 floor.
       - uses: PyO3/maturin-action@v1
         with:
           working-directory: worker
@@ -171,9 +150,8 @@ jobs:
             --release --out ../dist --interpreter python3.12
             --no-default-features --features wheel-bin
 
-      # Same invariant the release workflow gates on: the worker embeds
-      # CPython and must link it dynamically, or it runs its own interpreter
-      # instead of the user's and cannot see their tasks.
+      # The worker must link CPython dynamically, or it runs its own interpreter
+      # and cannot see the user's tasks.
       - name: Worker links libpython dynamically
         run: |
           set -euo pipefail
@@ -182,17 +160,13 @@ jobs:
           readelf -d _probe/*.data/scripts/cauli-worker-bin | tee _probe/dyn.txt
           grep -q "libpython3.12" _probe/dyn.txt \
             || { echo "FAIL: worker did not link libpython dynamically" >&2; exit 1; }
-          # pip copies the mode straight out of the wheel, so a console script
-          # committed without its exec bit installs unrunnable.
+          # pip copies the wheel's mode, so a script without its exec bit is unrunnable.
           test -x _probe/*.data/scripts/cauli-worker \
             || { echo "FAIL: cauli-worker console script is not executable" >&2; exit 1; }
 
-      # The one check the rest of CI structurally cannot make: every other
-      # job here runs under actions/setup-python, which exports
-      # LD_LIBRARY_PATH and so hides the fact that the worker binary carries
-      # no RUNPATH. In a bare container with a uv managed CPython, nothing
-      # points the loader at libpython, and the binary dies before main unless
-      # the cauli-worker console script fixes the search path first.
+      # setup-python exports LD_LIBRARY_PATH everywhere else, hiding that the binary
+      # has no RUNPATH. In a bare container with uv's CPython it dies before main
+      # unless the cauli-worker console script sets the search path.
       - name: Run the wheel where nothing has put libpython on the search path
         run: |
           set -euo pipefail
@@ -220,23 +194,20 @@ jobs:
             -v "$PWD/bare.sh:/bare.sh:ro" \
             ubuntu:24.04 bash /bare.sh
 
-      # `pip install cauli` on its own has to leave the user with a worker
-      # binary. Every other step here installs the two wheels by path, so this
-      # is the only one that reads the client's dependency metadata at all.
+      # The only step that reads cauli's dependency metadata: `pip install cauli`
+      # alone must yield a worker binary.
       - name: Plain `pip install cauli` lands a working worker
         run: |
           set -euo pipefail
           python -m venv .onecmd
           .onecmd/bin/pip install --upgrade pip
-          # Third party dependencies from the index first, so the resolve below
-          # can be --no-index and cauli/cauli-worker can only be the wheels
-          # just built rather than an older pair already on PyPI.
+          # Third party deps from the index first, so the --no-index resolve can only
+          # pick the wheels just built.
           .onecmd/bin/pip install "redis>=5.0.1" "msgspec>=0.18" tzdata
           .onecmd/bin/pip install --no-index --find-links dist cauli
           .onecmd/bin/pip show cauli-worker >/dev/null
           test -x .onecmd/bin/cauli-worker
-          # --print-plan needs no Redis and no app: the cheapest proof that
-          # what pip installed actually starts.
+          # --print-plan needs no Redis and no app: proof the install starts.
           .onecmd/bin/cauli-worker --print-plan
 
       - name: Install the wheels into a clean venv and run itest
@@ -244,11 +215,8 @@ jobs:
           set -euo pipefail
           python -m venv .relvenv
           .relvenv/bin/pip install --upgrade pip
-          # Named by path, not by requirement: cauli and cauli-worker can then only
-          # be the files we are about to publish, while their third party
-          # dependencies resolve from the index exactly as a user's pip fetches
-          # them. --no-index cannot do this job; cauli needs redis and msgspec,
-          # and neither is in the artifact directory.
+          # By path: cauli and cauli-worker are the files to be published, while
+          # third party deps resolve from the index as a user's pip does.
           .relvenv/bin/pip install dist/cauli-*.whl dist/cauli_worker-*.whl
           .relvenv/bin/pip install pytest
           worker_v=$(.relvenv/bin/cauli-worker --version | awk '{print $2}')

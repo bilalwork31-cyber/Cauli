@@ -1,13 +1,8 @@
-"""Async SQLAlchemy session lifecycle for cauli (optional; cauli core
-stays framework agnostic).
+"""Async SQLAlchemy session per task for cauli. Framework agnostic: it serves
+FastAPI, Starlette, Litestar or bare asyncio apps. ``cauli.contrib.fastapi``
+is an alias.
 
-Nothing here imports a web framework, and nothing here is specific to
-one: this is the session per task half of an async SQLAlchemy setup, so
-it serves a FastAPI, Starlette or Litestar app, or a bare asyncio one,
-identically. ``cauli.contrib.fastapi`` was this module's first name and
-still works, as a thin reexport alias.
-
-Typical project layout::
+Usage::
 
     # myproj/cauli.py
     from cauli.contrib.sqlalchemy import sqlalchemy_app, get_session
@@ -26,125 +21,38 @@ Typical project layout::
     # run the worker
     cauli-worker --app myproj.cauli:app
 
-What :func:`sqlalchemy_app` gives you on top of a plain ``Cauli()``:
+What it wires: one engine and sessionmaker built eagerly (no I/O until first
+checkout), ``engine.dispose()`` as a process init hook so no pooled
+connection is inherited across a fork, and one ``AsyncSession`` per task,
+opened by a before task hook, closed by an after task hook, read with
+:func:`get_session`.
 
-- ``create_async_engine()`` and ``async_sessionmaker()`` built ONCE, eagerly,
-  at call time (see :func:`install_sqlalchemy_session`), not lazily on first
-  task. Building an engine does no I/O and needs no running event loop, a
-  connection is only opened on first checkout, so eager construction is
-  safe. A lazily built per task engine buys nothing and invites exactly the
-  double checked locking bugs Django's ORM never has to think about, because
-  Django owns one implicit global connection registry. SQLAlchemy
-  deliberately has none, so this module owns the one engine instead.
-- ``engine.dispose()`` registered as a process init hook: the Django analog
-  of ``connections.close_all()``, for the same reason, a pooled connection
-  must not be inherited across a fork (PROTOCOL.md section 4.8 covers the
-  fork server child and stdio child timings this hook runs at).
-- One task scoped ``AsyncSession``, opened by a before task hook and closed
-  by an after task hook, reachable from task code through :func:`get_session`,
-  the smallest surface that works given SQLAlchemy's lack of a Django style
-  implicit registry: cauli calls tasks as ``fn(*args, **kwargs)`` straight
-  off the wire, with no per task argument injection anywhere in the
-  protocol, so something has to carry the session from the hook to the task
-  body, and a ``ContextVar`` plus one accessor is the minimum that does it.
+Sizing: the engine gets ``pool_size=15, max_overflow=0``. ``--io-concurrency``
+(default 256, see ``docs/configuration.md``) is not tied to it, so tasks
+beyond 15 wait for a slot up to ``pool_timeout`` (30 s) and then raise
+``QueuePool limit ... reached``. Either raise the pool to match
+``--io-concurrency`` or lower ``--io-concurrency`` to the pool size. Total
+connections are ``procs`` times that ceiling; put pgbouncer (transaction
+mode) in front once that nears Postgres ``max_connections``.
 
-Connection count is a different question from lifecycle, and this module
-does not manage it either. One process builds one engine. :func:`sqlalchemy_app`
-gives it ``pool_size=15, max_overflow=0``: the same 15 connection ceiling as
-SQLAlchemy's default of 5 plus 10 overflow, but every connection stays pooled,
-where the default closes each overflow connection on return and makes any
-burst above 5 concurrent tasks pay a fresh connect per task. Build your own
-engine and call :func:`install_sqlalchemy_session` for another size. cauli's
-own concurrency knob for the async lane is
-``--io-concurrency`` (default 256, see ``docs/CONFIGURATION.md``), and
-nothing wires the two together: cauli will admit up to 256 tasks at once,
-each opening a session in the before task hook, while the pool underneath
-can only serve 15 of them at a time. The rest queue for a pool slot up to
-SQLAlchemy's ``pool_timeout`` (default 30 seconds) and then raise, the
-failure a reviewer reproduced under exactly this mismatch: ``QueuePool limit
-of size 2 overflow 3 reached, connection timed out``. Since this module
-assumes ``--io-loops`` is 1 (see the hazards below), every session in a process
-funnels through that one pool, so sizing it is arithmetic: either raise
-``pool_size`` plus ``max_overflow`` to match ``--io-concurrency`` so an
-admitted task never waits on a connection, or lower ``--io-concurrency`` to
-the pool's ceiling so the semaphore, not a pool timeout, is what applies
-backpressure. ``procs`` multiplies whichever ceiling you land on, the same
-as ``cauli.contrib.django``'s formula, so watch Postgres's
-``max_connections`` (100 by default) once ``procs`` times that ceiling
-climbs past roughly a hundred, and put a pooler, pgbouncer in transaction
-mode, in front once it does.
+Transactions are yours: commit explicitly. An uncommitted write is
+discarded silently when the session closes.
 
-This module never commits or rolls back for you. Managing the transaction,
-``await session.commit()``, or letting an exception propagate to roll back,
-is task code's job, the same division ``cauli.contrib.django`` keeps between
-managing connections (its job) and managing transactions (yours). Skip both
-and the session's ``close()`` at the end of the task silently discards the
-transaction: an uncommitted write simply vanishes, zero rows persisted, with
-no error raised anywhere, so the failure mode is safe but easy to miss.
+Hazards, none detectable at import time:
 
-Four hazards this module deliberately leaves for you to respect, none
-detectable at import time:
-
-- **One io loop, or the pool is not really pooled.** An async connection
-  pool binds each connection to whichever event loop first checks it out.
-  cauli's ``--io-loops`` defaults to 1 and this module assumes that default;
-  running with ``--io-loops`` above 1 hands the same pool to more than one
-  loop thread, and a connection born on loop A handed to a task on loop B
-  fails, or worse, misbehaves quietly, depending on the driver. Nothing here
-  enforces ``--io-loops 1`` in code, leave it at the default.
-- **The cpu lane is out of scope, and "no running loop" does not prove you
-  are safe from it.** ``kind="cpu"`` tasks are not supported by this engine;
-  use a plain synchronous SQLAlchemy engine there instead, the same way
-  ``cauli.contrib.django`` leaves the cpu lane to Django's ordinary
-  synchronous ORM path, no special casing needed. The before task hook's
-  guard is ``asyncio.get_running_loop()`` raising, and that guard is
-  necessary but on its own it is not sufficient reasoning: a ``kind="cpu"``
-  task declared ``async def`` DOES run inside a real event loop, one
-  ``asyncio.run()`` per call, started by ``cauli._exec.py`` only after the
-  before/after hooks for that request have already run outside of it. The
-  hook is excluded only because it runs before that loop exists, an
-  accident of call order in ``_exec.py``, not a property of cpu lane async
-  tasks themselves; inside the task body itself
-  ``asyncio.get_running_loop()`` succeeds just fine. That is precisely why
-  :func:`get_session` performs no loop check of its own and never opens a
-  session lazily: the only place a session is allowed to come from is the
-  before task hook, at the one call site documented above, and a loop check
-  inside the accessor would be fooled by exactly the case this paragraph
-  describes.
-- **A soft timeout cancels the client, not the query.** cauli's soft
-  timeout cancels the task's own await; nothing about that cancellation
-  reaches Postgres, because asyncio cancellation over psycopg sends no
-  server side cancel request. Reproduced three times against a real server:
-  ``select pg_sleep(5)`` under a 0.4 second soft timeout returns control to
-  the task immediately, ``close()`` returns with no error, and the client
-  side pool recovers correctly, verified even with a single slot pool.
-  ``pg_stat_activity`` tells the other half of the story: the backend is
-  still shown running that same query more than a second after ``close()``
-  returned, and it goes on burning a real backend and holding whatever
-  locks the query held for its full natural duration, all of it invisible
-  to cauli. Nothing in this module can reach across the socket and stop the
-  server once the client has stopped waiting for it; if a query must
-  actually stop server side, set Postgres's own ``statement_timeout``
-  (role, session, or a connect option), the one setting that runs where the
-  query actually runs.
-- **A background task that outlives the task body can resurrect a closed
-  session.** The after task hook closes the session unconditionally, but
-  nothing stops task code from leaking a reference past that point, for
-  example handing the session to an ``asyncio.create_task(...)`` the task
-  body never awaits. Reproduced: open the session in the before hook,
-  capture it, spawn such a task, let the after hook run and close the
-  session, and the orphaned child goes on to run a query successfully about
-  0.2 seconds later. This is not a bug in ``close()``: SQLAlchemy's
-  ``AsyncSession`` reopens itself transparently on next use, deliberate
-  behaviour for request scoped sessions that this module relies on nowhere
-  but also cannot turn off. The consequence is that a leaked reference does
-  new database work this module has no way to see, on a connection nothing
-  will ever return to the pool, because the after hook, the only thing that
-  would have closed it, has already run. This module cannot stop task code
-  from holding a reference past the task body, so the contract is explicit
-  instead: a background task that outlives the task body it was spawned
-  from is not supported and will leak a connection. Await it, or whatever
-  it needs to keep the session alive for, before the task body returns.
+- **Keep ``--io-loops 1``.** An async pool binds each connection to the loop
+  that first checked it out; more than one loop hands connections across
+  loops and the driver fails or misbehaves.
+- **No cpu lane.** ``kind="cpu"`` tasks are unsupported; use a synchronous
+  engine there. An ``async def`` cpu task runs in its own loop, started after
+  the hooks ran, so :func:`get_session` raises there.
+- **A soft timeout cancels the client, not the query.** The server keeps
+  running it and holding its locks. Set Postgres ``statement_timeout`` if a
+  query must stop server side.
+- **Do not leak the session past the task body.** ``AsyncSession`` reopens
+  itself on next use, so a background task still holding it after the after
+  task hook ran does untracked work on a connection that never returns to
+  the pool. Await such work before the task returns.
 """
 
 from __future__ import annotations
@@ -159,22 +67,16 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 
-#: None means "no session active for the current task". A plain default
-#: rather than an unset ContextVar so every reader (the accessor, the after
-#: task hook, the tests) can use one uniform `.get()` with no try/except.
+#: None means no session is active for the current task.
 _session_var: ContextVar[Any] = ContextVar("cauli_sqlalchemy_session", default=None)
 
 
 def get_session() -> AsyncSession:
-    """Return the :class:`~sqlalchemy.ext.asyncio.AsyncSession` opened for the
-    task currently executing on this coroutine.
+    """Return the ``AsyncSession`` opened for the current task.
 
-    Only reads the ``ContextVar`` the before task hook set; performs no guard
-    of its own and never opens a session lazily, see the module docstring's
-    cpu lane paragraph for why a loop check here would not be trustworthy.
-    Raises ``LookupError`` when nothing is set: outside a task, on the sync
-    thread pool, or from a ``kind="cpu"`` task, which this integration does
-    not support.
+    Raises ``LookupError`` outside a task, on the sync thread pool, or in a
+    ``kind="cpu"`` task. It never opens a session itself: a loop check here
+    would pass inside an ``async def`` cpu task, which is unsupported.
     """
     session = _session_var.get()
     if session is None:
@@ -189,20 +91,16 @@ def get_session() -> AsyncSession:
     return session
 
 
-#: Connections in the engine sqlalchemy_app() builds, all kept pooled (see the
-#: module docstring on connection count).
+#: With max_overflow=0 every connection stays pooled; overflow ones reconnect per task.
 DEFAULT_POOL_SIZE = 15
 
 
 def sqlalchemy_app(database_url: str, **overrides: Any) -> AsyncCauli:
-    """Build a :class:`cauli.AsyncCauli` app wired with a session per task
-    async SQLAlchemy engine, so an endpoint can ``await task.adelay(...)``.
+    """Build an :class:`cauli.AsyncCauli` with a session per task engine.
 
-    ``database_url`` is passed straight to ``create_async_engine`` (an async
-    driver dialect such as ``postgresql+psycopg://`` or
-    ``postgresql+asyncpg://``; this module does not choose one for you).
-    Keyword ``overrides`` go to ``AsyncCauli(...)`` unchanged (``redis_url=...``
-    etc). Registers the session hooks via :func:`install_sqlalchemy_session`.
+    ``database_url`` goes to ``create_async_engine`` and must name an async
+    driver (``postgresql+psycopg://``, ``postgresql+asyncpg://``).
+    ``overrides`` go to ``AsyncCauli(...)`` unchanged.
     """
     from sqlalchemy.ext.asyncio import create_async_engine
 
@@ -214,40 +112,14 @@ def sqlalchemy_app(database_url: str, **overrides: Any) -> AsyncCauli:
 
 
 def install_sqlalchemy_session(app: Cauli, engine: AsyncEngine) -> Cauli:
-    """Register the session per task lifecycle hooks on ``app`` for ``engine``.
+    """Register the session per task hooks for ``engine`` on ``app``.
 
-    Builds one ``async_sessionmaker(engine, expire_on_commit=False)`` right
-    now, not lazily on first task, building a sessionmaker does no I/O
-    either. ``expire_on_commit=False`` is fixed, not configurable here: after
-    an ``await session.commit()`` a task very often keeps using attributes on
-    the rows it just committed, and SQLAlchemy's default of expiring them on
-    commit would turn that ordinary next line into an implicit I/O refresh,
-    which async SQLAlchemy raises on rather than allows outside an active
-    greenlet context.
-
-    - before task: opens an ``AsyncSession`` and stores it in the
-      ``ContextVar`` :func:`get_session` reads. Does nothing when
-      ``asyncio.get_running_loop()`` raises, the same "not my lane" guard
-      ``cauli.contrib.django.install_orm_executors`` uses; see the module
-      docstring for the one case, ``kind="cpu"`` async tasks, where that
-      guard's exclusion is a call order accident and not a property of the
-      task, and why that is exactly the reasoning this hook, not the
-      accessor, is the only place allowed to open a session.
-    - after task: unconditionally awaits ``session.close()`` and clears the
-      ContextVar, on every outcome the hook runs for (success, a raised
-      exception, a soft timeout), so a session never survives past its task
-      and the ContextVar never hands a closed, stale session to whatever
-      runs next on the same thread. Never commits or rolls back; that
-      decision belongs to task code, not this module (see the module
-      docstring).
-    - process init: disposes ``engine`` (via ``asyncio.run()``, since
-      process init hooks fire before any loop exists in every context they
-      run in). Must run in every process that imported this engine, most
-      importantly a forked cpu child, so a pooled connection opened before
-      the fork can never end up split between parent and child.
-
-    Called for you by :func:`sqlalchemy_app`; call directly when you already
-    have a ``Cauli`` app and/or built the engine yourself.
+    Use it when you build the app or engine yourself. The sessionmaker uses
+    ``expire_on_commit=False`` because async SQLAlchemy raises on the
+    implicit refresh that reading a committed row would otherwise trigger.
+    The after task hook closes the session on every outcome and never
+    commits or rolls back. The process init hook disposes the engine in
+    every process, including a forked cpu child.
     """
     from sqlalchemy.ext.asyncio import async_sessionmaker
 
@@ -257,13 +129,13 @@ def install_sqlalchemy_session(app: Cauli, engine: AsyncEngine) -> Cauli:
         try:
             asyncio.get_running_loop()
         except RuntimeError:
-            return  # sync pool thread or cpu child: not this integration's lane
+            return
         _session_var.set(session_factory())
 
     def cauli_close_sqlalchemy_session() -> Any:
         session = _session_var.get()
         if session is None:
-            return None  # before task hook never opened one on this path
+            return None
         _session_var.set(None)
         return session.close()  # shim awaits the returned coroutine (PROTOCOL.md 4.8)
 
