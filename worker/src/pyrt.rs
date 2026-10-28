@@ -265,7 +265,11 @@ pub fn interpreter_executable() -> Option<String> {
 impl PyRuntime {
     /// Initialize the interpreter, import the shim, load the app, register the
     /// completion callback and start the asyncio loop threads.
-    pub fn init(app_spec: &str, io_loops: usize) -> Result<(Arc<PyRuntime>, AppConfig)> {
+    pub fn init(
+        app_spec: &str,
+        io_loops: usize,
+        io_concurrency: usize,
+    ) -> Result<(Arc<PyRuntime>, AppConfig)> {
         // Never given back, even on failure: by then the shim body has run and
         // its loop threads exist.
         if RUNTIME_BUILT.swap(true, Ordering::SeqCst) {
@@ -340,7 +344,7 @@ impl PyRuntime {
                 .and_then(|f| f.call1((cb,)))
                 .map_err(|e| anyhow!("set_callback failed: {}", pyerr_string(py, &e)))?;
             m.getattr("start_loops")
-                .and_then(|f| f.call1((io_loops,)))
+                .and_then(|f| f.call1((io_loops, io_concurrency)))
                 .map_err(|e| anyhow!("start_loops failed: {}", pyerr_string(py, &e)))?;
 
             Ok((m.unbind(), decode, encode, cfg))
@@ -857,7 +861,7 @@ app = _App()
 "#,
             )
         });
-        let err = match PyRuntime::init(&app_spec, 1) {
+        let err = match PyRuntime::init(&app_spec, 1, 1) {
             Ok(_) => panic!("expected init to fail: result_ttl=-1 cannot parse as u64"),
             Err(e) => e,
         };
@@ -910,9 +914,9 @@ app = _App()
         let app_spec = Python::attach(|py| {
             install_fake_app_module(py, "cauli_test_double_init_app", MINIMAL_VALID_APP_SRC)
         });
-        let (_rt, _cfg) = PyRuntime::init(&app_spec, 1).expect("valid app must init cleanly");
+        let (_rt, _cfg) = PyRuntime::init(&app_spec, 1, 1).expect("valid app must init cleanly");
 
-        let err = match PyRuntime::init(&app_spec, 1) {
+        let err = match PyRuntime::init(&app_spec, 1, 1) {
             Ok(_) => panic!("a second PyRuntime in one process must not be allowed"),
             Err(e) => format!("{e:#}"),
         };
@@ -933,7 +937,7 @@ app = _App()
         let app_spec = Python::attach(|py| {
             install_fake_app_module(py, "cauli_test_ceiling_app", MINIMAL_VALID_APP_SRC)
         });
-        let (rt, _cfg) = PyRuntime::init(&app_spec, 1).expect("valid app must init cleanly");
+        let (rt, _cfg) = PyRuntime::init(&app_spec, 1, 1).expect("valid app must init cleanly");
         let pool = SyncPool::start(rt, 1, 32); // threads=1 -> max_threads = 4
         assert_eq!(pool.live_threads.load(Ordering::Relaxed), 1);
 
@@ -960,7 +964,7 @@ app = _App()
         let app_spec = Python::attach(|py| {
             install_fake_app_module(py, "cauli_test_panic_app", MINIMAL_VALID_APP_SRC)
         });
-        let (rt, _cfg) = PyRuntime::init(&app_spec, 1).expect("valid app must init cleanly");
+        let (rt, _cfg) = PyRuntime::init(&app_spec, 1, 1).expect("valid app must init cleanly");
         let pool = SyncPool::start(rt, 1, 4);
         assert_eq!(pool.live_threads.load(Ordering::Relaxed), 1);
 
@@ -1056,7 +1060,7 @@ app = _App()
         let app_spec = Python::attach(|py| {
             install_fake_app_module(py, "cauli_test_sync_overlap_app", SYNC_POOL_APP_SRC)
         });
-        let (rt, _cfg) = PyRuntime::init(&app_spec, 1).expect("valid app must init cleanly");
+        let (rt, _cfg) = PyRuntime::init(&app_spec, 1, 1).expect("valid app must init cleanly");
         let pool = SyncPool::start(rt, 8, 64);
 
         let started = std::time::Instant::now();
@@ -1084,7 +1088,7 @@ app = _App()
         let app_spec = Python::attach(|py| {
             install_fake_app_module(py, "cauli_test_sync_strand_app", SYNC_POOL_APP_SRC)
         });
-        let (rt, _cfg) = PyRuntime::init(&app_spec, 1).expect("valid app must init cleanly");
+        let (rt, _cfg) = PyRuntime::init(&app_spec, 1, 1).expect("valid app must init cleanly");
         let pool = SyncPool::start(rt, 4, 64);
 
         for round in 0..1000 {
@@ -1113,7 +1117,7 @@ app = _App()
         let app_spec = Python::attach(|py| {
             install_fake_app_module(py, "cauli_test_depth_sync_app", MINIMAL_VALID_APP_SRC)
         });
-        let (rt, _cfg) = PyRuntime::init(&app_spec, 1).expect("valid app must init cleanly");
+        let (rt, _cfg) = PyRuntime::init(&app_spec, 1, 1).expect("valid app must init cleanly");
 
         // Decoding fails before the unregistered name is looked up.
         for (args, kwargs) in [("[1e400]", "{}"), ("[]", r#"{"k": -1e400}"#)] {
@@ -1134,7 +1138,7 @@ app = _App()
         let app_spec = Python::attach(|py| {
             install_fake_app_module(py, "cauli_test_depth_async_app", MINIMAL_VALID_APP_SRC)
         });
-        let (rt, _cfg) = PyRuntime::init(&app_spec, 1).expect("valid app must init cleanly");
+        let (rt, _cfg) = PyRuntime::init(&app_spec, 1, 1).expect("valid app must init cleanly");
 
         for (args, kwargs) in [("[1e400]", "{}"), ("[]", r#"{"k": -1e400}"#)] {
             let (_token, rx) = rt.queue_submit("does.not.matter", args, kwargs, 5.0, None, None);
@@ -1194,7 +1198,7 @@ app = _App()
                 MINIMAL_VALID_APP_SRC,
             )
         });
-        let (rt, _cfg) = PyRuntime::init(&app_spec, 1).expect("valid app must init cleanly");
+        let (rt, _cfg) = PyRuntime::init(&app_spec, 1, 1).expect("valid app must init cleanly");
 
         match rt.run_sync_blocking("no.such.task", "[]", "{}", None, None) {
             Outcome::Failure { err, retryable } => {
@@ -1219,7 +1223,7 @@ app = _App()
                 MINIMAL_VALID_APP_SRC,
             )
         });
-        let (rt, _cfg) = PyRuntime::init(&app_spec, 1).expect("valid app must init cleanly");
+        let (rt, _cfg) = PyRuntime::init(&app_spec, 1, 1).expect("valid app must init cleanly");
 
         let (_token, rx) = rt.queue_submit("no.such.task", "[]", "{}", 5.0, None, None);
         // blocking_recv: the std MutexGuard must not cross an await.
@@ -1409,7 +1413,7 @@ app = _App()
         let app_spec = Python::attach(|py| {
             install_fake_app_module(py, "cauli_test_soft_timeout_app", SOFT_TIMEOUT_APP_SRC)
         });
-        let (rt, _cfg) = PyRuntime::init(&app_spec, 1).expect("valid app must init cleanly");
+        let (rt, _cfg) = PyRuntime::init(&app_spec, 1, 1).expect("valid app must init cleanly");
 
         let submit = |task: &str, hold_s: f64, hard_s: f64, soft_s: Option<f64>| {
             let (_token, rx) =
@@ -1577,7 +1581,7 @@ app = _App()
         let app_spec = Python::attach(|py| {
             install_fake_app_module(py, "cauli_test_hard_cancel_app", ASYNC_TIMEOUT_APP_SRC)
         });
-        let (rt, _cfg) = PyRuntime::init(&app_spec, 1).expect("valid app must init cleanly");
+        let (rt, _cfg) = PyRuntime::init(&app_spec, 1, 1).expect("valid app must init cleanly");
         let (_token, rx) = rt.queue_submit("stubborn", "[0.6]", "{}", 0.4, Some(0.1), None);
         match rx.blocking_recv().expect("submitter thread must respond") {
             Outcome::Failure { err, .. } => assert_eq!(err.type_, "TimeLimitExceeded"),
@@ -1604,7 +1608,7 @@ app = _App()
         let app_spec = Python::attach(|py| {
             install_fake_app_module(py, "cauli_test_own_timeout_app", ASYNC_TIMEOUT_APP_SRC)
         });
-        let (rt, _cfg) = PyRuntime::init(&app_spec, 1).expect("valid app must init cleanly");
+        let (rt, _cfg) = PyRuntime::init(&app_spec, 1, 1).expect("valid app must init cleanly");
         let (_token, rx) = rt.queue_submit("own_timeout", "[]", "{}", 5.0, None, None);
         match rx.blocking_recv().expect("submitter thread must respond") {
             Outcome::Failure { err, .. } => {
@@ -1631,7 +1635,7 @@ app = _App()
         );
         let app_spec =
             Python::attach(|py| install_fake_app_module(py, "cauli_test_deadline_clock_app", &src));
-        let (rt, _cfg) = PyRuntime::init(&app_spec, 1).expect("valid app must init cleanly");
+        let (rt, _cfg) = PyRuntime::init(&app_spec, 1, 1).expect("valid app must init cleanly");
         // Whether a deadline lands an ulp low depends on the loop clock
         // reading it starts at, so spread starts over many milliseconds.
         let rxs: Vec<_> = (0..400)
@@ -1671,7 +1675,7 @@ app = _App()
         );
         let app_spec =
             Python::attach(|py| install_fake_app_module(py, "cauli_test_deadline_order_app", &src));
-        let (rt, _cfg) = PyRuntime::init(&app_spec, 1).expect("valid app must init cleanly");
+        let (rt, _cfg) = PyRuntime::init(&app_spec, 1, 1).expect("valid app must init cleanly");
         let (long_token, _long) = rt.queue_submit("nap", "[]", "{}", 20.0, None, None);
         std::thread::sleep(std::time::Duration::from_millis(50));
         let started = std::time::Instant::now();
@@ -1704,7 +1708,7 @@ app = _App()
         );
         let app_spec =
             Python::attach(|py| install_fake_app_module(py, "cauli_test_deadline_heap_app", &src));
-        let (rt, _cfg) = PyRuntime::init(&app_spec, 1).expect("valid app must init cleanly");
+        let (rt, _cfg) = PyRuntime::init(&app_spec, 1, 1).expect("valid app must init cleanly");
         let (long_token, _long) = rt.queue_submit("nap", "[]", "{}", 300.0, None, None);
         let quick: Vec<_> = (0..3000)
             .map(|_| rt.queue_submit("quick", "[]", "{}", 300.0, None, None).1)

@@ -183,13 +183,14 @@ fn real_main() -> i32 {
         return supervisor::run(&args, &resolved);
     }
 
-    let (pyrt, appcfg) = match pyrt::PyRuntime::init(args.app_spec(), args.io_loops) {
-        Ok(v) => v,
-        Err(e) => {
-            error!("startup failed: {e:#}");
-            return 1;
-        }
-    };
+    let (pyrt, appcfg) =
+        match pyrt::PyRuntime::init(args.app_spec(), args.io_loops, resolved.io_concurrency) {
+            Ok(v) => v,
+            Err(e) => {
+                error!("startup failed: {e:#}");
+                return 1;
+            }
+        };
     #[cfg(any(test, feature = "test-hooks"))]
     exit_path_test_hooks::maybe_panic_after_pyrt_init();
 

@@ -84,13 +84,16 @@ _callback = None  # Rust completion callback: cb(token:int, outcome:dict)
 
 
 class AsyncQueueFull(RuntimeError):
-    """A loop's pending list is at _PENDING_CAP. Its own type so pyrt.rs can count it."""
+    """A loop's pending list is at its cap. Its own type so pyrt.rs can count it."""
 
 
-# A blocking call in an async task stops _drain on that loop, and without a
-# cap its pending list (holding args and kwargs) grows forever. 4096 is twice
-# the highest --io-concurrency measured, so a legitimate burst never hits it.
+# A blocking call in an async task stops _drain on that loop; the Rust
+# backstop then frees the io slots of the tasks stuck behind it, so without a
+# cap its pending list (holding args and kwargs) grows forever. A healthy loop
+# never holds more than the worker's io slots, so start_loops raises the cap
+# to that when it is above this floor.
 _PENDING_CAP = 4096
+_pending_cap = _PENDING_CAP
 _cap_warned = []  # per loop: already logged the cap hit warning once
 
 # Per loop liveness for the wedge watchdog (worker/src/loops.rs). One stamp
@@ -470,8 +473,10 @@ def _new_loop():
     return uvloop.new_event_loop(), "uvloop"
 
 
-def start_loops(n):
+def start_loops(n, pending_cap=_PENDING_CAP):
+    global _pending_cap
     n = max(1, int(n))
+    _pending_cap = max(_PENDING_CAP, int(pending_cap))
     impl = None
     with _loops_lock:
         for i in range(n):
@@ -563,7 +568,7 @@ def _drain(idx, loop):
 
 
 def submit_async(token, name, args, kwargs, timeout_s, soft_timeout_s=None, meta=None):
-    """Queue one async task on the next loop; raises AsyncQueueFull at _PENDING_CAP.
+    """Queue one async task on the next loop; raises AsyncQueueFull at the cap.
 
     The loop is woken only when its queue was empty: a wakeup per task, as
     run_coroutine_threadsafe does, dominates the async path's cost.
@@ -578,7 +583,7 @@ def submit_async(token, name, args, kwargs, timeout_s, soft_timeout_s=None, meta
         loop = _loops[idx]
 
     with _pending_locks[idx]:
-        if len(_pending[idx]) >= _PENDING_CAP:
+        if len(_pending[idx]) >= _pending_cap:
             if not _cap_warned[idx]:
                 _cap_warned[idx] = True
                 sys.stderr.write(
@@ -588,12 +593,12 @@ def submit_async(token, name, args, kwargs, timeout_s, soft_timeout_s=None, meta
                     "synchronous HTTP request, time.sleep, a blocking "
                     "database driver) in place of its non blocking "
                     "equivalent, which starves this loop of its own event "
-                    "loop turns.\n" % (idx, _PENDING_CAP)
+                    "loop turns.\n" % (idx, _pending_cap)
                 )
             raise AsyncQueueFull(
                 "cauli: async loop %d submission queue is full (cap=%d); "
                 "rejecting so the task can be retried instead of queued "
-                "forever" % (idx, _PENDING_CAP)
+                "forever" % (idx, _pending_cap)
             )
         _pending[idx].append(
             (token, name, args, kwargs, timeout_s, soft_timeout_s, meta)

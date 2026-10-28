@@ -45,7 +45,7 @@ def shim():
     return _load_shim()
 
 
-def _wedge_one_loop(shim):
+def _wedge_one_loop(shim, pending_cap=None):
     """Start 1 loop and jam it with a task that blocks the OS thread instead
     of awaiting, then wait until that task is actually running. Returns the
     Event to set to release it."""
@@ -61,7 +61,10 @@ def _wedge_one_loop(shim):
         return "released"
 
     shim._registry["wedge"] = SimpleNamespace(fn=wedge)
-    shim.start_loops(1)
+    if pending_cap is None:
+        shim.start_loops(1)
+    else:
+        shim.start_loops(1, pending_cap)
     shim.submit_async(1, "wedge", (), {}, 30.0)
     assert entered.wait(timeout=5), "wedge task never started running"
     return release
@@ -145,3 +148,23 @@ def test_healthy_loop_is_unaffected_by_the_cap(shim):
         assert done.wait(timeout=5)
 
     assert [out["result"] for _, out in results] == [i * 2 for i in range(20)]
+
+
+def test_a_worker_with_more_io_slots_than_the_default_cap_queues_its_burst(shim):
+    """A healthy loop never holds more submissions than the worker has io
+    slots, so with --io-concurrency above the default cap the cap is raised
+    to match: a burst that size is queued, not failed."""
+
+    async def fast(n):
+        return n
+
+    shim._registry["fast"] = SimpleNamespace(fn=fast)
+    shim.set_callback(lambda token, out: None)
+    burst = shim._PENDING_CAP + 200
+    release = _wedge_one_loop(shim, pending_cap=burst)
+    try:
+        for i in range(burst):
+            shim.submit_async(100 + i, "fast", (i,), {}, 5.0)
+        assert len(shim._pending[0]) == burst
+    finally:
+        release.set()
