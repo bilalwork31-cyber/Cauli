@@ -34,6 +34,18 @@ Redis, and each fix ships with a test that fails without it.
 
 Worker:
 
+- A fetch never takes more entries than the process has free io slots. A
+  dispatched task took its slot only when it started, so the loop fetched
+  again first: with `-c 200` and 200 sleeping tasks only 100 ran (two
+  processes held 100 entries each against 50 slots, two held none).
+- An async loop queues a burst up to the worker's io slots instead of a
+  fixed 4096: one process at `--io-concurrency 10000` failed 1,744 of 10,000
+  healthy tasks with `AsyncQueueFull`.
+- A dead lettered envelope over 4096 bytes (an unregistered task with large
+  args) gets its failure result, so `get()` returns instead of waiting
+  forever.
+- Recovery no longer logs `peek (pipelined XRANGE) failed: empty command`
+  at WARN on a healthy worker.
 - A Redis write refused during the completion flush (OOM under
   `maxmemory-policy noeviction`) no longer acks and deletes the entry. The
   task used to vanish: no retry, no dead letter, no result. Writes now go

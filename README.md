@@ -128,11 +128,16 @@ install marker and the enqueue only install.
 Method, environment and every losing result: [bench/RESULTS.md](bench/RESULTS.md).
 Each number comes from `python -m bench <name>`; [bench/README.md](bench/README.md) says what each one tests.
 
-| Measurement | cauli | Comparison |
-|---|---:|---|
-| Dispatch, no database, tasks/s | 32,798 (async, `--procs 8`) | taskiq 10,527; Celery 8 nodes 4,233 |
-| `kill -9` at 160 of 500 tasks: lost, recovery | 0, 10.8 s (`--visibility-timeout 5`) | Celery default loses its prefetch |
-| Memory per worker process, idle | 22.6 MiB | each held task about 6.6 KiB |
+One machine (10 threads), one session, each framework at its best measured
+configuration:
+
+| Measurement | cauli | Others |
+|---|---|---|
+| No-op dispatch, tasks/s | 35,128 async, 22,917 sync | Dramatiq 11,938; taskiq 10,360; Celery (8 nodes) 4,476; arq 1,055 |
+| CPU bound, 10 ms / 50 ms tasks, tasks/s | 582 / 119 | Celery prefork 545 / 117 |
+| Memory, 10,000 tasks in flight | 156 MiB | Celery gevent 325 MiB; taskiq 118 MiB |
+| `kill -9` mid run, tasks lost | 0 | Celery default 8, Dramatiq 24, arq 60 |
+| Free threaded 3.14t, CPU bound sync tasks | 4.6x the GIL build | |
 
 ## Documentation
 
