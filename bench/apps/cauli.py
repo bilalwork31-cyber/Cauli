@@ -21,6 +21,12 @@ from bench import (
 app = Cauli(redis_url=REDIS_URL)
 _sync = redis.Redis.from_url(REDIS_URL, max_connections=REDIS_POOL_MAX)
 _async = aredis.Redis.from_url(REDIS_URL, max_connections=REDIS_POOL_MAX)
+# The memory benchmark holds 10,000 tasks at once: a small blocking pool, or
+# they fail inside the task body (pool exhausted) or exceed Redis's default
+# maxclients of 10,000 across processes, and read as never in flight.
+_hold = aredis.Redis.from_pool(
+    aredis.BlockingConnectionPool.from_url(REDIS_URL, max_connections=64, timeout=None)
+)
 # About 2 ms of pure Python per call. The free threaded comparison needs a fixed
 # amount of work: cpu_burn stops at a wall clock deadline, so a thread starved
 # of CPU would still finish on time and hide the contention being measured.
@@ -64,7 +70,7 @@ def burn_process():
 
 @app.task(store_result=False, max_retries=0, timeout=HOLD_S)
 async def hold():
-    await _async.incr(STARTED_KEY)
+    await _hold.incr(STARTED_KEY)
     await asyncio.sleep(HOLD_S)
 
 
