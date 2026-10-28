@@ -9,7 +9,7 @@ use serde_json::value::RawValue;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, OwnedSemaphorePermit};
 use tokio::time::timeout;
 use tracing::warn;
 
@@ -49,13 +49,7 @@ fn task_meta(env: &Envelope) -> TaskMeta {
 /// timeout. A hard timeout cannot kill a thread, so the task fails, the
 /// thread result is abandoned and the pool spawns a replacement; otherwise
 /// wedged tasks would slowly zero sync io capacity.
-pub async fn run_sync_task(ctx: &Arc<Ctx>, env: &Envelope) -> Outcome {
-    let _permit = ctx
-        .io_sem
-        .clone()
-        .acquire_owned()
-        .await
-        .expect("io semaphore closed");
+pub async fn run_sync_task(ctx: &Arc<Ctx>, env: &Envelope, _slot: OwnedSemaphorePermit) -> Outcome {
     ctx.counters.inflight_io.fetch_add(1, Ordering::Relaxed);
     let _dec = DecrGuard(&ctx.counters.inflight_io);
 
@@ -134,13 +128,11 @@ pub async fn run_sync_task(ctx: &Arc<Ctx>, env: &Envelope) -> Outcome {
 /// Async io task on an embedded asyncio loop. The shim enforces soft then
 /// hard deadlines (§4.6); the Rust backstop (hard + grace) covers a wedged
 /// loop thread that never answers.
-pub async fn run_async_task(ctx: &Arc<Ctx>, env: &Envelope) -> Outcome {
-    let _permit = ctx
-        .io_sem
-        .clone()
-        .acquire_owned()
-        .await
-        .expect("io semaphore closed");
+pub async fn run_async_task(
+    ctx: &Arc<Ctx>,
+    env: &Envelope,
+    _slot: OwnedSemaphorePermit,
+) -> Outcome {
     ctx.counters.inflight_io.fetch_add(1, Ordering::Relaxed);
     let _dec = DecrGuard(&ctx.counters.inflight_io);
 

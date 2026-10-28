@@ -287,3 +287,19 @@ pub async fn wait_group(c: &mut redis::aio::MultiplexedConnection, queue: &str, 
     }
     panic!("consumer group on {queue} never appeared");
 }
+
+/// Entries delivered and not yet acked on `queue` (XPENDING summary count).
+pub async fn xpending_count(c: &mut redis::aio::MultiplexedConnection, queue: &str) -> i64 {
+    let v: redis::Value = redis::cmd("XPENDING")
+        .arg(format!("cauli:q:{queue}"))
+        .arg("cauli")
+        .query_async(c)
+        .await
+        .unwrap();
+    match v {
+        redis::Value::Array(items) => items
+            .first()
+            .map_or(0, |n| redis::from_redis_value_ref::<i64>(n).unwrap_or(0)),
+        _ => 0,
+    }
+}

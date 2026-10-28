@@ -391,23 +391,6 @@ async fn h2_sync_pool_survives_hard_timeout_abandonment(c: &mut redis::aio::Mult
     drop(w);
 }
 
-async fn xpending_count(c: &mut redis::aio::MultiplexedConnection, queue: &str) -> i64 {
-    let v: redis::Value = redis::cmd("XPENDING")
-        .arg(format!("cauli:q:{queue}"))
-        .arg("cauli")
-        .query_async(c)
-        .await
-        .unwrap();
-    // summary form: [count, min, max, consumers]
-    match v {
-        redis::Value::Array(items) => match items.first() {
-            Some(n) => redis::from_redis_value_ref::<i64>(n).unwrap_or(0),
-            None => 0,
-        },
-        _ => 0,
-    }
-}
-
 /// Wait until the queue has at least one pending (delivered) entry.
 async fn wait_inflight(c: &mut redis::aio::MultiplexedConnection, queue: &str, secs: u64) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);

@@ -10,17 +10,33 @@ use crate::exec;
 use serde_json::value::RawValue;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use tokio::sync::OwnedSemaphorePermit;
 use tracing::{debug, error, warn};
 
 /// Called by the fetch and recovery loops. `raw` is stream field `e`.
+///
+/// The io slot is taken here, before the spawn, not when the task starts:
+/// the loops size their next read from the free slot count, and a slot taken
+/// later let one process read twice its capacity and park the surplus.
 pub fn spawn_dispatch(ctx: Arc<Ctx>, queue: String, stream_id: String, raw: Option<String>) {
     ctx.counters.fetched.fetch_add(1, Ordering::Relaxed);
     ctx.counters.inflight_total.fetch_add(1, Ordering::SeqCst);
+    let slot = ctx.io_sem.clone().try_acquire_owned().ok();
     tokio::spawn(async move {
         // Both guards release on a panicking unwind too.
         let _guard = DecrGuard(&ctx.counters.inflight_total);
         let _held = InflightEntry::track(&ctx, &queue, &stream_id);
-        process(&ctx, &queue, &stream_id, raw).await;
+        let slot = match slot {
+            Some(s) => s,
+            // The other loop took the last slot first.
+            None => ctx
+                .io_sem
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("io semaphore closed"),
+        };
+        process(&ctx, &queue, &stream_id, raw, slot).await;
     });
 }
 
@@ -105,7 +121,13 @@ fn parses_as_tree(json: &str) -> bool {
     true
 }
 
-async fn process(ctx: &Arc<Ctx>, queue: &str, sid: &str, raw: Option<String>) {
+async fn process(
+    ctx: &Arc<Ctx>,
+    queue: &str,
+    sid: &str,
+    raw: Option<String>,
+    slot: OwnedSemaphorePermit,
+) {
     let raw = match raw {
         Some(r) => r,
         None => {
@@ -229,11 +251,13 @@ async fn process(ctx: &Arc<Ctx>, queue: &str, sid: &str, raw: Option<String>) {
 
     // The registry kind wins over the envelope kind.
     let outcome = if is_cpu {
+        // cpu tasks are bounded by the cpu pool, not the io slots.
+        drop(slot);
         exec::run_cpu_task(ctx, &env).await
     } else if is_async {
-        exec::run_async_task(ctx, &env).await
+        exec::run_async_task(ctx, &env, slot).await
     } else {
-        exec::run_sync_task(ctx, &env).await
+        exec::run_sync_task(ctx, &env, slot).await
     };
     finish(ctx, queue, sid, env, outcome).await;
 }

@@ -148,22 +148,6 @@ async fn e2e_cpu_backlog_observability() {
     let _ = std::fs::remove_file(&log_path);
 }
 
-async fn xpending_count(c: &mut redis::aio::MultiplexedConnection, queue: &str) -> i64 {
-    let v: redis::Value = redis::cmd("XPENDING")
-        .arg(format!("cauli:q:{queue}"))
-        .arg("cauli")
-        .query_async(c)
-        .await
-        .unwrap();
-    match v {
-        redis::Value::Array(items) => match items.first() {
-            Some(n) => redis::from_redis_value_ref::<i64>(n).unwrap_or(0),
-            None => 0,
-        },
-        _ => 0,
-    }
-}
-
 /// Poll `path` for a line containing `needle` for up to `secs`; returns the
 /// last match.
 async fn wait_log_contains(path: &Path, needle: &str, secs: u64) -> Option<String> {
