@@ -35,8 +35,8 @@ against Redis Streams per PROTOCOL.md. Module map:
   in flight, reclaim trickled at ~32/10s (~74s to recover work that re-runs
   in ~5s); the drain design recovers the same load in one tick
   (measured 74.0s -> 15.8s total, of which ~10s is the H1 idle threshold).
-- **Embedded CPython** via pyo3 auto-initialize; `prepare_freethreaded_python()`
-  at startup before the runtime. The GIL is NEVER held on tokio worker threads
+- **Embedded CPython** via pyo3 auto-initialize, before the runtime starts.
+  Works on the GIL and the free threaded (3.14t) builds alike. The GIL is NEVER held on tokio worker threads
   during broker I/O: sync tasks run on dedicated OS threads, async submission
   happens inside `spawn_blocking`, completions arrive from Python loop threads.
 - **Shim** (`src/shim.py`, imported once via `PyModule::from_code`): the pyo3

@@ -93,7 +93,7 @@ jobs:
       fail-fast: false
       matrix:
         target: [x86_64, aarch64]
-        python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        python: ["3.10", "3.11", "3.12", "3.13", "3.14", "3.14t"]
         include:
           - target: x86_64
             runner: ubuntu-22.04
@@ -191,7 +191,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        python: ["3.10", "3.11", "3.12", "3.13", "3.14", "3.14t"]
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -251,7 +251,7 @@ jobs:
           # below can be --no-index: cauli and cauli-worker then have exactly
           # one possible source, the artifacts we are about to publish, and
           # cannot quietly come from an older release already on PyPI.
-          .onecmd/bin/pip install "redis>=5" "msgspec>=0.18" tzdata
+          .onecmd/bin/pip install "redis>=5.0.1" "msgspec>=0.18" tzdata
           .onecmd/bin/pip install --no-index --find-links artifacts cauli
           .onecmd/bin/pip show cauli-worker >/dev/null
           test -x .onecmd/bin/cauli-worker
@@ -275,7 +275,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+        python: ["3.10", "3.11", "3.12", "3.13", "3.14", "3.14t"]
     steps:
       # Deliberately NO actions/setup-python. It exports LD_LIBRARY_PATH
       # pointing at its own libpython, which is why every other job in this

@@ -1034,6 +1034,32 @@ Cells with two numbers are 0.1.0 / fixed.
   `CONN_MAX_AGE` must be 0: with 60, the server climbed to 385 of 400
   Postgres connections in 15 s and starved the worker.
 
+## Free threaded CPython 3.14t against GIL 3.12 (2026-10-28)
+
+Harness: `bench/free_threaded.py`, tasks in `bench/tasks_cauli_threads.py`.
+Same worker source built twice, once against CPython 3.12.3 and once against
+3.14.5t, run with `PYTHON_GIL=0`. One worker process (`--procs 1`), drain rate
+over the middle 80% of the tasks, 3 interleaved pairs, medians. Box: Intel
+i7-9750H, 5 physical cores with 2 hyperthreads each (10 vCPU), so CPU bound
+Python tops out near 5 cores: plain threads with no cauli involved reach 2.88
+cores at 5 threads and 4.71 at 10 on the same box. The burn body is 2.44 ms on
+3.12 and 2.01 ms on 3.14t; cores = rate x body time.
+
+| lane | GIL 3.12 | free threaded 3.14t | ratio | cores, GIL / free threaded |
+|---|---:|---:|---:|---|
+| noop with a redis INCR, sync, 10 threads | 2,477/s | 14,070/s | 5.68x | |
+| CPU bound body, sync, 10 threads | 299/s | 1,429/s | 4.78x | 0.73 / 2.87 |
+| CPU bound body, cpu lane, 10 processes | 1,532/s | 1,932/s | 1.26x | 3.74 / 3.88 |
+
+- On the GIL build the sync lane runs CPU bound work on 0.73 cores whatever
+  `--io-threads` is, which is why `kind="cpu"` exists. On 3.14t the same lane
+  reaches 2.87 cores, 74% of what the forked cpu lane gets, without forking.
+- The noop row is the GIL's handoff cost on blocking I/O: ten threads that
+  each do one Redis round trip queue for one lock on 3.12.
+- The cpu lane gains only the interpreter's own speedup (the body is 18%
+  faster on 3.14); its parallelism came from processes already.
+- Not measured: `--procs` above 1, async lanes, and 3.13t (no wheel).
+
 ## Not yet done
 
 Listed explicitly rather than silently absent, per the standard this suite

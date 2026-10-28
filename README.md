@@ -55,7 +55,8 @@ The **client** installs and enqueues anywhere, macOS and Windows included.
 
 The **worker** is Linux only: x86_64 and aarch64, glibc 2.35 or newer, on an
 interpreter built with `--enable-shared` (python.org, the `python:*` Docker
-images, distro packages, uv). musl (Alpine), conda and the free threaded build
+images, distro packages, uv). Free threaded 3.14t is supported, and the
+worker runs it with the GIL off. musl (Alpine), conda and free threaded 3.13t
 have no worker wheel yet.
 
 Redis is the only broker. There is no RabbitMQ, SQS or Pub/Sub transport.

@@ -1795,13 +1795,13 @@ and the client installs and enqueues as before. The `python_version` bound has t
 whenever the matrix gains a version, or that new interpreter silently gets no worker.
 
 Two platforms stay broken and the marker cannot fix them, because PEP 508 defines no marker for
-either: **musl** (Alpine) and the **free threaded** build. `sys_platform` is `linux` on musl and
+either: **musl** (Alpine) and **free threaded 3.13t**. `sys_platform` is `linux` on musl and
 `python_version` is unchanged on a free threaded interpreter, so both satisfy the marker, no
-`musllinux` or `cp3XXt` worker wheel exists, and pip fails the whole install with
+`musllinux` or `cp313t` worker wheel exists, and pip fails the whole install with
 `ResolutionImpossible` rather than dropping the requirement. The two ways out are the
-enqueue-only command below and building the worker from source. Publishing musllinux and
-`cp3XXt` wheels would close both, and until the release matrix builds and RUNS them, this is
-documented rather than pretended away.
+enqueue-only command below and building the worker from source. Free threaded 3.14t is not in
+this list: the release matrix builds, verifies and runs a `cp314t` wheel, and CI runs the
+cross component suite against a worker embedding 3.14t with the GIL off.
 
 The cost of the single command is that every install on a supported platform carries the
 binary, including deployments that only enqueue. A FastAPI or Django web dyno never runs a

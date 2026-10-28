@@ -140,6 +140,11 @@ body moves the sync lane 1.14x and the async lane not measurably.
 
 ### Added
 
+- **Free threaded CPython 3.14t.** The release matrix builds, verifies and
+  runs a `cp314t` worker wheel, and CI runs the client suite and the cross
+  component suite on 3.14t with the GIL off. Sync tasks on threads now run in
+  parallel: a CPU bound body on 10 threads went from 0.73 cores on 3.12 to
+  2.87 cores on 3.14t (`bench/free_threaded.py`). 3.13t still has no wheel.
 - `bench/web/`: enqueue cost inside real Django (WSGI and ASGI) and FastAPI
   requests, end to end task latency, and an exactly once check per request.
 - A multi node Celery lane in `bench/campaign.py`.

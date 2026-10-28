@@ -56,7 +56,7 @@ the app import fails with a bare `ModuleNotFoundError`.
   `worker/src/cpu.rs` and `worker/src/supervisor.rs`, so source builds are Linux
   only too.
 - musl (Alpine), glibc below 2.35, macOS and Windows get no wheel and pip refuses
-  the install. The free threaded build has no wheel. The README lists conda as
+  the install. Free threaded 3.14t has a `cp314t` wheel; 3.13t has none. The README lists conda as
   unsupported.
 - An interpreter built without `--enable-shared` has no libpython to point at,
   and the worker cannot run on it.

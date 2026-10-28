@@ -13,7 +13,7 @@ macOS laptop, Windows, PyPy, a CPython newer than the release matrix, the worker
 requirement is dropped rather than failing the install: the client still lands
 and enqueueing still works, there is simply no `cauli-worker` to run. Two
 targets fail the install instead, because no marker can describe them: musl
-(Alpine) and the free threaded build. For those, and for enqueue only web dynos
+(Alpine) and free threaded 3.13t (free threaded 3.14t has a worker wheel). For those, and for enqueue only web dynos
 that never run a worker, see `PROTOCOL.md` section 13.4.
 
 ## Define an app and tasks (myproj/tasks.py)
