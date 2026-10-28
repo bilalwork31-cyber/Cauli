@@ -1,24 +1,17 @@
-# Pinned for reproducibility. cauli itself is not pinned here -- installed
-# editable from ../py (pip install -e ../py) so it always matches the local
-# cauli-worker binary you build. uvloop is pinned to the PyPI release, not
-# built from GitHub main -- see RESULTS.md's Environment section for why
-# (no passwordless sudo for libuv's autotools build deps in this env).
+# Install with cauli editable from ../py so the Python side matches the
+# cauli-worker binary under test:
+#   uv venv ~/bench-venv && uv pip install --python ~/bench-venv/bin/python -e ../py -r requirements.txt
 redis==8.1.0
-msgspec==0.21.1
 celery==5.6.3
 taskiq==0.12.4
 taskiq-redis==1.2.3
 dramatiq==2.2.0
 gevent==26.5.0
-eventlet==0.41.1
-psycogreen==1.0.2
-psycopg[binary,pool]==3.3.4
-psycopg2-binary==2.9.12
-hdrhistogram==0.10.7
-uvloop==0.22.1
+psycopg[binary]==3.3.4
 django==6.0.7
 sqlalchemy==2.0.52
 fastapi==0.162.0
 uvicorn==0.54.0
 gunicorn==26.2.0
 httptools==0.9.0
+uvloop==0.22.1
