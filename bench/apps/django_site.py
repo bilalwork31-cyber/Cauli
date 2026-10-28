@@ -95,7 +95,7 @@ def celery_process_job(job_id, t0_ns):
 
 
 def health(request):
-    return HttpResponse("ok")
+    return HttpResponse(str(os.getpid()))
 
 
 def insert(request):

@@ -72,7 +72,7 @@ async def _insert() -> int:
 
 @api.get("/health")
 async def health():
-    return "ok"
+    return os.getpid()
 
 
 @api.post("/insert")

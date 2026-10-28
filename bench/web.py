@@ -126,14 +126,24 @@ ARMS = {
 
 
 def wait_ready() -> None:
+    """Wait until every web process answers, not just the first: k6 opens its
+    keep alive connections at once, and the ones a still booting process
+    would have taken all pin to the processes already up, for the whole run."""
     deadline = time.monotonic() + READY_TIMEOUT_S
+    pids: set[bytes] = set()
     while time.monotonic() < deadline:
         try:
-            with urllib.request.urlopen(f"http://127.0.0.1:{PORT}/health", timeout=1):
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{PORT}/health", timeout=1
+            ) as r:
+                pids.add(r.read())
+            if len(pids) == int(WEB_PROCS):
                 return
         except OSError:
             time.sleep(0.2)
-    raise RuntimeError(f"web server on port {PORT} not ready after {READY_TIMEOUT_S}s")
+    raise RuntimeError(
+        f"{len(pids)} of {WEB_PROCS} web processes on port {PORT} ready after {READY_TIMEOUT_S}s"
+    )
 
 
 def k6(method: str, path: str, mode: str, args: argparse.Namespace) -> dict:
