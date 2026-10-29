@@ -1,6 +1,7 @@
 # Benchmark results
 
-One session, one machine, every benchmark. Method and commands:
+One machine, every benchmark; dispatch, cpu, memory and chaos run on both
+CPython 3.12 and free threaded 3.14t back to back. Method and commands:
 [README.md](README.md).
 
 ## Environment
@@ -8,49 +9,55 @@ One session, one machine, every benchmark. Method and commands:
 | | |
 |---|---|
 | Machine | Intel i7-9750H, 5 cores / 10 threads, 11 GB, WSL2 (kernel 6.18.33), shared with Redis, Postgres and the load generator |
-| Python | CPython 3.12.3; free threaded rows CPython 3.14.5t |
+| Python | CPython 3.12.3 and 3.14.5t (free threaded), each with a worker built against it |
 | Redis | 7.0.15, no persistence |
 | PostgreSQL | 16.15 |
-| cauli commit | c899bce; memory and web re-run at 8db5c91 after two harness fixes (hold task Redis pool, web readiness wait) |
+| cauli commit | 72ab716 for dispatch, cpu, memory and chaos (one session, both builds); web and free-threaded from an earlier session at 8db5c91 and c899bce |
 | Framework versions | Celery 5.6.3, taskiq 0.12.4, Dramatiq 2.2.0, arq 0.28.0, Django 6.0.7, FastAPI 0.162.0; all pins in [requirements.txt](requirements.txt), [requirements-arq.txt](requirements-arq.txt) |
 
 Cores are of a 10 thread box. A Redis near 1.0 core would mean the row
-measured Redis; none does.
+measured Redis; none does. On 3.14t, Dramatiq, gevent and arq (through
+hiredis) load a C extension that has not declared free threading support,
+so their 3.14t rows run with the GIL re-enabled; cauli, Celery prefork and
+solo, and taskiq keep it off.
 
 ## dispatch
 
 No-op task (one Redis INCR), every framework at its best measured
-configuration, 6 paired rounds. `python -m bench dispatch`
+configuration, 6 paired rounds per build. `python -m bench dispatch`
 
-| lane | tasks/s | vs cauli async | 95% interval | worker cores | redis cores |
-|---|---:|---:|---|---:|---:|
-| cauli async, 8 processes | 35,128 | 1.000 | | 7.80 | 0.83 |
-| cauli sync, 12 processes | 22,917 | 0.652 | 0.640 to 0.665 | 8.34 | 0.71 |
-| Dramatiq, 12 processes x 8 threads | 11,938 | 0.340 | 0.327 to 0.353 | 7.56 | 0.83 |
-| taskiq, 8 workers | 10,360 | 0.295 | 0.288 to 0.301 | 7.56 | 0.54 |
-| Celery, 8 solo nodes | 4,476 | 0.127 | 0.122 to 0.133 | 6.22 | 0.82 |
-| arq | 1,055 | 0.030 | 0.030 to 0.030 | 1.00 | 0.16 |
+| lane | 3.12 tasks/s | 3.14t tasks/s | 3.12 vs cauli async, 95% interval |
+|---|---:|---:|---|
+| cauli async, 8 processes | 31,712 | 32,487 | |
+| cauli sync, 12 processes | 19,340 | 21,301 | 0.614 (0.542 to 0.686) |
+| Dramatiq, 12 processes x 8 threads | 11,407 | 10,494 | 0.369 (0.295 to 0.444) |
+| taskiq, 8 workers | 9,736 | 9,394 | 0.315 (0.256 to 0.374) |
+| Celery, 8 solo nodes | 4,462 | 4,248 | 0.145 (0.113 to 0.177) |
+| arq | 1,030 | 1,022 | 0.033 (0.027 to 0.040) |
 
-cauli async is 2.9x Dramatiq, 3.4x taskiq and 7.8x Celery here. Every row
-except arq uses most of the box, so this is throughput per box, not a
-framework ceiling.
+cauli async is 2.8x Dramatiq, 3.3x taskiq and 7.1x Celery on 3.12. Every
+row except arq uses most of the box (6.2 to 7.9 worker cores), so this is
+throughput per box, not a framework ceiling. An earlier session on the same
+box measured cauli async at 35,128/s; the box varies by about 10% between
+sessions, which is why every comparison is a paired ratio.
 
 ## cpu
 
 `cpu_burn` busy loop, cauli `kind="cpu"` against Celery prefork, both at 6
-processes, 6 paired rounds. `python -m bench cpu`
+processes, 6 paired rounds per build. `python -m bench cpu`
 
-| task size | cauli tasks/s | Celery tasks/s | Celery vs cauli | 95% interval |
-|---|---:|---:|---:|---|
-| 0.5 ms | 7,597 | 856 | 0.113 | 0.112 to 0.113 |
-| 2 ms | 2,607 | 802 | 0.307 | 0.303 to 0.312 |
-| 10 ms | 582 | 545 | 0.936 | 0.930 to 0.941 |
-| 50 ms | 119 | 117 | 0.987 | 0.984 to 0.990 |
+| task size | cauli 3.12 | Celery 3.12 | cauli 3.14t | Celery 3.14t | Celery vs cauli (3.12) |
+|---|---:|---:|---:|---:|---|
+| 0.5 ms | 7,582 | 853 | 7,520 | 852 | 0.113 (0.112 to 0.113) |
+| 2 ms | 2,603 | 802 | 2,599 | 797 | 0.308 (0.306 to 0.311) |
+| 10 ms | 582 | 545 | 581 | 543 | 0.937 (0.932 to 0.942) |
+| 50 ms | 119 | 118 | 119 | 117 | 0.989 (0.985 to 0.994) |
 
 At 0.5 and 2 ms Celery runs into its single node consumer, which tops out
 near 870 tasks/s whatever the process count (the dispatch table scales Celery
 by nodes instead), so those two rows measure that ceiling as much as CPU work.
 At 10 ms and above both are bound by the cores and differ by a few percent.
+Both builds give the same numbers: forked processes do not need the GIL gone.
 
 ## memory
 
@@ -59,31 +66,40 @@ every task has reported itself started. `python -m bench memory`
 
 | worker | 100 in flight | 1,000 | 10,000 |
 |---|---:|---:|---:|
-| cauli async, 1 process | 51.0 MiB | 68.9 MiB | 155.7 MiB |
-| cauli async, `-c N` (processes derived) | 110.4 MiB (3) | 456.7 MiB (11) | 557.4 MiB (11) |
-| Celery gevent | 50.5 MiB | 75.4 MiB | 324.8 MiB |
-| taskiq, 1 worker | 64.7 MiB | 68.5 MiB | 118.3 MiB |
-| Celery prefork | 2,345.0 MiB (101) | | |
+| cauli async, 1 process, 3.12 | 59.3 MiB | 65.8 MiB | 151.8 MiB |
+| cauli async, 1 process, 3.14t | 74.7 MiB | 83.5 MiB | 165.9 MiB |
+| cauli async, `-c N`, 3.12 | 109.7 MiB (3) | 457.8 MiB (11) | 548.7 MiB (11) |
+| Celery gevent, 3.12 | 51.5 MiB | 76.4 MiB | 325.8 MiB |
+| Celery gevent, 3.14t | 76.0 MiB | 101.4 MiB | 383.3 MiB |
+| taskiq, 1 worker, 3.12 | 65.9 MiB (2) | 69.7 MiB (2) | 120.4 MiB (2) |
+| taskiq, 1 worker, 3.14t | 145.5 MiB (4) | 148.8 MiB (4) | 190.1 MiB (4) |
+| Celery prefork, 3.12 | 2,356.2 MiB (101) | | |
+| Celery prefork, 3.14t | 2,934.8 MiB (101) | | |
 
 Parentheses: process count. `-c` derives one process per 64 slots up to the
 core count, which buys throughput with memory: about 23 MiB per process. For
 memory, run one process with `--io-concurrency N`: then cauli is below
-Celery gevent at every size, and taskiq is smaller at 10,000.
+Celery gevent at every size on both builds, and taskiq is smaller at 10,000
+on 3.12. Every interpreter costs more memory free threaded.
 
 ## chaos
 
 500 tagged tasks, `kill -9` at 160 executed, fresh worker, count lost and
 duplicated tags. `python -m bench chaos`
 
-| lane | lost | duplicated | recovered |
-|---|---:|---:|---|
-| cauli | 0 | 0 | 29.9 s |
-| Celery `acks_late`, `visibility_timeout` 5 | 0 | 0 | 101.1 s |
-| Celery default | 8 | 0 | not within 120 s |
-| Dramatiq | 24 | 0 | not within 120 s |
-| arq | 60 | 0 | not within 120 s |
+| lane | lost, 3.12 / 3.14t | duplicated, 3.12 / 3.14t | recovered |
+|---|---|---|---|
+| cauli | 0 / 0 | 1 / 0 | 29.8 s |
+| Celery `acks_late`, `visibility_timeout` 5 | 0 / 0 | 0 / 0 | 101.1 s |
+| Celery default | 8 / 8 | 0 / 0 | not within 120 s |
+| Dramatiq | 24 / 24 | 0 / 0 | not within 120 s |
+| arq | 43 / 61 | 0 / 0 | not within 120 s |
 
-One segfaulting task among 10 sleeping ones, observed for 20 s:
+cauli's delivery is at least once: the one duplicate is a task that finished
+inside the 2 ms ack window before the kill, then ran again on redelivery.
+
+One segfaulting task among 10 sleeping ones, observed for 20 s, same on both
+builds:
 
 | lane | top level process | processes died |
 |---|---|---:|
@@ -91,8 +107,27 @@ One segfaulting task among 10 sleeping ones, observed for 20 s:
 | cauli async, 3 processes | alive, supervisor restarts the process | 1 |
 | cauli, segfault in a `kind="cpu"` task | alive | 1 |
 | Celery prefork | alive | 1 |
-| Dramatiq | exited (code 1) | 3 |
+| Dramatiq | exited (code 1) | 3 (3.12), 5 (3.14t) |
 | arq | exited (SIGSEGV) | 1 |
+
+## Process count on 3.14t
+
+Framework only noop tasks, one drain each, CPU per task from `/proc`.
+
+| setup | 3.12 tasks/s | 3.14t tasks/s |
+|---|---:|---:|
+| async, 1 process | 121,845 | 128,223 |
+| async, 8 processes | 163,830 | 160,335 |
+| async, 1 process, `--io-loops 4` | 95,071 | 33,054 |
+| sync, 1 process, 64 threads | 114,446 | 37,045 |
+| sync, 8 processes, 8 threads each | 173,931 | 158,607 |
+
+Free threading does not remove the need for processes. One event loop per
+process stays the async ceiling, and extra loops are slower on both builds.
+The sync pool hands each job to a GIL holder; without a GIL all 64 threads
+contend for it, and one 3.14t process runs noop sync tasks at a third of
+the 3.12 rate. With real CPU work in the task the free threaded sync lane is
+4.6x the 3.12 one (free-threaded section below).
 
 ## web
 
