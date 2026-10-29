@@ -53,6 +53,10 @@ def echo(*args, **kwargs):
     return {"args": list(args), "kwargs": kwargs}
 
 
+def redis_env():
+    return os.environ.get("CAULI_REDIS_URL")
+
+
 async def aecho(*args, **kwargs):
     await asyncio.sleep(0.05)
     return {"args": list(args), "kwargs": kwargs}
@@ -185,6 +189,7 @@ class App:
 
 app = App()
 app.add(TaskDef("fx.echo", echo))
+app.add(TaskDef("fx.redis_env", redis_env))
 app.add(TaskDef("fx.aecho", aecho, is_async=True))
 app.add(TaskDef("fx.fail", fail))
 app.add(TaskDef("fx.raise_timeout", raise_timeout))

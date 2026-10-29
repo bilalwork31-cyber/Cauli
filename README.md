@@ -128,15 +128,15 @@ install marker and the enqueue only install.
 Method, environment and every losing result: [bench/RESULTS.md](bench/RESULTS.md).
 Each number comes from `python -m bench <name>`; [bench/README.md](bench/README.md) says what each one tests.
 
-One machine (10 threads), one session, each framework at its best measured
+CPython 3.12, one machine (10 threads), one session, each framework at its best measured
 configuration:
 
 | Measurement | cauli | Others |
 |---|---|---|
-| No-op dispatch, tasks/s | 35,128 async, 22,917 sync | Dramatiq 11,938; taskiq 10,360; Celery (8 nodes) 4,476; arq 1,055 |
-| CPU bound, 10 ms / 50 ms tasks, tasks/s | 582 / 119 | Celery prefork 545 / 117 |
-| Memory, 10,000 tasks in flight | 156 MiB | Celery gevent 325 MiB; taskiq 118 MiB |
-| `kill -9` mid run, tasks lost | 0 | Celery default 8, Dramatiq 24, arq 60 |
+| No-op dispatch, tasks/s | 31,712 async, 19,340 sync | Dramatiq 11,407; taskiq 9,736; Celery (8 nodes) 4,462; arq 1,030 |
+| CPU bound, 10 ms / 50 ms tasks, tasks/s | 582 / 119 | Celery prefork 545 / 118 |
+| Memory, 10,000 tasks in flight | 152 MiB | Celery gevent 326 MiB; taskiq 120 MiB |
+| `kill -9` mid run, tasks lost | 0 | Celery default 8, Dramatiq 24, arq 43 |
 | Free threaded 3.14t, CPU bound sync tasks | 4.6x the GIL build | |
 
 ## Documentation

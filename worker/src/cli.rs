@@ -4,7 +4,12 @@ const ADVANCED: &str = "Advanced tuning (derived from -c; see docs/configuration
 
 /// cauli-worker: Rust worker runtime for cauli Python task queues (PROTOCOL §7).
 #[derive(Parser, Debug, Clone)]
-#[command(name = "cauli-worker", version, about)]
+#[command(
+    name = "cauli-worker",
+    version,
+    about,
+    after_help = "Every option, including tuning: cauli-worker --help"
+)]
 pub struct Args {
     /// App location as module:attr (e.g. myproj.tasks:app). Not needed with
     /// --print-plan.
@@ -20,64 +25,63 @@ pub struct Args {
     pub redis_url: Option<String>,
 
     /// Total concurrency: max tasks in flight across all worker processes.
-    /// The one knob most deployments need (like celery -c). Turns --procs
-    /// auto and derives the advanced flags below; any flag passed explicitly
-    /// still wins. Unset, the worker keeps its standalone defaults.
+    /// The one knob most deployments need. Derives the process count and the
+    /// tuning flags (see --help); a flag passed explicitly still wins.
     #[arg(short = 'c', long)]
     pub concurrency: Option<usize>,
 
     /// Worker processes, supervised by this binary (spawn, restart on death,
     /// signal fan-out). Default: 1, or with -c one process per ~64 slots up
     /// to all cores. -c is total and is divided across processes.
-    #[arg(long)]
+    #[arg(long, hide_short_help = true)]
     pub procs: Option<usize>,
 
     /// Print the derived execution plan (processes, threads, slots, cpu
     /// children) and exit without starting anything
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = false, hide_short_help = true)]
     pub print_plan: bool,
 
     /// Seconds before a dead worker's tasks are redelivered (PROTOCOL §4.4).
     /// At least 1.
-    #[arg(long, default_value_t = 60)]
+    #[arg(long, default_value_t = 60, hide_short_help = true)]
     pub visibility_timeout: u64,
 
     /// Graceful shutdown drain timeout in seconds
-    #[arg(long, default_value_t = 30)]
+    #[arg(long, default_value_t = 30, hide_short_help = true)]
     pub drain_timeout: u64,
 
     /// Seconds between stats log lines
-    #[arg(long, default_value_t = 10)]
+    #[arg(long, default_value_t = 10, hide_short_help = true)]
     pub stats_interval: u64,
 
     /// Log level (trace|debug|info|warn|error); RUST_LOG overrides
-    #[arg(long, default_value = "info")]
+    #[arg(short = 'l', long, default_value = "info")]
     pub log_level: String,
 
     /// Embedded asyncio event loop threads for async tasks. 1 won every
     /// measured sweep (extra loops contend for the one GIL); leave it alone
-    #[arg(long, default_value_t = 1, help_heading = ADVANCED)]
+    #[arg(long, default_value_t = 1, help_heading = ADVANCED, hide_short_help = true)]
     pub io_loops: usize,
 
     /// Python thread pool size for sync io tasks.
     /// Default: 64, or derived from -c as min(c, 512)/procs
-    #[arg(long, help_heading = ADVANCED)]
+    #[arg(long, help_heading = ADVANCED, hide_short_help = true)]
     pub io_threads: Option<usize>,
 
     /// Max in flight io tasks (admission semaphore), sync and async together.
     /// Default: 256, or derived from -c as c/procs. Size the connection
     /// pools your tasks use to at least this value.
-    #[arg(long, help_heading = ADVANCED)]
+    #[arg(long, help_heading = ADVANCED, hide_short_help = true)]
     pub io_concurrency: Option<usize>,
 
     /// Child processes for cpu tasks. Default: cores/procs
-    #[arg(long, help_heading = ADVANCED)]
+    #[arg(long, help_heading = ADVANCED, hide_short_help = true)]
     pub cpu_workers: Option<usize>,
 
     /// Worker threads per cpu child (fork-server mode). M > 1 pipelines up
     /// to M requests per child; responses are matched by id (PROTOCOL §5.1).
     /// Must be within [1, 1024].
-    #[arg(long, default_value_t = 1, help_heading = ADVANCED)]
+    #[arg(long, default_value_t = 1, help_heading = ADVANCED, hide_short_help = true)]
     pub cpu_child_threads: usize,
 
     /// Extra cpu requests staged in each child beyond the ones it is
@@ -85,71 +89,71 @@ pub struct Args {
     /// Raise it for sub millisecond tasks; keep it low for long ones: a child
     /// death fails everything staged behind it as retryable WorkerLost, and a
     /// staged task waits out the tasks ahead of it.
-    #[arg(long, default_value_t = 4, help_heading = ADVANCED)]
+    #[arg(long, default_value_t = 4, help_heading = ADVANCED, hide_short_help = true)]
     pub cpu_prefetch: usize,
 
     /// Recycle a cpu child after it completes this many tasks, like Celery's
     /// maxtasksperchild. 0 never recycles. Staged work drains first, so no
     /// task is lost to a recycle
-    #[arg(long, default_value_t = 10000, help_heading = ADVANCED)]
+    #[arg(long, default_value_t = 10000, help_heading = ADVANCED, hide_short_help = true)]
     pub cpu_max_tasks_per_child: usize,
 
     /// Start the cpu pool at boot instead of on the first cpu task. Costs
     /// resident children immediately; buys the first cpu task a warm start
-    #[arg(long, default_value_t = false, help_heading = ADVANCED)]
+    #[arg(long, default_value_t = false, help_heading = ADVANCED, hide_short_help = true)]
     pub eager_cpu: bool,
 
     /// Disable the fork-server cpu child model: spawn each child directly
     /// over stdio, one request in flight per child (PROTOCOL §5.1 fallback
     /// mode). Also entered automatically if fork-server startup fails
-    #[arg(long, default_value_t = false, help_heading = ADVANCED)]
+    #[arg(long, default_value_t = false, help_heading = ADVANCED, hide_short_help = true)]
     pub no_fork_server: bool,
 
     /// XREADGROUP COUNT per fetch, at least 1; a fetch never takes more than
     /// the free io slots. Raise it only for sub millisecond tasks: fetched cpu
     /// entries wait for a cpu slot inside the worker with their recovery clock
     /// running.
-    #[arg(long, default_value_t = 64, help_heading = ADVANCED)]
+    #[arg(long, default_value_t = 64, help_heading = ADVANCED, hide_short_help = true)]
     pub batch: usize,
 
     /// Max accepted envelope size in bytes. Larger entries are dead lettered
     /// as "malformed" before parsing. Keep it equal to the app's
     /// max_envelope_bytes.
-    #[arg(long, default_value_t = 1_048_576, help_heading = ADVANCED)]
+    #[arg(long, default_value_t = 1_048_576, help_heading = ADVANCED, hide_short_help = true)]
     pub max_envelope_bytes: usize,
 
     /// Python executable used to spawn cpu children.
     /// Default: this worker's own embedded interpreter (`sys.executable`)
-    #[arg(long, help_heading = ADVANCED)]
+    #[arg(long, help_heading = ADVANCED, hide_short_help = true)]
     pub python: Option<String>,
 
     /// Connection and response timeout, in seconds, for every redis call.
     /// A timed out call is handled like any redis error: the task is
     /// redelivered, never lost. Keep it between 1 and half of
     /// --visibility-timeout.
-    #[arg(long, default_value_t = 5, help_heading = ADVANCED)]
+    #[arg(long, default_value_t = 5, help_heading = ADVANCED, hide_short_help = true)]
     pub redis_timeout: u64,
 
     /// Delayed and retry sweep interval in milliseconds (PROTOCOL §4.3).
     /// Countdowns, etas, retries and beat firings can start up to this late
-    #[arg(long, default_value_t = 50, help_heading = ADVANCED)]
+    #[arg(long, default_value_t = 50, help_heading = ADVANCED, hide_short_help = true)]
     pub mover_interval: u64,
 
     /// Entries the delayed and retry sweep moves per queue per round trip.
     /// The sweep repeats until a queue is drained, so this does not cap the
     /// rate.
-    #[arg(long, default_value_t = 128, help_heading = ADVANCED)]
+    #[arg(long, default_value_t = 128, help_heading = ADVANCED, hide_short_help = true)]
     pub mover_limit: usize,
 
     /// Completions buffered per queue before one XACK and XDEL flush
     /// (PROTOCOL §4.1). Values below 1 mean no batching.
-    #[arg(long, default_value_t = 64, help_heading = ADVANCED)]
+    #[arg(long, default_value_t = 64, help_heading = ADVANCED, hide_short_help = true)]
     pub ack_batch: usize,
 
     /// Max milliseconds the oldest buffered ack waits before a partial
     /// flush. A crash inside this window redelivers, and reruns, at most one
     /// buffer per queue. 0 flushes every completion immediately.
-    #[arg(long, default_value_t = 2, help_heading = ADVANCED)]
+    #[arg(long, default_value_t = 2, help_heading = ADVANCED, hide_short_help = true)]
     pub ack_flush_ms: u64,
 }
 
