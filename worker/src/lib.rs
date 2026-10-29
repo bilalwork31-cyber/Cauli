@@ -183,6 +183,13 @@ fn real_main() -> i32 {
         return supervisor::run(&args, &resolved);
     }
 
+    // The app's Cauli() reads CAULI_REDIS_URL, so a task enqueueing a follow
+    // up goes to the Redis this worker consumes from, as under the supervisor.
+    // Set before the interpreter starts; no other thread reads the env yet.
+    if let Some(url) = &args.redis_url {
+        std::env::set_var("CAULI_REDIS_URL", url);
+    }
+
     let (pyrt, appcfg) =
         match pyrt::PyRuntime::init(args.app_spec(), args.io_loops, resolved.io_concurrency) {
             Ok(v) => v,
