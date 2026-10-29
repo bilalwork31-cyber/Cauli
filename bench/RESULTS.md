@@ -124,10 +124,22 @@ Framework only noop tasks, one drain each, CPU per task from `/proc`.
 
 Free threading does not remove the need for processes. One event loop per
 process stays the async ceiling, and extra loops are slower on both builds.
-The sync pool hands each job to a GIL holder; without a GIL all 64 threads
-contend for it, and one 3.14t process runs noop sync tasks at a third of
-the 3.12 rate. With real CPU work in the task the free threaded sync lane is
-4.6x the 3.12 one (free-threaded section below).
+
+Sync lane, one process, by thread count:
+
+| `--io-threads` | 1 | 4 | 16 | 64 |
+|---|---:|---:|---:|---:|
+| noop, 3.12 | 83,142 | 80,141 | 70,649 | 75,093 |
+| noop, 3.14t | 83,221 | 68,023 | 45,848 | 26,586 |
+| 1 ms blocking body, 3.12 | 811 | 3,432 | 13,994 | 13,912 |
+| 1 ms blocking body, 3.14t | 818 | 3,341 | 14,593 | 30,918 |
+
+With one thread both builds match. Without a GIL the threads really run at
+once, so trivial tasks slow down as threads are added (they contend on
+shared interpreter state), while tasks that block overlap better: at 64
+threads a 1 ms blocking body runs 2.2x the 3.12 rate at 31% less CPU per
+task. With real CPU work in the task the free threaded sync lane is 4.6x the
+3.12 one (free-threaded section below).
 
 ## web
 
