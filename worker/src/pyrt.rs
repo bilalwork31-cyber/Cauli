@@ -343,9 +343,12 @@ impl PyRuntime {
             m.getattr("set_callback")
                 .and_then(|f| f.call1((cb,)))
                 .map_err(|e| anyhow!("set_callback failed: {}", pyerr_string(py, &e)))?;
-            m.getattr("start_loops")
+            let loop_impl: String = m
+                .getattr("start_loops")
                 .and_then(|f| f.call1((io_loops, io_concurrency)))
+                .and_then(|r| r.extract())
                 .map_err(|e| anyhow!("start_loops failed: {}", pyerr_string(py, &e)))?;
+            tracing::info!(loops = io_loops, implementation = %loop_impl, "asyncio loops started");
 
             Ok((m.unbind(), decode, encode, cfg))
         })?;

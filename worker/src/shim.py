@@ -494,9 +494,7 @@ def start_loops(n, pending_cap=_PENDING_CAP):
             _hb_lag.append(0)
             _hb_sub.append(0)
             _hb_done.append(0)
-    if impl is not None:
-        sys.stderr.write("cauli: %d asyncio loop(s), impl=%s\n" % (n, impl))
-    return len(_loops)
+    return impl
 
 
 def set_callback(cb):

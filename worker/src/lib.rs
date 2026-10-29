@@ -227,12 +227,10 @@ fn real_main() -> i32 {
     // timeout) trip it for every task.
     if let Some((name, timeout_ms)) = longest_timeout_past_drain(&appcfg.tasks, args.drain_timeout)
     {
-        warn!(
+        info!(
             task = %name, timeout_ms, drain_timeout_s = args.drain_timeout,
-            "a registered task can run longer than --drain-timeout: on graceful shutdown \
-             (§4.7) anything still running at the deadline is killed mid task and left \
-             pending for redelivery. Raise --drain-timeout past your longest task, or \
-             lower the task's timeout."
+            "a task still running at the end of a graceful shutdown is killed and \
+             redelivered; raise --drain-timeout past your longest task to let it finish"
         );
     }
 
@@ -334,13 +332,12 @@ async fn run_worker(
     // Routing is by registry kind, so with no cpu task the pool is unreachable
     // and never started; with one, it starts lazily on the first cpu task.
     let needs_cpu = appcfg.tasks.values().any(|s| s.kind == "cpu");
-    let cpu_python = resolve_python(args.python.as_deref());
     let cpu_cfg = needs_cpu.then(|| cpu::StartCfg {
         workers: resolved.cpu_workers,
         child_threads: args.cpu_child_threads,
         prefetch: args.cpu_prefetch,
         recycle: args.cpu_max_tasks_per_child,
-        python: cpu_python,
+        python: resolve_python(args.python.as_deref()),
         app_spec: args.app_spec().to_string(),
         no_fork_server: args.no_fork_server,
     });
