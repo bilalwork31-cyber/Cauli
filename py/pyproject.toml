@@ -55,7 +55,7 @@ Issues = "https://github.com/bilalwork31-cyber/Cauli/issues"
 dev = [
     "pytest>=8",
     # Same pin as .github/workflows/ci.yml. Newer ruff enables more rules by default.
-    "ruff==0.15.22",
+    "ruff==0.17.3",
 ]
 django = [
     "django>=4.2",
