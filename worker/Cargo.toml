@@ -46,8 +46,8 @@ crossbeam-channel = "0.5"
 gethostname = "1"
 libc = "0.2"
 mimalloc = { version = "0.1", default-features = false }
-pyo3 = { version = "0.26", features = ["auto-initialize"] }
-rand = "0.9"
+pyo3 = { version = "0.30", features = ["auto-initialize"] }
+rand = "0.10"
 ring = "0.17"
 # tokio-rustls-comp: without a TLS feature, rediss:// URLs fail to parse and
 # every TLS only managed Redis is unreachable. rustls avoids an OpenSSL build
