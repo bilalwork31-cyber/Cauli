@@ -414,3 +414,20 @@ def test_a_task_can_terminate_its_own_forked_subprocess(child):
         }
     )
     assert resp == {"id": "g1", "ok": True, "result": -15}
+
+
+def test_an_error_message_with_a_lone_surrogate_stays_the_tasks_own_error():
+    """`os.fsdecode` of a non UTF-8 filename puts lone surrogates in a
+    message. Unreplaced, the response failed to encode and the task was
+    recorded as a terminal SerializationError instead of being retried."""
+    from cauli import _exec
+
+    exc = RuntimeError("upstream rejected report-caf\udce9.pdf")
+    line = _exec._serialize_response_bytes(
+        {"id": "s1", "ok": False, "retryable": True, "error": _exec._error_json(exc)}
+    )
+
+    resp = _exec._codec.decode(line)
+    assert resp["error"]["type"] == "RuntimeError"
+    assert resp["retryable"] is True
+    assert "report-caf" in resp["error"]["message"]
