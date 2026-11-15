@@ -6,8 +6,9 @@ child protocol, results, the scheduler and packaging. Both implementations MUST
 match it. A disagreement between this document and the code is a bug in one of
 them. Design rationale lives in [docs/architecture.md](docs/architecture.md).
 
-Broker and result store: Redis >= 7.0. Timestamps are integer unix epoch
-milliseconds unless stated otherwise.
+Broker and result store: Redis >= 7.0. RabbitMQ or Amazon SQS can carry the
+ready queue instead (§14); sections 1 to 13 describe the Redis broker.
+Timestamps are integer unix epoch milliseconds unless stated otherwise.
 
 ## 1. Redis key layout
 
@@ -21,6 +22,7 @@ Every key has the prefix `cauli:`. `{queue}` matches `[a-zA-Z0-9_.-]+`.
 | `cauli:result:{task_id}` | String | Result JSON (§8), `SET ... EX result_ttl` |
 | `cauli:idemp:{h}` | String | Idempotency claim. Value = claiming task id (§4.5) |
 | `cauli:beat:*` | several | Scheduler state, owned by `cauli-beat` (§10.1) |
+| `cauli:redelivered:{task_id}:{retries}` | String | Redelivery count of one attempt, only with a RabbitMQ or SQS ready queue (§14.4) |
 
 - `{h}` is SHA-256 of the `idempotency_key`, truncated to 128 bits, as 32
   lowercase hex characters. The raw key never appears in a key name.
@@ -479,6 +481,7 @@ app = Cauli(
     queue_ttl=None,          # §9.2
     redis_client=None,       # a redis.Redis or a zero argument factory
     max_envelope_bytes=1048576,
+    broker_url=None,         # None: env CAULI_BROKER_URL, else Redis (§14)
 )
 
 @app.task(
@@ -577,6 +580,7 @@ Worker introspection contract. The worker reads exactly these attributes:
   `jitter: bool`, `store_result: bool`
 - `app.redis_url: str`, `app.default_queue: str`, `app.result_ttl: int`,
   `app.idemp_ttl: int`
+- `app.broker_url: str | None`, absent = None (§14)
 - `app.queue_ttl: dict[str, float]`, seconds, `"*"` = fallback, absent = none
 - `app._before_task_hooks`, `app._after_task_hooks`, `app._process_init_hooks`:
   `list[callable]`, absent = empty
@@ -591,6 +595,8 @@ Flags and defaults: [docs/configuration.md](docs/configuration.md), or
   running in an untrusted directory can import untrusted modules.
 - Redis URL precedence: `--redis-url` > env `CAULI_REDIS_URL` > `app.redis_url`.
   The URL is logged with credentials redacted.
+- Broker URL precedence: `--broker-url` > env `CAULI_BROKER_URL` >
+  `app.broker_url` (§14). Logged with credentials redacted.
 - `--queues` defaults to `app.default_queue`.
 - `--batch`, `--visibility-timeout` and `--max-envelope-bytes` MUST be >= 1;
   the worker exits 1 otherwise.
@@ -949,6 +955,9 @@ Beat talks to a `ScheduleStore` (`cauli/beat.py`). A backend needs:
 2. A lease with a TTL that only its holder can refresh or release. Required
    only for efficiency.
 
+RabbitMQ and SQS offer neither, which is why beat keeps its state in Redis
+when one of them is the ready queue (§14.1).
+
 ### 10.7 Why a separate entrypoint rather than a worker flag
 
 See [docs/architecture.md](docs/architecture.md#design-decisions). `cauli-beat`
@@ -957,8 +966,9 @@ is a Python console script; `python -m cauli.beat` is the same.
 ## 11. Non-goals for v1
 
 Chains, groups, chords, canvas; priority levels (§9.4); rate limits; an events
-bus; brokers and result backends other than Redis; Redis Cluster; a Windows or
-macOS worker (the client and `cauli-beat` are cross platform); a schedule admin
+bus; result backends other than Redis; brokers other than Redis, RabbitMQ and
+SQS (§14); RabbitMQ classic queues and SQS FIFO queues; Redis Cluster; a
+Windows or macOS worker (the client and `cauli-beat` are cross platform); a schedule admin
 UI (§10.1 is laid out for one).
 
 ## 12. Building and testing
@@ -1036,3 +1046,122 @@ pip install --no-deps cauli 'redis>=5.0.1' 'msgspec>=0.18' tzdata
 Keep the names in that command in step with `[project].dependencies` in
 `py/pyproject.toml`. `pip check` then reports the missing `cauli-worker`, which
 is accurate.
+
+## 14. RabbitMQ and SQS as the ready queue
+
+By default Redis Streams carry the ready tasks (§1 to §4). With a broker URL,
+RabbitMQ or Amazon SQS carries them instead. Redis keeps everything else: the
+delayed set, results, idempotency claims, dead letters, the clock and
+`cauli-beat`. Redis is still required.
+
+| Broker URL | Ready queue |
+|---|---|
+| unset | Redis Streams, `cauli:q:{queue}` |
+| `amqp://user:pass@host:5672/vhost`, `amqps://...` | RabbitMQ 3.12 or newer. An empty vhost means `/` |
+| `sqs://`, `sqs://<region>` | Amazon SQS. Credentials, and the region when the URL names none, come from the AWS credential chain. Credentials in the URL are refused |
+
+Set it with `Cauli(broker_url=...)`, the environment variable
+`CAULI_BROKER_URL`, or the worker's `--broker-url`. Precedence in the worker:
+flag, then environment, then `app.broker_url`. The worker exports its value as
+`CAULI_BROKER_URL` to the app it imports and to supervised processes. Every
+producer and every worker of a queue MUST use the same broker.
+
+### 14.1 What moves and what stays
+
+| Step | With a broker URL |
+|---|---|
+| Enqueue, due now (§3 step 4) | The client publishes the envelope JSON to the broker and returns once the broker has confirmed it |
+| Enqueue, delayed (§3 step 3) | Unchanged: `ZADD cauli:delayed:{queue}` |
+| Delayed mover (§4.3) | Leases, publishes, then removes (§14.4) |
+| Delivery | Pushed by RabbitMQ or long polled from SQS, gated on free io slots and the cpu backlog like a Redis fetch |
+| Completion (§4.1) | The outcome's own writes go to Redis first, in the same pipeline. The broker ack is sent only for deliveries whose writes all landed |
+| Crash redelivery (§4.4) | Done by the broker. The recovery loop, the trim and consumer reaping do not run |
+| Redelivery limit | Same rule and the same worst case as §4.4, counted by the worker (§14.4) |
+| Dead letters, results, idempotency | Unchanged, in Redis |
+| `cauli-beat` | Publishes every firing to the delayed set, due now, so the slot claim and the publish stay one Redis script (§10.5). A worker's mover hands it to the broker, up to `--mover-interval` later |
+
+### 14.2 RabbitMQ
+
+- Queue `cauli.q.{queue}`: durable, with the argument `x-queue-type` set to
+  `quorum`. Clients and workers declare it. A queue of that name declared any
+  other way makes the declare fail with `PRECONDITION_FAILED`.
+- Messages are published to the default exchange with the queue name as the
+  routing key, persistent, `mandatory`, with publisher confirms. The body is
+  the envelope JSON.
+- The client keeps one connection per process, guarded by a lock, and opens a
+  new one after a fork. A connection that fails mid publish is reopened once
+  and the unconfirmed messages are sent again, so a publish is at least once.
+- The worker consumes with manual acks. Per queue prefetch is
+  `(io slots + cpu admission slots) / queues`, at least 1.
+- There is no visibility timeout. A delivery returns to its queue when the
+  worker's connection closes: on a crash at once, on a network partition
+  after the heartbeat times out. `--visibility-timeout` is unused.
+- RabbitMQ closes a channel that holds a delivery unacked for longer than its
+  `consumer_timeout` (30 minutes by default) and requeues everything on it.
+  Set `consumer_timeout` above the longest task `timeout`.
+- When the connection is lost the worker reconnects, backing off from 0.5 to
+  5 seconds. Tasks running at that moment finish, their acks are dropped, and
+  the broker delivers them again.
+- `--queues` order is not dispatch order.
+
+### 14.3 SQS
+
+- Queue `cauli-{queue}`, a standard queue. A queue name containing `.`, or
+  one that makes the SQS name longer than 80 characters, is refused at enqueue
+  and at worker startup. FIFO queues are not supported.
+- A missing queue is created with default attributes, which needs
+  `sqs:CreateQueue`. Otherwise create it yourself. The worker needs
+  `sqs:GetQueueUrl`, `sqs:ReceiveMessage`, `sqs:DeleteMessage`,
+  `sqs:ChangeMessageVisibility` and `sqs:SendMessage`; a producer needs
+  `sqs:GetQueueUrl` and `sqs:SendMessage`.
+- The body is the envelope JSON. SQS takes at most 1,048,576 bytes and
+  refuses some Unicode characters (U+FFFE and U+FFFF among them). A refused
+  enqueue raises at the call site. A delayed envelope the broker can never
+  take is dead lettered `"malformed"` by the mover, with a failure result.
+- The worker long polls each queue for 20 seconds, takes at most 10 messages
+  and never more than its free io slots, and sets the visibility timeout to
+  `--visibility-timeout`. It renews that timeout every third of it for every
+  message it holds, through the drain too. A dead worker stops renewing, and
+  SQS redelivers its messages within `--visibility-timeout`.
+- SQS caps total invisibility at 12 hours. A task that runs longer is
+  delivered again while it is still running.
+- The endpoint follows the AWS SDK settings, `AWS_ENDPOINT_URL_SQS` included.
+- `--queues` order is not dispatch order.
+
+### 14.4 Guarantees that differ
+
+- **Durable enqueue.** A due task is acknowledged by a quorum queue or by SQS,
+  which closes the replication window of §4 for ready tasks. Delayed and
+  retried tasks wait in Redis and still depend on its persistence.
+- **Redis down, broker up.** Deliveries keep arriving, so two rules replace
+  the Redis ones. A completion whose writes fail is written again, backing
+  off from 0.25 to 5 seconds, until Redis takes it: the delivery stays
+  unacked, the task is not run a second time, and fetching pauses while any
+  completion waits. An idempotency claim (§4.5) that cannot reach Redis waits
+  and retries every second instead of failing open. A worker stopped during
+  either wait leaves the delivery to the broker, which delivers it again.
+- **The mover is a lease.** One script returns the due envelopes and moves
+  their score 30 seconds ahead, so another worker's sweep skips them. The
+  worker publishes them and removes the confirmed ones with `ZREM`. An
+  envelope whose publish was not confirmed is published again when its lease
+  ends, so a crash in between can duplicate, never lose.
+- **The redelivery count lives in Redis.** A delivery the broker marks as
+  redelivered (`x-delivery-count` on RabbitMQ, `ApproximateReceiveCount`
+  above 1 on SQS) increments `cauli:redelivered:{id}:{retries}`, which
+  expires 7 days after its last increment, before it is dispatched. Past
+  `redelivery_limit` increments the envelope is dead lettered
+  `"redelivery_limit"`. The broker's own count is not used: it also rises for
+  deliveries a dying worker held and never started, so a worker in a crash
+  loop would dead letter unrelated tasks unrun. It decides only for a body
+  with no usable `id`. If the increment fails the task is dispatched.
+- **Monitoring.** `oldest_ms` is always 0 and `XLEN` does not apply. Read
+  queue depth and age from the broker.
+
+```lua
+-- KEYS[1]=cauli:delayed:{queue}  ARGV[1]=now_ms  ARGV[2]=limit  ARGV[3]=leased_until_ms
+local due = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, tonumber(ARGV[2]))
+for i, e in ipairs(due) do
+  redis.call('ZADD', KEYS[1], ARGV[3], e)
+end
+return due
+```

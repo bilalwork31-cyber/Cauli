@@ -60,6 +60,14 @@ dev = [
 django = [
     "django>=4.2",
 ]
+# The publishers for a RabbitMQ or SQS task queue (PROTOCOL.md section 14).
+rabbitmq = [
+    "amqp>=5.1",
+]
+sqs = [
+    # 1.28.57: the first release that reads AWS_ENDPOINT_URL_SQS.
+    "boto3>=1.28.57",
+]
 # Empty: msgspec is required now; kept so `cauli[speed]` still installs.
 speed = []
 

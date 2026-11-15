@@ -545,9 +545,11 @@ class Beat:
             except Exception as exc:
                 log.error("beat: cannot build envelope for %r: %s", entry.name, exc)
                 return False
-            # Informational; the worker preserves but ignores it (PROTOCOL.md 2).
-            envelope["beat_name"] = entry.name
-            envelope["beat_slot"] = slot
+            if fire_at is None and getattr(self.app, "broker_url", None) is not None:
+                # The slot claim and the publish are one Redis script, which
+                # cannot reach RabbitMQ or SQS. The firing goes to the delayed
+                # set, due now, and a worker's mover hands it on.
+                fire_at = now
 
         state = {
             "last_slot": slot,

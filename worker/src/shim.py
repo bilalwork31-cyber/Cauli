@@ -275,6 +275,7 @@ def load_app(app_spec, extra_paths_json):
     return json.dumps(
         {
             "redis_url": str(getattr(app, "redis_url", "redis://localhost:6379/0")),
+            "broker_url": getattr(app, "broker_url", None),
             "default_queue": str(getattr(app, "default_queue", "default")),
             "result_ttl": int(getattr(app, "result_ttl", 3600)),
             "idemp_ttl": int(getattr(app, "idemp_ttl", 86400)),

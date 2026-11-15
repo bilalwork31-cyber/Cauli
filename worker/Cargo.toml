@@ -41,9 +41,17 @@ required-features = ["wheel-bin"]
 [dependencies]
 anyhow = "1"
 async-channel = "2"
+# SQS (PROTOCOL.md section 14). No default features: they pull aws-lc-rs,
+# which needs cmake, and a second TLS stack beside the ring one below.
+aws-config = { version = "1", default-features = false, features = ["rt-tokio", "credentials-process", "sso"] }
+aws-sdk-sqs = { version = "1", default-features = false, features = ["rt-tokio"] }
+aws-smithy-http-client = { version = "1", features = ["rustls-ring"] }
 clap = { version = "4", features = ["derive"] }
 crossbeam-channel = "0.5"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 gethostname = "1"
+# RabbitMQ (PROTOCOL.md section 14), on the same ring TLS as redis.
+lapin = { version = "4", default-features = false, features = ["tokio", "rustls--ring", "rustls-native-certs"] }
 libc = "0.2"
 mimalloc = { version = "0.1", default-features = false }
 pyo3 = { version = "0.26", features = ["auto-initialize"] }

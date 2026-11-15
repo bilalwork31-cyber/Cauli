@@ -19,6 +19,7 @@ this file disagrees with the code or [PROTOCOL.md](../PROTOCOL.md), they win.
 | `shim.py` | Embedded Python: app loading, `run_sync`, asyncio loops, soft timeout watchdog, hooks |
 | `cpu.rs` | cpu pool: fork server and stdio children |
 | `broker.rs` | Key layout, Lua scripts, completion pipeline |
+| `transport.rs`, `amqp.rs`, `sqs.rs` | RabbitMQ and SQS as the ready queue: receive, ack, publish for the mover |
 | `envelope.rs` | Envelope, result JSON, expiry deadline, redelivery limit |
 | `pyjson.rs` | JSON type gate for io lane results |
 | `clock.rs`, `backoff.rs` | Redis anchored clock; retry delay |
@@ -183,6 +184,19 @@ never share a slot, so the mover fails and a retry can be acked without its
 exits 1 on `cluster_enabled:1` unless `CAULI_ALLOW_REDIS_CLUSTER` is set. Hash
 tags were rejected: beat's claim script spans every queue, which needs one
 global tag and removes the reason to run Cluster.
+
+**RabbitMQ and SQS carry deliveries only.** Results, the delayed set,
+idempotency claims, dead letters and beat need a store with scripts, TTLs and
+sorted sets, which neither broker has, so Redis keeps them and the transport
+is three operations: receive, ack, publish. `Ctx::transport` is `None` for
+Redis Streams, and the Redis fetch, recovery and trim loops are untouched.
+Two rules exist only for the transports, because a Redis outage no longer
+stops deliveries: a completion that cannot be written waits and retries in
+`AckBufs::submit` instead of leaving the entry to recovery, and an
+idempotency claim that cannot be made waits instead of failing open. Undone,
+the first reruns finished tasks (SQS) or strands deliveries unacked
+(RabbitMQ), and the second runs every keyed task unguarded for the length of
+the outage.
 
 **One worker wheel per CPython minor.** The binary links
 `libpython3.X.so.1.0` and has no RUNPATH. The wheel's `cauli-worker` is a

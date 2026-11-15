@@ -21,6 +21,9 @@ pub struct Ctx {
     pub redis: ConnectionManager,
     /// §4.1 completion buffers, one flusher per queue (see `broker::AckBufs`).
     pub acks: AckBufs,
+    /// The ready queue when it is RabbitMQ or SQS (PROTOCOL §14); None
+    /// means Redis Streams.
+    pub transport: Option<Arc<crate::transport::Transport>>,
     pub counters: Arc<Counters>,
     pub io_sem: Arc<Semaphore>,
     /// Total permits of `io_sem`: the fetch loop needs capacity, not the free

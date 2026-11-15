@@ -18,9 +18,9 @@ Usage, mirroring the Celery layout::
     cauli-worker --app myproj.cauli:app
 
 :func:`django_app` runs ``django.setup()`` when needed, reads
-``CAULI_REDIS_URL``, ``CAULI_DEFAULT_QUEUE``, ``CAULI_RESULT_TTL`` and
-``CAULI_IDEMP_TTL`` from settings, and installs :func:`install_orm_executors`
-and :func:`install_db_hooks`.
+``CAULI_REDIS_URL``, ``CAULI_BROKER_URL``, ``CAULI_DEFAULT_QUEUE``,
+``CAULI_RESULT_TTL`` and ``CAULI_IDEMP_TTL`` from settings, and installs
+:func:`install_orm_executors` and :func:`install_db_hooks`.
 
 Connections: Postgres backends are about ``procs * io_threads`` plus
 ``procs * min(CAULI_ORM_EXECUTORS, io_concurrency)`` plus
@@ -44,6 +44,7 @@ from cauli.app import AsyncCauli, Cauli
 
 _SETTINGS_MAP = (
     ("CAULI_REDIS_URL", "redis_url"),
+    ("CAULI_BROKER_URL", "broker_url"),
     ("CAULI_DEFAULT_QUEUE", "default_queue"),
     ("CAULI_RESULT_TTL", "result_ttl"),
     ("CAULI_IDEMP_TTL", "idemp_ttl"),

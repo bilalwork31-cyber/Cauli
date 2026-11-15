@@ -260,6 +260,11 @@ mod tests {
             "passed through the child's CAULI_REDIS_URL instead, so the \
              userinfo does not land in /proc/<pid>/cmdline (spawn_child)",
         ),
+        (
+            "broker-url",
+            "exported as CAULI_BROKER_URL before the supervisor starts \
+             (lib.rs), so every child inherits it without it reaching argv",
+        ),
     ];
 
     /// Enumerated from clap's definition, so a new flag fails here until it

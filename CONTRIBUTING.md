@@ -3,7 +3,7 @@
 Open an issue before anything larger than a bug fix or a documentation change.
 The non goals in [PROTOCOL.md section 11](PROTOCOL.md#11-non-goals-for-v1) are
 declined however well implemented: chains, groups, chords, rate limits,
-priorities, brokers other than Redis, Redis Cluster.
+priorities, brokers other than Redis, RabbitMQ and SQS, Redis Cluster.
 
 Wanted: a `cauli` CLI for the dead letter queue, queue depth and the delayed
 set; the benchmark lanes [bench/RESULTS.md](bench/RESULTS.md) lists as not yet
@@ -63,6 +63,17 @@ python scripts/check_versions.py
 
 `itest/test_django.py` also needs `django>=4.2`, `psycopg[binary]` and the
 Postgres server binaries (`initdb`, `pg_ctl`); it skips itself without them.
+
+The RabbitMQ and SQS tests (`py/tests/test_broker.py`,
+`itest/test_brokers.py`) need a real server and skip without one. Point them
+at a RabbitMQ 3.12 or newer and at an SQS emulator (ElasticMQ, LocalStack),
+and install the client libraries:
+
+```bash
+pip install -e "py[rabbitmq,sqs]"
+export CAULI_TEST_AMQP_URL=amqp://guest:guest@127.0.0.1:5672/
+export CAULI_TEST_SQS_ENDPOINT=http://127.0.0.1:9324
+```
 On a slow or network filesystem, set `CARGO_TARGET_DIR` to a local path.
 
 CI runs exactly these, plus the Python suite on 3.10 through 3.14 and a

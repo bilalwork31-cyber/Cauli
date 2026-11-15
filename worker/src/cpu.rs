@@ -142,6 +142,13 @@ pub struct StartCfg {
     pub no_fork_server: bool,
 }
 
+/// Executing plus staged prefetch; see `CpuPool::admission`.
+pub fn admission_slots(workers: usize, child_threads: usize, prefetch: usize) -> usize {
+    workers
+        .saturating_mul(child_threads.max(1).saturating_add(prefetch))
+        .max(1)
+}
+
 /// Start the cpu pool. Tries fork-server mode unless `no_fork_server`; any
 /// startup failure there (listener bind, parent spawn, no server-ready line)
 /// logs a warning and falls back to stdio mode.
@@ -159,12 +166,11 @@ pub async fn start(cfg: StartCfg, counters: Arc<Counters>) -> CpuPool {
     // Twice the in flight capacity. Prefetched requests live in the children.
     let cap = (2 * workers * child_threads).max(1);
     let (tx, rx) = async_channel::bounded::<CpuJob>(cap);
-    // Executing plus staged prefetch; see `CpuPool::admission`.
-    let admission = Arc::new(Semaphore::new(
-        workers
-            .saturating_mul(child_threads.saturating_add(prefetch))
-            .max(1),
-    ));
+    let admission = Arc::new(Semaphore::new(admission_slots(
+        workers,
+        child_threads,
+        prefetch,
+    )));
     let overflow = Arc::new(AtomicUsize::new(0));
     let drained = Arc::new(Notify::new());
     let pids = Arc::new(Mutex::new(Vec::new()));

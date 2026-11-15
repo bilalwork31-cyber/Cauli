@@ -3,11 +3,14 @@
 //! (PROTOCOL §1, §4.1-§4.3, §4.5).
 
 use crate::envelope::ErrorJson;
+use crate::transport::Transport;
 use anyhow::{anyhow, Result};
 use redis::aio::{ConnectionLike, ConnectionManager};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use tokio::sync::{mpsc, oneshot};
+use std::time::Duration;
+use tokio::sync::{mpsc, oneshot, watch};
 
 pub fn q_key(queue: &str) -> String {
     format!("cauli:q:{queue}")
@@ -102,6 +105,78 @@ pub async fn run_mover(
     Ok(n)
 }
 
+/// §14 mover lease, for a ready queue outside Redis. Returns the due
+/// envelopes and pushes their score to ARGV[3], so another worker's sweep
+/// skips them while this one publishes. An envelope whose publish is never
+/// confirmed is due again at ARGV[3]: at least once, like MOVER_LUA.
+pub const MOVER_CLAIM_LUA: &str = r#"
+local due = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1], 'LIMIT', 0, tonumber(ARGV[2]))
+for i, e in ipairs(due) do
+  redis.call('ZADD', KEYS[1], ARGV[3], e)
+end
+return due
+"#;
+
+pub async fn claim_due(
+    conn: &mut ConnectionManager,
+    script: &redis::Script,
+    queue: &str,
+    now_ms: u64,
+    limit: usize,
+    leased_until_ms: u64,
+) -> Result<Vec<String>> {
+    let due: Vec<String> = script
+        .key(delayed_key(queue))
+        .arg(now_ms)
+        .arg(limit)
+        .arg(leased_until_ms)
+        .invoke_async(conn)
+        .await?;
+    Ok(due)
+}
+
+/// How long a redelivery count outlives its last increment: the DLQ's own
+/// retention, since both exist to explain a task that never finished.
+const REDELIVERY_COUNT_TTL_S: u64 = DLQ_TTL_S;
+
+/// §14: counts one more start of a redelivered attempt, and returns the
+/// count. Keyed by attempt, so every retry begins at zero like a fresh
+/// stream entry's `delivery_count`.
+pub async fn count_redelivery(
+    conn: &mut ConnectionManager,
+    task_id: &str,
+    retries: u32,
+) -> Result<u64> {
+    let key = format!("cauli:redelivered:{task_id}:{retries}");
+    let (started,): (u64,) = redis::pipe()
+        .cmd("INCR")
+        .arg(&key)
+        .cmd("EXPIRE")
+        .arg(&key)
+        .arg(REDELIVERY_COUNT_TTL_S)
+        .ignore()
+        .query_async(conn)
+        .await?;
+    Ok(started)
+}
+
+/// Drops envelopes the broker has confirmed from the delayed set.
+pub async fn forget_moved(
+    conn: &mut ConnectionManager,
+    queue: &str,
+    envelopes: &[&str],
+) -> Result<()> {
+    if envelopes.is_empty() {
+        return Ok(());
+    }
+    let _: u64 = redis::cmd("ZREM")
+        .arg(delayed_key(queue))
+        .arg(envelopes)
+        .query_async(conn)
+        .await?;
+    Ok(())
+}
+
 /// Redis Cluster CROSSSLOT: permanent for this script's keys, so not to be
 /// retried like a transient error.
 pub fn is_crossslot(e: &anyhow::Error) -> bool {
@@ -190,7 +265,19 @@ struct AckReq {
 }
 
 /// Cloneable: one flush answers every waiter in the batch.
-type FlushOutcome = std::result::Result<(), Arc<redis::RedisError>>;
+type FlushOutcome = std::result::Result<(), Arc<anyhow::Error>>;
+
+/// RabbitMQ or SQS as the ready queue (PROTOCOL §14): where a flush sends
+/// its acks, and the shutdown signal that ends a completion's wait for Redis.
+#[derive(Clone)]
+pub struct Foreign {
+    pub transport: Arc<Transport>,
+    pub shutdown: watch::Receiver<bool>,
+}
+
+/// Backoff of a completion whose writes Redis refused, under `Foreign`.
+const STALLED_RETRY_MIN: Duration = Duration::from_millis(250);
+const STALLED_RETRY_MAX: Duration = Duration::from_secs(5);
 
 /// §4.1 completion buffers, one flusher per queue. A flush is one batch
 /// XACK plus one batch XDEL, sent at `--ack-batch` completions or
@@ -205,26 +292,89 @@ type FlushOutcome = std::result::Result<(), Arc<redis::RedisError>>;
 #[derive(Clone)]
 pub struct AckBufs {
     senders: Arc<HashMap<String, mpsc::Sender<AckReq>>>,
+    foreign: Option<Foreign>,
+    /// Completions waiting in `submit` for Redis to take their writes.
+    stalled: Arc<AtomicUsize>,
 }
 
 impl AckBufs {
-    /// Must be called on a tokio runtime.
-    pub fn start(conn: &ConnectionManager, queues: &[String], batch: usize, flush_ms: u64) -> Self {
+    /// Must be called on a tokio runtime. `foreign` is None when Redis
+    /// Streams are the ready queue.
+    pub fn start(
+        conn: &ConnectionManager,
+        queues: &[String],
+        batch: usize,
+        flush_ms: u64,
+        foreign: Option<Foreign>,
+    ) -> Self {
         let batch = batch.max(1);
         let mut senders = HashMap::new();
         for q in queues {
             // Bounds memory if redis stalls; senders then wait in `submit`.
             let (tx, rx) = mpsc::channel(batch.saturating_mul(4).max(256));
-            tokio::spawn(flusher(conn.clone(), q.clone(), rx, batch, flush_ms));
+            let transport = foreign.as_ref().map(|f| f.transport.clone());
+            tokio::spawn(flusher(
+                conn.clone(),
+                q.clone(),
+                rx,
+                batch,
+                flush_ms,
+                transport,
+            ));
             senders.insert(q.clone(), tx);
         }
         Self {
             senders: Arc::new(senders),
+            foreign,
+            stalled: Arc::new(AtomicUsize::new(0)),
         }
     }
 
+    /// True while a completion cannot reach Redis (only under `Foreign`).
+    pub fn stalled(&self) -> bool {
+        self.stalled.load(Ordering::Relaxed) > 0
+    }
+
     /// Waits for the flush: §4.7 drain counts a task until its ack lands.
+    ///
+    /// A failed flush under Redis Streams leaves the entry pending, and §4.4
+    /// recovery runs it again. RabbitMQ never redelivers on its own and SQS
+    /// would rerun a task that already finished, so there the outcome waits
+    /// here and is written again until Redis takes it or the worker stops.
     async fn submit(&self, queue: &str, stream_id: &str, extra: Vec<redis::Cmd>) -> Result<()> {
+        let Some(foreign) = &self.foreign else {
+            return self.submit_once(queue, stream_id, extra).await;
+        };
+        let mut delay = STALLED_RETRY_MIN;
+        let mut counted = None;
+        loop {
+            let err = match self.submit_once(queue, stream_id, extra.clone()).await {
+                Ok(()) => return Ok(()),
+                Err(e) => e,
+            };
+            if *foreign.shutdown.borrow() {
+                return Err(err);
+            }
+            if counted.is_none() {
+                tracing::warn!(
+                    queue,
+                    "completion write failed ({err}); holding the delivery unacked and \
+                     retrying until redis accepts it"
+                );
+                self.stalled.fetch_add(1, Ordering::Relaxed);
+                counted = Some(StalledGuard(&self.stalled));
+            }
+            tokio::time::sleep(delay).await;
+            delay = (delay * 2).min(STALLED_RETRY_MAX);
+        }
+    }
+
+    async fn submit_once(
+        &self,
+        queue: &str,
+        stream_id: &str,
+        extra: Vec<redis::Cmd>,
+    ) -> Result<()> {
         let Some(tx) = self.senders.get(queue) else {
             // Unreachable (queues are fixed), but never drop silently.
             return Err(anyhow!("no completion buffer for queue {queue}"));
@@ -245,6 +395,16 @@ impl AckBufs {
     }
 }
 
+/// Leaves the stalled count on every exit from `submit`, a cancelled one
+/// included.
+struct StalledGuard<'a>(&'a AtomicUsize);
+
+impl Drop for StalledGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// Exits when every sender is gone; `submit` keeps its sender alive until
 /// answered, so nothing is dropped.
 async fn flusher(
@@ -253,6 +413,7 @@ async fn flusher(
     mut rx: mpsc::Receiver<AckReq>,
     max_batch: usize,
     flush_ms: u64,
+    transport: Option<Arc<Transport>>,
 ) {
     loop {
         let Some(first) = rx.recv().await else { return };
@@ -265,14 +426,19 @@ async fn flusher(
                 Ok(None) | Err(_) => break, // senders gone, or window elapsed
             }
         }
-        flush_batch(&mut conn, &queue, batch).await;
+        flush_batch(&mut conn, &queue, batch, transport.as_deref()).await;
     }
 }
 
 /// Two round trips, never one pipeline: OOM under `noeviction` refuses ZADD,
 /// XADD and SET but still runs a later XACK and XDEL, which would ack work
 /// never written. A refused entry stays pending for §4.4.
-async fn flush_batch(conn: &mut ConnectionManager, queue: &str, batch: Vec<AckReq>) {
+async fn flush_batch(
+    conn: &mut ConnectionManager,
+    queue: &str,
+    batch: Vec<AckReq>,
+    transport: Option<&Transport>,
+) {
     let mut writes = redis::pipe();
     let mut owner = Vec::new();
     let mut reqs: Vec<(String, oneshot::Sender<FlushOutcome>, FlushOutcome)> = Vec::new();
@@ -288,12 +454,12 @@ async fn flush_batch(conn: &mut ConnectionManager, queue: &str, batch: Vec<AckRe
             Ok(replies) => {
                 for (i, reply) in owner.into_iter().zip(replies) {
                     if let (Err(e), Ok(())) = (reply.extract_error(), &reqs[i].2) {
-                        reqs[i].2 = Err(Arc::new(e));
+                        reqs[i].2 = Err(Arc::new(e.into()));
                     }
                 }
             }
             Err(e) => {
-                let e = Arc::new(e);
+                let e = Arc::new(anyhow::Error::from(e));
                 reqs.iter_mut().for_each(|r| r.2 = Err(e.clone()));
             }
         }
@@ -305,10 +471,17 @@ async fn flush_batch(conn: &mut ConnectionManager, queue: &str, batch: Vec<AckRe
     if written.is_empty() {
         return;
     }
-    let outcome: FlushOutcome = ack_pipeline(queue, written.iter().map(|r| r.0.as_str()))
-        .query_async::<()>(conn)
-        .await
-        .map_err(Arc::new);
+    let ids = written.iter().map(|r| r.0.as_str());
+    let outcome: FlushOutcome = match transport {
+        None => ack_pipeline(queue, ids)
+            .query_async::<()>(conn)
+            .await
+            .map_err(|e| Arc::new(e.into())),
+        Some(transport) => transport
+            .ack(queue, &ids.collect::<Vec<_>>())
+            .await
+            .map_err(Arc::new),
+    };
     for (_, done, _) in written {
         let _ = done.send(outcome.clone());
     }
@@ -389,16 +562,14 @@ const DLQ_MAXLEN: u64 = 1000;
 /// dead letter outlives a weekend. See PROTOCOL §1.
 const DLQ_TTL_S: u64 = 7 * 24 * 60 * 60;
 
-/// DLQ write (§4.2, §4, §4.4): XADD dlq + [SET result]? + batched XACK + XDEL.
-pub async fn finish_dlq(
-    bufs: &AckBufs,
+/// The writes of one dead letter: XADD dlq, its retention, [SET result]?.
+fn dlq_writes(
     queue: &str,
-    stream_id: &str,
     envelope_json: &str,
     reason: &str,
     error: Option<&ErrorJson>,
     result: Option<(&str, &str, u64)>, // (task_id, result_json, ttl_s)
-) -> Result<()> {
+) -> Vec<redis::Cmd> {
     let error_field = match error {
         Some(e) => serde_json::to_string(e).unwrap_or_default(),
         None => String::new(),
@@ -426,7 +597,41 @@ pub async fn finish_dlq(
         set.arg(result_key(task_id)).arg(rj).arg("EX").arg(ttl);
         extra.push(set);
     }
-    bufs.submit(queue, stream_id, extra).await
+    extra
+}
+
+/// DLQ write (§4.2, §4, §4.4): the dead letter + batched XACK + XDEL.
+pub async fn finish_dlq(
+    bufs: &AckBufs,
+    queue: &str,
+    stream_id: &str,
+    envelope_json: &str,
+    reason: &str,
+    error: Option<&ErrorJson>,
+    result: Option<(&str, &str, u64)>, // (task_id, result_json, ttl_s)
+) -> Result<()> {
+    let writes = dlq_writes(queue, envelope_json, reason, error, result);
+    bufs.submit(queue, stream_id, writes).await
+}
+
+/// A dead letter with no delivery to ack: the §14 mover's, for an envelope
+/// the broker will never accept. Every reply is read, so a refused write
+/// fails the call and the envelope stays in the delayed set.
+pub async fn dead_letter(
+    conn: &mut ConnectionManager,
+    queue: &str,
+    envelope_json: &str,
+    reason: &str,
+    error: Option<&ErrorJson>,
+    result: Option<(&str, &str, u64)>,
+) -> Result<()> {
+    let writes = dlq_writes(queue, envelope_json, reason, error, result);
+    let mut pipe = redis::pipe();
+    for cmd in writes {
+        pipe.add_command(cmd).ignore();
+    }
+    pipe.query_async::<()>(conn).await?;
+    Ok(())
 }
 
 /// §4.1 trim boundary: every entry below it is acked. The oldest pending id,
@@ -888,6 +1093,73 @@ mod tests {
         );
     }
 
+    /// §14 mover: two workers sweeping at once must not both publish an
+    /// envelope, and one that was never confirmed must come due again.
+    #[tokio::test]
+    async fn a_claimed_envelope_is_leased_not_removed() {
+        let redis = ThrowawayRedis::start(6445, false);
+        let client = redis::Client::open(redis.url()).expect("client");
+        let mut conn = ConnectionManager::new(client)
+            .await
+            .expect("connection manager");
+        let queue = "leased";
+        for (member, due_at) in [("due-1", 900), ("due-2", 1_000), ("later", 5_000)] {
+            let _: () = redis::cmd("ZADD")
+                .arg(delayed_key(queue))
+                .arg(due_at)
+                .arg(member)
+                .query_async(&mut conn)
+                .await
+                .expect("seed");
+        }
+        let script = redis::Script::new(MOVER_CLAIM_LUA);
+
+        let first = claim_due(&mut conn, &script, queue, 1_000, 128, 31_000)
+            .await
+            .expect("claim");
+        assert_eq!(first, ["due-1", "due-2"]);
+        let rival = claim_due(&mut conn, &script, queue, 1_000, 128, 31_000)
+            .await
+            .expect("rival claim");
+        assert!(rival.is_empty(), "a leased envelope was claimed twice");
+
+        forget_moved(&mut conn, queue, &["due-1"])
+            .await
+            .expect("forget");
+        let after_lease = claim_due(&mut conn, &script, queue, 31_000, 128, 61_000)
+            .await
+            .expect("claim after the lease");
+        assert_eq!(
+            after_lease,
+            ["later", "due-2"],
+            "the unconfirmed envelope is due again, the confirmed one is gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_redelivery_count_is_per_attempt_and_expires() {
+        let redis = ThrowawayRedis::start(6446, false);
+        let client = redis::Client::open(redis.url()).expect("client");
+        let mut conn = ConnectionManager::new(client)
+            .await
+            .expect("connection manager");
+        let id = "a".repeat(32);
+
+        assert_eq!(count_redelivery(&mut conn, &id, 0).await.expect("1"), 1);
+        assert_eq!(count_redelivery(&mut conn, &id, 0).await.expect("2"), 2);
+        assert_eq!(
+            count_redelivery(&mut conn, &id, 1).await.expect("retry"),
+            1,
+            "a retry is a new attempt and starts its own count"
+        );
+        let ttl: i64 = redis::cmd("TTL")
+            .arg(format!("cauli:redelivered:{id}:0"))
+            .query_async(&mut conn)
+            .await
+            .expect("ttl");
+        assert!(ttl > 0 && ttl <= REDELIVERY_COUNT_TTL_S as i64, "ttl {ttl}");
+    }
+
     /// cauli:q:myqueue and cauli:delayed:myqueue hash to slots 416 and 439.
     #[tokio::test]
     async fn mover_crossslot_is_detected_not_treated_as_transient() {
@@ -1032,7 +1304,7 @@ mod tests {
         ensure_groups(&mut conn, &[queue.to_string()])
             .await
             .expect("groups");
-        let bufs = AckBufs::start(&conn, &[queue.to_string()], 1, 1);
+        let bufs = AckBufs::start(&conn, &[queue.to_string()], 1, 1, None);
         let sid: String = redis::cmd("XADD")
             .arg(q_key(queue))
             .arg("*")
@@ -1192,7 +1464,7 @@ mod tests {
         ensure_groups(&mut conn, &[queue.to_string()])
             .await
             .expect("groups");
-        let bufs = AckBufs::start(&conn, &[queue.to_string()], 64, 1);
+        let bufs = AckBufs::start(&conn, &[queue.to_string()], 64, 1, None);
         let _: String = redis::cmd("XADD")
             .arg(q_key(queue))
             .arg("*")
@@ -1269,7 +1541,7 @@ mod tests {
         ensure_groups(&mut conn, &[queue.to_string()])
             .await
             .expect("groups");
-        let bufs = AckBufs::start(&conn, &[queue.to_string()], 64, 1);
+        let bufs = AckBufs::start(&conn, &[queue.to_string()], 64, 1, None);
 
         let _: String = redis::cmd("XADD")
             .arg(q_key(queue))
@@ -1501,7 +1773,7 @@ mod tests {
         ensure_groups(&mut conn, &[queue.to_string()])
             .await
             .expect("groups");
-        let bufs = AckBufs::start(&conn, &[queue.to_string()], 8, 1);
+        let bufs = AckBufs::start(&conn, &[queue.to_string()], 8, 1, None);
 
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let rival_stop = stop.clone();
@@ -1601,7 +1873,7 @@ mod tests {
             .await
             .expect("deliver");
 
-        let bufs = AckBufs::start(&conn, &[queue.to_string()], 4, 10_000);
+        let bufs = AckBufs::start(&conn, &[queue.to_string()], 4, 10_000, None);
         let t0 = std::time::Instant::now();
         let mut waits = Vec::new();
         for sid in &sids[..4] {
@@ -1619,7 +1891,7 @@ mod tests {
             "a full batch must flush on count, not wait out the window"
         );
 
-        let lone = AckBufs::start(&conn, &[queue.to_string()], 1000, 200);
+        let lone = AckBufs::start(&conn, &[queue.to_string()], 1000, 200, None);
         let t0 = std::time::Instant::now();
         finish_success(&lone, queue, &sids[4], "f4", None, 60)
             .await
@@ -1698,7 +1970,7 @@ mod tests {
             .await
             .expect("force OOM");
 
-        let bufs = AckBufs::start(&conn, &[queue.to_string()], 2, 10_000);
+        let bufs = AckBufs::start(&conn, &[queue.to_string()], 2, 10_000, None);
         let (retry, plain) = tokio::join!(
             finish_retry(&bufs, queue, &sids[0], r#"{"id":"o0"}"#, 1),
             finish_success(&bufs, queue, &sids[1], "o1", None, 60),

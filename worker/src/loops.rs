@@ -5,8 +5,9 @@ use crate::broker;
 // Redis anchored: the mover cutoff and stream id ages compare redis values.
 use crate::clock::now_ms;
 use crate::ctx::Ctx;
-use crate::dispatch::{dlq_terminal, spawn_dispatch};
+use crate::dispatch::{dlq_terminal, dlq_unpublishable, spawn_dispatch};
 use crate::envelope::{redelivery_limit, Envelope};
+use crate::transport::{Published, Transport};
 use redis::streams::{StreamReadOptions, StreamReadReply};
 use redis::AsyncCommands;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -131,17 +132,31 @@ const MOVER_ROUNDS_PER_TICK: usize = 32;
 /// the tick until a page comes back short, so `--mover-limit` does not cap
 /// the drain rate.
 pub async fn mover_loop(ctx: Arc<Ctx>) {
-    let script = redis::Script::new(broker::MOVER_LUA);
+    let script = redis::Script::new(match ctx.transport {
+        None => broker::MOVER_LUA,
+        Some(_) => broker::MOVER_CLAIM_LUA,
+    });
     let mut conn = ctx.redis.clone();
     let limit = ctx.args.mover_limit.max(1);
     let mut tick = tokio::time::interval(Duration::from_millis(ctx.args.mover_interval.max(1)));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Queues whose last publish to RabbitMQ or SQS failed, so the failure
+    // is logged when it starts and when it ends, not on every sweep.
+    let mut failing: std::collections::HashSet<String> = Default::default();
     loop {
         tick.tick().await;
         for q in &ctx.queues {
             for _ in 0..MOVER_ROUNDS_PER_TICK {
-                match broker::run_mover(&mut conn, &script, q, now_ms(), limit).await {
-                    Ok(n) if (n as usize) < limit => break,
+                let moved = match &ctx.transport {
+                    None => broker::run_mover(&mut conn, &script, q, now_ms(), limit)
+                        .await
+                        .map(|n| n as usize),
+                    Some(transport) => {
+                        publish_due(&ctx, transport, &mut conn, &script, q, &mut failing).await
+                    }
+                };
+                match moved {
+                    Ok(n) if n < limit => break,
                     Ok(_) => continue,
                     Err(e) => {
                         report_mover_error(q, &e);
@@ -149,6 +164,63 @@ pub async fn mover_loop(ctx: Arc<Ctx>) {
                     }
                 }
             }
+        }
+    }
+}
+
+/// How long a claimed envelope stays out of other sweeps. An envelope the
+/// broker never confirmed is published again this long after the attempt.
+const MOVER_LEASE_MS: u64 = 30_000;
+
+/// §14 mover: lease a page of due envelopes, publish them to RabbitMQ or
+/// SQS, then drop the confirmed ones from the delayed set. Returns the page
+/// length, or 0 after a failed publish so the caller stops paging this tick.
+async fn publish_due(
+    ctx: &Arc<Ctx>,
+    transport: &Transport,
+    conn: &mut redis::aio::ConnectionManager,
+    script: &redis::Script,
+    queue: &str,
+    failing: &mut std::collections::HashSet<String>,
+) -> anyhow::Result<usize> {
+    let now = now_ms();
+    let limit = ctx.args.mover_limit.max(1);
+    let lease = now.saturating_add(MOVER_LEASE_MS);
+    let due = broker::claim_due(conn, script, queue, now, limit, lease).await?;
+    if due.is_empty() {
+        return Ok(0);
+    }
+    let outcomes = transport.publish(queue, &due).await;
+    let mut settled: Vec<&str> = Vec::with_capacity(due.len());
+    let mut failure: Option<String> = None;
+    for (envelope, outcome) in due.iter().zip(outcomes) {
+        match outcome {
+            Published::Done => settled.push(envelope),
+            Published::Failed(why) => failure = Some(why),
+            Published::Rejected(why) => {
+                warn!(queue, "broker refused a due task for good ({why}) -> DLQ");
+                dlq_unpublishable(ctx, conn, queue, envelope, &why).await?;
+                settled.push(envelope);
+            }
+        }
+    }
+    broker::forget_moved(conn, queue, &settled).await?;
+    match failure {
+        Some(why) => {
+            if failing.insert(queue.to_string()) {
+                warn!(
+                    queue,
+                    "broker did not take due tasks ({why}); they stay in the delayed set \
+                     and are published again after {MOVER_LEASE_MS}ms"
+                );
+            }
+            Ok(0)
+        }
+        None => {
+            if failing.remove(queue) {
+                info!(queue, "broker is taking due tasks again");
+            }
+            Ok(due.len())
         }
     }
 }
@@ -272,7 +344,7 @@ pub async fn recovery_loop(ctx: Arc<Ctx>) {
 /// reclaim, which is the free permit count: a larger page parks entries on
 /// `io_sem`, and every reclaim bumps `delivery_count` toward a dead letter.
 /// `None` if shutdown began while waiting.
-async fn admission_open(ctx: &Arc<Ctx>) -> Option<usize> {
+pub async fn admission_open(ctx: &Arc<Ctx>) -> Option<usize> {
     loop {
         if ctx.shutting_down() {
             return None;
@@ -714,6 +786,10 @@ pub async fn stats_loop(ctx: Arc<Ctx>) {
 /// reporting while fetching is paused. Not the stream head: that can be an
 /// acked entry awaiting its XDEL.
 async fn oldest_unacked_ms(ctx: &Arc<Ctx>, conn: &mut redis::aio::ConnectionManager) -> u64 {
+    // RabbitMQ and SQS expose no message age to a consumer (PROTOCOL §14).
+    if ctx.transport.is_some() {
+        return 0;
+    }
     let now = now_ms();
     let mut oldest = 0;
     for q in &ctx.queues {

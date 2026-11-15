@@ -89,6 +89,16 @@ def slow_idemp(path, seconds):
     return {"slow_idemp_done": True}
 
 
+@app.task(max_retries=0)
+def kill_worker(path):
+    """Counts the attempt in `path`, then takes the whole worker down with it."""
+    import signal
+
+    with open(path, "a") as f:
+        f.write("x")
+    os.kill(os.getpid(), signal.SIGKILL)
+
+
 @app.task(max_retries=0, timeout=0.5)
 def redelivery_doomed(x):
     """Never runs: the redelivery limit test dead letters it on sight."""

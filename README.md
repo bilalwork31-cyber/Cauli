@@ -7,12 +7,12 @@
 <p align="center">
   <a href="#license"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue" alt="License"></a>
   <img src="https://img.shields.io/badge/python-3.10%2B-blue" alt="Python 3.10+">
-  <img src="https://img.shields.io/badge/broker-Redis%20%E2%89%A5%207.0-red" alt="Redis 7.0+">
+  <img src="https://img.shields.io/badge/broker-Redis%20%7C%20RabbitMQ%20%7C%20SQS-red" alt="Redis, RabbitMQ or SQS">
   <img src="https://img.shields.io/badge/worker-Linux-lightgrey" alt="Linux worker">
 </p>
 
 cauli is a task queue for Python. You write tasks in Python; one Rust binary,
-`cauli-worker`, runs them from Redis.
+`cauli-worker`, runs them from Redis, RabbitMQ or Amazon SQS.
 
 ## Why
 
@@ -110,6 +110,21 @@ async def signup(email: str):
 
 For a session per task on async SQLAlchemy, use `cauli.contrib.sqlalchemy`.
 
+### RabbitMQ or SQS as the queue
+
+Redis carries the tasks by default. A broker URL moves the task queue to
+RabbitMQ or Amazon SQS; Redis stays for results, delayed tasks, idempotency
+keys and `cauli-beat`.
+
+```bash
+pip install 'cauli[rabbitmq]'   # or 'cauli[sqs]'
+export CAULI_BROKER_URL=amqp://user:pass@rabbit.internal:5672/   # or sqs://eu-west-1
+cauli-worker -A myproj.tasks:app -c 50
+```
+
+The same variable configures the client. What changes with each broker:
+[PROTOCOL.md section 14](PROTOCOL.md#14-rabbitmq-and-sqs-as-the-ready-queue).
+
 ## Supported platforms
 
 | Part | Runs on |
@@ -117,6 +132,7 @@ For a session per task on async SQLAlchemy, use `cauli.contrib.sqlalchemy`.
 | Client and `cauli-beat` | CPython 3.10 to 3.14, any OS |
 | Worker | Linux, x86_64 or aarch64, glibc 2.35+, CPython 3.10 to 3.14 built with `--enable-shared`, free threaded 3.14t |
 | Broker and result store | Redis 7.0+ standalone, `rediss://` supported. Sentinel from the client and `cauli-beat` only |
+| Task queue, optional | RabbitMQ 3.12+ quorum queues, or Amazon SQS standard queues. Redis is still required |
 
 No worker wheel exists for musl (Alpine) or free threaded 3.13t; conda is untested. Redis
 Cluster, other brokers and canvas primitives (chains, groups, chords) are not
