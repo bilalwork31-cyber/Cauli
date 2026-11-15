@@ -381,16 +381,37 @@ async fn final_failure(
 /// Best effort id for a terminal DLQ write, parsed from a 4096 byte preview
 /// so a huge hostile payload is never fully parsed.
 fn recover_id(raw_e: &str) -> Option<String> {
-    // Only the id: some other field is what failed to parse. `raw_e` is
-    // already bounded: an oversize envelope arrives here as its preview.
-    #[derive(serde::Deserialize)]
-    struct IdOnly {
-        id: String,
+    /// Stops at the first top level `id`. A derived struct would read the
+    /// whole object first, and an oversize entry arrives as a preview cut
+    /// mid value, which never parses to its end.
+    struct FirstId<'a>(&'a mut Option<String>);
+
+    impl<'de> serde::de::Visitor<'de> for FirstId<'_> {
+        type Value = ();
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("an envelope object")
+        }
+
+        fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+            while let Some(key) = map.next_key::<String>()? {
+                if key == "id" {
+                    *self.0 = Some(map.next_value()?);
+                    return Ok(());
+                }
+                map.next_value::<serde::de::IgnoredAny>()?;
+            }
+            Ok(())
+        }
     }
-    match serde_json::from_str::<IdOnly>(raw_e) {
-        Ok(e) if valid_task_id(&e.id) => Some(e.id),
-        _ => None,
-    }
+
+    let mut id = None;
+    // The error is what follows the id (more fields, or the cut): expected.
+    let _ = serde::Deserializer::deserialize_map(
+        &mut serde_json::Deserializer::from_str(raw_e),
+        FirstId(&mut id),
+    );
+    id.filter(|id| valid_task_id(id))
 }
 
 /// Error for a task that never ran, typed so callers can tell it from a
@@ -609,6 +630,29 @@ mod tests {
     fn recover_id_none_for_an_id_that_fails_the_charset_gate() {
         let raw = r#"{"id":"not-32-hex","task":"t"}"#;
         assert_eq!(recover_id(raw), None);
+    }
+
+    /// What dispatch passes for an oversize entry: a preview cut mid value.
+    #[test]
+    fn recover_id_from_a_truncated_oversize_preview() {
+        let raw = format!(
+            r#"{{"v":1,"id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","task":"t","args":["{}"]}}"#,
+            "x".repeat(5000)
+        );
+        let preview = envelope::safe_truncate(&raw, 4096);
+        assert!(serde_json::from_str::<serde_json::Value>(preview).is_err());
+        assert_eq!(
+            recover_id(preview),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
+        );
+    }
+
+    #[test]
+    fn recover_id_ignores_an_id_nested_in_another_value() {
+        let raw = r#"{"args":[{"id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}],"task":"t"}"#;
+        assert_eq!(recover_id(raw), None);
+        let cut = r#"{"kwargs":{"id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","pad":"xxx"#;
+        assert_eq!(recover_id(cut), None);
     }
 
     #[test]
