@@ -310,9 +310,22 @@ class TaskDef:
             ) from exc
         frozen_args = tuple(args)
         frozen_kwargs = dict(kwargs or {})
-        # Raising at COMMIT would leave the row durable and the task lost.
+        # Raising at COMMIT would leave the row durable and the task lost,
+        # so everything apply_async can refuse is refused here, on a dry run.
         self._check_signature(frozen_args, frozen_kwargs)
         self._check_encodable(frozen_args, frozen_kwargs)
+        envelope, _queue, _fire_at = self.app.make_envelope(
+            self.name,
+            frozen_args,
+            frozen_kwargs,
+            task=self,
+            queue=queue,
+            idempotency_key=idempotency_key,
+            countdown=countdown,
+            eta=eta,
+            expires=expires,
+        )
+        self.app._encode_envelope(envelope)
         transaction.on_commit(
             lambda: self.apply_async(
                 frozen_args,

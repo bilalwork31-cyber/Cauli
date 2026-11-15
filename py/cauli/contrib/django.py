@@ -33,6 +33,7 @@ until the current transaction commits.
 
 from __future__ import annotations
 
+import contextvars
 import importlib
 import importlib.util
 import os
@@ -103,6 +104,36 @@ _orm_executors: list[Any] = []
 _orm_tokens: list[Any] = []
 _orm_rr = 0
 _orm_lock = threading.Lock()
+#: Tasks in flight per executor token, and whether the current task is one.
+_orm_in_flight: dict[Any, int] = {}
+_orm_counted: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "cauli_orm_counted", default=False
+)
+
+
+def _shares_its_executor() -> bool:
+    """True when another task is running on the current task's ORM executor."""
+    from asgiref.sync import SyncToAsync
+
+    token = SyncToAsync.thread_sensitive_context.get(None)
+    with _orm_lock:
+        others = _orm_in_flight.get(token, 0) - _orm_counted.get()
+    return others > 0
+
+
+def _close_broken_connections() -> None:
+    """``close_old_connections`` for a thread other tasks are using.
+
+    Closes only a connection that has already failed, which no task can be
+    relying on. Closing one merely past ``CONN_MAX_AGE`` would pull it from
+    under a neighbour that is mid query; that waits until the executor has a
+    single task.
+    """
+    from django.db import connections
+
+    for conn in connections.all(initialized_only=True):
+        if conn.errors_occurred and not conn.is_usable():
+            conn.close()
 
 
 def install_orm_executors(app: Cauli, workers: int = DEFAULT_ORM_EXECUTORS) -> Cauli:
@@ -114,6 +145,8 @@ def install_orm_executors(app: Cauli, workers: int = DEFAULT_ORM_EXECUTORS) -> C
     async task one executor round robin through asgiref's
     ``thread_sensitive_context``, so one task keeps one thread and one
     connection, and the process holds at most ``workers`` connections.
+    Tasks on one executor share its connection: do not hold a transaction
+    open across an ``await``.
 
     Sync pool and cpu tasks are untouched. ``workers=0`` disables it. The
     pool is process wide and the first caller sets its size.
@@ -166,10 +199,21 @@ def install_orm_executors(app: Cauli, workers: int = DEFAULT_ORM_EXECUTORS) -> C
         with _orm_lock:
             token = _orm_tokens[_orm_rr % len(_orm_tokens)]
             _orm_rr += 1
+            _orm_in_flight[token] = _orm_in_flight.get(token, 0) + 1
         # Hooks run inside the task's context, so this is per task.
         SyncToAsync.thread_sensitive_context.set(token)
+        _orm_counted.set(True)
+
+    def cauli_release_orm_executor() -> None:
+        if not _orm_counted.get():
+            return
+        _orm_counted.set(False)
+        token = SyncToAsync.thread_sensitive_context.get(None)
+        with _orm_lock:
+            _orm_in_flight[token] = _orm_in_flight.get(token, 1) - 1
 
     app.before_task(cauli_assign_orm_executor)
+    app.after_task(cauli_release_orm_executor)
     return app
 
 
@@ -183,7 +227,8 @@ def install_db_hooks(app: Cauli) -> Cauli:
       import survives into forked cpu children.
 
     Async tasks run the cleanup through ``sync_to_async(thread_sensitive=True)``,
-    the thread that holds their connections. That hop is skipped until the
+    the thread that holds their connections. While another task shares that
+    thread only a connection that has already failed is closed. The hop is skipped until the
     process opens its first connection (latched on ``connection_created``;
     the loop thread cannot see the executor's connections), saving 21% of
     worker CPU on an async HTTP workload.
@@ -210,7 +255,12 @@ def install_db_hooks(app: Cauli) -> Cauli:
         # The shim awaits the returned coroutine (PROTOCOL.md section 4.8).
         from asgiref.sync import sync_to_async
 
-        return sync_to_async(close_old_connections, thread_sensitive=True)()
+        cleanup = (
+            _close_broken_connections
+            if _shares_its_executor()
+            else close_old_connections
+        )
+        return sync_to_async(cleanup, thread_sensitive=True)()
 
     def cauli_close_all_connections() -> None:
         global _connection_opened

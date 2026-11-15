@@ -13,6 +13,7 @@ import os
 import sys
 import tempfile
 import threading
+from datetime import datetime, timezone
 
 import pytest
 
@@ -79,7 +80,11 @@ def test_django_app_reads_cauli_settings():
         "cauli_assign_orm_executor",
         "cauli_close_old_connections",
     ]
-    assert len(app._after_task_hooks) == 1
+    # The executor is released before the cleanup asks whether it is shared.
+    assert [h.__name__ for h in app._after_task_hooks] == [
+        "cauli_release_orm_executor",
+        "cauli_close_old_connections",
+    ]
     assert len(app._process_init_hooks) == 1
 
 
@@ -464,7 +469,7 @@ def test_on_commit_rejects_a_bad_signature_inside_the_transaction(monkeypatch):
 def test_on_commit_rejects_an_unencodable_argument_inside_the_transaction(monkeypatch):
     """The encode dry run must fire at the call site too.
 
-    The audit's exact case: a model with a UUID primary key. The codec refuses
+    The case that showed it: a model with a UUID primary key. The codec refuses
     a UUID, and without the dry run that refusal lands at COMMIT, after the
     row is written.
     """
@@ -497,3 +502,100 @@ def test_on_commit_docstrings_warn_about_django_testcase():
     assert "TestCase" in both
     assert "captureOnCommitCallbacks(execute=True)" in both
     assert "TransactionTestCase" in both
+
+
+@pytest.mark.parametrize(
+    "options, error",
+    [
+        ({"eta": datetime(2030, 1, 1)}, ValueError),
+        ({"queue": "not a queue"}, ValueError),
+        (
+            {"countdown": 5, "eta": datetime(2030, 1, 1, tzinfo=timezone.utc)},
+            ValueError,
+        ),
+        ({"idempotency_key": 42}, TypeError),
+        ({"expires": "soon"}, TypeError),
+    ],
+)
+def test_on_commit_rejects_bad_options_inside_the_transaction(
+    monkeypatch, options, error
+):
+    """Options were only checked when the commit hook ran: the row was
+    committed, the exception surfaced after it, and no task was published."""
+    from django.db import transaction
+
+    t1, sent = _captured_app(monkeypatch)
+
+    with transaction.atomic():
+        with pytest.raises(error):
+            t1.apply_async_on_commit(args=(1,), **options)
+    assert sent == []
+
+
+def test_on_commit_rejects_an_oversize_envelope_inside_the_transaction(monkeypatch):
+    from django.db import transaction
+
+    t1, sent = _captured_app(monkeypatch)
+    t1.app.max_envelope_bytes = 600
+
+    with transaction.atomic():
+        with pytest.raises(ValueError, match="600 byte limit"):
+            t1.delay_on_commit("x" * 2000)
+    assert sent == []
+
+
+def test_a_task_does_not_close_the_connection_another_task_is_using(monkeypatch):
+    """Async tasks share executor threads, and with them connections. With
+    Django's default CONN_MAX_AGE of 0 one task's close_old_connections hook
+    closed the connection under a neighbour that was mid query."""
+    from asgiref.sync import sync_to_async
+    from django.db import connection
+
+    app = _fresh_executor_state(monkeypatch, workers=1)
+    install_db_hooks(app)
+
+    async def run_hooks(hooks):
+        for hook in hooks:
+            pending = hook()
+            if pending is not None:
+                await pending
+
+    def raw_connection():
+        connection.ensure_connection()
+        return connection.connection
+
+    def current_connection():
+        return connection.connection
+
+    async def scenario():
+        started, release = asyncio.Event(), asyncio.Event()
+        seen = {}
+
+        async def long_task():
+            await run_hooks(app._before_task_hooks)
+            seen["opened"] = await sync_to_async(
+                raw_connection, thread_sensitive=True
+            )()
+            started.set()
+            await release.wait()
+            seen["later"] = await sync_to_async(
+                current_connection, thread_sensitive=True
+            )()
+            await run_hooks(app._after_task_hooks)
+            seen["after"] = await sync_to_async(
+                current_connection, thread_sensitive=True
+            )()
+
+        async def short_task():
+            await started.wait()
+            await run_hooks(app._before_task_hooks)
+            await run_hooks(app._after_task_hooks)
+            release.set()
+
+        await asyncio.gather(long_task(), short_task())
+        return seen
+
+    seen = asyncio.run(scenario())
+    assert seen["opened"] is not None
+    assert seen["later"] is seen["opened"], "the neighbour's hook closed it"
+    assert seen["after"] is None, "alone again, the last task still cleans up"
