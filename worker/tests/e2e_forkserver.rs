@@ -16,6 +16,7 @@ async fn e2e_fork_server() {
     kill_and_respawn_via_fork(&mut c).await;
     threaded_soft_timeout(&mut c).await;
     fallback_stdio_mode(&mut c).await;
+    stdio_stray_response_does_not_shift_later_results(&mut c).await;
     cpu_unknown_id_log_does_not_leak_payload(&mut c).await;
     busy_child_write_backpressure_is_not_wedged(&mut c).await;
     genuinely_wedged_child_is_still_killed_despite_prefetch_stall(&mut c).await;
@@ -230,9 +231,45 @@ async fn fallback_stdio_mode(c: &mut redis::aio::MultiplexedConnection) {
     drop(w);
 }
 
+/// Stdio mode: a stray response line fails only the task in flight. Before
+/// the id check every later task received its predecessor's result.
+async fn stdio_stray_response_does_not_shift_later_results(
+    c: &mut redis::aio::MultiplexedConnection,
+) {
+    let mut w = Worker::spawn("strayq", &["--no-fork-server", "--cpu-workers", "1"]);
+    wait_group(c, "strayq", 20).await;
+
+    let (ghost_id, e) = envelope("fx.cpu_ghost", "strayq", |v| {
+        v["kind"] = json!("cpu");
+        v["max_retries"] = json!(0);
+    });
+    xadd(c, "strayq", &e.to_string()).await;
+    let r = wait_result(c, &ghost_id, 15).await;
+    assert_eq!(r["status"], "failure", "the stray line is nobody's result");
+    assert_eq!(r["error"]["type"], "WorkerLost");
+
+    for n in [101, 102, 103] {
+        let (id, e) = envelope("fx.cpu_echo", "strayq", |v| {
+            v["kind"] = json!("cpu");
+            v["args"] = json!([n]);
+        });
+        xadd(c, "strayq", &e.to_string()).await;
+        let r = wait_result(c, &id, 15).await;
+        assert_eq!(r["status"], "success");
+        assert_eq!(
+            r["result"]["args"],
+            json!([n]),
+            "task {n} got another's result"
+        );
+    }
+
+    w.signal(libc::SIGTERM);
+    assert_eq!(w.wait_code(20), 0);
+    drop(w);
+}
+
 /// An unsolicited cpu child response (unknown id) must not log task data.
-/// Fork server only: the stdio path does no id matching. fx.cpu_ghost sends
-/// one such line before its real response.
+/// fx.cpu_ghost sends one such line before its real response.
 async fn cpu_unknown_id_log_does_not_leak_payload(c: &mut redis::aio::MultiplexedConnection) {
     let log_path = fixtures_dir().join(format!("cpughost-{}.log", unique_id()));
     let mut w = Worker::spawn_ex("cpughost", &["--cpu-workers", "1"], &[], Some(&log_path));

@@ -742,6 +742,11 @@ struct IdOnly<'a> {
     id: Option<&'a str>,
 }
 
+/// True when a stdio child's response line carries the request's id.
+fn answers(line: &str, request_id: &str) -> bool {
+    serde_json::from_str::<IdOnly>(line).is_ok_and(|resp| resp.id == Some(request_id))
+}
+
 enum ChildGone {
     /// Read EOF or a failed write: the child is gone, possibly reaped by the
     /// parent already, so its pid may be reused. Must not be SIGKILLed.
@@ -1074,6 +1079,19 @@ async fn stdio_child_loop(
             }
 
             match timeout(Duration::from_millis(job.timeout_ms), lines.next_line()).await {
+                Ok(Ok(Some(resp))) if !answers(&resp, &job.id) => {
+                    // One stray line (a task that forked and returned twice)
+                    // would hand every later task its predecessor's result.
+                    // Never log the line: it carries task data.
+                    warn!(
+                        "cpu[{idx}] pid={pid}: response does not answer the request in \
+                         flight (len={}); SIGKILL + respawn (WorkerLost)",
+                        resp.len()
+                    );
+                    let _ = job.resp.send(CpuOutcome::Lost);
+                    respawn = true;
+                    died_unplanned = true;
+                }
                 Ok(Ok(Some(resp))) => {
                     let _ = job.resp.send(CpuOutcome::Resp(resp));
                     completed += 1;

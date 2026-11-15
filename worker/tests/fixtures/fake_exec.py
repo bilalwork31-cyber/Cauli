@@ -69,6 +69,13 @@ def handle(task, args, kwargs):
     raise KeyError("unknown fake task %r" % (task,))
 
 
+GHOST_RESPONSE = {
+    "id": "ffffffffffffffffffffffffffffffff",
+    "ok": True,
+    "result": "GHOST_SECRET_MARKER",
+}
+
+
 def _on_alarm(signum, frame):
     raise SoftTimeLimitExceeded("soft time limit exceeded")
 
@@ -126,6 +133,10 @@ def stdio_main():
             req = json.loads(line)
         except Exception:
             continue
+        if req.get("task") == "fx.cpu_ghost":
+            # One unsolicited line before the real response, as a task that
+            # forked and returned in both processes would produce.
+            sys.stdout.write(json.dumps(GHOST_RESPONSE) + "\n")
         out = run_request(req, threaded=False)
         sys.stdout.write(json.dumps(out) + "\n")
         sys.stdout.flush()
@@ -183,15 +194,8 @@ def child_main(sock_path, threads):
                 # request, carrying a marker string in place of real task
                 # output, before the real response. Lets an e2e test confirm
                 # the worker's log line for that branch does not include
-                # response payload content. Only reachable with the fork
-                # server pool: the stdio fallback path matches no id at all.
-                send(
-                    {
-                        "id": "ffffffffffffffffffffffffffffffff",
-                        "ok": True,
-                        "result": "GHOST_SECRET_MARKER",
-                    }
-                )
+                # response payload content.
+                send(GHOST_RESPONSE)
             send(run_request(req, threaded=False))
         return 0
 
