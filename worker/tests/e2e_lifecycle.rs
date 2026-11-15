@@ -176,6 +176,8 @@ async fn kill9_mid_ack_flush_loses_nothing(c: &mut redis::aio::MultiplexedConnec
 /// eligible backlog per tick, not one `--batch` page.
 async fn bulk_recovery_drains_backlog_per_tick(c: &mut redis::aio::MultiplexedConnection) {
     const N: usize = 192;
+    // --redis-timeout 1 keeps the reclaim margin at its 2s floor. At the
+    // default 5s the wait below is 12s, and the total sat on the 17s bound.
     let pool_flags = [
         "--io-threads",
         "64",
@@ -183,6 +185,8 @@ async fn bulk_recovery_drains_backlog_per_tick(c: &mut redis::aio::MultiplexedCo
         "256",
         "--visibility-timeout",
         "2",
+        "--redis-timeout",
+        "1",
     ];
     let mut w1 = Worker::spawn("bulkq", &pool_flags);
     wait_group(c, "bulkq", 20).await;
@@ -244,11 +248,11 @@ async fn bulk_recovery_drains_backlog_per_tick(c: &mut redis::aio::MultiplexedCo
         remaining.len()
     );
     let spread = total - first_result_at.unwrap();
-    // Idle ~7s + one 1s tick + 3s of execution ≈ 11-12s; one page per tick needs
-    // ~21s total with ~12s spread. Bounds sit between.
+    // Idle ~9s + one 1s tick + 3s of execution ≈ 13-14s; one page per tick needs
+    // ~23s total with ~12s spread. Bounds sit between.
     assert!(
         total < std::time::Duration::from_secs(17),
-        "recovery took {total:?}; per-tick reclaim is trickling again (pre-fix behavior ~21s)"
+        "recovery took {total:?}; per-tick reclaim is trickling again (~23s)"
     );
     assert!(
         spread < std::time::Duration::from_secs(7),
