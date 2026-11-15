@@ -385,3 +385,22 @@ def test_successive_event_loops_do_not_leak_connections(redis_url, redis_client)
         asyncio.run(t.adelay(i))
     gc.collect()
     assert len(redis_client.client_list()) - before <= 1
+
+
+def test_a_sync_only_injected_client_fails_the_async_calls_loudly(
+    redis_url, monkeypatch
+):
+    """adelay used to fall back to redis://localhost:6379 while delay went to
+    the injected client: two halves of one app on two servers."""
+    monkeypatch.delenv("CAULI_REDIS_URL", raising=False)
+    app = AsyncCauli(redis_client=redis_lib.Redis.from_url(redis_url))
+
+    @app.task(name="t")
+    async def t():
+        return None
+
+    async def run():
+        await t.adelay()
+
+    with pytest.raises(RuntimeError, match="async_redis_client"):
+        asyncio.run(run())

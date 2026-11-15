@@ -215,6 +215,7 @@ class Cauli:
     ) -> None:
         env_redis_url = os.environ.get("CAULI_REDIS_URL")
         self.redis_url: str = redis_url or env_redis_url or _DEFAULT_REDIS_URL
+        self._redis_url_given = bool(redis_url or env_redis_url)
         if not redis_url and not env_redis_url:
             # An unrelated redis on 6379 would swallow tasks silently. warning
             # is visible with no logging configured.
@@ -729,6 +730,16 @@ class AsyncCauli(Cauli):
         from redis import asyncio as aioredis
 
         if self.async_redis_client is None:
+            if self.redis_client is not None and not self._redis_url_given:
+                # Building from the default URL would send every awaited call
+                # to localhost while .delay() goes to the injected client.
+                raise RuntimeError(
+                    f"{type(self).__name__} was given redis_client but neither "
+                    "async_redis_client nor a redis_url, so the asyncio calls "
+                    "(adelay, aget, aenqueue_many) have no Redis to use. Pass "
+                    "async_redis_client=, a redis.asyncio client or a factory "
+                    "for the same server"
+                )
             return aioredis.Redis.from_pool(
                 aioredis.BlockingConnectionPool.from_url(
                     self.redis_url,
