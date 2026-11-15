@@ -8,28 +8,14 @@ ran a different CPython and could not import the app's C extensions.
 
 from __future__ import annotations
 
-import importlib.util
 import os
 import sys
 import sysconfig
-import uuid
 from pathlib import Path
 
 import pytest
 
-SHIM_PATH = Path(__file__).resolve().parents[2] / "worker" / "src" / "shim.py"
 OWN_NAME = f"python{sys.version_info.major}.{sys.version_info.minor}{sys.abiflags}"
-
-
-@pytest.fixture()
-def shim():
-    name = f"cauli_shim_test_{uuid.uuid4().hex}"
-    spec = importlib.util.spec_from_file_location(name, SHIM_PATH)
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[name] = mod
-    spec.loader.exec_module(mod)
-    yield mod
-    del sys.modules[name]
 
 
 def _own_interpreter() -> str:

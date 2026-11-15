@@ -445,7 +445,15 @@ def _run_sync_inner(name, args, kwargs, soft_timeout_ms, meta=None):
 
 def _loop_main(loop):
     asyncio.set_event_loop(loop)
-    loop.run_forever()
+    while True:
+        try:
+            loop.run_forever()
+            return
+        except (SystemExit, KeyboardInterrupt):
+            # asyncio re-raises these out of run_forever from any Task, which
+            # would end this thread and wedge every async task behind it. The
+            # Task already holds the exception, so its awaiter still fails.
+            traceback.print_exc()
 
 
 def _new_loop():
