@@ -63,6 +63,19 @@ def test_a_venv_over_a_different_python_is_not_used(shim, tmp_path, monkeypatch)
     assert shim.cpu_child_python() == own
 
 
+def test_the_venv_wins_when_sys_executable_is_its_own_base_interpreter(
+    shim, tmp_path, monkeypatch
+):
+    """A venv over the system python, never activated: an embedded
+    sys.executable is the system python3 off PATH, which lacks the venv's
+    packages."""
+    own = _own_interpreter()
+    venv_python = _venv_over(own, tmp_path / "venv")
+    monkeypatch.setattr(sys, "executable", own)
+    monkeypatch.setenv("VIRTUAL_ENV", str(tmp_path / "venv"))
+    assert shim.cpu_child_python() == venv_python
+
+
 def test_sys_executable_is_kept_when_it_is_this_interpreter(shim, monkeypatch):
     own = _own_interpreter()
     monkeypatch.setattr(sys, "executable", own)

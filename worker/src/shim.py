@@ -316,8 +316,11 @@ def cpu_child_python():
         base_dir = venv_home(exe) or os.path.dirname(real)
         return base_dir == home
 
+    # The venv first: an embedded sys.executable is "python3" off PATH, and
+    # when that is the venv's own base interpreter it also belongs, but
+    # starts children without the venv's packages.
     venv = os.environ.get("VIRTUAL_ENV")
-    for exe in (sys.executable, venv and os.path.join(venv, "bin", "python")):
+    for exe in (venv and os.path.join(venv, "bin", "python"), sys.executable):
         if belongs(exe):
             return exe
     own = os.path.join(home, own_name)
