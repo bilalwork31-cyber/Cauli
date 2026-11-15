@@ -1,4 +1,4 @@
-"""Test 6: cauli._exec subprocess end to end over the line pipe protocol (PROTOCOL.md 5.1)."""
+"""The cauli._exec subprocess end to end over the line pipe protocol (PROTOCOL.md 5.1)."""
 
 from __future__ import annotations
 
@@ -204,7 +204,7 @@ def test_retry_response_with_non_numeric_countdown_falls_back(child):
 
 
 def test_retry_recognized_by_duck_type_not_isinstance(child):
-    # M6 regression: a "Retry" class that does NOT subclass cauli.exceptions.Retry
+    # A "Retry" class that does NOT subclass cauli.exceptions.Retry
     # must still be recognized (name + .countdown duck typing), matching
     # worker/src/shim.py's rule for io tasks.
     resp = child.request(

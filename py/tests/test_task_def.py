@@ -1,4 +1,4 @@
-"""Test 7: is_async detection, kind validation, name defaults, unit conversions."""
+"""is_async detection, kind validation, name defaults, unit conversions."""
 
 from __future__ import annotations
 

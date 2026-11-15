@@ -1,4 +1,4 @@
-"""Test 5: decorated tasks stay directly callable without a broker."""
+"""Decorated tasks stay directly callable without a broker."""
 
 from __future__ import annotations
 

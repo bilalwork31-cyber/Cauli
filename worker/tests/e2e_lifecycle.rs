@@ -67,9 +67,9 @@ async fn e2e_sigterm_drain_and_sigkill_recovery() {
 
     back_to_back_stop_signals_still_drain(&mut c).await;
     kill9_mid_ack_flush_loses_nothing(&mut c).await;
-    h1_visibility_floor_does_not_reclaim_long_task(&mut c).await;
-    h2_sync_pool_survives_hard_timeout_abandonment(&mut c).await;
-    m8_cli_floors_reject_zero();
+    visibility_floor_does_not_reclaim_long_task(&mut c).await;
+    sync_pool_survives_hard_timeout_abandonment(&mut c).await;
+    cli_rejects_values_that_cannot_work();
     mem1_async_backstop_fires_cleanly(&mut c).await;
     bulk_recovery_drains_backlog_per_tick(&mut c).await;
 
@@ -192,7 +192,8 @@ async fn bulk_recovery_drains_backlog_per_tick(c: &mut redis::aio::MultiplexedCo
     wait_group(c, "bulkq", 20).await;
 
     // 1s sleepers, timeout_ms 5000 (covers the ~2s worst in-pool queue wait
-    // behind 64 threads), so required_idle = max(2000, 5000+2000) = 7s.
+    // behind 64 threads), so required_idle = 5000 + 2000 grace + 2000 margin
+    // = 9s.
     let mut ids = Vec::with_capacity(N);
     for _ in 0..N {
         let (id, e) = envelope("fx.slow", "bulkq", |v| {
@@ -297,7 +298,7 @@ async fn mem1_async_backstop_fires_cleanly(c: &mut redis::aio::MultiplexedConnec
 
 /// `--batch 0`, `--visibility-timeout 0` and `--max-envelope-bytes 0` exit 1
 /// at startup.
-fn m8_cli_floors_reject_zero() {
+fn cli_rejects_values_that_cannot_work() {
     let mut bad_batch = Worker::spawn("m8q", &["--batch", "0"]);
     assert_eq!(bad_batch.wait_code(15), 1, "--batch 0 must be rejected");
     drop(bad_batch);
@@ -329,7 +330,7 @@ fn m8_cli_floors_reject_zero() {
 
 /// A task running past a low visibility_timeout with a large timeout_ms must
 /// not be reclaimed and run twice: reclaim also checks the envelope's idle.
-async fn h1_visibility_floor_does_not_reclaim_long_task(c: &mut redis::aio::MultiplexedConnection) {
+async fn visibility_floor_does_not_reclaim_long_task(c: &mut redis::aio::MultiplexedConnection) {
     let mut w = Worker::spawn("h1q", &["--visibility-timeout", "1"]);
     wait_group(c, "h1q", 20).await;
 
@@ -359,7 +360,7 @@ async fn h1_visibility_floor_does_not_reclaim_long_task(c: &mut redis::aio::Mult
 
 /// After a sync hard timeout abandons a thread, a replacement thread runs new
 /// tasks at once. --io-threads 1 pins the wedged thread.
-async fn h2_sync_pool_survives_hard_timeout_abandonment(c: &mut redis::aio::MultiplexedConnection) {
+async fn sync_pool_survives_hard_timeout_abandonment(c: &mut redis::aio::MultiplexedConnection) {
     let mut w = Worker::spawn("h2q", &["--io-threads", "1"]);
     wait_group(c, "h2q", 20).await;
 
