@@ -145,6 +145,10 @@ fn real_main() -> i32 {
         );
         return 1;
     }
+    if let Some(msg) = flag_ceiling_error(&args) {
+        error!("{msg}");
+        return 1;
+    }
     if args.concurrency == Some(0) {
         error!("-c/--concurrency must be >= 1");
         return 1;
@@ -680,6 +684,41 @@ fn longest_timeout_past_drain(
         .map(|(name, spec)| (name.as_str(), spec.timeout_ms))
 }
 
+/// Sizes the cpu admission semaphore, which panics past tokio's permit
+/// ceiling on the first cpu task. The same bound as `--cpu-child-threads`.
+const MAX_CPU_PREFETCH: usize = 1024;
+
+/// The completion channel holds four times this, and tokio panics on a
+/// channel past its permit ceiling. A million is far beyond any flush.
+const MAX_ACK_BATCH: usize = 1_000_000;
+
+/// Added to an `Instant`, which panics on overflow. 30 days is already no
+/// drain at all.
+const MAX_DRAIN_TIMEOUT_S: u64 = 30 * 86_400;
+
+/// A flag value that would panic later instead of failing at startup.
+fn flag_ceiling_error(args: &cli::Args) -> Option<String> {
+    if args.cpu_prefetch > MAX_CPU_PREFETCH {
+        return Some(format!(
+            "--cpu-prefetch must be at most {MAX_CPU_PREFETCH} (got {})",
+            args.cpu_prefetch
+        ));
+    }
+    if args.ack_batch > MAX_ACK_BATCH {
+        return Some(format!(
+            "--ack-batch must be at most {MAX_ACK_BATCH} (got {})",
+            args.ack_batch
+        ));
+    }
+    if args.drain_timeout > MAX_DRAIN_TIMEOUT_S {
+        return Some(format!(
+            "--drain-timeout must be at most {MAX_DRAIN_TIMEOUT_S} seconds (got {})",
+            args.drain_timeout
+        ));
+    }
+    None
+}
+
 /// Four times the ~1000 thread sync knee: above it is a typo, and the eager
 /// spawn would run until the OS refuses and then panic.
 const MAX_IO_THREADS: usize = 4096;
@@ -914,6 +953,29 @@ mod tests {
             longest_timeout_past_drain(&registry(&[("t", u64::MAX)]), u64::MAX),
             None
         );
+    }
+
+    #[test]
+    fn amqp_prefetch_splits_the_slots_across_queues_and_never_reaches_zero() {
+        assert_eq!(amqp_prefetch(256, 0, 1), 256);
+        assert_eq!(amqp_prefetch(256, 40, 2), 148);
+        assert_eq!(amqp_prefetch(2, 0, 8), 1, "0 would mean unlimited");
+        assert_eq!(amqp_prefetch(usize::MAX, usize::MAX, 1), u16::MAX);
+    }
+
+    #[test]
+    fn flags_that_would_panic_later_are_refused_at_startup() {
+        let parse = |flag: &str, value: &str| {
+            cli::Args::try_parse_from(["cauli-worker", "-A", "m:app", flag, value]).unwrap()
+        };
+        let defaults = cli::Args::try_parse_from(["cauli-worker", "-A", "m:app"]).unwrap();
+        assert_eq!(flag_ceiling_error(&defaults), None);
+        assert_eq!(flag_ceiling_error(&parse("--cpu-prefetch", "1024")), None);
+        for flag in ["--cpu-prefetch", "--ack-batch", "--drain-timeout"] {
+            let msg = flag_ceiling_error(&parse(flag, "18446744073709551615"))
+                .unwrap_or_else(|| panic!("{flag} u64::MAX must be refused"));
+            assert!(msg.contains(flag), "{msg}");
+        }
     }
 
     #[test]

@@ -313,6 +313,14 @@ fn m8_cli_floors_reject_zero() {
         "--max-envelope-bytes 0 must be rejected"
     );
     drop(bad_meb);
+
+    // Each of these used to start and panic later: on the first cpu task, at
+    // startup, and on SIGTERM.
+    for flag in ["--cpu-prefetch", "--ack-batch", "--drain-timeout"] {
+        let mut huge = Worker::spawn("m8q", &[flag, "18446744073709551615"]);
+        assert_eq!(huge.wait_code(15), 1, "{flag} u64::MAX must be rejected");
+        drop(huge);
+    }
 }
 
 /// A task running past a low visibility_timeout with a large timeout_ms must
