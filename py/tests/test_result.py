@@ -1,4 +1,4 @@
-"""Test 4: AsyncResult against result JSONs written directly to redis (PROTOCOL.md section 8)."""
+"""AsyncResult against result JSONs written directly to redis (PROTOCOL.md section 8)."""
 
 from __future__ import annotations
 
@@ -371,3 +371,18 @@ def test_get_returns_as_soon_as_the_result_lands(app, redis_client):
     elapsed = time.monotonic() - started
     t.join()
     assert elapsed < 0.035, f"took {elapsed * 1000:.1f}ms, ramp is not engaging"
+
+
+@pytest.mark.parametrize("status", ["failure", "expired"])
+@pytest.mark.parametrize("error", ["boom", ["boom"], 7])
+def test_an_error_that_is_not_an_object_is_an_invalid_result(
+    app, redis_client, status, error
+):
+    ar = _ar(app)
+    _write_result(
+        redis_client, ar.id, {"status": status, "result": None, "error": error}
+    )
+    with pytest.raises(TaskFailedError) as raised:
+        ar.get(timeout=1)
+    assert raised.value.type == "InvalidResult"
+    assert raised.value.origin == "client"
