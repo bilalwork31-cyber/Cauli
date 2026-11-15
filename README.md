@@ -171,9 +171,11 @@ Bugs and questions: [github.com/bilalwork31-cyber/Cauli/issues](https://github.c
 
 ## Status
 
-cauli 0.1.0, the first public release. The envelope, the Redis key layout and
-the stats line key set are stable; any change to them before 1.0 is called out
-as breaking in the changelog. There is no third party production mileage yet.
+cauli 1.0.0, the first stable release. The envelope, the Redis key layout and
+the stats line key set are stable: changing one is a major version. RabbitMQ
+and SQS as the task queue are beta, tested against RabbitMQ 3.12 and an SQS
+emulator but not yet against AWS itself. There is no third party production
+mileage yet.
 
 ## License
 
