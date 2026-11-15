@@ -1080,3 +1080,44 @@ def test_an_entry_that_cannot_be_fired_does_not_delay_the_others(
     beat.tick()
     store.clock += 1_000
     assert beat.tick() <= 0.25, "the next fast slot is 250 ms away"
+
+
+def test_the_hash_field_names_an_entry_whatever_its_json_says(
+    beat_app, store, redis_client
+):
+    """An entry copied to a new field keeps its source's "name" in the JSON.
+    Seeded under the field and claimed under the JSON name, it never fired."""
+    beat_app.add_periodic_task("nightly", "app.ping", interval(60))
+    beat = make_beat(beat_app, store)
+    beat.sync_code_entries()
+    copied = json.loads(redis_client.hget(SCHEDULE_KEY, "nightly"))
+    copied["source"] = "admin"
+    redis_client.hset(SCHEDULE_KEY, "nightly-copy", json.dumps(copied))
+
+    assert store.load()["nightly-copy"].name == "nightly-copy"
+    beat.tick()
+    store.clock += 60_000
+    beat.tick()
+
+    assert sorted(env["beat_name"] for env in stream(redis_client)) == [
+        "nightly",
+        "nightly-copy",
+    ]
+
+
+def test_beat_does_not_publish_an_envelope_over_the_producer_limit(
+    beat_app, store, redis_client, caplog
+):
+    beat_app.max_envelope_bytes = 600
+    beat_app.add_periodic_task("big", "app.ping", interval(60), args=("x" * 2000,))
+    beat = make_beat(beat_app, store)
+    beat.sync_code_entries()
+    beat.tick()
+    store.clock += 60_000
+
+    with caplog.at_level(logging.ERROR, logger="cauli.beat"):
+        beat.tick()
+
+    assert beat.fired == 0
+    assert stream(redis_client) == []
+    assert "600 byte limit" in caplog.text

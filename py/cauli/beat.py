@@ -208,7 +208,10 @@ class RedisScheduleStore(ScheduleStore):
             name = _text(key) or ""
             try:
                 doc = _codec.decode(value)
-                doc.setdefault("name", name)
+                # The hash field is the identity (PROTOCOL.md 10.2). A copied
+                # entry still carrying its source's "name" would be seeded
+                # under one name and claimed under the other, and never fire.
+                doc["name"] = name
                 out[name] = ScheduleEntry.from_dict(doc)
             except Exception as exc:
                 # One bad entry must not stop every other entry firing.
@@ -534,6 +537,11 @@ class Beat:
                     idempotency_key=idempotency_key,
                     now=now,
                 )
+                # Informational; the worker preserves but ignores it (PROTOCOL.md 2).
+                envelope["beat_name"] = entry.name
+                envelope["beat_slot"] = slot
+                # A producer must refuse an envelope over its limit.
+                self.app._encode_envelope(envelope)
             except Exception as exc:
                 log.error("beat: cannot build envelope for %r: %s", entry.name, exc)
                 return False
