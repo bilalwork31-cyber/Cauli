@@ -51,7 +51,7 @@ classifiers = [
 # share one wire contract (PROTOCOL.md). Pinned exactly rather than ranged: the
 # two halves are one release cut in two, so a mismatched pair is a bug and not
 # a convenience. scripts/check_versions.py gates this pin on every push.
-dependencies = ["cauli==0.1.0"]
+dependencies = ["cauli==0.2.0"]
 dynamic = ["version"]
 
 [project.urls]
