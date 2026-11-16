@@ -375,6 +375,19 @@ async fn idempotency_and_timeouts(c: &mut redis::aio::MultiplexedConnection) {
         efield.len() <= 4096,
         "oversize envelope must be stored truncated, not in full"
     );
+
+    // Oversize with the id inside the preview: the caller still gets a result.
+    let id = unique_id();
+    let raw = format!(
+        r#"{{"v":1,"id":"{id}","task":"fx.echo","args":["{}"]}}"#,
+        "x".repeat(2_000_000)
+    );
+    xadd(c, "default", &raw).await;
+    let (reason, _, _) = wait_dlq(c, "default", &id, 10).await;
+    assert_eq!(reason, "malformed");
+    let r = wait_result(c, &id, 10).await;
+    assert_eq!(r["status"], "failure");
+    assert_eq!(r["error"]["type"], "Malformed");
 }
 
 /// A failed result write must not count `ok`. result_ttl=0 makes Redis reject

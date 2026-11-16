@@ -1,4 +1,4 @@
-"""Test 3: task options land in TaskDef attrs AND the envelope; queue precedence; idempotency_key."""
+"""Task options land in TaskDef attrs AND the envelope; queue precedence; idempotency_key."""
 
 from __future__ import annotations
 
@@ -162,7 +162,7 @@ def test_env_redis_url_does_not_log_the_default_notice(monkeypatch, caplog):
 
 
 def test_repr_redacts_credentials():
-    # M4 regression: a redis URL with embedded credentials must never appear
+    # A redis URL with embedded credentials must never appear
     # in plaintext in repr() (logs/tracebacks commonly include repr output).
     app = Cauli(redis_url="redis://user:hunter2@dbhost:6379/0")
     r = repr(app)
@@ -174,7 +174,7 @@ def test_repr_redacts_credentials():
     app2 = Cauli(redis_url="redis://dbhost:6379/0")
     assert "redis://dbhost:6379/0" in repr(app2)
 
-    # M4 follow up: userinfo is split at the LAST at sign, matching
+    # Userinfo is split at the LAST at sign, matching
     # urllib.parse (what redis-py itself uses) -- splitting at the first one
     # used to leave the rest of a password containing "@" in plaintext.
     app3 = Cauli(redis_url="redis://user:p@ss@dbhost:6379/0")

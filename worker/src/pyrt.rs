@@ -31,6 +31,9 @@ pub struct TaskSpec {
 #[derive(Deserialize, Debug)]
 pub struct AppConfig {
     pub redis_url: String,
+    /// PROTOCOL §14: RabbitMQ or SQS as the ready queue; None is Redis.
+    #[serde(default)]
+    pub broker_url: Option<String>,
     pub default_queue: String,
     pub result_ttl: u64,
     pub idemp_ttl: u64,

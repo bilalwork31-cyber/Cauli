@@ -1,13 +1,32 @@
 from __future__ import annotations
 
+import importlib.util
 import shutil
 import subprocess
+import sys
 import time
+import uuid
+from pathlib import Path
 
 import pytest
 import redis as redis_lib
 
 from cauli import Cauli
+
+SHIM_PATH = Path(__file__).resolve().parents[2] / "worker" / "src" / "shim.py"
+
+
+@pytest.fixture()
+def shim():
+    """The worker's embedded shim, imported as a plain module."""
+    name = f"cauli_shim_test_{uuid.uuid4().hex}"
+    spec = importlib.util.spec_from_file_location(name, SHIM_PATH)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    yield mod
+    del sys.modules[name]
+
 
 REDIS_PORT = 6391  # throwaway test instance; never the shared 6379
 REDIS_URL = f"redis://127.0.0.1:{REDIS_PORT}/0"

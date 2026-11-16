@@ -24,6 +24,13 @@ pub struct Args {
     #[arg(long)]
     pub redis_url: Option<String>,
 
+    /// RabbitMQ (amqp://, amqps://) or SQS (sqs://, sqs://<region>) as the
+    /// task queue; Redis still holds results, delayed tasks and idempotency
+    /// keys. Unset: Redis is the queue too.
+    /// Precedence: CLI > env CAULI_BROKER_URL > app.broker_url
+    #[arg(long)]
+    pub broker_url: Option<String>,
+
     /// Total concurrency: max tasks in flight across all worker processes.
     /// The one knob most deployments need. Derives the process count and the
     /// tuning flags (see --help); a flag passed explicitly still wins.

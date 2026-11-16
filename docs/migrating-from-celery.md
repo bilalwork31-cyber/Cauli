@@ -6,8 +6,11 @@ What changes when a Celery deployment moves to cauli. Three hard stops first:
    3.10 to 3.14 or free threaded 3.14t. macOS and Windows can enqueue and run
    `cauli-beat`, not tasks. musl (Alpine) and free threaded 3.13t fail the
    install.
-2. **Redis is the only broker and result backend.** The worker refuses Redis
-   Cluster. Sentinel works from the client and `cauli-beat`, not the worker.
+2. **Redis is required, and is the only result backend.** RabbitMQ or SQS
+   can carry the task queue, but Redis still holds results, delayed tasks and
+   the schedule ([PROTOCOL.md section 14](../PROTOCOL.md#14-rabbitmq-and-sqs-as-the-ready-queue)).
+   The worker refuses Redis Cluster. Sentinel works from the client and
+   `cauli-beat`, not the worker.
 3. **No chains, groups, chords, rate limits or priorities**, and none planned.
 
 ## What ports directly
@@ -113,7 +116,9 @@ runs and the assertion fails with nothing enqueued. Use
 | `celery inspect`, `celery purge`, `celery control` | No equivalent. `cauli-beat` is the only console script besides the worker |
 | Flower or any dashboard | None. The operator interface is a stats log line every `--stats-interval` seconds |
 | A metrics endpoint, JSON logging, a health endpoint | All rejected for now. Scraping means parsing a log line |
-| Brokers other than Redis | Not planned |
+| `broker_url = "amqp://..."` | `Cauli(broker_url="amqp://...")`. Quorum queues only, named `cauli.q.<queue>`: a Celery queue is not reused |
+| `broker_url = "sqs://..."` | `Cauli(broker_url="sqs://<region>")`. Standard queues named `cauli-<queue>`, credentials from the AWS chain only |
+| Brokers other than Redis, RabbitMQ and SQS | Not planned |
 | Result backends other than Redis | Not planned |
 | Pickle or a custom serializer | Not planned. JSON only, by design |
 | `task_always_eager` | No setting, but a task stays a plain callable: `crunch([1, 2])` runs inline with no broker |

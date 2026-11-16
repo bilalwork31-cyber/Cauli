@@ -142,6 +142,13 @@ pub struct StartCfg {
     pub no_fork_server: bool,
 }
 
+/// Executing plus staged prefetch; see `CpuPool::admission`.
+pub fn admission_slots(workers: usize, child_threads: usize, prefetch: usize) -> usize {
+    workers
+        .saturating_mul(child_threads.max(1).saturating_add(prefetch))
+        .max(1)
+}
+
 /// Start the cpu pool. Tries fork-server mode unless `no_fork_server`; any
 /// startup failure there (listener bind, parent spawn, no server-ready line)
 /// logs a warning and falls back to stdio mode.
@@ -159,12 +166,11 @@ pub async fn start(cfg: StartCfg, counters: Arc<Counters>) -> CpuPool {
     // Twice the in flight capacity. Prefetched requests live in the children.
     let cap = (2 * workers * child_threads).max(1);
     let (tx, rx) = async_channel::bounded::<CpuJob>(cap);
-    // Executing plus staged prefetch; see `CpuPool::admission`.
-    let admission = Arc::new(Semaphore::new(
-        workers
-            .saturating_mul(child_threads.saturating_add(prefetch))
-            .max(1),
-    ));
+    let admission = Arc::new(Semaphore::new(admission_slots(
+        workers,
+        child_threads,
+        prefetch,
+    )));
     let overflow = Arc::new(AtomicUsize::new(0));
     let drained = Arc::new(Notify::new());
     let pids = Arc::new(Mutex::new(Vec::new()));
@@ -742,6 +748,11 @@ struct IdOnly<'a> {
     id: Option<&'a str>,
 }
 
+/// True when a stdio child's response line carries the request's id.
+fn answers(line: &str, request_id: &str) -> bool {
+    serde_json::from_str::<IdOnly>(line).is_ok_and(|resp| resp.id == Some(request_id))
+}
+
 enum ChildGone {
     /// Read EOF or a failed write: the child is gone, possibly reaped by the
     /// parent already, so its pid may be reused. Must not be SIGKILLed.
@@ -1074,6 +1085,19 @@ async fn stdio_child_loop(
             }
 
             match timeout(Duration::from_millis(job.timeout_ms), lines.next_line()).await {
+                Ok(Ok(Some(resp))) if !answers(&resp, &job.id) => {
+                    // One stray line (a task that forked and returned twice)
+                    // would hand every later task its predecessor's result.
+                    // Never log the line: it carries task data.
+                    warn!(
+                        "cpu[{idx}] pid={pid}: response does not answer the request in \
+                         flight (len={}); SIGKILL + respawn (WorkerLost)",
+                        resp.len()
+                    );
+                    let _ = job.resp.send(CpuOutcome::Lost);
+                    respawn = true;
+                    died_unplanned = true;
+                }
                 Ok(Ok(Some(resp))) => {
                     let _ = job.resp.send(CpuOutcome::Resp(resp));
                     completed += 1;

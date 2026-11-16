@@ -53,6 +53,20 @@ jobs:
       fail-fast: false
       matrix:
         python-version: ["3.10", "3.11", "3.12", "3.13", "3.14", "3.14t"]
+    # The brokers of PROTOCOL.md section 14. ElasticMQ stands in for SQS.
+    services:
+      rabbitmq:
+        image: rabbitmq:3.13
+        ports: ["5672:5672"]
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q ping"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+      elasticmq:
+        image: softwaremill/elasticmq-native:1.6.11
+        ports: ["9324:9324"]
+    env:
+      CAULI_TEST_AMQP_URL: amqp://guest:guest@127.0.0.1:5672/
+      CAULI_TEST_SQS_ENDPOINT: http://127.0.0.1:9324
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-python@v7
@@ -66,6 +80,7 @@ jobs:
           # a release, so third party deps go first and cauli goes in with --no-deps.
           # The packaging job proves the pin against the wheels it builds.
           pip install "redis>=5.0.1" "msgspec>=0.18" tzdata "pytest>=8"
+          pip install "amqp>=5.1" "boto3>=1.28.57"
           pip install -e py --no-deps
           pip install ruff==0.15.22
       - name: ruff check
@@ -89,6 +104,20 @@ jobs:
       matrix:
         # 3.14t: the free threaded build, worker embedded with the GIL off.
         python-version: ["3.12", "3.14t"]
+    # The brokers of PROTOCOL.md section 14. ElasticMQ stands in for SQS.
+    services:
+      rabbitmq:
+        image: rabbitmq:3.13
+        ports: ["5672:5672"]
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q ping"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+      elasticmq:
+        image: softwaremill/elasticmq-native:1.6.11
+        ports: ["9324:9324"]
+    env:
+      CAULI_TEST_AMQP_URL: amqp://guest:guest@127.0.0.1:5672/
+      CAULI_TEST_SQS_ENDPOINT: http://127.0.0.1:9324
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -106,12 +135,14 @@ jobs:
         # --no-deps: cauli-worker is the binary cargo just built, not PyPI's.
         run: |
           pip install "redis>=5.0.1" "msgspec>=0.18" tzdata pytest
+          pip install "amqp>=5.1" "boto3>=1.28.57"
           pip install -e py --no-deps
       - name: Run itest
         working-directory: itest
         env:
           CAULI_WORKER_BIN: ${{ github.workspace }}/worker/target/release/cauli-worker
           CAULI_VENV: ${{ env.pythonLocation }}
+          CAULI_TEST_RABBITMQCTL: docker exec ${{ job.services.rabbitmq.id }} rabbitmqctl
         run: pytest -q
 
   package:

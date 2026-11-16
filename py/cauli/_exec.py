@@ -58,12 +58,18 @@ def _format_traceback(exc: BaseException) -> str:
     return text
 
 
+def _wire_text(text: str) -> str:
+    """``text`` with lone surrogates replaced: JSON cannot carry them, and an
+    error that fails to encode would be recorded as a SerializationError."""
+    return text.encode("utf-8", "replace").decode("utf-8")
+
+
 def _error_json(exc: BaseException, origin: str = "task") -> dict[str, Any]:
     # PROTOCOL.md section 8: "worker" only where cauli synthesized the error.
     return {
         "type": type(exc).__name__,
-        "message": str(exc),
-        "traceback": _format_traceback(exc),
+        "message": _wire_text(str(exc)),
+        "traceback": _wire_text(_format_traceback(exc)),
         "origin": origin,
     }
 

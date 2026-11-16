@@ -94,7 +94,7 @@ def retryme(countdown=None):
 class _DuckRetry(Exception):
     """A duck-typed lookalike of cauli.Retry that does NOT subclass it.
 
-    Used to regression-test M6: `_exec.py` must recognize a forced retry by
+    `_exec.py` must recognize a forced retry by
     class NAME + `.countdown` (matching worker/src/shim.py's rule), not by
     `isinstance(exc, cauli.exceptions.Retry)` -- the old isinstance-based
     check would silently miss this and treat it as a plain failure. Renamed

@@ -1,4 +1,4 @@
-"""Test 2: countdown enqueues to the delayed zset (no XADD), score = now + countdown*1000."""
+"""Countdown enqueues to the delayed zset (no XADD), score = now + countdown*1000."""
 
 from __future__ import annotations
 

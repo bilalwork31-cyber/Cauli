@@ -54,6 +54,7 @@ explicit `--io-threads` is not capped by the gate.
 | `-A`, `--app` | required | `module:attr`. The working directory is prepended to `sys.path` |
 | `-Q`, `--queues` | `app.default_queue` | Comma separated queues. Order is dispatch order within a fetch batch |
 | `--redis-url` | from app | Precedence: flag > `CAULI_REDIS_URL` > `app.redis_url` |
+| `--broker-url` | from app | `amqp://`, `amqps://`, `sqs://` or `sqs://<region>`: RabbitMQ or SQS as the task queue, see [Brokers](#brokers). Precedence: flag > `CAULI_BROKER_URL` > `app.broker_url`. Unset means Redis |
 | `--python` | the embedded interpreter's `sys.executable` | Interpreter used to spawn cpu children |
 
 ### IO execution
@@ -130,6 +131,7 @@ options plus `async_redis_client`.
 | `task_routes` | `None` | `{glob: destination}`, `(glob, destination)` pairs, or callables. Overrides the decorator `queue`, never a per call `queue=` |
 | `queue_ttl` | `None` | Seconds, or `{queue: seconds}` with `"*"` as fallback. Measured from enqueue; a delay past it is refused at enqueue |
 | `max_envelope_bytes` | 1048576 | Largest envelope the client publishes. Over it, the call raises `ValueError` and writes nothing |
+| `broker_url` | `CAULI_BROKER_URL`, else `None` | RabbitMQ or SQS as the task queue, see [Brokers](#brokers). `None` means Redis. An unsupported URL raises `ValueError` at construction |
 | `redis_client` | `None` | A `redis.Redis`, or a zero argument factory. Overrides `redis_url` for the client and `cauli-beat`. Sentinel: `Cauli(redis_client=lambda: sentinel.master_for("mymaster"))`. The worker ignores it |
 | `async_redis_client` | `None` | `AsyncCauli` only: a `redis.asyncio.Redis`, or a factory, for the async client |
 
@@ -189,11 +191,40 @@ because the test transaction never commits: use
 | Variable | Read by | Effect |
 |---|---|---|
 | `CAULI_REDIS_URL` | client, `cauli-beat`, worker | Broker URL. For `Cauli()` an explicit `redis_url` wins. For the worker and `cauli-beat` this variable overrides the app's URL and only `--redis-url` beats it. The worker passes it to supervised processes through the environment, never argv |
+| `CAULI_BROKER_URL` | client, `cauli-beat`, worker | RabbitMQ or SQS as the task queue. Same precedence as `CAULI_REDIS_URL`: an explicit `broker_url` wins in `Cauli()`, and only `--broker-url` beats it in the worker |
+| `AWS_*` | client, worker, with an `sqs://` broker | The standard AWS SDK settings: credentials, `AWS_REGION`, `AWS_PROFILE`, `AWS_ENDPOINT_URL_SQS` |
 | `CAULI_ALLOW_REDIS_CLUSTER` | worker | `1`, `true`, `yes` or `on` starts the worker against Redis Cluster instead of exiting 1. Delayed tasks, retries and beat lose work there |
 | `CAULI_LOOP` | worker | Unset: uvloop when importable, else asyncio. `asyncio` forces the stock loop; `uvloop` fails startup without it |
 | `RUST_LOG` | worker | Overrides `--log-level`. The log target is `cauli_worker_bin` for the wheel and `cauli_worker` for a `cargo build` |
 | `VIRTUAL_ENV` | worker | Site packages of this venv are added to the embedded interpreter. The wheel's launcher sets it from the running venv |
 | `CAULI_EXEC_CMD` | worker, `test-hooks` builds only | Replaces the cpu child command |
+
+## Brokers
+
+Redis always holds results, delayed and retried tasks, idempotency keys, dead
+letters and the beat schedule. The task queue itself is Redis Streams unless
+a broker URL names RabbitMQ or SQS. Full behaviour:
+[PROTOCOL.md section 14](../PROTOCOL.md#14-rabbitmq-and-sqs-as-the-ready-queue).
+
+| | Redis (default) | RabbitMQ | SQS |
+|---|---|---|---|
+| Broker URL | unset | `amqp://user:pass@host:5672/vhost`, `amqps://` | `sqs://`, `sqs://<region>` |
+| Install | `pip install cauli` | `pip install 'cauli[rabbitmq]'` | `pip install 'cauli[sqs]'` |
+| Queue created as | stream `cauli:q:<queue>` | durable quorum queue `cauli.q.<queue>` | standard queue `cauli-<queue>` |
+| A dead worker's tasks return after | `--visibility-timeout` | the connection closes | `--visibility-timeout` |
+| Longest task without a second delivery | 24 hours | RabbitMQ's `consumer_timeout`, 30 minutes unless raised | 12 hours |
+| Largest envelope | `max_envelope_bytes` | `max_envelope_bytes` | 1,048,576 bytes |
+| Queue names | `[a-zA-Z0-9_.-]+` | the same | no `.`, at most 74 characters |
+| `oldest_ms` in the stats line | reported | always 0 | always 0 |
+
+With RabbitMQ, set `consumer_timeout` in `rabbitmq.conf` above your longest
+task `timeout`, in milliseconds. With SQS, give the worker `sqs:GetQueueUrl`,
+`sqs:ReceiveMessage`, `sqs:DeleteMessage`, `sqs:ChangeMessageVisibility` and
+`sqs:SendMessage`, and create the queues yourself or add `sqs:CreateQueue`.
+
+When Redis is unreachable while the broker is up, the worker holds finished
+tasks unacked, writes their outcomes once Redis is back, and pauses fetching
+meanwhile. The log says `holding the delivery unacked`.
 
 ## Django settings
 
@@ -203,6 +234,7 @@ Keyword arguments win over settings, which win over the `Cauli` defaults.
 | Setting | Maps to |
 |---|---|
 | `CAULI_REDIS_URL` | `redis_url` |
+| `CAULI_BROKER_URL` | `broker_url` |
 | `CAULI_DEFAULT_QUEUE` | `default_queue` |
 | `CAULI_RESULT_TTL` | `result_ttl` |
 | `CAULI_IDEMP_TTL` | `idemp_ttl` |

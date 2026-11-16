@@ -1,4 +1,4 @@
-"""Test 1: delay() XADDs a single-field 'e' envelope matching PROTOCOL.md section 2 exactly."""
+"""delay() XADDs a single-field 'e' envelope matching PROTOCOL.md section 2 exactly."""
 
 from __future__ import annotations
 

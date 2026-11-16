@@ -1,0 +1,259 @@
+# cauli
+
+> A task queue for Python. You write tasks in Python; one Rust binary,
+> `cauli-worker`, runs them from Redis, RabbitMQ or Amazon SQS. This file is
+> for a coding agent adding cauli to a project: what to write, what to
+> configure, and every mistake that costs a debugging session. It is complete
+> on its own. Read all of it before writing code.
+
+The specification is [PROTOCOL.md](PROTOCOL.md); every flag is
+in [docs/configuration.md](docs/configuration.md).
+
+## What you need
+
+| Part | Requirement |
+|---|---|
+| Worker | Linux only, x86_64 or aarch64, glibc 2.35+, CPython 3.10 to 3.14. No Alpine, no macOS, no Windows |
+| Client (enqueue, results, `cauli-beat`) | Any OS, CPython 3.10 to 3.14 |
+| Redis | 7.0+, standalone, always required. Not Redis Cluster |
+| Optional task queue | RabbitMQ 3.12+ or Amazon SQS. Redis is still required with either |
+
+```bash
+pip install cauli                 # client, and the worker on Linux
+pip install 'cauli[rabbitmq]'     # only with an amqp:// broker
+pip install 'cauli[sqs]'          # only with an sqs:// broker
+```
+
+On macOS or Windows the worker does not install. Develop there by calling
+tasks as plain functions, and run the worker in a Linux container.
+
+## The minimal correct setup
+
+One module owns the app and is importable by both the web process and the
+worker under the same module path.
+
+```python
+# myproj/tasks.py
+import os
+from cauli import Cauli, Retry, current_task
+
+app = Cauli(redis_url=os.environ["CAULI_REDIS_URL"])
+
+@app.task(max_retries=5, timeout=30)
+def send_email(to: str, template: str) -> None:      # def: runs on a thread
+    ...
+
+@app.task(timeout=30)
+async def call_api(url: str) -> int:                  # async def: runs on the event loop
+    ...
+
+@app.task(kind="cpu", timeout=120)
+def render_pdf(order_id: int) -> str:                 # cpu: runs in a child process
+    ...
+```
+
+```python
+# anywhere in the application
+from myproj.tasks import send_email
+
+result = send_email.delay("a@example.com", "welcome")
+result.id                       # store this if you need the outcome later
+result.get(timeout=10)          # always pass a timeout
+```
+
+```bash
+CAULI_REDIS_URL=redis://redis:6379/0 cauli-worker -A myproj.tasks:app -c 50
+```
+
+`-A` is `module:attribute`. `-c 50` means 50 tasks in flight in total.
+`cauli-worker --print-plan -c 50` shows the processes and threads that gives.
+
+From async code use `AsyncCauli` and the `a` calls, which never block the loop:
+
+```python
+from cauli import AsyncCauli
+app = AsyncCauli(redis_url=os.environ["CAULI_REDIS_URL"])
+result = await send_email.adelay("a@example.com", "welcome")
+value = await result.aget(timeout=10)
+```
+
+## Choose the task kind by what the body does
+
+| Body | Write it as | Why |
+|---|---|---|
+| Blocking network or disk calls (`requests`, `psycopg`, boto3, file IO) | `def` | Runs on a thread pool; blocking is fine |
+| `await` only (`httpx.AsyncClient`, `asyncpg`, async ORM) | `async def` | Runs on one event loop |
+| Pure Python CPU work, or anything that must be killable at its timeout, or leaks memory | `def` with `kind="cpu"` | Runs in a child process |
+
+## Rules that prevent bugs
+
+Each of these is a real failure mode, not style advice.
+
+### Delivery
+
+1. **Every task can run more than once.** Delivery is at least once: a
+   crashed worker's tasks run again. Write task bodies so a second run is
+   harmless (upsert, check before charge, use a provider's idempotency key).
+2. **`idempotency_key` narrows duplicates, it does not remove rule 1.**
+   `task.apply_async(args=(...), idempotency_key=f"charge:{order_id}")`
+   suppresses a second task with the same key for `idemp_ttl` (24 hours by
+   default). The key must be a `str`. The second call's result has status
+   `duplicate` and `get()` returns `None`.
+3. **Every exception is retried**, up to `max_retries` (default 3), with
+   backoff. To stop retrying, catch the exception and return. To retry on
+   your own schedule, `raise Retry(countdown=30)`.
+4. **After the last retry the task goes to the dead letter queue** and
+   `get()` raises `TaskFailedError`. The dead letter queue keeps about the
+   newest 1000 entries per queue for 7 days and nothing reads it for you.
+   Alert on the `dlq` counter in the stats line.
+5. `current_task()` inside a task gives `.id`, `.retries`, `.max_retries`,
+   `.queue` and `.is_last_attempt()`.
+
+### Arguments and results
+
+6. **Arguments and return values are JSON only**: `str`, `int`, `float`,
+   `bool`, `None`, `list`, `dict` with `str` keys. A `tuple` arrives as a
+   `list`. `datetime`, `Decimal`, `UUID`, `bytes`, sets and model instances
+   raise `TypeError` at the call site. Pass ids and ISO strings, and load
+   the object inside the task.
+7. **An envelope is at most 1 MiB.** Over that, the call raises
+   `ValueError`. Pass a reference (an object key, a row id), never the
+   payload.
+8. **Always call `get(timeout=...)`.** Without a timeout it can block
+   forever, for example for a task declared `store_result=False`.
+9. **A returned value that is not JSON fails the task** with
+   `SerializationError` and is not retried. Return plain data.
+10. Results live `result_ttl` seconds (default 3600). After that the task
+    looks pending again. Results, arguments and tracebacks are stored in
+    Redis in plaintext: keep secrets out of all three.
+
+### Task bodies
+
+11. **Never make a blocking call inside `async def`.** `time.sleep`,
+    `requests`, a sync database driver or boto3 there freezes the event loop
+    for every async task. The worker detects it and exits with code 87. Use
+    a `def` task for blocking libraries.
+12. **A `def` task past its `timeout` cannot be killed.** It is reported as
+    failed and retried, but the thread keeps running until the call returns.
+    Give every network call its own timeout shorter than the task's, or use
+    `kind="cpu"` when the work must be killable.
+13. **`soft_timeout` differs by lane.** A `def` task gets
+    `SoftTimeLimitExceeded` raised inside it. An `async def` task is
+    cancelled and sees `asyncio.CancelledError`, so `except
+    SoftTimeLimitExceeded` never fires there; use `finally` for cleanup.
+14. **Do not rely on `atexit`.** The worker exits without running Python
+    exit handlers. Flush Sentry, OpenTelemetry or buffered logs in an
+    `@app.after_task` hook or explicitly.
+15. Thread local state survives from one task to the next on the same
+    thread. Reset anything you put there.
+16. Size every connection pool a task uses (database, Redis, HTTP) to at
+    least `--io-threads` for `def` tasks and `--io-concurrency` for
+    `async def` tasks, or tasks queue on the pool.
+
+### Names, queues and scheduling
+
+17. **The task name is `module.function`, taken from where it is defined.**
+    The client and the worker must import the task under the same module
+    path. A task the worker has not imported is dead lettered as
+    `UnregisteredTask`. Make the `-A` module import every task module.
+18. **The worker only consumes the queues it is told to.** With
+    `queue="emails"` on a task or a call, start a worker with
+    `-Q default,emails`. Without `-Q` it consumes only the default queue,
+    and tasks on other queues wait forever. Queue names match
+    `[a-zA-Z0-9_.-]+`.
+19. `eta` and `expires` datetimes must be time zone aware; a naive one
+    raises. `countdown` and `eta` are exclusive. `expires` is measured from
+    enqueue, so an expiry shorter than the delay is refused.
+20. There are no chains, groups, chords, priorities or rate limits. Enqueue
+    the next task from inside the current one. Use separate queues and
+    workers where you wanted priorities.
+21. Periodic tasks: declare with `app.add_periodic_task("name", task,
+    crontab(minute=0, hour=3, timezone="Europe/Berlin"))` or `interval(30)`,
+    and run the separate `cauli-beat -A myproj.tasks:app` process. Two
+    replicas are safe; each slot fires once. Renaming an entry creates a new
+    one.
+
+### Django and SQLAlchemy
+
+22. Django: build the app with `cauli.contrib.django.django_app(
+    "myproj.settings")`. It reads `CAULI_REDIS_URL` and the other `CAULI_*`
+    settings and manages database connections around every task.
+23. **Enqueue from a view with `task.delay_on_commit(...)`**, not `delay`,
+    whenever the task reads rows the request is writing. `delay` inside
+    `transaction.atomic()` can run the task before the commit.
+24. Under `django.test.TestCase` nothing is enqueued by `delay_on_commit`,
+    because the test transaction never commits. Use
+    `self.captureOnCommitCallbacks(execute=True)`.
+25. In an `async def` Django task, do not hold a transaction open across an
+    `await`: async tasks share a small pool of database connections.
+26. Async SQLAlchemy: `cauli.contrib.sqlalchemy.sqlalchemy_app(dsn)` gives one
+    `AsyncSession` per task through `get_session()`. Commit explicitly; an
+    uncommitted write is discarded. Keep `--io-loops 1`.
+27. `AsyncCauli(redis_client=...)` also needs `async_redis_client=...`, or the
+    awaited calls raise.
+
+### Testing
+
+28. A task object is a plain callable: `send_email("a@example.com",
+    "welcome")` runs the body inline with no broker. Unit test task bodies
+    that way. There is no eager mode setting.
+
+## Configuration that production needs
+
+| Setting | Value | Reason |
+|---|---|---|
+| Redis persistence | AOF or RDB on | A Redis that restarts empty loses queued, delayed and retried tasks |
+| Redis `maxmemory-policy` | `noeviction` | Eviction deletes tasks silently |
+| `--drain-timeout` | above your longest task `timeout` | Deploys kill tasks still running after it (default 30 s; they are redelivered) |
+| `--visibility-timeout` | above your longest task `timeout` | Seconds before a dead worker's tasks run elsewhere (default 60) |
+| Process supervisor | systemd, Kubernetes or Docker restart policy | The worker exits on purpose in some failures |
+| `-c` | total tasks in flight | Size database `max_connections` against it |
+| Graceful stop | send SIGTERM, wait `--drain-timeout` | A second SIGTERM a second later forces exit |
+
+Worker exit codes: 0 drained, 1 bad configuration, 87 frozen event loop
+(rule 11), 88 drain timeout with tasks left, 101 panic, 130 forced.
+
+The worker logs one `stats:` line every 10 seconds. Alert on: `dlq` rising,
+`oldest_ms` growing (backlog), `async_rejected` above 0 (frozen loop),
+`sync_abandoned` rising (tasks past their timeout holding threads),
+`cpu_lost` rising (cpu children dying).
+
+Redis URL precedence in the worker: `--redis-url`, then `CAULI_REDIS_URL`,
+then the app's `redis_url`. Use `rediss://` for TLS. Sentinel works from the
+client through `Cauli(redis_client=...)`, not from the worker.
+
+## RabbitMQ or SQS as the task queue (beta)
+
+Set the same `CAULI_BROKER_URL` for every producer and every worker. Redis
+stays required for results, delayed tasks, idempotency keys and `cauli-beat`.
+
+| | RabbitMQ | SQS |
+|---|---|---|
+| URL | `amqp://user:pass@host:5672/vhost` or `amqps://` | `sqs://` or `sqs://<region>` |
+| Queue created | durable quorum queue `cauli.q.<queue>` | standard queue `cauli-<queue>` |
+| Must configure | `consumer_timeout` in `rabbitmq.conf` above your longest task timeout (default 30 minutes) | IAM: `sqs:GetQueueUrl`, `ReceiveMessage`, `DeleteMessage`, `ChangeMessageVisibility`, `SendMessage`; `CreateQueue` or create the queues yourself |
+| Limits | none beyond `max_envelope_bytes` | queue names without `.`; a task over 12 hours is delivered twice |
+| Credentials | in the URL | the AWS credential chain only; a URL with credentials is refused |
+
+SQS has been tested against an emulator, not against AWS itself.
+
+## Before you call it done
+
+- [ ] Every task body is safe to run twice.
+- [ ] Every argument is JSON, and large data is passed by reference.
+- [ ] No blocking call inside an `async def` task.
+- [ ] Every outbound call in a task has a timeout below the task `timeout`.
+- [ ] The worker's `-A` module imports every task module.
+- [ ] The worker's `-Q` lists every queue the code uses.
+- [ ] Every `get()` has a timeout, or the result is not awaited at all.
+- [ ] Redis persists and uses `noeviction`.
+- [ ] `--drain-timeout` and `--visibility-timeout` exceed the longest task timeout.
+- [ ] The worker runs under a supervisor that restarts it.
+- [ ] Alerts exist on `dlq`, `oldest_ms` and `async_rejected`.
+
+## Reference
+
+- [PROTOCOL.md](PROTOCOL.md): delivery guarantees, retries, timeouts, results, beat, the brokers (section 14)
+- [docs/configuration.md](docs/configuration.md): every flag, option, environment variable and Django setting
+- [docs/migrating-from-celery.md](docs/migrating-from-celery.md): the Celery equivalents and what has none
+- [docs/architecture.md](docs/architecture.md): worker internals and known limitations

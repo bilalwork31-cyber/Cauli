@@ -18,7 +18,7 @@ from typing import Any, Callable, Iterable, overload
 
 import redis
 
-from cauli import _codec
+from cauli import _broker, _codec
 from cauli.result import AsyncResult
 from cauli.schedules import ScheduleEntry
 from cauli.task import TaskDef
@@ -212,9 +212,11 @@ class Cauli:
         queue_ttl: Any = None,
         redis_client: Any = None,
         max_envelope_bytes: int = _DEFAULT_MAX_ENVELOPE_BYTES,
+        broker_url: str | None = None,
     ) -> None:
         env_redis_url = os.environ.get("CAULI_REDIS_URL")
         self.redis_url: str = redis_url or env_redis_url or _DEFAULT_REDIS_URL
+        self._redis_url_given = bool(redis_url or env_redis_url)
         if not redis_url and not env_redis_url:
             # An unrelated redis on 6379 would swallow tasks silently. warning
             # is visible with no logging configured.
@@ -251,6 +253,14 @@ class Cauli:
         self.redis_client: Any = redis_client
         self._redis: redis.Redis | None = None
         self._redis_lock = threading.Lock()
+        # None: Redis Streams carry the ready queue. Set: RabbitMQ or SQS
+        # does, and Redis keeps everything else (PROTOCOL.md 14).
+        self.broker_url: str | None = (
+            broker_url or os.environ.get("CAULI_BROKER_URL") or None
+        )
+        if self.broker_url is not None:
+            _broker.check_url(self.broker_url)
+        self._broker: Any = None
 
     def _new_redis(self) -> redis.Redis:
         """Build the client: the injected one (or its factory), else ``redis_url``."""
@@ -272,6 +282,16 @@ class Cauli:
                 if self._redis is None:
                     self._redis = self._new_redis()
         return self._redis
+
+    def _get_broker(self) -> Any:
+        """The RabbitMQ or SQS publisher, or None when Redis is the broker."""
+        if self.broker_url is None:
+            return None
+        if self._broker is None:
+            with self._redis_lock:
+                if self._broker is None:
+                    self._broker = _broker.open_broker(self.broker_url)
+        return self._broker
 
     def before_task(self, fn: Callable[[], Any]) -> Callable[[], Any]:
         """Register ``fn`` to run before every task, as a decorator or a plain call.
@@ -609,7 +629,11 @@ class Cauli:
             expires=expires,
         )
         raw = self._encode_envelope(envelope)
-        self._publish(self._get_redis(), raw, queue_name, fire_at)
+        broker = self._get_broker()
+        if broker is not None and fire_at is None:
+            broker.publish_many([(queue_name, raw)])
+        else:
+            self._publish(self._get_redis(), raw, queue_name, fire_at)
         return AsyncResult(envelope["id"], self)
 
     def enqueue_many(
@@ -635,13 +659,28 @@ class Cauli:
         published. Returns one :class:`~cauli.result.AsyncResult` per call, in order.
         """
         prepared = self._prepare_many(calls)
-        if not prepared:
-            return []
-        with self._get_redis().pipeline(transaction=False) as pipe:
-            for _task_id, raw, queue_name, fire_at in prepared:
-                self._publish(pipe, raw, queue_name, fire_at)
-            pipe.execute()
+        to_redis, to_broker = self._split_by_destination(prepared)
+        if to_redis:
+            with self._get_redis().pipeline(transaction=False) as pipe:
+                for raw, queue_name, fire_at in to_redis:
+                    self._publish(pipe, raw, queue_name, fire_at)
+                pipe.execute()
+        if to_broker:
+            self._get_broker().publish_many(to_broker)
         return [AsyncResult(task_id, self) for task_id, _raw, _q, _f in prepared]
+
+    def _split_by_destination(
+        self, prepared: list[tuple[str, bytes, str, int | None]]
+    ) -> tuple[list[tuple[bytes, str, int | None]], list[tuple[str, bytes]]]:
+        """``(redis writes, broker publishes)``: a broker takes only what is due now."""
+        to_redis: list[tuple[bytes, str, int | None]] = []
+        to_broker: list[tuple[str, bytes]] = []
+        for _task_id, raw, queue_name, fire_at in prepared:
+            if self.broker_url is not None and fire_at is None:
+                to_broker.append((queue_name, raw))
+            else:
+                to_redis.append((raw, queue_name, fire_at))
+        return to_redis, to_broker
 
     def _prepare_many(
         self, calls: Iterable["TaskDef | tuple[Any, ...]"]
@@ -690,9 +729,15 @@ class Cauli:
         return client.xadd(f"cauli:q:{queue}", {"e": raw})
 
     def __repr__(self) -> str:
+        broker = (
+            ""
+            if self.broker_url is None
+            else f" broker_url={_broker.redact_url(self.broker_url)!r}"
+        )
         return (
             f"<{type(self).__name__} default_queue={self.default_queue!r} "
-            f"tasks={len(self._tasks)} redis_url={_redact_redis_url(self.redis_url)!r}>"
+            f"tasks={len(self._tasks)} "
+            f"redis_url={_redact_redis_url(self.redis_url)!r}{broker}>"
         )
 
 
@@ -729,6 +774,16 @@ class AsyncCauli(Cauli):
         from redis import asyncio as aioredis
 
         if self.async_redis_client is None:
+            if self.redis_client is not None and not self._redis_url_given:
+                # Building from the default URL would send every awaited call
+                # to localhost while .delay() goes to the injected client.
+                raise RuntimeError(
+                    f"{type(self).__name__} was given redis_client but neither "
+                    "async_redis_client nor a redis_url, so the asyncio calls "
+                    "(adelay, aget, aenqueue_many) have no Redis to use. Pass "
+                    "async_redis_client=, a redis.asyncio client or a factory "
+                    "for the same server"
+                )
             return aioredis.Redis.from_pool(
                 aioredis.BlockingConnectionPool.from_url(
                     self.redis_url,
@@ -785,7 +840,14 @@ class AsyncCauli(Cauli):
             expires=expires,
         )
         raw = self._encode_envelope(envelope)
-        await self._publish(self._get_async_redis(), raw, queue_name, fire_at)
+        broker = self._get_broker()
+        if broker is not None and fire_at is None:
+            import asyncio
+
+            # The publishers block on a socket; a thread keeps the loop free.
+            await asyncio.to_thread(broker.publish_many, [(queue_name, raw)])
+        else:
+            await self._publish(self._get_async_redis(), raw, queue_name, fire_at)
         return AsyncResult(envelope["id"], self)
 
     async def aenqueue_many(
@@ -793,13 +855,17 @@ class AsyncCauli(Cauli):
     ) -> list[AsyncResult]:
         """The asyncio mirror of :meth:`Cauli.enqueue_many`."""
         prepared = self._prepare_many(calls)
-        if not prepared:
-            return []
-        async with self._get_async_redis().pipeline(transaction=False) as pipe:
-            for _task_id, raw, queue_name, fire_at in prepared:
-                # Not awaited: a buffered pipeline command returns the pipeline.
-                self._publish(pipe, raw, queue_name, fire_at)
-            await pipe.execute()
+        to_redis, to_broker = self._split_by_destination(prepared)
+        if to_redis:
+            async with self._get_async_redis().pipeline(transaction=False) as pipe:
+                for raw, queue_name, fire_at in to_redis:
+                    # Not awaited: a buffered pipeline command returns the pipeline.
+                    self._publish(pipe, raw, queue_name, fire_at)
+                await pipe.execute()
+        if to_broker:
+            import asyncio
+
+            await asyncio.to_thread(self._get_broker().publish_many, to_broker)
         return [AsyncResult(task_id, self) for task_id, _raw, _q, _f in prepared]
 
     async def aclose(self) -> None:

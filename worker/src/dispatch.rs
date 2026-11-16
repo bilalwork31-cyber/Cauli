@@ -13,6 +13,10 @@ use std::sync::Arc;
 use tokio::sync::OwnedSemaphorePermit;
 use tracing::{debug, error, warn};
 
+/// Pause between idempotency claim attempts while Redis is unreachable
+/// and the ready queue is RabbitMQ or SQS.
+const CLAIM_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Called by the fetch and recovery loops. `raw` is stream field `e`.
 ///
 /// The io slot is taken here, before the spawn, not when the task starts:
@@ -43,7 +47,7 @@ pub fn spawn_dispatch(ctx: Arc<Ctx>, queue: String, stream_id: String, raw: Opti
 /// PROTOCOL §2: 32 char lowercase hex. Stops a crafted `id` from
 /// overwriting another task's result key, carrying cluster hash tags, or
 /// being a key size DoS.
-fn valid_task_id(id: &str) -> bool {
+pub fn valid_task_id(id: &str) -> bool {
     id.len() == 32
         && id
             .bytes()
@@ -214,7 +218,28 @@ async fn process(
     // §4.5 claim. Its TTL also depends on timeout_ms (broker::claim_ttl_s).
     if let Some(key) = env.idempotency_key.clone() {
         let mut conn = ctx.redis.clone();
-        match broker::idemp_claim(&mut conn, &key, &env.id, ctx.idemp_ttl, env.timeout_ms).await {
+        let mut waiting = false;
+        let claim = loop {
+            let claim =
+                broker::idemp_claim(&mut conn, &key, &env.id, ctx.idemp_ttl, env.timeout_ms).await;
+            // §14: RabbitMQ and SQS keep delivering through a Redis outage,
+            // so failing open would run every keyed task unguarded for as
+            // long as it lasts. The delivery waits for the guard instead.
+            match claim {
+                Err(e) if ctx.transport.is_some() => {
+                    if ctx.shutting_down() {
+                        return;
+                    }
+                    if !waiting {
+                        warn!(id = %env.id, "idempotency claim failed ({e}); waiting for redis");
+                        waiting = true;
+                    }
+                    tokio::time::sleep(CLAIM_RETRY).await;
+                }
+                claim => break claim,
+            }
+        };
+        match claim {
             Ok(broker::IdempClaim::Fresh) | Ok(broker::IdempClaim::MineAgain) => {}
             Ok(broker::IdempClaim::Duplicate { claimant }) => {
                 // Never released, even after the claimant is dead lettered
@@ -381,16 +406,37 @@ async fn final_failure(
 /// Best effort id for a terminal DLQ write, parsed from a 4096 byte preview
 /// so a huge hostile payload is never fully parsed.
 fn recover_id(raw_e: &str) -> Option<String> {
-    // Only the id: some other field is what failed to parse. `raw_e` is
-    // already bounded: an oversize envelope arrives here as its preview.
-    #[derive(serde::Deserialize)]
-    struct IdOnly {
-        id: String,
+    /// Stops at the first top level `id`. A derived struct would read the
+    /// whole object first, and an oversize entry arrives as a preview cut
+    /// mid value, which never parses to its end.
+    struct FirstId<'a>(&'a mut Option<String>);
+
+    impl<'de> serde::de::Visitor<'de> for FirstId<'_> {
+        type Value = ();
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("an envelope object")
+        }
+
+        fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+            while let Some(key) = map.next_key::<String>()? {
+                if key == "id" {
+                    *self.0 = Some(map.next_value()?);
+                    return Ok(());
+                }
+                map.next_value::<serde::de::IgnoredAny>()?;
+            }
+            Ok(())
+        }
     }
-    match serde_json::from_str::<IdOnly>(raw_e) {
-        Ok(e) if valid_task_id(&e.id) => Some(e.id),
-        _ => None,
-    }
+
+    let mut id = None;
+    // The error is what follows the id (more fields, or the cut): expected.
+    let _ = serde::Deserializer::deserialize_map(
+        &mut serde_json::Deserializer::from_str(raw_e),
+        FirstId(&mut id),
+    );
+    id.filter(|id| valid_task_id(id))
 }
 
 /// Error for a task that never ran, typed so callers can tell it from a
@@ -418,17 +464,10 @@ pub async fn dlq_terminal(
     reason: &str,
     err: Option<&ErrorJson>,
 ) {
-    let recovered_id = recover_id(raw_e);
-    let synthesized = err.is_none().then(|| dlq_error(reason));
-    let result_error = err.or(synthesized.as_ref());
-    let result_json = match (&recovered_id, result_error) {
-        (Some(_), Some(e)) => Some(envelope::result_failure(e, now_ms())),
-        _ => None,
-    };
-    let store = match (&recovered_id, &result_json) {
-        (Some(id), Some(rj)) => Some((id.as_str(), rj.as_str(), ctx.result_ttl)),
-        _ => None,
-    };
+    let result = terminal_result(raw_e, reason, err);
+    let store = result
+        .as_ref()
+        .map(|(id, rj)| (id.as_str(), rj.as_str(), ctx.result_ttl));
     match broker::finish_dlq(&ctx.acks, queue, sid, raw_e, reason, err, store).await {
         Ok(()) => {
             ctx.counters.dlq.fetch_add(1, Ordering::Relaxed);
@@ -437,6 +476,43 @@ pub async fn dlq_terminal(
             error!(reason, "terminal dlq write failed: {e}");
         }
     }
+}
+
+/// `(task id, failure result)` of an entry dead lettered unrun, when its id
+/// is recoverable. `err` None means the error is synthesized from `reason`.
+fn terminal_result(raw_e: &str, reason: &str, err: Option<&ErrorJson>) -> Option<(String, String)> {
+    let id = recover_id(raw_e)?;
+    let synthesized = err.is_none().then(|| dlq_error(reason));
+    let error = err.or(synthesized.as_ref())?;
+    Some((id, envelope::result_failure(error, now_ms())))
+}
+
+/// §14: a due envelope RabbitMQ or SQS will never accept, dead lettered
+/// straight from the delayed set. Stored as a preview when oversize, like
+/// an oversize stream entry.
+pub async fn dlq_unpublishable(
+    ctx: &Arc<Ctx>,
+    conn: &mut redis::aio::ConnectionManager,
+    queue: &str,
+    raw_e: &str,
+    why: &str,
+) -> anyhow::Result<()> {
+    let kept = if raw_e.len() > ctx.args.max_envelope_bytes {
+        envelope::safe_truncate(raw_e, 4096)
+    } else {
+        raw_e
+    };
+    let err = ErrorJson::new(
+        "Malformed",
+        format!("the broker refused this envelope, so the task never ran: {why}"),
+    );
+    let result = terminal_result(kept, "malformed", Some(&err));
+    let store = result
+        .as_ref()
+        .map(|(id, rj)| (id.as_str(), rj.as_str(), ctx.result_ttl));
+    broker::dead_letter(conn, queue, kept, "malformed", Some(&err), store).await?;
+    ctx.counters.dlq.fetch_add(1, Ordering::Relaxed);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -603,6 +679,29 @@ mod tests {
             recover_id(&raw),
             Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
         );
+    }
+
+    /// What dispatch passes for an oversize entry: a preview cut mid value.
+    #[test]
+    fn recover_id_from_a_truncated_oversize_preview() {
+        let raw = format!(
+            r#"{{"v":1,"id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","task":"t","args":["{}"]}}"#,
+            "x".repeat(5000)
+        );
+        let preview = envelope::safe_truncate(&raw, 4096);
+        assert!(serde_json::from_str::<serde_json::Value>(preview).is_err());
+        assert_eq!(
+            recover_id(preview),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string())
+        );
+    }
+
+    #[test]
+    fn recover_id_ignores_an_id_nested_in_another_value() {
+        let raw = r#"{"args":[{"id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}],"task":"t"}"#;
+        assert_eq!(recover_id(raw), None);
+        let cut = r#"{"kwargs":{"id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","pad":"xxx"#;
+        assert_eq!(recover_id(cut), None);
     }
 
     #[test]

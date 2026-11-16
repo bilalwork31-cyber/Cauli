@@ -37,8 +37,9 @@ The boundary is what a message can make a worker do:
   path around either is in scope.
 - Anything reachable through the fork server socket, which is created at 0700
   and checks `SO_PEERCRED`.
-- Credential leaks: the Redis URL is redacted in every log path and is passed
-  to supervised processes through the environment rather than argv.
+- Credential leaks: the Redis URL and the broker URL are redacted in every
+  log path and are passed to supervised processes through the environment
+  rather than argv. An `sqs://` URL carrying credentials is refused.
 - Memory safety in the Rust worker, and anything that crashes it from a crafted
   envelope rather than dead lettering the envelope.
 
@@ -46,10 +47,11 @@ The boundary is what a message can make a worker do:
 
 These are design positions, not vulnerabilities.
 
-- **Redis is trusted.** Anything with write access to the broker can enqueue
-  any registered task with any arguments. Run Redis on a private network with
-  `requirepass` or `rediss://`, and treat broker access as equivalent to code
-  execution in your workers.
+- **Redis is trusted, and so is a RabbitMQ or SQS broker.** Anything with
+  write access to the task queue can enqueue any registered task with any
+  arguments. Run Redis on a private network with `requirepass` or `rediss://`,
+  use `amqps://` and scoped IAM policies, and treat broker access as
+  equivalent to code execution in your workers.
 - **Task arguments, results and tracebacks are stored in Redis in plaintext.**
   Keep secrets out of all three.
 - **Dead letter entries hold the full envelope, arguments included.** The

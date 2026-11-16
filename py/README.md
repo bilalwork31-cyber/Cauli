@@ -27,3 +27,7 @@ the enqueue only install.
     r.get(timeout=10)
 
 Run the worker with `cauli-worker -A myproj.tasks:app -c 50`.
+
+Redis carries the tasks by default. `pip install 'cauli[rabbitmq]'` or
+`'cauli[sqs]'` and a `CAULI_BROKER_URL` move the task queue to RabbitMQ or
+Amazon SQS; Redis stays for results and delayed tasks.

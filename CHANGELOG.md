@@ -91,6 +91,26 @@ Worker:
 - The Redis password is redacted from worker logs and `repr(Cauli)` for
   unix socket URLs (`?pass=`), passwords containing an unencoded `/` or `#`,
   and percent encoded query keys.
+- An envelope over `--max-envelope-bytes` gets its failure result. The id was
+  read by parsing the stored 4096 byte preview as a whole JSON document, which
+  a truncated preview never is, so `get()` waited out its timeout.
+- `sys.exit()` or `KeyboardInterrupt` inside an `async def` task with a
+  `soft_timeout`, or inside any task it spawned, no longer ends the event
+  loop thread. Every later async task failed `TimeLimitExceeded` and the
+  worker exited 87 about 20 seconds later.
+- cpu children start on the venv's interpreter when the worker runs from a
+  venv that was never activated (systemd, a Dockerfile calling the absolute
+  path). They started on the base interpreter, could not import the app, and
+  cpu tasks neither ran nor failed.
+- `--no-fork-server`: a stray line on a cpu child's stdout (a task that forks
+  and returns in both processes) fails the task in flight and replaces the
+  child. Every later task used to receive the result of the one before it.
+- A cpu task whose exception message holds a lone surrogate (`os.fsdecode` of
+  a non UTF-8 filename) is retried like any other failure. It was recorded as
+  a terminal `SerializationError` on its first attempt.
+- `--cpu-prefetch`, `--ack-batch` and `--drain-timeout` are bounded at
+  startup (1024, 1,000,000 and 30 days). Near `u64::MAX` each started a worker
+  that panicked later: on the first cpu task, at boot, and on SIGTERM.
 
 Client and integrations:
 
@@ -112,6 +132,21 @@ Client and integrations:
 - `django_app()` and `sqlalchemy_app()` return an `AsyncCauli`, so async
   views and endpoints can `await task.adelay(...)` instead of blocking the
   event loop on Redis.
+- `cauli.contrib.django`: an async task no longer closes the database
+  connection another async task is using. Tasks share ORM executor threads,
+  and with Django's default `CONN_MAX_AGE = 0` one task's cleanup hook closed
+  the connection under a neighbour (`aiterator()` failed with "Cannot operate
+  on a closed database"). While an executor is shared only a connection that
+  has already failed is closed.
+- `apply_async_on_commit` and `delay_on_commit` check every option and the
+  envelope size at the call site. A naive `eta`, an invalid queue name, a
+  non string `idempotency_key` or an oversize payload used to raise when the
+  transaction committed: the row was saved and no task was published.
+- `AsyncCauli(redis_client=...)` without `async_redis_client` or a
+  `redis_url` raises on the first awaited call. `adelay` and `aget` used to
+  go to `redis://localhost:6379` while `delay` went to the injected client.
+- `get()` on a result whose `error` is not a JSON object raises
+  `TaskFailedError(type="InvalidResult")`, not `AttributeError`.
 
 Beat:
 
@@ -119,6 +154,14 @@ Beat:
   when older slots were missed.
 - An entry that cannot be fired is retried once a second instead of 20 times
   a second with an ERROR line each time.
+- A schedule entry copied to a new hash field fires under that field's name.
+  The `"name"` inside the copied JSON used to win, so the copy never fired
+  and beat polled 20 times a second with nothing logged.
+- A stored `max_lateness` that is infinite or absurdly large is rejected when
+  the entry is loaded. It raised `OverflowError` out of the tick and stopped
+  every replica.
+- Beat refuses an envelope over `max_envelope_bytes`, as every other producer
+  does, and logs it.
 
 ### Performance
 
@@ -178,6 +221,16 @@ handing over between threads, and runs 3.9x faster on free threaded 3.14t.
 
 ### Added
 
+- **RabbitMQ and Amazon SQS as the task queue (beta).** `Cauli(broker_url=...)`,
+  `CAULI_BROKER_URL` or `cauli-worker --broker-url` with `amqp://`,
+  `amqps://`, `sqs://` or `sqs://<region>` moves ready tasks to durable
+  RabbitMQ quorum queues or SQS standard queues; Redis still holds results,
+  delayed and retried tasks, idempotency keys, dead letters and the beat
+  schedule. Install the publisher with `pip install 'cauli[rabbitmq]'` or
+  `'cauli[sqs]'`. Specified in PROTOCOL.md section 14. Tested end to end
+  against RabbitMQ 3.12.1 and the ElasticMQ 1.6.11 SQS emulator, including a
+  killed worker, a Redis outage during completion and a dropped broker
+  connection. Not yet run against RabbitMQ 4 or against AWS itself.
 - **Free threaded CPython 3.14t.** The release matrix builds, verifies and
   runs a `cp314t` worker wheel, and CI runs the client suite and the cross
   component suite on 3.14t with the GIL off. Sync tasks on threads now run in

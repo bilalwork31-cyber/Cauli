@@ -31,6 +31,9 @@ __all__ = [
 
 #: Missed-slot policies (PROTOCOL.md section 10.4).
 ON_MISSED = ("fire_once", "skip")
+#: Exclusive ceiling on ``max_lateness``, in seconds: a century. Far past any
+#: real value, and it keeps a hand edited entry's millisecond arithmetic finite.
+MAX_LATENESS_LIMIT = 100 * 365 * 86400.0
 
 _MONTH_NAMES = {
     n: i
@@ -483,11 +486,12 @@ class ScheduleEntry:
             raise ValueError(
                 f"schedule entry {name!r}: on_missed must be one of {ON_MISSED}"
             )
-        if max_lateness is not None and max_lateness < 0:
-            # A negative bound would silently stop the entry from ever firing.
+        if max_lateness is not None and not 0 <= max_lateness < MAX_LATENESS_LIMIT:
+            # A negative bound would silently stop the entry from ever firing;
+            # an infinite one overflows the millisecond arithmetic in beat.
             raise ValueError(
-                f"schedule entry {name!r}: max_lateness must be >= 0 seconds, "
-                f"got {max_lateness!r}"
+                f"schedule entry {name!r}: max_lateness must be >= 0 and below "
+                f"{MAX_LATENESS_LIMIT:g} seconds, got {max_lateness!r}"
             )
         self.name = name
         self.task = task

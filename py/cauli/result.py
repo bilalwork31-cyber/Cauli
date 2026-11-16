@@ -190,7 +190,7 @@ class AsyncResult:
         if status == "success":
             return doc.get("result")
         if status == "failure":
-            error = doc.get("error") or {}
+            error = self._error_object(doc)
             raise TaskFailedError(
                 error.get("type"),
                 error.get("message"),
@@ -204,7 +204,7 @@ class AsyncResult:
             return None
         if status == "expired":
             self.expired = True
-            error = doc.get("error") or {}
+            error = self._error_object(doc)
             raise TaskFailedError(
                 error.get("type") or "Expired",
                 error.get("message") or "task expired before it was executed",
@@ -217,6 +217,18 @@ class AsyncResult:
             None,
             "client",
         )
+
+    def _error_object(self, doc: dict[str, Any]) -> dict[str, Any]:
+        error = doc.get("error") or {}
+        if not isinstance(error, dict):
+            raise TaskFailedError(
+                "InvalidResult",
+                f"result document for task {self.id} has an error that is not "
+                f"a JSON object, got {type(error).__name__}",
+                None,
+                "client",
+            )
+        return error
 
     def claimant(self) -> "AsyncResult | None":
         """Handle to the task that suppressed this one, or ``None``.

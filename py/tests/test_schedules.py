@@ -556,3 +556,17 @@ def test_dst_fall_back_every_15_minutes_keeps_firing_in_the_repeated_hour(tz_nam
     fired = fires_during_local_day(s, tz_name, *day)
     assert fired == real_matching_instants(s, tz_name, *day)
     assert len(fired) == 25 * 4
+
+
+@pytest.mark.parametrize("value", [-1, float("inf"), float("nan"), 1.8e305])
+def test_max_lateness_must_be_a_finite_number_of_seconds(value):
+    """An unbounded value read back from Redis raised OverflowError out of
+    beat's tick and stopped every replica."""
+    with pytest.raises(ValueError, match="max_lateness"):
+        ScheduleEntry(
+            name="e",
+            task="t",
+            schedule=interval(60),
+            on_missed="skip",
+            max_lateness=value,
+        )

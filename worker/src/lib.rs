@@ -4,6 +4,7 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+mod amqp;
 mod backoff;
 mod broker;
 mod cli;
@@ -17,8 +18,10 @@ mod logsink;
 mod loops;
 mod pyjson;
 mod pyrt;
+mod sqs;
 mod stats;
 mod supervisor;
+mod transport;
 
 use clap::Parser;
 use ctx::Ctx;
@@ -142,6 +145,10 @@ fn real_main() -> i32 {
         );
         return 1;
     }
+    if let Some(msg) = flag_ceiling_error(&args) {
+        error!("{msg}");
+        return 1;
+    }
     if args.concurrency == Some(0) {
         error!("-c/--concurrency must be >= 1");
         return 1;
@@ -169,6 +176,12 @@ fn real_main() -> i32 {
     if args.print_plan {
         print_plan(&args, &resolved, cores);
         return 0;
+    }
+    // Before the supervisor branch and before the interpreter starts: every
+    // child inherits it, and the app's Cauli() reads it, so a task that
+    // enqueues a follow up publishes to the broker this worker consumes.
+    if let Some(url) = &args.broker_url {
+        std::env::set_var(BROKER_URL_ENV, url);
     }
     if resolved.procs > 1 {
         info!(
@@ -220,10 +233,15 @@ fn real_main() -> i32 {
             return 1;
         }
     }
+    let broker_url = std::env::var(BROKER_URL_ENV)
+        .ok()
+        .filter(|url| !url.is_empty())
+        .or_else(|| appcfg.broker_url.clone());
     info!(
-        "cauli-worker starting: app={} queues={:?} redis={} tasks={} io_threads={} io_concurrency={} cpu_workers={}",
+        "cauli-worker starting: app={} queues={:?} broker={} redis={} tasks={} io_threads={} io_concurrency={} cpu_workers={}",
         args.app_spec(),
         queues,
+        broker_url.as_deref().map_or("redis".into(), redact_redis_url),
         redact_redis_url(&redis_url),
         appcfg.tasks.len(),
         resolved.io_threads,
@@ -249,7 +267,19 @@ fn real_main() -> i32 {
         rt_builder.worker_threads((cores / resolved.procs).max(1));
     }
     let rt = rt_builder.build().expect("tokio runtime");
-    rt.block_on(run_worker(args, resolved, pyrt, appcfg, redis_url, queues))
+    rt.block_on(run_worker(
+        args, resolved, pyrt, appcfg, redis_url, broker_url, queues,
+    ))
+}
+
+/// The flag's environment twin, read by the worker and by the app's Cauli().
+const BROKER_URL_ENV: &str = "CAULI_BROKER_URL";
+
+/// Deliveries RabbitMQ may push per queue: every io slot plus the cpu
+/// admission slots, split across queues like a Redis fetch page.
+fn amqp_prefetch(io_concurrency: usize, cpu_slots: usize, queues: usize) -> u16 {
+    let per_queue = io_concurrency.saturating_add(cpu_slots) / queues.max(1);
+    per_queue.clamp(1, u16::MAX as usize) as u16
 }
 
 async fn run_worker(
@@ -258,6 +288,7 @@ async fn run_worker(
     pyrt: Arc<pyrt::PyRuntime>,
     appcfg: pyrt::AppConfig,
     redis_url: String,
+    broker_url: Option<String>,
     queues: Vec<String>,
 ) -> i32 {
     install_tls_provider();
@@ -308,10 +339,40 @@ async fn run_worker(
             }
         }
     }
-    if let Err(e) = broker::ensure_groups(&mut write_conn, &queues).await {
-        error!("XGROUP CREATE failed: {e}");
-        return 1;
-    }
+    let needs_cpu = appcfg.tasks.values().any(|s| s.kind == "cpu");
+    let transport = match &broker_url {
+        None => {
+            if let Err(e) = broker::ensure_groups(&mut write_conn, &queues).await {
+                error!("XGROUP CREATE failed: {e}");
+                return 1;
+            }
+            None
+        }
+        Some(url) => {
+            let cpu_slots = if needs_cpu {
+                cpu::admission_slots(
+                    resolved.cpu_workers,
+                    args.cpu_child_threads,
+                    args.cpu_prefetch,
+                )
+            } else {
+                0
+            };
+            let settings = transport::Settings {
+                queues: queues.clone(),
+                visibility_timeout_s: args.visibility_timeout,
+                prefetch: amqp_prefetch(resolved.io_concurrency, cpu_slots, queues.len()),
+                timeout: Duration::from_secs(args.redis_timeout),
+            };
+            match transport::Transport::connect(url, settings).await {
+                Ok(transport) => Some(Arc::new(transport)),
+                Err(e) => {
+                    error!("cannot use broker {}: {e:#}", redact_redis_url(url));
+                    return 1;
+                }
+            }
+        }
+    };
     // Before anything reads the clock (clock.rs).
     clock::init(&mut write_conn).await;
     tokio::spawn(clock::sampler_loop(write_conn.clone()));
@@ -338,7 +399,6 @@ async fn run_worker(
     let io_concurrency = resolved.io_concurrency;
     // Routing is by registry kind, so with no cpu task the pool is unreachable
     // and never started; with one, it starts lazily on the first cpu task.
-    let needs_cpu = appcfg.tasks.values().any(|s| s.kind == "cpu");
     let cpu_cfg = needs_cpu.then(|| cpu::StartCfg {
         workers: resolved.cpu_workers,
         child_threads: args.cpu_child_threads,
@@ -370,8 +430,19 @@ async fn run_worker(
         .iter()
         .map(|q| (q.clone(), std::sync::Mutex::new(Default::default())))
         .collect();
-    let acks = broker::AckBufs::start(&write_conn, &queues, args.ack_batch, args.ack_flush_ms);
+    let foreign = transport.clone().map(|transport| broker::Foreign {
+        transport,
+        shutdown: shutdown_rx.clone(),
+    });
+    let acks = broker::AckBufs::start(
+        &write_conn,
+        &queues,
+        args.ack_batch,
+        args.ack_flush_ms,
+        foreign,
+    );
     let ctx = Arc::new(Ctx {
+        transport,
         io_sem: Arc::new(tokio::sync::Semaphore::new(io_concurrency)),
         io_concurrency,
         inflight_entries,
@@ -397,12 +468,24 @@ async fn run_worker(
 
     spawn_signal_task(shutdown_tx, ctx.clone());
     tokio::spawn(loops::mover_loop(ctx.clone()));
-    tokio::spawn(loops::trim_loop(ctx.clone()));
-    tokio::spawn(loops::recovery_loop(ctx.clone()));
     tokio::spawn(loops::stats_loop(ctx.clone()));
     tokio::spawn(loops::wedge_loop(ctx.clone()));
 
-    loops::fetch_loop(ctx.clone(), fetch_conn).await; // returns on shutdown
+    // Both return on shutdown.
+    match ctx.transport.clone() {
+        None => {
+            // The trim and §4.4 recovery act on the stream and its PEL.
+            // RabbitMQ and SQS redeliver by themselves (PROTOCOL §14).
+            tokio::spawn(loops::trim_loop(ctx.clone()));
+            tokio::spawn(loops::recovery_loop(ctx.clone()));
+            loops::fetch_loop(ctx.clone(), fetch_conn).await;
+        }
+        Some(transport) => {
+            let renewing = transport.clone();
+            tokio::spawn(async move { renewing.renew_loop().await });
+            transport.fetch_loop(&ctx).await;
+        }
+    }
 
     // §4.7 drain: mover + acks keep running; wait for in flight tasks.
     let deadline = Instant::now() + Duration::from_secs(ctx.args.drain_timeout);
@@ -599,6 +682,41 @@ fn longest_timeout_past_drain(
                 .then_with(|| b_name.as_str().cmp(a_name.as_str()))
         })
         .map(|(name, spec)| (name.as_str(), spec.timeout_ms))
+}
+
+/// Sizes the cpu admission semaphore, which panics past tokio's permit
+/// ceiling on the first cpu task. The same bound as `--cpu-child-threads`.
+const MAX_CPU_PREFETCH: usize = 1024;
+
+/// The completion channel holds four times this, and tokio panics on a
+/// channel past its permit ceiling. A million is far beyond any flush.
+const MAX_ACK_BATCH: usize = 1_000_000;
+
+/// Added to an `Instant`, which panics on overflow. 30 days is already no
+/// drain at all.
+const MAX_DRAIN_TIMEOUT_S: u64 = 30 * 86_400;
+
+/// A flag value that would panic later instead of failing at startup.
+fn flag_ceiling_error(args: &cli::Args) -> Option<String> {
+    if args.cpu_prefetch > MAX_CPU_PREFETCH {
+        return Some(format!(
+            "--cpu-prefetch must be at most {MAX_CPU_PREFETCH} (got {})",
+            args.cpu_prefetch
+        ));
+    }
+    if args.ack_batch > MAX_ACK_BATCH {
+        return Some(format!(
+            "--ack-batch must be at most {MAX_ACK_BATCH} (got {})",
+            args.ack_batch
+        ));
+    }
+    if args.drain_timeout > MAX_DRAIN_TIMEOUT_S {
+        return Some(format!(
+            "--drain-timeout must be at most {MAX_DRAIN_TIMEOUT_S} seconds (got {})",
+            args.drain_timeout
+        ));
+    }
+    None
 }
 
 /// Four times the ~1000 thread sync knee: above it is a typo, and the eager
@@ -835,6 +953,29 @@ mod tests {
             longest_timeout_past_drain(&registry(&[("t", u64::MAX)]), u64::MAX),
             None
         );
+    }
+
+    #[test]
+    fn amqp_prefetch_splits_the_slots_across_queues_and_never_reaches_zero() {
+        assert_eq!(amqp_prefetch(256, 0, 1), 256);
+        assert_eq!(amqp_prefetch(256, 40, 2), 148);
+        assert_eq!(amqp_prefetch(2, 0, 8), 1, "0 would mean unlimited");
+        assert_eq!(amqp_prefetch(usize::MAX, usize::MAX, 1), u16::MAX);
+    }
+
+    #[test]
+    fn flags_that_would_panic_later_are_refused_at_startup() {
+        let parse = |flag: &str, value: &str| {
+            cli::Args::try_parse_from(["cauli-worker", "-A", "m:app", flag, value]).unwrap()
+        };
+        let defaults = cli::Args::try_parse_from(["cauli-worker", "-A", "m:app"]).unwrap();
+        assert_eq!(flag_ceiling_error(&defaults), None);
+        assert_eq!(flag_ceiling_error(&parse("--cpu-prefetch", "1024")), None);
+        for flag in ["--cpu-prefetch", "--ack-batch", "--drain-timeout"] {
+            let msg = flag_ceiling_error(&parse(flag, "18446744073709551615"))
+                .unwrap_or_else(|| panic!("{flag} u64::MAX must be refused"));
+            assert!(msg.contains(flag), "{msg}");
+        }
     }
 
     #[test]

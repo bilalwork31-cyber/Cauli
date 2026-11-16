@@ -369,7 +369,7 @@ def test_eof_shuts_down_parent_and_children(fs):
 
 
 def test_reaper_logs_signal_on_abnormal_child_exit(fs):
-    """Audit item 4: the reaper used to discard the exit status entirely
+    """The reaper used to discard the exit status entirely
     (`pid, _status = os.waitpid(-1, os.WNOHANG)`), so a segfault, an OOM
     kill, and any other unprompted death all looked identical to the worker
     (cpu.rs logs every one as a plain "child connection closed"). The child

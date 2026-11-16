@@ -275,6 +275,7 @@ def load_app(app_spec, extra_paths_json):
     return json.dumps(
         {
             "redis_url": str(getattr(app, "redis_url", "redis://localhost:6379/0")),
+            "broker_url": getattr(app, "broker_url", None),
             "default_queue": str(getattr(app, "default_queue", "default")),
             "result_ttl": int(getattr(app, "result_ttl", 3600)),
             "idemp_ttl": int(getattr(app, "idemp_ttl", 86400)),
@@ -316,8 +317,11 @@ def cpu_child_python():
         base_dir = venv_home(exe) or os.path.dirname(real)
         return base_dir == home
 
+    # The venv first: an embedded sys.executable is "python3" off PATH, and
+    # when that is the venv's own base interpreter it also belongs, but
+    # starts children without the venv's packages.
     venv = os.environ.get("VIRTUAL_ENV")
-    for exe in (sys.executable, venv and os.path.join(venv, "bin", "python")):
+    for exe in (venv and os.path.join(venv, "bin", "python"), sys.executable):
         if belongs(exe):
             return exe
     own = os.path.join(home, own_name)
@@ -445,7 +449,15 @@ def _run_sync_inner(name, args, kwargs, soft_timeout_ms, meta=None):
 
 def _loop_main(loop):
     asyncio.set_event_loop(loop)
-    loop.run_forever()
+    while True:
+        try:
+            loop.run_forever()
+            return
+        except (SystemExit, KeyboardInterrupt):
+            # asyncio re-raises these out of run_forever from any Task, which
+            # would end this thread and wedge every async task behind it. The
+            # Task already holds the exception, so its awaiter still fails.
+            traceback.print_exc()
 
 
 def _new_loop():

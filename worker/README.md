@@ -1,7 +1,8 @@
 # cauli-worker
 
 The Rust worker for [cauli](https://pypi.org/project/cauli/), a Python task
-queue. One binary embeds CPython and runs async, sync and cpu tasks from Redis.
+queue. One binary embeds CPython and runs async, sync and cpu tasks from Redis,
+RabbitMQ or Amazon SQS.
 
 Install it with `pip install cauli`, which pulls in the matching
 `cauli-worker` wheel. Documentation:
