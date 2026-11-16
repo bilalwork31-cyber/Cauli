@@ -3,7 +3,7 @@
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## 0.2.0 (unreleased)
+## 0.2.0 (2026-11-16)
 
 Every entry below was found by reproducing it against a real worker and
 Redis, and each fix ships with a test that fails without it.
