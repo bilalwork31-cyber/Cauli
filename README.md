@@ -165,6 +165,7 @@ configuration:
 | [docs/migrating-from-celery.md](docs/migrating-from-celery.md) | What ports, what diverges, in what order to migrate |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Building and testing from source |
 | [SECURITY.md](SECURITY.md) | Reporting a vulnerability, and the trust model |
+| [llms.txt](llms.txt) | For coding agents: setup, the rules that prevent bugs, and a production checklist, in one file |
 | [CHANGELOG.md](CHANGELOG.md) | Changes per release |
 
 Bugs and questions: [github.com/bilalwork31-cyber/Cauli/issues](https://github.com/bilalwork31-cyber/Cauli/issues).
