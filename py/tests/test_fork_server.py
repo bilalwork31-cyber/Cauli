@@ -391,8 +391,10 @@ def test_reaper_logs_signal_on_abnormal_child_exit(fs):
     assert child.at_eof(timeout=10), "the child must be gone, not merely slow"
     assert _wait_pid_gone(pid)
 
+    # The child's own startup line also says pid=N, so wait for the reaper's.
+    reaped = f"child pid={pid} killed by signal"
     deadline = time.monotonic() + 5.0
-    while time.monotonic() < deadline and f"pid={pid}" not in fs.stderr():
+    while time.monotonic() < deadline and reaped not in fs.stderr():
         time.sleep(0.05)
     log = fs.stderr()
     assert f"pid={pid}" in log and "signal" in log, (

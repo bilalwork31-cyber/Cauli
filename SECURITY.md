@@ -4,6 +4,7 @@
 
 | Version | Supported |
 |---|---|
+| 0.2.x | yes |
 | 0.1.x | yes |
 | anything older | no. Nothing older was ever published |
 

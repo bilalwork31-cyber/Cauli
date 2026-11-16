@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cauli"
-version = "0.1.0"
+version = "0.2.0"
 description = "Python client for cauli, a Rust background worker runtime for Python task queues"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -39,7 +39,7 @@ dependencies = [
     # client installs enqueue only. Raise python_version with the release
     # matrix. musl and 3.13t look supported to PEP 508 but have no wheel, so pip
     # fails there: use the enqueue only recipe (PROTOCOL.md section 13.4).
-    "cauli-worker==0.1.0; sys_platform == 'linux' and platform_python_implementation == 'CPython' and (platform_machine == 'x86_64' or platform_machine == 'aarch64') and python_version < '3.15'",
+    "cauli-worker==0.2.0; sys_platform == 'linux' and platform_python_implementation == 'CPython' and (platform_machine == 'x86_64' or platform_machine == 'aarch64') and python_version < '3.15'",
 ]
 
 [project.scripts]
